@@ -32,10 +32,6 @@ CONFIG = {
 
     # --- 3. API & Model Settings ---
     "GEMINI_API_KEYS": [
-        "AIzaSyChIxaIoNhjjlKOUDw5A6wHm9roInC_xyg", # Replace with your key
-        "AIzaSyCJ-62mLmMpAGZUy_gqOyatPf6RK7Ofcqg", # Replace with your key
-        "AIzaSyCLCzKSQQP1ZMLJghBbxLDK8Zzkj3CRWqo", # Replace with your key
-        "AIzaSyA8OpOfT6MXizcUr2CJ1MD7YoJMvifnVK4"
     ],
     # Per-model and global rate limiting settings.
     "GEMINI_MODEL_QUOTAS": {
