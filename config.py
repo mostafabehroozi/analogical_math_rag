@@ -29,6 +29,7 @@ CONFIG = {
     "VERBOSE_LOGGING": True,  # Master switch for detailed print statements to the console.
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "LOGS_DIR": LOGS_DIR, # Directory where detailed run logs will be saved.
+    "RESULTS_DIR": RESULTS_DIR,
 
     # --- 3. API & Model Settings ---
     "GEMINI_API_KEYS": [
@@ -57,6 +58,7 @@ CONFIG = {
     
     # Input data source.
     "HARD_QUESTIONS_JSON_PATH": os.path.join(DATA_DIR, "hard_questions_passed@10_251.json"),
+    "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
     
     # RAG exemplar corpus details.
     "EXEMPLAR_CORPUS_NAME": "AI-MO/NuminaMath-CoT",
