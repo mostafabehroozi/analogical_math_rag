@@ -145,22 +145,30 @@ def adapt(
         # Step 2a: Transformation
         if apply_transform:
             logger.info(f"Applying transformation to exemplar index {idx}.")
+            # --- ADDED FOR MONITORING ---
+            print(f"    -> Transforming exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, original_question, original_solution)
             response = gemini_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
                 logger.info("Transformation successful.")
+                # --- ADDED FOR MONITORING ---
+                print(f"       Transformed text (start): '{current_text[:120]}...'")
             else:
                 logger.warning(f"Transformation failed for exemplar {idx}: {response['error_message']}. Using original text.")
         
         # Step 2b: Summarization
         if apply_summarize:
             logger.info(f"Applying summarization to exemplar index {idx}.")
+            # --- ADDED FOR MONITORING ---
+            print(f"    -> Summarizing exemplar {idx}...")
             prompt = create_summarization_prompt(target_query, original_question, current_text)
             response = gemini_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
                 logger.info("Summarization successful.")
+                # --- ADDED FOR MONITORING ---
+                print(f"       Summarized text (start): '{current_text[:120]}...'")
             else:
                 logger.warning(f"Summarization failed for exemplar {idx}: {response['error_message']}. Using text from previous step.")
 
@@ -217,6 +225,11 @@ def merge(
         # Simple strategy: merge the first two samples.
         pair_to_merge = [current_texts.pop(0), current_texts.pop(0)]
         
+        # --- ADDED FOR MONITORING ---
+        print(f"    -> Merging pair in iteration {iteration}:")
+        print(f"       Sample 1 (start): '{pair_to_merge[0][:100]}...'")
+        print(f"       Sample 2 (start): '{pair_to_merge[1][:100]}...'")
+        
         prompt = create_merging_prompt(target_query, pair_to_merge)
         if "Error:" in prompt:
             logger.error(f"Failed to create merging prompt: {prompt}")
@@ -224,6 +237,8 @@ def merge(
             
         response = gemini_manager.generate_content(prompt, model_name, temperature)
         if response['status'] == 'SUCCESS':
+            # --- ADDED FOR MONITORING ---
+            print(f"       Merged text (start): '{response['text'][:120]}...'")
             current_texts.append(response['text']) # Add the new merged sample to the pool
             logger.info("Merging successful.")
         else:
@@ -269,10 +284,14 @@ def solve(
     logger.info(f"Generating {n_attempts} solution attempts for Pass@{n_attempts}.")
     for i in range(n_attempts):
         logger.info(f"Generating attempt {i+1}/{n_attempts}.")
+        # --- ADDED FOR MONITORING ---
+        print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
         response = gemini_manager.generate_content(prompt, model_name, temperature)
         
         if response['status'] == 'SUCCESS':
             solution_attempts.append(response['text'])
+            # --- ADDED FOR MONITORING ---
+            print(f"       Attempt {i+1} successful.")
         else:
             # Append a formatted error message to maintain the list size for Pass@K analysis
             error_str = f"Error on attempt {i+1}: {response['error_message']}"
