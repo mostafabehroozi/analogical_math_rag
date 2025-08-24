@@ -45,6 +45,12 @@ def run_pipeline_for_single_query(
     """
     logger = logging.getLogger(__name__)
     logger.info(f"--- Starting pipeline for Query #{hard_list_idx}: '{target_query[:80]}...' ---")
+    
+    # --- ADDED FOR MONITORING ---
+    print("\n" + "="*80)
+    print(f"Processing Query #{hard_list_idx}: '{target_query[:100]}...'")
+    print("="*80)
+
 
     # Log the specific configuration flags being used for this run
     run_log = {
@@ -63,6 +69,8 @@ def run_pipeline_for_single_query(
     }
 
     # --- Step 1: Retrieve ---
+    # --- ADDED FOR MONITORING ---
+    print("\n[STEP 1] RETRIEVE")
     retrieval_result = retrieve(
         target_query=target_query,
         embedding_model=embedding_model,
@@ -74,9 +82,16 @@ def run_pipeline_for_single_query(
     if retrieval_result['status'] == 'FAILURE':
         run_log['pipeline_status'] = "FAILURE: Retrieval failed."
         logger.error(run_log['pipeline_status'])
+        # --- ADDED FOR MONITORING ---
+        print("  -> Retrieval FAILED.")
         return run_log
+    # --- ADDED FOR MONITORING ---
+    print(f"  -> Retrieved indices: {retrieval_result['retrieved_indices']}")
+
 
     # --- Step 2: Adapt ---
+    # --- ADDED FOR MONITORING ---
+    print("\n[STEP 2] ADAPT")
     adapt_result = adapt(
         target_query=target_query,
         retrieved_indices=retrieval_result['retrieved_indices'],
@@ -86,8 +101,13 @@ def run_pipeline_for_single_query(
         config=config
     )
     run_log['steps']['adaptation'] = adapt_result
+    # --- ADDED FOR MONITORING ---
+    for i, text in enumerate(adapt_result.get('adapted_texts', [])):
+        print(f"  -> Adapted text #{i+1} (start): '{text[:120]}...'")
     
     # --- Step 3: Merge ---
+    # --- ADDED FOR MONITORING ---
+    print("\n[STEP 3] MERGE")
     merge_result = merge(
         target_query=target_query,
         adapted_texts=adapt_result['adapted_texts'],
@@ -96,8 +116,16 @@ def run_pipeline_for_single_query(
         config=config
     )
     run_log['steps']['merging'] = merge_result
+    # --- ADDED FOR MONITORING ---
+    if merge_result['status'] == 'SKIPPED':
+        print("  -> Merging was SKIPPED as per config.")
+    for i, text in enumerate(merge_result.get('merged_texts', [])):
+        print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
+
 
     # --- Step 4: Solve ---
+    # --- ADDED FOR MONITORING ---
+    print("\n[STEP 4] SOLVE")
     solve_result = solve(
         target_query=target_query,
         final_exemplars=merge_result['merged_texts'],
@@ -106,6 +134,10 @@ def run_pipeline_for_single_query(
     )
     run_log['steps']['solving'] = solve_result
     run_log['llm_final_solution_attempts_texts'] = solve_result.get('solution_attempts', [])
+    # --- ADDED FOR MONITORING ---
+    for i, text in enumerate(solve_result.get('solution_attempts', [])):
+        print(f"  -> Solution attempt #{i+1} (start): '{text[:120]}...'")
+
 
     run_log['pipeline_status'] = "SUCCESS"
     logger.info(f"--- Pipeline finished successfully for Query #{hard_list_idx} ---")
@@ -139,6 +171,9 @@ def run_experiments(
         exp_name = current_config.get("experiment_name", "unnamed_experiment")
         logger.info(f"########## Starting Experiment: {exp_name} ##########")
 
+        # --- THIS IS THE KEY LINE FOR YOUR SECOND REQUEST ---
+        # The log file path is created using the experiment name.
+        # This acts as a checkpoint file for each specific experiment.
         log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
         
         # --- Pause and Resume Logic ---
