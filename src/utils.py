@@ -15,6 +15,7 @@ import json
 import pickle
 import numpy as np
 from datetime import datetime
+import shutil
 
 # --- 1. Logging Setup ---
 
@@ -182,3 +183,97 @@ def load_from_pickle(file_path: str):
         except Exception:
             print(f"ERROR: Failed to load Pickle from {file_path}: {e}")
         return None
+
+
+
+
+# While the request was primarily 'os', shutil.move is generally safer
+# for moving files across different file systems.
+# I will primarily use os.rename as requested, but add a note about shutil.
+
+def move_files_to_directories(files_to_move_map: dict) -> dict:
+    """
+    Moves files from their source paths to specified destination directories.
+
+    Args:
+        files_to_move_map (dict): A dictionary where:
+            - Keys are strings representing destination directory paths.
+            - Values are lists of strings, where each string is the
+              full path to a source file that should be moved to the
+              corresponding destination directory.
+
+    Returns:
+        dict: A dictionary containing two lists:
+            - 'successful_moves': A list of tuples, each representing a
+                                  successful move (source_path, destination_path).
+            - 'failed_moves': A list of tuples, each representing a
+                              failed move (source_path, destination_path_attempted, error_message).
+    """
+    successful_moves = []
+    failed_moves = []
+
+    for dest_dir, source_files_list in files_to_move_map.items():
+        # 1. Validate and create the destination directory
+        if not os.path.exists(dest_dir):
+            try:
+                os.makedirs(dest_dir, exist_ok=True) # exist_ok=True prevents error if dir already exists
+                print(f"Created destination directory: '{dest_dir}'")
+            except OSError as e:
+                print(f"Error: Could not create directory '{dest_dir}'. Skipping files for this destination. Reason: {e}")
+                for source_file in source_files_list:
+                    failed_moves.append((source_file, os.path.join(dest_dir, os.path.basename(source_file)), f"Destination directory creation failed: {e}"))
+                continue # Skip to the next destination directory
+
+        elif not os.path.isdir(dest_dir):
+            print(f"Error: Destination path '{dest_dir}' exists but is not a directory. Skipping files for this destination.")
+            for source_file in source_files_list:
+                failed_moves.append((source_file, os.path.join(dest_dir, os.path.basename(source_file)), f"Destination '{dest_dir}' is not a directory"))
+            continue # Skip to the next destination directory
+
+        # 2. Iterate through source files for the current destination
+        for source_file_path in source_files_list:
+            if not os.path.exists(source_file_path):
+                print(f"Warning: Source file '{source_file_path}' not found. Skipping.")
+                failed_moves.append((source_file_path, os.path.join(dest_dir, os.path.basename(source_file_path)), "Source file not found"))
+                continue
+
+            if not os.path.isfile(source_file_path):
+                print(f"Warning: '{source_file_path}' is not a file. Skipping.")
+                failed_moves.append((source_file_path, os.path.join(dest_dir, os.path.basename(source_file_path)), "Source is not a file"))
+                continue
+
+            # Construct the full destination path for the file
+            # os.path.basename gets just the file name from the source path
+            destination_file_path = os.path.join(dest_dir, os.path.basename(source_file_path))
+
+            if source_file_path == destination_file_path:
+                print(f"Info: Source and destination paths are the same for '{source_file_path}'. No action needed.")
+                successful_moves.append((source_file_path, destination_file_path))
+                continue
+
+            try:
+                # Using os.rename for moving
+                # Note: os.rename might fail if moving across different file systems.
+                #       shutil.move is generally more robust for such cases.
+                os.rename(source_file_path, destination_file_path)
+                print(f"Successfully moved: '{source_file_path}' -> '{destination_file_path}'")
+                successful_moves.append((source_file_path, destination_file_path))
+            except FileNotFoundError:
+                print(f"Error: Source file '{source_file_path}' not found during move attempt.")
+                failed_moves.append((source_file_path, destination_file_path, "Source file not found during move"))
+            except PermissionError as e:
+                print(f"Error: Permission denied for moving '{source_file_path}' to '{destination_file_path}'. Reason: {e}")
+                failed_moves.append((source_file_path, destination_file_path, f"Permission denied: {e}"))
+            except OSError as e:
+                # This could catch errors like "Cannot overwrite existing directory"
+                # or cross-device link errors
+                print(f"Error: Failed to move '{source_file_path}' to '{destination_file_path}'. Reason: {e}")
+                failed_moves.append((source_file_path, destination_file_path, f"OS Error during move: {e}"))
+            except Exception as e:
+                print(f"An unexpected error occurred while moving '{source_file_path}': {e}")
+                failed_moves.append((source_file_path, destination_file_path, f"Unexpected error: {e}"))
+
+    return {
+        'successful_moves': successful_moves,
+        'failed_moves': failed_moves
+    }
