@@ -164,6 +164,7 @@ class GeminiAPIManager:
 
         if sleep_time > 0:
             self.logger.info(f"Rate limit requires sleeping for {sleep_time:.2f}s.")
+            print(f"Sleeping for {sleep_time:.2f} seconds due to rate limiting.")
             time.sleep(sleep_time)
 
         try:
