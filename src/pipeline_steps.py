@@ -22,6 +22,7 @@ from typing import List, Dict, Any, Tuple
 # Import our custom modules
 from src.api_manager import GeminiAPIManager
 from src.prompts import (
+    EXEMPLAR_FORMAT,
     create_transformation_prompt,
     create_summarization_prompt,
     create_merging_prompt,
@@ -116,17 +117,7 @@ def adapt(
 ) -> Dict[str, Any]:
     """
     Performs transformation and summarization on a list of retrieved exemplars.
-
-    Args:
-        target_query (str): The main question.
-        retrieved_indices (List[int]): Indices of the exemplars to adapt.
-        exemplar_questions (List[str]): Full list of corpus questions.
-        exemplar_solutions (List[str]): Full list of corpus solutions.
-        gemini_manager (GeminiAPIManager): The API manager instance.
-        config (Dict): The main configuration dictionary.
-
-    Returns:
-        A dictionary containing the list of final adapted exemplar texts.
+    ...
     """
     logger = logging.getLogger(__name__)
     logger.info("Starting adaptation step.")
@@ -140,19 +131,22 @@ def adapt(
     for idx in retrieved_indices:
         original_question = exemplar_questions[idx]
         original_solution = exemplar_solutions[idx]
-        current_text = f"Question: {original_question}\nRationale and Answer: {original_solution}"
+        
+        # MODIFIED: Create the initial text using the standardized format
+        current_text = EXEMPLAR_FORMAT.format(question=original_question, solution=original_solution)
         
         # Step 2a: Transformation
         if apply_transform:
             logger.info(f"Applying transformation to exemplar index {idx}.")
-            # --- ADDED FOR MONITORING ---
             print(f"    -> Transforming exemplar {idx}...")
-            prompt = create_transformation_prompt(target_query, original_question, original_solution)
+            
+            # MODIFIED: Call the updated prompt creation function
+            prompt = create_transformation_prompt(target_query, current_text)
+            
             response = gemini_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
                 logger.info("Transformation successful.")
-                # --- ADDED FOR MONITORING ---
                 print(f"       Transformed text (start): '{current_text[:120]}...'")
             else:
                 logger.warning(f"Transformation failed for exemplar {idx}: {response['error_message']}. Using original text.")
@@ -160,14 +154,15 @@ def adapt(
         # Step 2b: Summarization
         if apply_summarize:
             logger.info(f"Applying summarization to exemplar index {idx}.")
-            # --- ADDED FOR MONITORING ---
             print(f"    -> Summarizing exemplar {idx}...")
-            prompt = create_summarization_prompt(target_query, original_question, current_text)
+            
+            # MODIFIED: Call the updated prompt creation function
+            prompt = create_summarization_prompt(target_query, current_text)
+
             response = gemini_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
                 logger.info("Summarization successful.")
-                # --- ADDED FOR MONITORING ---
                 print(f"       Summarized text (start): '{current_text[:120]}...'")
             else:
                 logger.warning(f"Summarization failed for exemplar {idx}: {response['error_message']}. Using text from previous step.")
