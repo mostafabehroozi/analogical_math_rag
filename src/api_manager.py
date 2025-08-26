@@ -191,6 +191,7 @@ class GeminiAPIManager:
                 }
             
             self.logger.info(f"API call with key {key_for_log} successful.")
+            print(f"    LLM Response (truncated): {response.text[:100]}...")
             return {
                 "status": "SUCCESS", "text": response.text, "error_message": None,
                 "model_name": model_name, "api_key_used": key_for_log, "raw_response": response
