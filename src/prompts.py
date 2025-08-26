@@ -10,11 +10,11 @@ management and selection of different prompt versions via the main configuration
 
 from typing import List, Dict
 
-# --- 1. Prompt Template Registry ---
-# This dictionary holds all the raw f-string templates. Using a registry makes
-# it easy to add new versions (e.g., 'transformation_v2') and switch between
-# them in the main config file.
+# --- NEW: Standard format for a question-solution pair ---
+# This will be used to create a consistent text block for exemplars.
+EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
 
+# --- 1. Prompt Template Registry ---
 PROMPT_TEMPLATES: Dict[str, str] = {
     "transformation_standardize_v1": """You are a helpful math assistant.
 
@@ -36,9 +36,7 @@ Make the question and its reasoning more readable, formal, and useful for solvin
 ---
 
 **Original Example (Input)**:
-
-Question: {retrieved_question}
-Solution (CoT and Answer): {retrieved_rationale_answer}
+{original_example}
 
 ---
 
@@ -51,7 +49,7 @@ Rationale: [Your rewritten reasoning here, written clearly and step by step]
 Final Answer: [Your clean and direct final answer]
 """,
 
-    "summarization_v1": """You are provided with a **Main Question** and a **Sample to Summarize** (consisting of its question and rationale plus answer, which may have already been transformed).
+    "summarization_v1": """You are provided with a **Main Question** and a **Sample to Summarize**.
 Your task is to summarize the **Sample's Rationale** into a concise, clear version that emphasizes elements useful for solving the **Main Question**, while ensuring it remains accurate to its own question.
 
 **Main Question:**
@@ -61,7 +59,7 @@ Your task is to summarize the **Sample's Rationale** into a concise, clear versi
 {text_to_summarize}
 
 **Instructions for Summarizing the Sample's Rationale:**
-1. Analyze the **Sample's Rationale** in the context of its own question ("{original_retrieved_question}") to understand its core reasoning.
+1. Analyze the **Sample's Rationale** in the context of its own question to understand its core reasoning.
 2. Remove redundant or verbose parts from the **Sample's Rationale**.
 3. Condense the rationale, retaining key reasoning patterns and logical steps.
 4. Prioritize elements in the summary most transferable to solving the **Main Question**.
@@ -157,30 +155,27 @@ Begin Output:
 }
 
 
-# --- 2. Prompt Creation Functions ---
+# --- 2. Prompt Creation Functions (MODIFIED) ---
 
-def create_transformation_prompt(target_query: str, retrieved_question: str, retrieved_rationale_answer: str) -> str:
+def create_transformation_prompt(target_query: str, original_example: str) -> str:
     """Creates a prompt for the 'transformation' (standardization) step."""
     template = PROMPT_TEMPLATES["transformation_standardize_v1"]
     return template.format(
         target_query=target_query,
-        retrieved_question=retrieved_question,
-        retrieved_rationale_answer=retrieved_rationale_answer
+        original_example=original_example
     )
 
-def create_summarization_prompt(target_query: str, original_retrieved_question: str, text_to_summarize: str) -> str:
+def create_summarization_prompt(target_query: str, text_to_summarize: str) -> str:
     """Creates a prompt for the 'summarization' step."""
     template = PROMPT_TEMPLATES["summarization_v1"]
     return template.format(
         target_query=target_query,
-        original_retrieved_question=original_retrieved_question,
         text_to_summarize=text_to_summarize
     )
 
 def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str:
     """Creates a prompt for the 'merging' step."""
     if len(samples_to_merge) != 2:
-        # Returning an error string is a simple way to propagate issues.
         return "Error: create_merging_prompt requires exactly two samples."
     
     template = PROMPT_TEMPLATES["merging_v1"]
@@ -195,7 +190,6 @@ def create_final_reasoning_prompt(main_question_text: str, final_adapted_samples
     if not final_adapted_samples:
         return "Error: At least one adapted sample is required for the final reasoning prompt."
 
-    # Build the block of adapted samples to insert into the main template
     samples_block = ""
     for i, sample_text in enumerate(final_adapted_samples):
         samples_block += f"\n**Adapted Sample {i+1}:**\n{sample_text}\n"
