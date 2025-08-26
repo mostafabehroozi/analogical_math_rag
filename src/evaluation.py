@@ -55,6 +55,7 @@ def evaluate_single_answer_with_llm(
         return False
 
     raw_text = response['text'].strip()
+    print(f"    Evaluator LLM Raw Output: {raw_text}")
     logger.debug(f"Evaluator raw response: '{raw_text}'")
     
     # Use regex to robustly parse the 'true' or 'false' from the structured output
