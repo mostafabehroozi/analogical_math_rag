@@ -16,7 +16,7 @@ EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
 
 # --- 1. Prompt Template Registry ---
 PROMPT_TEMPLATES: Dict[str, str] = {
-    "transformation_standardize_v1": """You are a helpful math assistant.
+    "standardization_v1": """You are a helpful math assistant.
 
 Your task is to rewrite the following solved math example into a **clear, well-structured, and standardized format** that is easier for a language model to learn from.
 
@@ -49,27 +49,25 @@ Rationale: [Your rewritten reasoning here, written clearly and step by step]
 Final Answer: [Your clean and direct final answer]
 """,
 
-    "summarization_v1": """You are provided with a **Main Question** and a **Sample to Summarize**.
-Your task is to summarize the **Sample's Rationale** into a concise, clear version that emphasizes elements useful for solving the **Main Question**, while ensuring it remains accurate to its own question.
+    "transformation_v1": """You are provided with a **Main Question** and a **Sample to Transform**.
+Your task is to transform the **Sample's Rationale** into a version that is more aligned with the **Main Question**, while ensuring it remains accurate to its own question.
 
 **Main Question:**
 {target_query}
 
-**Sample to Summarize:**
-{text_to_summarize}
+**Sample to Transform:**
+{text_to_transform}
 
-**Instructions for Summarizing the Sample's Rationale:**
+**Instructions for Transforming the Sample's Rationale:**
 1. Analyze the **Sample's Rationale** in the context of its own question to understand its core reasoning.
-2. Remove redundant or verbose parts from the **Sample's Rationale**.
-3. Condense the rationale, retaining key reasoning patterns and logical steps.
-4. Prioritize elements in the summary most transferable to solving the **Main Question**.
-5. Use clear, straightforward language.
-6. Do not alter the core logic to solve the **Main Question**, nor modify the **Sample's Question** or its **Final Answer** (as presented in the 'Sample to Summarize').
-7. Ensure the summary clearly conveys reasoning flow.
+2. Rewrite the rationale, prioritizing elements most transferable to solving the **Main Question**.
+3. Use clear, straightforward language.
+4. Do not alter the core logic to solve the **Main Question**, nor modify the **Sample's Question** or its **Final Answer** (as presented in the 'Sample to Transform').
+5. Ensure the transformed rationale clearly conveys the reasoning flow.
 
 **Output Format (Strictly follow this format):**
-Question: [Original Question from the 'Sample to Summarize']
-Rationale and Answer: [Summarized Rationale, followed by the Original Answer from the 'Sample to Summarize']
+Question: [Original Question from the 'Sample to Transform']
+Rationale and Answer: [Transformed Rationale, followed by the Original Answer from the 'Sample to Transform']
 """,
 
     "merging_v1": """You are provided with a main question and two adapted samples, each consisting of a question and its rationale plus answer. Your task is to merge these samples into a single, more potent sample. Combine their rationales into a cohesive and concise rationale that is highly relevant to solving the main question. The merged sample must retain the same format and preserve critical reasoning.
@@ -157,20 +155,19 @@ Begin Output:
 
 # --- 2. Prompt Creation Functions (MODIFIED) ---
 
-def create_transformation_prompt(target_query: str, original_example: str) -> str:
-    """Creates a prompt for the 'transformation' (standardization) step."""
-    template = PROMPT_TEMPLATES["transformation_standardize_v1"]
+def create_standardization_prompt(original_example: str) -> str:
+    """Creates a prompt for the 'standardization' step."""
+    template = PROMPT_TEMPLATES["standardization_v1"]
     return template.format(
-        target_query=target_query,
         original_example=original_example
     )
 
-def create_summarization_prompt(target_query: str, text_to_summarize: str) -> str:
-    """Creates a prompt for the 'summarization' step."""
-    template = PROMPT_TEMPLATES["summarization_v1"]
+def create_transformation_prompt(target_query: str, text_to_transform: str) -> str:
+    """Creates a prompt for the 'transformation' step."""
+    template = PROMPT_TEMPLATES["transformation_v1"]
     return template.format(
         target_query=target_query,
-        text_to_summarize=text_to_summarize
+        text_to_transform=text_to_transform
     )
 
 def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str:

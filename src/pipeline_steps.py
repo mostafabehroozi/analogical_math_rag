@@ -23,8 +23,8 @@ from typing import List, Dict, Any, Tuple
 from src.api_manager import GeminiAPIManager
 from src.prompts import (
     EXEMPLAR_FORMAT,
+    create_standardization_prompt,
     create_transformation_prompt,
-    create_summarization_prompt,
     create_merging_prompt,
     create_final_reasoning_prompt
 )
@@ -116,7 +116,7 @@ def adapt(
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Performs transformation and summarization on a list of retrieved exemplars.
+    Performs standardization and transformation on a list of retrieved exemplars.
     ...
     """
     logger = logging.getLogger(__name__)
@@ -125,8 +125,8 @@ def adapt(
     
     model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
+    apply_standardize = config.get('APPLY_STANDARDIZATION', False)
     apply_transform = config.get('APPLY_TRANSFORMATION', False)
-    apply_summarize = config.get('APPLY_SUMMARIZATION', False)
 
     for idx in retrieved_indices:
         original_question = exemplar_questions[idx]
@@ -135,7 +135,23 @@ def adapt(
         # MODIFIED: Create the initial text using the standardized format
         current_text = EXEMPLAR_FORMAT.format(question=original_question, solution=original_solution)
         
-        # Step 2a: Transformation
+        # Step 2a: Standardization
+        if apply_standardize:
+            logger.info(f"Applying standardization to exemplar index {idx}.")
+            print(f"    -> Standardizing exemplar {idx}...")
+            
+            # MODIFIED: Call the updated prompt creation function
+            prompt = create_standardization_prompt(current_text)
+            
+            response = gemini_manager.generate_content(prompt, model_name, temperature)
+            if response['status'] == 'SUCCESS':
+                current_text = response['text']
+                logger.info("Standardization successful.")
+                print(f"       Standardized text (start): '{current_text[:120]}...'")
+            else:
+                logger.warning(f"Standardization failed for exemplar {idx}: {response['error_message']}. Using original text.")
+
+        # Step 2b: Transformation
         if apply_transform:
             logger.info(f"Applying transformation to exemplar index {idx}.")
             print(f"    -> Transforming exemplar {idx}...")
@@ -149,24 +165,8 @@ def adapt(
                 logger.info("Transformation successful.")
                 print(f"       Transformed text (start): '{current_text[:120]}...'")
             else:
-                logger.warning(f"Transformation failed for exemplar {idx}: {response['error_message']}. Using original text.")
+                logger.warning(f"Transformation failed for exemplar {idx}: {response['error_message']}. Using text from previous step.")
         
-        # Step 2b: Summarization
-        if apply_summarize:
-            logger.info(f"Applying summarization to exemplar index {idx}.")
-            print(f"    -> Summarizing exemplar {idx}...")
-            
-            # MODIFIED: Call the updated prompt creation function
-            prompt = create_summarization_prompt(target_query, current_text)
-
-            response = gemini_manager.generate_content(prompt, model_name, temperature)
-            if response['status'] == 'SUCCESS':
-                current_text = response['text']
-                logger.info("Summarization successful.")
-                print(f"       Summarized text (start): '{current_text[:120]}...'")
-            else:
-                logger.warning(f"Summarization failed for exemplar {idx}: {response['error_message']}. Using text from previous step.")
-
         adapted_texts.append(current_text)
 
     return {"status": "SUCCESS", "adapted_texts": adapted_texts}

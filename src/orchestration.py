@@ -57,8 +57,8 @@ def run_pipeline_for_single_query(
         "target_query_original_hard_list_idx": hard_list_idx,
         "target_query_text": target_query,
         "config_flags_used": {
+            "APPLY_STANDARDIZATION": config.get('APPLY_STANDARDIZATION'),
             "APPLY_TRANSFORMATION": config.get('APPLY_TRANSFORMATION'),
-            "APPLY_SUMMARIZATION": config.get('APPLY_SUMMARIZATION'),
             "APPLY_MERGING": config.get('APPLY_MERGING'),
             "TOP_N_CANDIDATES_RETRIEVAL": config.get('TOP_N_CANDIDATES_RETRIEVAL'),
             "N_PASS_ATTEMPTS": config.get('N_PASS_ATTEMPTS'),

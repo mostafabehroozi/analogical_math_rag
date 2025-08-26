@@ -80,8 +80,8 @@ CONFIG = {
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
 
     # Booleans to enable/disable specific adaptation sub-steps.
+    "APPLY_STANDARDIZATION": False,
     "APPLY_TRANSFORMATION": False,
-    "APPLY_SUMMARIZATION": False,
     "APPLY_MERGING": False,
 
     # Numeric parameters for pipeline stages.
@@ -98,8 +98,8 @@ CONFIG = {
     # --- 7. Prompt Template Selection ---
     # Keys should match the keys in src/prompts.py's PROMPT_TEMPLATES dictionary.
     # This allows easy A/B testing of different prompt versions.
-    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_standardize_v1",
-    "PROMPT_TEMPLATE_SUMMARIZATION": "summarization_v1",
+    "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
+    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v1",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
