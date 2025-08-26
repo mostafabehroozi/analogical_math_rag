@@ -20,6 +20,8 @@ import numpy as np
 from src.pipeline_steps import retrieve, adapt, merge, solve
 from src.api_manager import GeminiAPIManager
 from src.utils import save_json, load_json
+# --- NEW: Import for periodic synchronization ---
+from src.hf_sync import periodic_sync_check
 
 def run_pipeline_for_single_query(
     hard_list_idx: int,
@@ -31,28 +33,14 @@ def run_pipeline_for_single_query(
 ) -> Dict[str, Any]:
     """
     Executes the full RAG pipeline for a single 'hard question'.
-
-    Args:
-        hard_list_idx (int): The index of the query in the original hard list.
-        target_query (str): The text of the question to solve.
-        config (Dict): The configuration for this specific run.
-        embedding_model (SentenceTransformer): The initialized embedding model.
-        exemplar_data (Dict): A dict containing questions, solutions, and embeddings for the corpus.
-        gemini_manager (GeminiAPIManager): The initialized API manager.
-
-    Returns:
-        A dictionary containing a detailed log of the entire pipeline run for this query.
     """
     logger = logging.getLogger(__name__)
     logger.info(f"--- Starting pipeline for Query #{hard_list_idx}: '{target_query[:80]}...' ---")
     
-    # --- ADDED FOR MONITORING ---
     print("\n" + "="*80)
     print(f"Processing Query #{hard_list_idx}: '{target_query[:100]}...'")
     print("="*80)
 
-
-    # Log the specific configuration flags being used for this run
     run_log = {
         "target_query_original_hard_list_idx": hard_list_idx,
         "target_query_text": target_query,
@@ -68,8 +56,7 @@ def run_pipeline_for_single_query(
         "steps": {}
     }
 
-    # --- Step 1: Retrieve ---
-    # --- ADDED FOR MONITORING ---
+    # Step 1: Retrieve
     print("\n[STEP 1] RETRIEVE")
     retrieval_result = retrieve(
         target_query=target_query,
@@ -82,15 +69,11 @@ def run_pipeline_for_single_query(
     if retrieval_result['status'] == 'FAILURE':
         run_log['pipeline_status'] = "FAILURE: Retrieval failed."
         logger.error(run_log['pipeline_status'])
-        # --- ADDED FOR MONITORING ---
         print("  -> Retrieval FAILED.")
         return run_log
-    # --- ADDED FOR MONITORING ---
     print(f"  -> Retrieved indices: {retrieval_result['retrieved_indices']}")
 
-
-    # --- Step 2: Adapt ---
-    # --- ADDED FOR MONITORING ---
+    # Step 2: Adapt
     print("\n[STEP 2] ADAPT")
     adapt_result = adapt(
         target_query=target_query,
@@ -101,30 +84,25 @@ def run_pipeline_for_single_query(
         config=config
     )
     run_log['steps']['adaptation'] = adapt_result
-    # --- ADDED FOR MONITORING ---
     for i, text in enumerate(adapt_result.get('adapted_texts', [])):
         print(f"  -> Adapted text #{i+1} (start): '{text[:120]}...'")
     
-    # --- Step 3: Merge ---
-    # --- ADDED FOR MONITORING ---
+    # Step 3: Merge
     print("\n[STEP 3] MERGE")
     merge_result = merge(
         target_query=target_query,
         adapted_texts=adapt_result['adapted_texts'],
-        embedding_model=embedding_model, # Required for advanced merging strategies
+        embedding_model=embedding_model,
         gemini_manager=gemini_manager,
         config=config
     )
     run_log['steps']['merging'] = merge_result
-    # --- ADDED FOR MONITORING ---
     if merge_result['status'] == 'SKIPPED':
         print("  -> Merging was SKIPPED as per config.")
     for i, text in enumerate(merge_result.get('merged_texts', [])):
         print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
 
-
-    # --- Step 4: Solve ---
-    # --- ADDED FOR MONITORING ---
+    # Step 4: Solve
     print("\n[STEP 4] SOLVE")
     solve_result = solve(
         target_query=target_query,
@@ -134,10 +112,8 @@ def run_pipeline_for_single_query(
     )
     run_log['steps']['solving'] = solve_result
     run_log['llm_final_solution_attempts_texts'] = solve_result.get('solution_attempts', [])
-    # --- ADDED FOR MONITORING ---
     for i, text in enumerate(solve_result.get('solution_attempts', [])):
         print(f"  -> Solution attempt #{i+1} (start): '{text[:120]}...'")
-
 
     run_log['pipeline_status'] = "SUCCESS"
     logger.info(f"--- Pipeline finished successfully for Query #{hard_list_idx} ---")
@@ -154,29 +130,19 @@ def run_experiments(
 ) -> Dict[str, List[Dict]]:
     """
     Orchestrates running multiple experiments with different configurations.
-
-    Manages loading previous results to allow for pausing and resuming.
-    
-    Returns:
-        A dictionary containing the full logs for all completed experiments.
     """
     logger = logging.getLogger(__name__)
     all_results = {}
 
     for exp_overrides in experiment_configs:
-        # Create a new config for this specific experiment
         current_config = global_config.copy()
         current_config.update(exp_overrides)
         
         exp_name = current_config.get("experiment_name", "unnamed_experiment")
         logger.info(f"########## Starting Experiment: {exp_name} ##########")
 
-        # --- THIS IS THE KEY LINE FOR YOUR SECOND REQUEST ---
-        # The log file path is created using the experiment name.
-        # This acts as a checkpoint file for each specific experiment.
         log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
         
-        # --- Pause and Resume Logic ---
         existing_logs = load_json(log_file_path)
         if existing_logs:
             logger.info(f"Loaded {len(existing_logs)} existing results from {log_file_path}.")
@@ -195,9 +161,10 @@ def run_experiments(
             all_results[exp_name] = run_logs
             continue
 
-        for idx, query_text in tqdm(queries_to_process, desc=f"Running {exp_name}"):
+        # --- MODIFIED: Use enumerate to get a loop counter for periodic sync ---
+        for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
             single_run_log = run_pipeline_for_single_query(
-                hard_list_idx=idx,
+                hard_list_idx=original_idx,
                 target_query=query_text,
                 config=current_config,
                 embedding_model=embedding_model,
@@ -206,12 +173,14 @@ def run_experiments(
             )
             run_logs.append(single_run_log)
             
-            # Save progress periodically
-            if (len(run_logs) % 5 == 0): # Save every 5 queries
-                save_json(run_logs, log_file_path)
-                logger.info(f"Saved progress for '{exp_name}' ({len(run_logs)} queries complete).")
+            # Save progress locally
+            save_json(run_logs, log_file_path)
+            
+            # --- NEW: Call the periodic sync check ---
+            # This will trigger an upload to the Hub if the interval is reached.
+            periodic_sync_check(loop_idx, current_config)
 
-        # Final save at the end of the experiment
+        # Final local save at the end of the experiment
         save_json(run_logs, log_file_path)
         logger.info(f"########## Finished Experiment: {exp_name} ##########")
         all_results[exp_name] = run_logs

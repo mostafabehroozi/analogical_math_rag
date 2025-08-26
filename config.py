@@ -33,6 +33,8 @@ CONFIG = {
 
     # --- 3. API & Model Settings ---
     "GEMINI_API_KEYS": [
+        # Add your Gemini API keys here.
+        # e.g., "AIzaSy...",
     ],
     # Per-model and global rate limiting settings.
     "GEMINI_MODEL_QUOTAS": {
@@ -65,7 +67,6 @@ CONFIG = {
     "EXEMPLAR_CORPUS_HF_TOKEN": None, # Your Hugging Face token if the dataset is private.
 
     # Paths for storing/loading the generated embeddings for the exemplar corpus.
-    # The code will first check for a local file, then try to download from HF, then generate if missing.
     "EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH": os.path.join(EMBEDDINGS_DIR, 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy'),
     "EXEMPLAR_EMBEDDINGS_HF_REPO_ID": "mostafabehroozi/embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath",
     "EXEMPLAR_EMBEDDINGS_HF_FILENAME": "embeddings.npy",
@@ -75,34 +76,39 @@ CONFIG = {
     "ADVANCED_RAG_EVALUATION_RESULTS_PATH": os.path.join(RESULTS_DIR, "advanced_rag_evaluation_results.pkl"),
 
     # --- 5. Pipeline Step Control Flags & Parameters ---
-    # This is the new modular control key. The orchestrator will run these steps in order.
-    # Possible values: 'retrieve', 'adapt', 'merge', 'solve'
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
-
-    # Booleans to enable/disable specific adaptation sub-steps.
     "APPLY_STANDARDIZATION": False,
     "APPLY_TRANSFORMATION": False,
     "APPLY_MERGING": False,
-
-    # Numeric parameters for pipeline stages.
-    "TOP_N_CANDIDATES_RETRIEVAL": 1,   # How many exemplars to retrieve initially.
-    "FINAL_K_SELECTION_ADAPTATION": 1, # How many of the retrieved to actually process in the 'adapt' step.
-    "TARGET_ADAPTED_SAMPLES_MERGING": 1, # The target number of exemplars after the 'merge' step.
+    "TOP_N_CANDIDATES_RETRIEVAL": 1,
+    "FINAL_K_SELECTION_ADAPTATION": 1,
+    "TARGET_ADAPTED_SAMPLES_MERGING": 1,
 
     # --- 6. Pass@N & Evaluation Settings ---
-    "N_PASS_ATTEMPTS": 3, # How many solutions to generate for each question in Pass@N.
-    "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5], # Which Pass@K metrics to calculate (e.g., Pass@1, Pass@3).
-
-
+    "N_PASS_ATTEMPTS": 3,
+    "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
     # --- 7. Prompt Template Selection ---
-    # Keys should match the keys in src/prompts.py's PROMPT_TEMPLATES dictionary.
-    # This allows easy A/B testing of different prompt versions.
     "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
     "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v1",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
+
+    # --- 8. Hugging Face Hub Synchronization ---
+    # Master switch to enable or disable the entire synchronization feature.
+    "PERSIST_RESULTS_ONLINE": True,
+    
+    # Your Hugging Face username. The repo will be created under this account.
+    # IMPORTANT: Change this to your actual username.
+    "HF_HUB_USERNAME": "your-hf-username-here",
+    
+    # The name of the dataset repository on the Hub where results will be stored.
+    "HF_HUB_REPO_NAME": "analogical-math-rag-results",
+    
+    # How often to sync the local workspace to the Hub.
+    # A sync will occur after this many queries are processed in a loop.
+    "HF_SYNC_INTERVAL": 10,
 
 } # This closes the main CONFIG dictionary
 
@@ -120,3 +126,4 @@ def setup_directories():
         except OSError as e:
             print(f"Error creating directory {dir_path}: {e}")
     print("--- Directory setup complete ---\n")
+
