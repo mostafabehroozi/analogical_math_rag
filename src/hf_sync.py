@@ -1,15 +1,20 @@
 # src/hf_sync.py
 
 """
-Hugging Face Hub Synchronization Module.
+Hugging Face Hub Synchronization Module (Token-Based).
 
 This file provides functions to manage the persistence of experiment results
-and logs by synchronizing the local workspace with a Hugging Face Hub dataset repository.
+and logs by synchronizing the local workspace with a Hugging Face Hub dataset
+repository.
+
+This version is modified to pass the Hugging Face token directly from a
+configuration dictionary for all API interactions, removing the need for a
+separate login step or reliance on cached credentials.
 
 Functions:
-- initialize_workspace: Downloads the remote repo state to the local machine on startup.
-- sync_workspace_to_hub: Uploads the local output directories to the remote repo.
-- periodic_sync_check: A helper to trigger synchronization during long-running loops.
+- initialize_workspace: Downloads the remote repo to the local machine on startup.
+- sync_workspace_to_hub: Uploads local output directories to the remote repo.
+- periodic_sync_check: A helper to trigger synchronization during long loops.
 """
 
 import os
@@ -17,99 +22,108 @@ import logging
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HfHubHTTPError
 
+def _get_hf_config(config: dict) -> tuple:
+    """Helper function to safely extract Hugging Face credentials from the config."""
+    hf_token = config.get("EXEMPLAR_CORPUS_HF_TOKEN")
+    hf_username = config.get("HF_HUB_USERNAME")
+    repo_name = config.get("HF_HUB_REPO_NAME")
+    return hf_token, hf_username, repo_name
+
 def initialize_workspace(config: dict):
     """
     Downloads all files from the HF Hub repo to the local output directory.
-    This populates the workspace with the results from previous runs.
+
+    This populates the workspace with results from previous runs. It uses the
+    HF token directly from the provided configuration dictionary.
     """
     logger = logging.getLogger(__name__)
     if not config.get("PERSIST_RESULTS_ONLINE"):
-        logger.info("Online persistence is disabled. Skipping workspace initialization from Hub.")
+        logger.info("Online persistence is disabled. Skipping workspace initialization.")
         return
 
-    hf_username = config.get("HF_HUB_USERNAME")
-    repo_name = config.get("HF_HUB_REPO_NAME")
-    
-    if not hf_username or "your-hf-username-here" in hf_username:
-        logger.warning("HF_HUB_USERNAME is not set in config. Cannot initialize workspace.")
+    hf_token, hf_username, repo_name = _get_hf_config(config)
+
+    if not all([hf_token, hf_username, repo_name]):
+        logger.warning("HF token, username, or repo name not found in config. Cannot initialize workspace.")
         return
 
     repo_id = f"{hf_username}/{repo_name}"
     local_outputs_dir = config["OUTPUTS_DIR"]
-    
+
     logger.info(f"Initializing workspace from Hugging Face Hub repo: {repo_id}")
-    
+
     try:
-        # Ensure the repository exists, create it if it's the first run.
-        api = HfApi()
+        # 1. Instantiate the API client, passing the token directly.
+        api = HfApi(token=hf_token)
+
+        # 2. Ensure the repository exists, creating it if necessary.
         api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
         logger.info(f"Repository {repo_id} exists or was created successfully.")
 
-        # Download the entire repository content to the local outputs directory.
-        # This will overwrite local files if remote versions are newer.
+        # 3. Download the repository's contents, passing the token directly.
         snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
             local_dir=local_outputs_dir,
-            local_dir_use_symlinks=False, # Use direct copies in Kaggle
+            local_dir_use_symlinks=False, # Recommended for Kaggle/Docker
             resume_download=True,
+            token=hf_token  # Pass the token for authentication
         )
-        logger.info(f"Workspace synchronized. All files from {repo_id} are downloaded to {local_outputs_dir}.")
+        logger.info(f"Workspace synchronized. Files from {repo_id} are downloaded to {local_outputs_dir}.")
 
     except HfHubHTTPError as e:
-        # This can happen if the repo is private and the token is wrong.
-        logger.error(f"HTTP Error initializing workspace from {repo_id}. Check your HF token and repo permissions. Error: {e}", exc_info=True)
+        logger.error(f"HTTP Error initializing workspace from {repo_id}. Check your HF token permissions. Error: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"An unexpected error occurred during workspace initialization: {e}", exc_info=True)
-
 
 def sync_workspace_to_hub(config: dict):
     """
     Uploads the entire local outputs directory to the Hugging Face Hub repo.
+
+    Uses the HF token directly from the provided configuration dictionary.
     """
     logger = logging.getLogger(__name__)
     if not config.get("PERSIST_RESULTS_ONLINE"):
-        # This check prevents accidental uploads if the feature is off.
-        return
+        return # Silently exit if persistence is disabled.
 
-    hf_username = config.get("HF_HUB_USERNAME")
-    repo_name = config.get("HF_HUB_REPO_NAME")
+    hf_token, hf_username, repo_name = _get_hf_config(config)
 
-    if not hf_username or "your-hf-username-here" in hf_username:
-        logger.warning("HF_HUB_USERNAME is not set in config. Cannot sync workspace.")
+    if not all([hf_token, hf_username, repo_name]):
+        logger.warning("HF token, username, or repo name not found in config. Cannot sync workspace.")
         return
 
     repo_id = f"{hf_username}/{repo_name}"
     local_outputs_dir = config["OUTPUTS_DIR"]
 
-    logger.info(f"Starting synchronization of local workspace to HF Hub repo: {repo_id}")
+    logger.info(f"Starting synchronization of '{local_outputs_dir}' to HF Hub repo: {repo_id}")
 
     try:
-        api = HfApi()
-        # Upload the entire 'outputs' folder. This will add new files, update existing ones,
-        # and can even delete files in the repo if they are deleted locally (with allow_patterns).
+        # 1. Instantiate the API client with the token.
+        api = HfApi(token=hf_token)
+
+        # 2. Upload the entire outputs folder.
         api.upload_folder(
             folder_path=local_outputs_dir,
             repo_id=repo_id,
             repo_type="dataset",
-            commit_message="Periodic experiment results sync"
+            commit_message="Automated experiment results sync"
         )
-        logger.info(f"Successfully synced {local_outputs_dir} to {repo_id}.")
+        logger.info(f"Successfully synced '{local_outputs_dir}' to {repo_id}.")
     except Exception as e:
         logger.error(f"Failed to sync workspace to Hugging Face Hub: {e}", exc_info=True)
 
-
-def periodic_sync_check(counter: int, config: dict):
+def periodic_sync_check(loop_counter: int, config: dict):
     """
-    Checks if a sync is needed based on the counter and sync interval from the config.
+    Checks if a sync is needed based on the counter and sync interval.
     """
     if not config.get("PERSIST_RESULTS_ONLINE"):
         return
 
     sync_interval = config.get("HF_SYNC_INTERVAL", 10)
-    # We check counter > 0 to avoid syncing on the very first item (index 0).
-    if counter > 0 and (counter + 1) % sync_interval == 0:
-        print(f"\n--- Reached sync interval at item #{counter + 1}. Syncing results to Hugging Face Hub. ---")
-        sync_workspace_to_hub(config)
-        print(f"--- Sync complete. ---\n")
 
+    # Sync after the specified number of items (e.g., if interval is 1, sync after item 1, 2, etc.)
+    # We check (loop_counter + 1) because loops are often 0-indexed.
+    if (loop_counter + 1) % sync_interval == 0:
+        print(f"\n--- Reached sync interval at item #{loop_counter + 1}. Syncing results to Hugging Face Hub. ---")
+        sync_workspace_to_hub(config)
+        print("--- Sync complete. ---\n")
