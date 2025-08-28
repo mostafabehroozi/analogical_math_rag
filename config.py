@@ -29,6 +29,7 @@ CONFIG = {
     "VERBOSE_LOGGING": True,  # Master switch for detailed print statements to the console.
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "LOGS_DIR": LOGS_DIR, # Directory where detailed run logs will be saved.
+    "OUTPUTS_DIR": OUTPUTS_DIR,
     "RESULTS_DIR": RESULTS_DIR,
 
     # --- 3. API & Model Settings ---
