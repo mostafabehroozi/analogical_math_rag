@@ -24,7 +24,8 @@ from huggingface_hub.utils import HfHubHTTPError
 
 def _get_hf_config(config: dict) -> tuple:
     """Helper function to safely extract Hugging Face credentials from the config."""
-    hf_token = config.get("EXEMPLAR_CORPUS_HF_TOKEN")
+    # This now correctly points to the token for synchronization.
+    hf_token = config.get("HF_SYNC_TOKEN")
     hf_username = config.get("HF_HUB_USERNAME")
     repo_name = config.get("HF_HUB_REPO_NAME")
     return hf_token, hf_username, repo_name

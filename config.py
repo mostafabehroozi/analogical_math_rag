@@ -99,6 +99,10 @@ CONFIG = {
     # --- 8. Hugging Face Hub Synchronization ---
     # Master switch to enable or disable the entire synchronization feature.
     "PERSIST_RESULTS_ONLINE": True,
+
+    # This token is specifically for the synchronization process.
+    # It will be populated at runtime from secrets.
+    "HF_SYNC_TOKEN": None,
     
     # Your Hugging Face username. The repo will be created under this account.
     # IMPORTANT: Change this to your actual username.
@@ -127,4 +131,3 @@ def setup_directories():
         except OSError as e:
             print(f"Error creating directory {dir_path}: {e}")
     print("--- Directory setup complete ---\n")
-
