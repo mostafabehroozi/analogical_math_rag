@@ -101,8 +101,8 @@ CONFIG = {
     "PERSIST_RESULTS_ONLINE": True,
 
     # This token is specifically for the synchronization process.
-    # It will be populated at runtime from secrets.
-    "HF_SYNC_TOKEN": None,
+    # PASTE YOUR HUGGING FACE TOKEN HERE (e.g., "hf_...").
+    "HF_SYNC_TOKEN": "YOUR_HUGGING_FACE_TOKEN_HERE",
     
     # Your Hugging Face username. The repo will be created under this account.
     # IMPORTANT: Change this to your actual username.
