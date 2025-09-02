@@ -14,52 +14,65 @@ import os
 import re
 import pandas as pd
 from tqdm import tqdm
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 
 # Import our custom modules
 from src.api_manager import GeminiAPIManager
 from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
-# --- NEW: Import for periodic synchronization ---
 from src.hf_sync import periodic_sync_check
+
+# --- NEW: More descriptive return type for fine-grained evaluation status ---
+EvaluationResult = Tuple[Optional[bool], str]
 
 def evaluate_single_answer_with_llm(
     model_answer: str,
     ground_truth: str,
     gemini_manager: GeminiAPIManager,
     config: Dict[str, Any]
-) -> bool:
+) -> EvaluationResult:
     """
     Evaluates a single model-generated answer against a ground truth using an LLM.
+
+    Returns:
+        A tuple containing:
+        - Optional[bool]: True if correct, False if incorrect, None if evaluation failed.
+        - str: A status message ('SUCCESS', 'EMPTY_ANSWER', 'API_BLOCKED', 'API_ERROR', 'PARSING_FAILED').
     """
     logger = logging.getLogger(__name__)
-    
-    if not model_answer or model_answer.startswith("Error:"):
-        return False
+
+    if not model_answer or not isinstance(model_answer, str) or model_answer.startswith("Error:"):
+        return None, "EMPTY_ANSWER"
 
     evaluator_model = config['GEMINI_MODEL_NAME_EVALUATOR']
     evaluator_temp = config['DEFAULT_EVALUATOR_TEMPERATURE']
-    
+
     prompt = create_evaluation_prompt(model_answer, ground_truth)
     response = gemini_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
+    # --- ADVANCED ERROR HANDLING ---
+    # Handle non-success statuses from the API manager explicitly.
     if response['status'] != 'SUCCESS':
-        logger.warning(f"LLM-based evaluation failed: {response['error_message']}")
-        return False
+        error_msg = response['error_message']
+        logger.warning(f"LLM-based evaluation API call failed with status '{response['status']}': {error_msg}")
+        if response['status'] == 'BLOCKED':
+            return None, "API_BLOCKED"
+        # Covers 'FAILURE' (e.g., rate limits) and 'ERROR'
+        return None, "API_ERROR"
 
     raw_text = response['text'].strip()
     print(f"    Evaluator LLM Raw Output: {raw_text}")
     logger.debug(f"Evaluator raw response: '{raw_text}'")
-    
+
     eval_match = re.search(r"Evaluation:\s*(true|false)", raw_text, re.IGNORECASE)
-    
+
     if eval_match:
         result_str = eval_match.group(1).lower()
         logger.info(f"Parsed evaluation result: {result_str}")
-        return result_str == 'true'
+        return result_str == 'true', "SUCCESS"
     else:
-        logger.warning(f"Could not parse 'Evaluation:' line from LLM response. Treating as False.")
-        return False
+        logger.warning(f"Could not parse 'Evaluation:' line from LLM response. Treating as failure.")
+        return None, "PARSING_FAILED"
 
 def analyze_experiment_logs(
     all_experiments_logs: Dict[str, List[Dict]],
@@ -73,7 +86,7 @@ def analyze_experiment_logs(
     logger = logging.getLogger(__name__)
     logger.info("Starting analysis of all experiment logs.")
     analysis_summary = []
-    
+
     pass_k_values_to_report = config.get("PASS_K_VALUES_TO_REPORT", [1])
     results_dir = config['RESULTS_DIR']
 
@@ -82,17 +95,18 @@ def analyze_experiment_logs(
         if not query_logs:
             logger.warning(f"No logs found for experiment '{exp_name}'. Skipping.")
             continue
-        
+
         exp_config = query_logs[0].get("config_flags_used", {})
         n_attempts = exp_config.get("N_PASS_ATTEMPTS", 1)
         pass_k_values = sorted([k for k in pass_k_values_to_report if 0 < k <= n_attempts])
-        
+
         pass_k_counts = {k: 0 for k in pass_k_values}
+        # --- NEW: Counters for fine-grained error analysis ---
+        error_counts = {"API_BLOCKED": 0, "API_ERROR": 0, "PARSING_FAILED": 0, "EMPTY_ANSWER": 0}
         total_valid_queries = 0
-        
-        # --- MODIFIED: Pause and Resume logic for evaluations ---
+
         eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
-        
+
         existing_evals = load_json(eval_file_path)
         if existing_evals:
             detailed_evaluations = existing_evals
@@ -103,47 +117,63 @@ def analyze_experiment_logs(
             evaluated_indices = set()
 
         logs_to_process = [log for log in query_logs if log["target_query_original_hard_list_idx"] not in evaluated_indices]
-        
+
         if not logs_to_process:
             logger.info(f"All query logs for '{exp_name}' have already been evaluated. Moving to summary.")
         else:
-            # --- MODIFIED: Use enumerate to get a loop counter ---
             for loop_idx, log in enumerate(tqdm(logs_to_process, desc=f"Evaluating {exp_name}")):
                 hard_list_idx = log["target_query_original_hard_list_idx"]
                 ground_truth = ground_truths[hard_list_idx]
                 solution_attempts = log["llm_final_solution_attempts_texts"]
 
-                valid_attempts = [s for s in solution_attempts if isinstance(s, str) and not s.startswith("Error:")]
-                if not valid_attempts:
-                    continue
-                
-                is_correct_list = [
-                    evaluate_single_answer_with_llm(attempt, ground_truth, gemini_manager, config)
-                    for attempt in valid_attempts
-                ]
-                
+                is_correct_list = []
+                status_list = []
+
+                for i, attempt in enumerate(solution_attempts):
+                    # --- IMPROVED CONSOLE LOGGING ---
+                    print(f"    -> Evaluating attempt {i+1}/{len(solution_attempts)} for query #{hard_list_idx}")
+                    is_correct, status = evaluate_single_answer_with_llm(attempt, ground_truth, gemini_manager, config)
+
+                    # Log a warning if the evaluation itself failed
+                    if status != "SUCCESS":
+                         print(f"       WARNING: Evaluation attempt failed with status: {status}")
+                         logger.warning(f"Evaluation for query {hard_list_idx}, attempt {i+1} failed with status: {status}")
+
+                    is_correct_list.append(is_correct)
+                    status_list.append(status)
+
                 detailed_evaluations.append({
                     "hard_list_idx": hard_list_idx,
                     "is_correct_list": is_correct_list,
-                    "attempts": valid_attempts
+                    "evaluation_status_list": status_list, # Store the new status info
+                    "attempts": solution_attempts
                 })
-                
-                # --- NEW: Save progress locally and sync periodically ---
+
                 save_json(detailed_evaluations, eval_file_path)
                 periodic_sync_check(loop_idx, config)
 
         # Final local save
         save_json(detailed_evaluations, eval_file_path)
-        
+
         # Calculate final metrics from the complete list of evaluations
         for eval_result in detailed_evaluations:
+            # An attempt is valid if it was generated (not an error string)
             if eval_result.get("attempts"):
                 total_valid_queries += 1
                 is_correct_list = eval_result["is_correct_list"]
+                status_list = eval_result["evaluation_status_list"]
+
+                # Increment error counters
+                for status in status_list:
+                    if status in error_counts:
+                        error_counts[status] += 1
+
+                # Calculate Pass@K
                 for k in pass_k_values:
-                    if any(is_correct_list[:k]):
+                    # A query passes at k if any of the first k attempts are True
+                    if any(res for res in is_correct_list[:k] if res is True):
                         pass_k_counts[k] += 1
-        
+
         summary_row = {"experiment_name": exp_name, **exp_config}
         summary_row["total_queries_processed"] = len(query_logs)
         summary_row["total_queries_with_valid_solutions"] = total_valid_queries
@@ -153,7 +183,9 @@ def analyze_experiment_logs(
             accuracy = (count / total_valid_queries) * 100 if total_valid_queries > 0 else 0
             summary_row[f"pass@{k}_count"] = count
             summary_row[f"pass@{k}_accuracy (%)"] = round(accuracy, 2)
-        
+
+        # --- NEW: Add detailed error counts to the final summary ---
+        summary_row.update(error_counts)
         analysis_summary.append(summary_row)
-        
+
     return pd.DataFrame(analysis_summary)
