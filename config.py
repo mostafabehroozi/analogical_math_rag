@@ -111,6 +111,14 @@ CONFIG = {
     # The name of the dataset repository on the Hub where results will be stored.
     "HF_HUB_REPO_NAME": "analogical-math-rag-results",
     
+    # Set to True to download a specific version of the repository workspace.
+    "HF_SYNC_REVISION_ENABLED": False,
+    
+    # The git revision (branch, tag, or commit hash) to download.
+    # This is ONLY used if HF_SYNC_REVISION_ENABLED is set to True.
+    # Examples: "main", "v1.0", "a1b2c3d4e5f6..."
+    "HF_SYNC_REVISION_ID": "main",
+    
     # How often to sync the local workspace to the Hub.
     # A sync will occur after this many queries are processed in a loop.
     "HF_SYNC_INTERVAL": 10,
