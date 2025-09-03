@@ -53,6 +53,16 @@ def initialize_workspace(config: dict):
 
     logger.info(f"Initializing workspace from Hugging Face Hub repo: {repo_id}")
 
+    # Check for specific revision settings from the config
+    revision = None
+    if config.get("HF_SYNC_REVISION_ENABLED", False):
+        revision_id = config.get("HF_SYNC_REVISION_ID")
+        if revision_id:
+            revision = revision_id
+            logger.info(f"Downloading specific revision: {revision}")
+        else:
+            logger.warning("HF_SYNC_REVISION_ENABLED is True, but HF_SYNC_REVISION_ID is not set. Downloading latest.")
+    
     try:
         # 1. Instantiate the API client, passing the token directly.
         api = HfApi(token=hf_token)
@@ -61,14 +71,15 @@ def initialize_workspace(config: dict):
         api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
         logger.info(f"Repository {repo_id} exists or was created successfully.")
 
-        # 3. Download the repository's contents, passing the token directly.
+        # 3. Download the repository's contents, passing the token and revision.
         snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
             local_dir=local_outputs_dir,
             local_dir_use_symlinks=False, # Recommended for Kaggle/Docker
             resume_download=True,
-            token=hf_token  # Pass the token for authentication
+            token=hf_token,               # Pass the token for authentication
+            revision=revision             # Pass the specific version or None for latest
         )
         logger.info(f"Workspace synchronized. Files from {repo_id} are downloaded to {local_outputs_dir}.")
 
