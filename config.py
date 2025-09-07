@@ -77,6 +77,7 @@ CONFIG = {
     "ADVANCED_RAG_EVALUATION_RESULTS_PATH": os.path.join(RESULTS_DIR, "advanced_rag_evaluation_results.pkl"),
 
     # --- 5. Pipeline Step Control Flags & Parameters ---
+    "USE_RETRIEVAL": True, # NEW: Master switch for the retrieval process.
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
     "APPLY_STANDARDIZATION": False,
     "APPLY_TRANSFORMATION": False,
@@ -95,6 +96,8 @@ CONFIG = {
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v1",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
+    # NEW: Prompt for when retrieval is turned off.
+    "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
 
     # --- 8. Hugging Face Hub Synchronization ---
     # Master switch to enable or disable the entire synchronization feature.

@@ -45,6 +45,8 @@ def run_pipeline_for_single_query(
         "target_query_original_hard_list_idx": hard_list_idx,
         "target_query_text": target_query,
         "config_flags_used": {
+            # NEW: Added USE_RETRIEVAL flag to the log for clarity.
+            "USE_RETRIEVAL": config.get('USE_RETRIEVAL'),
             "APPLY_STANDARDIZATION": config.get('APPLY_STANDARDIZATION'),
             "APPLY_TRANSFORMATION": config.get('APPLY_TRANSFORMATION'),
             "APPLY_MERGING": config.get('APPLY_MERGING'),
@@ -56,57 +58,71 @@ def run_pipeline_for_single_query(
         "steps": {}
     }
 
-    # Step 1: Retrieve
-    print("\n[STEP 1] RETRIEVE")
-    retrieval_result = retrieve(
-        target_query=target_query,
-        embedding_model=embedding_model,
-        exemplar_questions=exemplar_data['questions'],
-        embedded_exemplars=exemplar_data['embeddings'],
-        top_k=config['TOP_N_CANDIDATES_RETRIEVAL']
-    )
-    run_log['steps']['retrieval'] = retrieval_result
-    if retrieval_result['status'] == 'FAILURE':
-        run_log['pipeline_status'] = "FAILURE: Retrieval failed."
-        logger.error(run_log['pipeline_status'])
-        print("  -> Retrieval FAILED.")
-        return run_log
-    print(f"  -> Retrieved indices: {retrieval_result['retrieved_indices']}")
+    # --- MODIFIED: Conditional execution based on USE_RETRIEVAL flag ---
+    if config.get('USE_RETRIEVAL', True):
+        # Step 1: Retrieve
+        print("\n[STEP 1] RETRIEVE")
+        retrieval_result = retrieve(
+            target_query=target_query,
+            embedding_model=embedding_model,
+            exemplar_questions=exemplar_data['questions'],
+            embedded_exemplars=exemplar_data['embeddings'],
+            top_k=config['TOP_N_CANDIDATES_RETRIEVAL']
+        )
+        run_log['steps']['retrieval'] = retrieval_result
+        if retrieval_result['status'] == 'FAILURE':
+            run_log['pipeline_status'] = "FAILURE: Retrieval failed."
+            logger.error(run_log['pipeline_status'])
+            print("  -> Retrieval FAILED.")
+            return run_log
+        print(f"  -> Retrieved indices: {retrieval_result['retrieved_indices']}")
 
-    # Step 2: Adapt
-    print("\n[STEP 2] ADAPT")
-    adapt_result = adapt(
-        target_query=target_query,
-        retrieved_indices=retrieval_result['retrieved_indices'],
-        exemplar_questions=exemplar_data['questions'],
-        exemplar_solutions=exemplar_data['solutions'],
-        gemini_manager=gemini_manager,
-        config=config
-    )
-    run_log['steps']['adaptation'] = adapt_result
-    for i, text in enumerate(adapt_result.get('adapted_texts', [])):
-        print(f"  -> Adapted text #{i+1} (start): '{text[:120]}...'")
-    
-    # Step 3: Merge
-    print("\n[STEP 3] MERGE")
-    merge_result = merge(
-        target_query=target_query,
-        adapted_texts=adapt_result['adapted_texts'],
-        embedding_model=embedding_model,
-        gemini_manager=gemini_manager,
-        config=config
-    )
-    run_log['steps']['merging'] = merge_result
-    if merge_result['status'] == 'SKIPPED':
-        print("  -> Merging was SKIPPED as per config.")
-    for i, text in enumerate(merge_result.get('merged_texts', [])):
-        print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
+        # Step 2: Adapt
+        print("\n[STEP 2] ADAPT")
+        adapt_result = adapt(
+            target_query=target_query,
+            retrieved_indices=retrieval_result['retrieved_indices'],
+            exemplar_questions=exemplar_data['questions'],
+            exemplar_solutions=exemplar_data['solutions'],
+            gemini_manager=gemini_manager,
+            config=config
+        )
+        run_log['steps']['adaptation'] = adapt_result
+        for i, text in enumerate(adapt_result.get('adapted_texts', [])):
+            print(f"  -> Adapted text #{i+1} (start): '{text[:120]}...'")
+        
+        # Step 3: Merge
+        print("\n[STEP 3] MERGE")
+        merge_result = merge(
+            target_query=target_query,
+            adapted_texts=adapt_result['adapted_texts'],
+            embedding_model=embedding_model,
+            gemini_manager=gemini_manager,
+            config=config
+        )
+        run_log['steps']['merging'] = merge_result
+        if merge_result['status'] == 'SKIPPED':
+            print("  -> Merging was SKIPPED as per config.")
+        for i, text in enumerate(merge_result.get('merged_texts', [])):
+            print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
+        
+        # The final exemplars come from the merging step.
+        final_exemplars_for_solve = merge_result['merged_texts']
+        
+    else:
+        # If retrieval is OFF, skip all intermediate steps.
+        print("\n[STEP 1, 2, 3] RETRIEVE, ADAPT, MERGE SKIPPED (USE_RETRIEVAL is False).")
+        run_log['steps']['retrieval'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
+        run_log['steps']['adaptation'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
+        run_log['steps']['merging'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
+        # Pass an empty list to the solver.
+        final_exemplars_for_solve = []
 
     # Step 4: Solve
     print("\n[STEP 4] SOLVE")
     solve_result = solve(
         target_query=target_query,
-        final_exemplars=merge_result['merged_texts'],
+        final_exemplars=final_exemplars_for_solve, # Use the variable set in the if/else block
         gemini_manager=gemini_manager,
         config=config
     )

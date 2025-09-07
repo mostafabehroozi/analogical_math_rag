@@ -26,7 +26,9 @@ from src.prompts import (
     create_standardization_prompt,
     create_transformation_prompt,
     create_merging_prompt,
-    create_final_reasoning_prompt
+    create_final_reasoning_prompt,
+    # NEW: Import the simple prompt creation function
+    create_final_reasoning_prompt_simple
 )
 
 # --- Utility Function for Embedding Generation ---
@@ -257,6 +259,7 @@ def solve(
     Args:
         target_query (str): The main question to solve.
         final_exemplars (List[str]): The final list of exemplars after adaptation/merging.
+                                     This will be empty if retrieval is off.
         gemini_manager (GeminiAPIManager): The API manager instance.
         config (Dict): The main configuration dictionary.
 
@@ -266,7 +269,16 @@ def solve(
     logger = logging.getLogger(__name__)
     logger.info("Starting final solver step.")
     
-    prompt = create_final_reasoning_prompt(target_query, final_exemplars)
+    # --- MODIFIED: Select the prompt based on whether exemplars exist ---
+    if final_exemplars:
+        # RAG path: Use the prompt with exemplars.
+        prompt = create_final_reasoning_prompt(target_query, final_exemplars)
+        logger.info("Using retrieval-augmented prompt for the solver.")
+    else:
+        # No RAG path: Use the simple, direct prompt.
+        prompt = create_final_reasoning_prompt_simple(target_query)
+        logger.info("Using simple prompt for the solver (no retrieval).")
+
     if "Error:" in prompt:
         logger.error(f"Failed to create final reasoning prompt: {prompt}")
         return {"status": "FAILURE", "solution_attempts": [prompt]}

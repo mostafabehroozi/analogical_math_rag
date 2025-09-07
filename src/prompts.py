@@ -119,6 +119,30 @@ Final Answer:
 ---
 **Your Solution:**
 """,
+    
+    # NEW: Simple prompt for solving without retrieval.
+    "final_solver_simple_v1": """**Objective:**
+Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
+
+**Your Method & Constraints:**
+1.  **Construct Your Solution:** Develop a logical, step-by-step **Rationale** for the **Main Question**.
+2.  Perform calculations accurately and show your work.
+3.  Clearly state the **Final Answer** at the end.
+
+**Required Output Format (Strictly Adhere):**
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+
+---
+**Inputs:**
+**Main Question:**
+{main_question_text}
+---
+**Your Solution:**
+""",
 
     "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
 Both 'Model Output' and 'Ground Truth' may contain intermediate steps (Chain-of-Thought) leading to a final answer.
@@ -195,6 +219,15 @@ def create_final_reasoning_prompt(main_question_text: str, final_adapted_samples
     return template.format(
         main_question_text=main_question_text,
         adapted_samples_block=samples_block.strip()
+    )
+
+# NEW: Function for the simple solver prompt
+def create_final_reasoning_prompt_simple(main_question_text: str) -> str:
+    """Creates the final prompt for the solver LLM without any adapted samples."""
+    template_name = "final_solver_simple_v1"
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(
+        main_question_text=main_question_text
     )
 
 def create_evaluation_prompt(model_answer: str, ground_truth: str) -> str:
