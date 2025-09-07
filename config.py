@@ -59,8 +59,8 @@ CONFIG = {
     # --- 4. File Paths, Data & Embedding Settings ---
     "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',
     
-    # Input data source.
-    "HARD_QUESTIONS_JSON_PATH": os.path.join(DATA_DIR, "hard_questions_passed@10_251.json"),
+    # MODIFIED: Input data source now points to a file with indices, not full questions.
+    "HARD_QUESTIONS_INDICES_PATH": os.path.join(DATA_DIR, "hard_question_indices.json"),
     "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
     
     # RAG exemplar corpus details.
