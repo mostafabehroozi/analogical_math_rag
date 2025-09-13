@@ -20,12 +20,12 @@ import numpy as np
 from src.pipeline_steps import retrieve, adapt, merge, solve
 from src.api_manager import GeminiAPIManager
 from src.utils import save_json, load_json
-# --- NEW: Import for periodic synchronization ---
 from src.hf_sync import periodic_sync_check
 
 def run_pipeline_for_single_query(
     hard_list_idx: int,
     target_query: str,
+    ground_truth: str, # NEW: Added ground_truth for online evaluation
     config: Dict[str, Any],
     embedding_model: SentenceTransformer,
     exemplar_data: Dict[str, Any],
@@ -45,23 +45,23 @@ def run_pipeline_for_single_query(
         "target_query_original_hard_list_idx": hard_list_idx,
         "target_query_text": target_query,
         "config_flags_used": {
-            # NEW: Added USE_RETRIEVAL flag to the log for clarity.
             "USE_RETRIEVAL": config.get('USE_RETRIEVAL'),
             "APPLY_STANDARDIZATION": config.get('APPLY_STANDARDIZATION'),
             "APPLY_TRANSFORMATION": config.get('APPLY_TRANSFORMATION'),
             "APPLY_MERGING": config.get('APPLY_MERGING'),
             "TOP_N_CANDIDATES_RETRIEVAL": config.get('TOP_N_CANDIDATES_RETRIEVAL'),
             "N_PASS_ATTEMPTS": config.get('N_PASS_ATTEMPTS'),
-            "PASS_N_SOLVER_TEMPERATURE_USED": config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE')
+            # NEW: Log online evaluation settings for clarity
+            "ONLINE_EVALUATION_ENABLED": config.get('ONLINE_EVALUATION_ENABLED'),
+            "STOP_ON_FIRST_SUCCESS": config.get('STOP_ON_FIRST_SUCCESS')
         },
         "pipeline_status": "PENDING",
         "steps": {}
     }
 
-    # --- MODIFIED: Conditional execution based on USE_RETRIEVAL flag ---
+    # --- Conditional execution based on USE_RETRIEVAL flag ---
     if config.get('USE_RETRIEVAL', True):
-        # Step 1: Retrieve
-        print("\n[STEP 1] RETRIEVE")
+        # Step 1: Retrieve, Adapt, Merge
         retrieval_result = retrieve(
             target_query=target_query,
             embedding_model=embedding_model,
@@ -72,13 +72,8 @@ def run_pipeline_for_single_query(
         run_log['steps']['retrieval'] = retrieval_result
         if retrieval_result['status'] == 'FAILURE':
             run_log['pipeline_status'] = "FAILURE: Retrieval failed."
-            logger.error(run_log['pipeline_status'])
-            print("  -> Retrieval FAILED.")
             return run_log
-        print(f"  -> Retrieved indices: {retrieval_result['retrieved_indices']}")
 
-        # Step 2: Adapt
-        print("\n[STEP 2] ADAPT")
         adapt_result = adapt(
             target_query=target_query,
             retrieved_indices=retrieval_result['retrieved_indices'],
@@ -88,11 +83,7 @@ def run_pipeline_for_single_query(
             config=config
         )
         run_log['steps']['adaptation'] = adapt_result
-        for i, text in enumerate(adapt_result.get('adapted_texts', [])):
-            print(f"  -> Adapted text #{i+1} (start): '{text[:120]}...'")
         
-        # Step 3: Merge
-        print("\n[STEP 3] MERGE")
         merge_result = merge(
             target_query=target_query,
             adapted_texts=adapt_result['adapted_texts'],
@@ -101,38 +92,41 @@ def run_pipeline_for_single_query(
             config=config
         )
         run_log['steps']['merging'] = merge_result
-        if merge_result['status'] == 'SKIPPED':
-            print("  -> Merging was SKIPPED as per config.")
-        for i, text in enumerate(merge_result.get('merged_texts', [])):
-            print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
-        
-        # The final exemplars come from the merging step.
         final_exemplars_for_solve = merge_result['merged_texts']
         
     else:
         # If retrieval is OFF, skip all intermediate steps.
-        print("\n[STEP 1, 2, 3] RETRIEVE, ADAPT, MERGE SKIPPED (USE_RETRIEVAL is False).")
         run_log['steps']['retrieval'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
         run_log['steps']['adaptation'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
         run_log['steps']['merging'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
-        # Pass an empty list to the solver.
         final_exemplars_for_solve = []
 
-    # Step 4: Solve
+    # --- Step 4: Solve (MODIFIED) ---
     print("\n[STEP 4] SOLVE")
     solve_result = solve(
         target_query=target_query,
-        final_exemplars=final_exemplars_for_solve, # Use the variable set in the if/else block
+        final_exemplars=final_exemplars_for_solve,
+        ground_truth=ground_truth, # Pass the ground truth for online evaluation
         gemini_manager=gemini_manager,
         config=config
     )
     run_log['steps']['solving'] = solve_result
+    
+    # --- NEW: Handle the updated return structure from solve ---
     run_log['llm_final_solution_attempts_texts'] = solve_result.get('solution_attempts', [])
-    for i, text in enumerate(solve_result.get('solution_attempts', [])):
-        print(f"  -> Solution attempt #{i+1} (start): '{text[:120]}...'")
+    
+    if config.get("ONLINE_EVALUATION_ENABLED"):
+        run_log['online_evaluation_results'] = solve_result.get('evaluation_results', [])
 
-    run_log['pipeline_status'] = "SUCCESS"
-    logger.info(f"--- Pipeline finished successfully for Query #{hard_list_idx} ---")
+    # Check for the new 'UN-EVALUABLE' status from the solve step
+    if solve_result.get('status') == 'UN-EVALUABLE':
+        run_log['pipeline_status'] = f"UN-EVALUABLE: {solve_result.get('reason', 'Unknown error in solve step.')}"
+        logger.error(run_log['pipeline_status'])
+        print(f"  -> Pipeline HALTED. Reason: {run_log['pipeline_status']}")
+    else:
+        run_log['pipeline_status'] = "SUCCESS"
+        logger.info(f"--- Pipeline finished successfully for Query #{hard_list_idx} ---")
+        
     return run_log
 
 
@@ -140,6 +134,7 @@ def run_experiments(
     experiment_configs: List[Dict[str, Any]],
     global_config: Dict[str, Any],
     hard_questions: List[str],
+    hard_questions_ground_truths: List[str], # NEW: Pass ground truths
     embedding_model: SentenceTransformer,
     exemplar_data: Dict[str, Any],
     gemini_manager: GeminiAPIManager
@@ -161,7 +156,6 @@ def run_experiments(
         
         existing_logs = load_json(log_file_path)
         if existing_logs:
-            logger.info(f"Loaded {len(existing_logs)} existing results from {log_file_path}.")
             completed_indices = {log['target_query_original_hard_list_idx'] for log in existing_logs}
             run_logs = existing_logs
         else:
@@ -177,26 +171,36 @@ def run_experiments(
             all_results[exp_name] = run_logs
             continue
 
-        # --- MODIFIED: Use enumerate to get a loop counter for periodic sync ---
         for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
+            # Get the corresponding ground truth
+            ground_truth_text = hard_questions_ground_truths[original_idx]
+            
             single_run_log = run_pipeline_for_single_query(
                 hard_list_idx=original_idx,
                 target_query=query_text,
+                ground_truth=ground_truth_text, # Pass it to the single query runner
                 config=current_config,
                 embedding_model=embedding_model,
                 exemplar_data=exemplar_data,
                 gemini_manager=gemini_manager
             )
+            
+            # --- NEW: Exclude un-evaluable questions from the final log ---
+            # This ensures they don't skew results, as per the requirements.
+            if single_run_log['pipeline_status'].startswith('UN-EVALUABLE'):
+                print(f"\n--- Query #{original_idx} was un-evaluable and will be excluded from the final logs. ---")
+                logger.warning(f"Query {original_idx} excluded from logs for experiment '{exp_name}' due to being un-evaluable.")
+                # We save it to a separate file for debugging but don't append to the main run_logs
+                error_log_path = os.path.join(global_config['LOGS_DIR'], f"{exp_name}_unevaluable_log.json")
+                existing_errors = load_json(error_log_path) or []
+                existing_errors.append(single_run_log)
+                save_json(existing_errors, error_log_path)
+                continue # Skip to the next query
+            
             run_logs.append(single_run_log)
-            
-            # Save progress locally
             save_json(run_logs, log_file_path)
-            
-            # --- NEW: Call the periodic sync check ---
-            # This will trigger an upload to the Hub if the interval is reached.
             periodic_sync_check(loop_idx, current_config)
 
-        # Final local save at the end of the experiment
         save_json(run_logs, log_file_path)
         logger.info(f"########## Finished Experiment: {exp_name} ##########")
         all_results[exp_name] = run_logs

@@ -1,0 +1,26 @@
+[33m8b1887e[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;31morigin/master[m[33m, [m[1;31morigin/HEAD[m[33m)[m Implement hard question finding and gathering workflow
+[33m6d4ed0c[m fixed teh bug of indices instead of hard questions in the main_experiment notebook file
+[33me1b8a46[m refactor(config): Prepare for index-based loading of hard questions
+[33m2648194[m Add toggle to enable or disable retrieval
+[33m21d4abd[m API_ERROR refine and monitor - trace has been added
+[33m759233c[m huggingface hub advanced version downloading for logs
+[33m3751cc2[m huggingface hub advanced version downloading for logs
+[33md39bbcd[m fix(evaluation): Correct silent failures and improve error logging
+[33m8d68282[m huggingface automatically download the log and output files fixed
+[33m2f220fb[m huggingface automatically download the log and output files fixed
+[33m35ff306[m direct huggingface api access token passing
+[33mc446e31[m OUTPUTS_DIR added
+[33m8305965[m feature of huggingface hub as a datastore added
+[33m729c77e[m feature of huggingface hub as a datastore added
+[33m156eeb4[m reform sub steps to standardization ,transformation ,...   ,prompt templates and sub steps's codes and names in all , removed summarization
+[33m4569248[m debug prompt templates input format
+[33mc5a2697[m debug prompt templates input format
+[33mdbf7f89[m added print of evaluation LLM output
+[33m2935d79[m print LLM answers added
+[33m73cf511[m added sleep print
+[33m887e958[m added new utility
+[33mb78a9ed[m Update orchestration.py
+[33m5fec8f1[m Update pipeline_steps.py
+[33mb4372d0[m Update config.py
+[33m686943d[m Update config.py
+[33mf278643[m init project

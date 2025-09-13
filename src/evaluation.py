@@ -5,7 +5,8 @@ Evaluation module for the Analogical Reasoning RAG project.
 
 This file provides functions to:
 - Evaluate generated answers against ground truths using an LLM.
-- Parse and analyze the detailed JSON logs from experiment runs.
+- Parse and analyze detailed JSON logs from experiment runs, accommodating
+  both pre-computed online evaluations and traditional batch evaluations.
 - Calculate Pass@K metrics and generate a summary DataFrame.
 """
 
@@ -22,7 +23,6 @@ from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 
-# --- NEW: More descriptive return type for fine-grained evaluation status ---
 EvaluationResult = Tuple[Optional[bool], str]
 
 def evaluate_single_answer_with_llm(
@@ -33,6 +33,7 @@ def evaluate_single_answer_with_llm(
 ) -> EvaluationResult:
     """
     Evaluates a single model-generated answer against a ground truth using an LLM.
+    This function is now called directly by the `solve` step for online evaluation.
 
     Returns:
         A tuple containing:
@@ -50,28 +51,15 @@ def evaluate_single_answer_with_llm(
     prompt = create_evaluation_prompt(model_answer, ground_truth)
     response = gemini_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
-    # --- ADVANCED ERROR HANDLING ---
-    # Handle non-success statuses from the API manager explicitly.
     if response['status'] != 'SUCCESS':
-        error_msg = response['error_message']
-        logger.warning(f"LLM-based evaluation API call failed with status '{response['status']}': {error_msg}")
-        if response['status'] == 'BLOCKED':
-            return None, "API_BLOCKED"
-        # Covers 'FAILURE' (e.g., rate limits) and 'ERROR'
-        return None, "API_ERROR"
+        return None, response.get('status', 'API_ERROR')
 
     raw_text = response['text'].strip()
-    print(f"    Evaluator LLM Raw Output: {raw_text}")
-    logger.debug(f"Evaluator raw response: '{raw_text}'")
-
     eval_match = re.search(r"Evaluation:\s*(true|false)", raw_text, re.IGNORECASE)
 
     if eval_match:
-        result_str = eval_match.group(1).lower()
-        logger.info(f"Parsed evaluation result: {result_str}")
-        return result_str == 'true', "SUCCESS"
+        return eval_match.group(1).lower() == 'true', "SUCCESS"
     else:
-        logger.warning(f"Could not parse 'Evaluation:' line from LLM response. Treating as failure.")
         return None, "PARSING_FAILED"
 
 def analyze_experiment_logs(
@@ -82,9 +70,12 @@ def analyze_experiment_logs(
 ) -> pd.DataFrame:
     """
     Analyzes the complete logs from all experiments to calculate Pass@K metrics.
+
+    This function is now dual-mode:
+    1. If online evaluation was enabled, it directly uses the results from the logs.
+    2. If online evaluation was disabled, it performs the evaluation in a batch.
     """
     logger = logging.getLogger(__name__)
-    logger.info("Starting analysis of all experiment logs.")
     analysis_summary = []
 
     pass_k_values_to_report = config.get("PASS_K_VALUES_TO_REPORT", [1])
@@ -93,98 +84,87 @@ def analyze_experiment_logs(
     for exp_name, query_logs in all_experiments_logs.items():
         logger.info(f"--- Analyzing Experiment: {exp_name} ---")
         if not query_logs:
-            logger.warning(f"No logs found for experiment '{exp_name}'. Skipping.")
             continue
 
         exp_config = query_logs[0].get("config_flags_used", {})
         n_attempts = exp_config.get("N_PASS_ATTEMPTS", 1)
         pass_k_values = sorted([k for k in pass_k_values_to_report if 0 < k <= n_attempts])
+        
+        # --- NEW: Check if online evaluation was performed ---
+        online_eval_was_enabled = exp_config.get("ONLINE_EVALUATION_ENABLED", False)
+        
+        eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
+        detailed_evaluations = load_json(eval_file_path) or []
 
+        if online_eval_was_enabled:
+            logger.info("Online evaluation was enabled. Using pre-computed results from run logs.")
+            # Convert the run logs directly into the detailed_evaluations format
+            detailed_evaluations = []
+            for log in query_logs:
+                hard_list_idx = log["target_query_original_hard_list_idx"]
+                online_results = log.get("online_evaluation_results", [])
+                
+                detailed_evaluations.append({
+                    "hard_list_idx": hard_list_idx,
+                    "is_correct_list": [res.get("is_correct") for res in online_results],
+                    "evaluation_status_list": [res.get("status") for res in online_results],
+                    "attempts": log["llm_final_solution_attempts_texts"]
+                })
+            save_json(detailed_evaluations, eval_file_path) # Save for consistency and potential retries
+        
+        else:
+            logger.info("Online evaluation was disabled. Performing batch evaluation.")
+            evaluated_indices = {eval_log['hard_list_idx'] for eval_log in detailed_evaluations}
+            logs_to_process = [log for log in query_logs if log["target_query_original_hard_list_idx"] not in evaluated_indices]
+
+            if logs_to_process:
+                for loop_idx, log in enumerate(tqdm(logs_to_process, desc=f"Batch Evaluating {exp_name}")):
+                    hard_list_idx = log["target_query_original_hard_list_idx"]
+                    ground_truth = ground_truths[hard_list_idx]
+                    solution_attempts = log["llm_final_solution_attempts_texts"]
+                    
+                    is_correct_list, status_list = [], []
+                    for attempt in solution_attempts:
+                        is_correct, status = evaluate_single_answer_with_llm(attempt, ground_truth, gemini_manager, config)
+                        is_correct_list.append(is_correct)
+                        status_list.append(status)
+
+                    detailed_evaluations.append({
+                        "hard_list_idx": hard_list_idx,
+                        "is_correct_list": is_correct_list,
+                        "evaluation_status_list": status_list,
+                        "attempts": solution_attempts
+                    })
+                    save_json(detailed_evaluations, eval_file_path)
+                    periodic_sync_check(loop_idx, config)
+
+        # --- Metric Calculation (Unified for both modes) ---
         pass_k_counts = {k: 0 for k in pass_k_values}
-        # --- NEW: Counters for fine-grained error analysis ---
         error_counts = {"API_BLOCKED": 0, "API_ERROR": 0, "PARSING_FAILED": 0, "EMPTY_ANSWER": 0}
         total_valid_queries = 0
 
-        eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
-
-        existing_evals = load_json(eval_file_path)
-        if existing_evals:
-            detailed_evaluations = existing_evals
-            evaluated_indices = {eval_log['hard_list_idx'] for eval_log in detailed_evaluations}
-            logger.info(f"Loaded {len(detailed_evaluations)} existing evaluation results for '{exp_name}'.")
-        else:
-            detailed_evaluations = []
-            evaluated_indices = set()
-
-        logs_to_process = [log for log in query_logs if log["target_query_original_hard_list_idx"] not in evaluated_indices]
-
-        if not logs_to_process:
-            logger.info(f"All query logs for '{exp_name}' have already been evaluated. Moving to summary.")
-        else:
-            for loop_idx, log in enumerate(tqdm(logs_to_process, desc=f"Evaluating {exp_name}")):
-                hard_list_idx = log["target_query_original_hard_list_idx"]
-                ground_truth = ground_truths[hard_list_idx]
-                solution_attempts = log["llm_final_solution_attempts_texts"]
-
-                is_correct_list = []
-                status_list = []
-
-                for i, attempt in enumerate(solution_attempts):
-                    # --- IMPROVED CONSOLE LOGGING ---
-                    print(f"    -> Evaluating attempt {i+1}/{len(solution_attempts)} for query #{hard_list_idx}")
-                    is_correct, status = evaluate_single_answer_with_llm(attempt, ground_truth, gemini_manager, config)
-
-                    # Log a warning if the evaluation itself failed
-                    if status != "SUCCESS":
-                         print(f"       WARNING: Evaluation attempt failed with status: {status}")
-                         logger.warning(f"Evaluation for query {hard_list_idx}, attempt {i+1} failed with status: {status}")
-
-                    is_correct_list.append(is_correct)
-                    status_list.append(status)
-
-                detailed_evaluations.append({
-                    "hard_list_idx": hard_list_idx,
-                    "is_correct_list": is_correct_list,
-                    "evaluation_status_list": status_list, # Store the new status info
-                    "attempts": solution_attempts
-                })
-
-                save_json(detailed_evaluations, eval_file_path)
-                periodic_sync_check(loop_idx, config)
-
-        # Final local save
-        save_json(detailed_evaluations, eval_file_path)
-
-        # Calculate final metrics from the complete list of evaluations
         for eval_result in detailed_evaluations:
-            # An attempt is valid if it was generated (not an error string)
             if eval_result.get("attempts"):
                 total_valid_queries += 1
                 is_correct_list = eval_result["is_correct_list"]
-                status_list = eval_result["evaluation_status_list"]
-
-                # Increment error counters
-                for status in status_list:
+                
+                for status in eval_result["evaluation_status_list"]:
                     if status in error_counts:
                         error_counts[status] += 1
-
-                # Calculate Pass@K
+                
                 for k in pass_k_values:
-                    # A query passes at k if any of the first k attempts are True
                     if any(res for res in is_correct_list[:k] if res is True):
                         pass_k_counts[k] += 1
 
         summary_row = {"experiment_name": exp_name, **exp_config}
-        summary_row["total_queries_processed"] = len(query_logs)
-        summary_row["total_queries_with_valid_solutions"] = total_valid_queries
+        summary_row["total_queries_processed"] = len(detailed_evaluations)
 
         for k in pass_k_values:
             count = pass_k_counts[k]
             accuracy = (count / total_valid_queries) * 100 if total_valid_queries > 0 else 0
             summary_row[f"pass@{k}_count"] = count
             summary_row[f"pass@{k}_accuracy (%)"] = round(accuracy, 2)
-
-        # --- NEW: Add detailed error counts to the final summary ---
+        
         summary_row.update(error_counts)
         analysis_summary.append(summary_row)
 
