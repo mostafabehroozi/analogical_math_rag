@@ -277,3 +277,38 @@ def move_files_to_directories(files_to_move_map: dict) -> dict:
         'successful_moves': successful_moves,
         'failed_moves': failed_moves
     }
+
+
+import time
+import google.generativeai as genai
+
+def check_api_keys(config: dict):
+    """
+    Checks the validity of all API keys in the config.
+
+    Args:
+        config (dict): The main configuration dictionary.
+    """
+    print("--- Checking API Keys ---")
+    api_keys = config.get("GEMINI_API_KEYS", [])
+    if not api_keys:
+        print("No API keys found in the configuration.")
+        return
+
+    for i, key in enumerate(api_keys):
+        key_for_log = f"...{key[-4:]}"
+        print(f"Checking key #{i+1} ({key_for_log})...")
+        try:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            response = model.generate_content("hello")
+            print(f"  -> SUCCESS: {response.text.strip()}")
+        except Exception as e:
+            print(f"  -> FAILURE: {e}")
+
+        # Respect the global delay between calls
+        if i < len(api_keys) - 1:
+            delay = config.get("GLOBAL_API_CALL_DELAY_SECONDS", 0)
+            print(f"  ...sleeping for {delay}s...")
+            time.sleep(delay)
+    print("--- API Key Check Complete ---\n")
