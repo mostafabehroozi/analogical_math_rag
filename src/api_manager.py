@@ -198,6 +198,16 @@ class GeminiAPIManager:
             }
 
         except Exception as e:
+            # --- NEW: Enhanced Error Printing ---
+            print("\n" + "="*80)
+            print("!!! API CALL ERROR !!!")
+            print(f"    - Error Type: {type(e).__name__}")
+            print(f"    - Error Message: {e}")
+            print("    - Prompt that caused the error (first 500 chars):")
+            print(f"    - \"\"\"{prompt[:500]}...\"\"\"")
+            print("="*80 + "\n")
+            # --- END NEW ---
+            
             self.logger.error(f"API call with key {key_for_log} FAILED. Error: {type(e).__name__} - {e}", exc_info=True)
             # Record the attempt even if it failed to prevent hammering a failing key.
             self._record_api_call(api_key, model_name)
@@ -206,4 +216,3 @@ class GeminiAPIManager:
                 "error_message": f"An API error occurred: {type(e).__name__} - {e}",
                 "model_name": model_name, "api_key_used": key_for_log, "raw_response": None
             }
-    

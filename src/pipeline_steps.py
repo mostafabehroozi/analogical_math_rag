@@ -94,7 +94,7 @@ def retrieve(
     }
 
 
-# --- 2. ADAPTATION STEP (Unchanged) ---
+# --- 2. ADAPTATION STEP (MODIFIED) ---
 
 def adapt(
     target_query: str,
@@ -127,19 +127,30 @@ def adapt(
             response = gemini_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
+            else:
+                # --- NEW: Enhanced Error Printing ---
+                print(f"--- ERROR during ADAPTATION (Standardization) ---")
+                print(f"    - Error: {response['error_message']}")
+                print(f"-------------------------------------------------")
+
 
         if apply_transform:
             prompt = create_transformation_prompt(target_query, current_text)
             response = gemini_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
+            else:
+                # --- NEW: Enhanced Error Printing ---
+                print(f"--- ERROR during ADAPTATION (Transformation) ---")
+                print(f"    - Error: {response['error_message']}")
+                print(f"------------------------------------------------")
         
         adapted_texts.append(current_text)
 
     return {"status": "SUCCESS", "adapted_texts": adapted_texts}
 
 
-# --- 3. MERGING STEP (Unchanged) ---
+# --- 3. MERGING STEP (MODIFIED) ---
 
 def merge(
     target_query: str,
@@ -171,6 +182,10 @@ def merge(
         if response['status'] == 'SUCCESS':
             current_texts.append(response['text'])
         else:
+            # --- NEW: Enhanced Error Printing ---
+            print(f"--- ERROR during MERGING ---")
+            print(f"    - Error: {response['error_message']}")
+            print(f"----------------------------")
             logger.warning(f"Merging failed: {response['error_message']}. Discarding pair.")
 
     return {"status": "SUCCESS", "merged_texts": current_texts}
@@ -239,6 +254,7 @@ def solve(
         
         if response['status'] != 'SUCCESS':
             # API error during generation. Halt all processing for this question.
+            # The error is already printed by api_manager, so we just log and return.
             error_str = f"Error on attempt {i+1}: {response['error_message']}"
             solution_attempts.append(error_str)
             logger.error(f"API generation failed for query. Halting. Error: {error_str}")

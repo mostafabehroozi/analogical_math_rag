@@ -52,6 +52,10 @@ def evaluate_single_answer_with_llm(
     response = gemini_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
     if response['status'] != 'SUCCESS':
+        # --- NEW: Enhanced Error Printing ---
+        print(f"--- ERROR during LLM-based EVALUATION ---")
+        print(f"    - Error: {response.get('error_message', 'No error message provided.')}")
+        print(f"-----------------------------------------")
         return None, response.get('status', 'API_ERROR')
 
     raw_text = response['text'].strip()
