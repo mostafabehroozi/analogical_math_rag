@@ -312,3 +312,24 @@ def check_api_keys(config: dict):
             print(f"  ...sleeping for {delay}s...")
             time.sleep(delay)
     print("--- API Key Check Complete ---\n")
+
+
+def create_run_suffix_from_config(id_config: dict) -> str:
+    """
+    Creates a descriptive filename suffix from the hard question identification config.
+    """
+    num_samples = id_config.get("NUM_RANDOM_SAMPLES", "N/A")
+    max_attempts = id_config.get("MAX_ATTEMPTS_PER_QUESTION", "N/A")
+    
+    # Check if a specific index file is used, which overrides random sampling
+    if id_config.get("TARGET_INDICES_FILE_PATH"):
+        # Extract a name from the file path to keep it concise
+        indices_filename = os.path.basename(id_config["TARGET_INDICES_FILE_PATH"])
+        indices_name = os.path.splitext(indices_filename)[0]
+        sample_part = f"indices-{indices_name}"
+    else:
+        sample_part = f"samples-{num_samples}"
+        
+    attempt_part = f"attempts-{max_attempts}"
+    
+    return f"{sample_part}_{attempt_part}"

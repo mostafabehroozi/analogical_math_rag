@@ -110,7 +110,7 @@ CONFIG = {
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
 
-    # --- NEW: 9. Hard Question Identification Settings ---
+    # --- 9. Hard Question Identification Settings ---
     # This section contains parameters specifically for the `identify_hard_questions.ipynb` notebook.
     "HARD_QUESTION_IDENTIFICATION_CONFIG": {
         # Number of questions to randomly select from the dataset if no specific indices are provided.
@@ -120,8 +120,10 @@ CONFIG = {
         "TARGET_INDICES_FILE_PATH": None, # e.g., os.path.join(DATA_DIR, "my_target_indices.json")
         # The number of attempts the model gets to solve a question before it is classified as "hard".
         "MAX_ATTEMPTS_PER_QUESTION": 5,
-        # The file path where the final list of identified hard question indices will be saved.
-        "HARD_QUESTIONS_OUTPUT_PATH": os.path.join(RESULTS_DIR, "identified_hard_question_indices.json")
+        
+        # --- NEW: Filename prefixes for dynamic naming ---
+        "LOG_FILENAME_PREFIX": "hard_question_identification_log",
+        "OUTPUT_FILENAME_PREFIX": "identified_hard_question_indices"
     }
 }
 
