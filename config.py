@@ -113,6 +113,9 @@ CONFIG = {
     # --- 9. Hard Question Identification Settings ---
     # This section contains parameters specifically for the `identify_hard_questions.ipynb` notebook.
     "HARD_QUESTION_IDENTIFICATION_CONFIG": {
+        # --- NEW: A specific name for this identification run for clearer file naming ---
+        "RUN_NAME": "baseline_hard_question_run",
+        
         # Number of questions to randomly select from the dataset if no specific indices are provided.
         "NUM_RANDOM_SAMPLES": 100,
         # (Optional) Path to a JSON file containing a specific list of question indices to process.
