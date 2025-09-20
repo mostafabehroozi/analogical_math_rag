@@ -119,6 +119,38 @@ Final Answer:
 ---
 **Your Solution:**
 """,
+
+    "final_solver_v2":"""You are provided with a Main Question and a set of Retrieved Examples including their reasoning and solutions.
+Solve the Main Question with help of learning from the examples.
+<Instructions>
+- Identify both surface patterns (formulas, steps, calculations) and underlying reasoning structures (strategies, logical pathways).
+- Apply these patterns at the appropriate stages when solving the Main Question.
+- Adapt the patterns to any differences in numbers, variables, or conditions.
+- Present the solution clearly and systematically, step by step.
+- State the final answer explicitly.
+</Instructions>
+
+<Retrieved Examples>
+{adapted_samples_block}
+</Retrieved Examples>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Output Format>
+
+Your Solution:
+""",
+
+
+
     
     # NEW: Simple prompt for solving without retrieval.
     "final_solver_simple_v1": """**Objective:**
