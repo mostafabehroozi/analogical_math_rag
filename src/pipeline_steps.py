@@ -11,17 +11,17 @@ broken down into modular, sequential steps:
 4.  solve: Generates the final answer using the processed exemplars, with
            new capabilities for online evaluation and early stopping.
 
-Each function is designed to be called in sequence by the orchestration module.
+This version is updated to be provider-agnostic, working with any API manager
+that follows the project's standard interface (e.g., GeminiAPIManager, AvalAIManager).
 """
 
 import logging
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 # Import our custom modules
-from src.api_manager import GeminiAPIManager
 from src.prompts import (
     EXEMPLAR_FORMAT,
     create_standardization_prompt,
@@ -30,10 +30,9 @@ from src.prompts import (
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple
 )
-# --- NEW: Import for online evaluation capability ---
 from src.evaluation import evaluate_single_answer_with_llm
 
-# --- Utility Function for Embedding Generation ---
+# --- Utility Function for Embedding Generation (Unchanged) ---
 def _generate_embeddings(
     texts: List[str],
     embedding_model: SentenceTransformer,
@@ -94,14 +93,14 @@ def retrieve(
     }
 
 
-# --- 2. ADAPTATION STEP (MODIFIED) ---
+# --- 2. ADAPTATION STEP (MODIFIED for Provider Agnosticism) ---
 
 def adapt(
     target_query: str,
     retrieved_indices: List[int],
     exemplar_questions: List[str],
     exemplar_solutions: List[str],
-    gemini_manager: GeminiAPIManager,
+    api_manager: Any,  # MODIFIED: Generic API manager
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
@@ -111,7 +110,8 @@ def adapt(
     logger.info("Starting adaptation step.")
     adapted_texts = []
     
-    model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    # MODIFIED: Use generic model name key set by the notebook's factory logic.
+    model_name = config.get('MODEL_NAME_ADAPTATION')
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
     apply_standardize = config.get('APPLY_STANDARDIZATION', False)
     apply_transform = config.get('APPLY_TRANSFORMATION', False)
@@ -124,23 +124,22 @@ def adapt(
         
         if apply_standardize:
             prompt = create_standardization_prompt(current_text)
-            response = gemini_manager.generate_content(prompt, model_name, temperature)
+            # MODIFIED: Call the generic api_manager
+            response = api_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                # --- NEW: Enhanced Error Printing ---
                 print(f"--- ERROR during ADAPTATION (Standardization) ---")
                 print(f"    - Error: {response['error_message']}")
                 print(f"-------------------------------------------------")
 
-
         if apply_transform:
             prompt = create_transformation_prompt(target_query, current_text)
-            response = gemini_manager.generate_content(prompt, model_name, temperature)
+            # MODIFIED: Call the generic api_manager
+            response = api_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                # --- NEW: Enhanced Error Printing ---
                 print(f"--- ERROR during ADAPTATION (Transformation) ---")
                 print(f"    - Error: {response['error_message']}")
                 print(f"------------------------------------------------")
@@ -150,13 +149,13 @@ def adapt(
     return {"status": "SUCCESS", "adapted_texts": adapted_texts}
 
 
-# --- 3. MERGING STEP (MODIFIED) ---
+# --- 3. MERGING STEP (MODIFIED for Provider Agnosticism) ---
 
 def merge(
     target_query: str,
     adapted_texts: List[str],
     embedding_model: SentenceTransformer,
-    gemini_manager: GeminiAPIManager,
+    api_manager: Any,  # MODIFIED: Generic API manager
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
@@ -171,18 +170,20 @@ def merge(
     logger.info("Starting merging step.")
     current_texts = list(adapted_texts)
     target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
-    model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    
+    # MODIFIED: Use generic model name key. Merging re-uses the adaptation model.
+    model_name = config.get('MODEL_NAME_ADAPTATION')
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
     
     while len(current_texts) > target_count and len(current_texts) >= 2:
         pair_to_merge = [current_texts.pop(0), current_texts.pop(0)]
         prompt = create_merging_prompt(target_query, pair_to_merge)
         
-        response = gemini_manager.generate_content(prompt, model_name, temperature)
+        # MODIFIED: Call the generic api_manager
+        response = api_manager.generate_content(prompt, model_name, temperature)
         if response['status'] == 'SUCCESS':
             current_texts.append(response['text'])
         else:
-            # --- NEW: Enhanced Error Printing ---
             print(f"--- ERROR during MERGING ---")
             print(f"    - Error: {response['error_message']}")
             print(f"----------------------------")
@@ -191,37 +192,22 @@ def merge(
     return {"status": "SUCCESS", "merged_texts": current_texts}
 
 
-# --- 4. SOLVER STEP (REWRITTEN) ---
+# --- 4. SOLVER STEP (MODIFIED for Provider Agnosticism) ---
 
 def solve(
     target_query: str,
     final_exemplars: List[str],
     ground_truth: str,
-    gemini_manager: GeminiAPIManager,
+    api_manager: Any,  # MODIFIED: Generic API manager
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
     Generates solution(s) for the target query, with optional online evaluation.
-
-    If online evaluation is enabled, it evaluates each attempt immediately. If an
-    error occurs during generation or evaluation, it halts and marks the question
-    as 'UN-EVALUABLE'. It also supports stopping after the first correct answer.
-
-    Args:
-        target_query (str): The main question to solve.
-        final_exemplars (List[str]): Final exemplars after adaptation/merging.
-        ground_truth (str): The ground truth solution for online evaluation.
-        gemini_manager (GeminiAPIManager): The API manager instance.
-        config (Dict): The main configuration dictionary.
-
-    Returns:
-        A dictionary containing the overall status, a list of solution attempts,
-        and a corresponding list of evaluation results if applicable.
+    This function is provider-agnostic.
     """
     logger = logging.getLogger(__name__)
     logger.info("Starting final solver step.")
     
-    # Select the prompt based on whether exemplars exist
     prompt = (
         create_final_reasoning_prompt(target_query, final_exemplars)
         if final_exemplars
@@ -231,13 +217,12 @@ def solve(
     if "Error:" in prompt:
         return {"status": "FAILURE", "solution_attempts": [prompt], "evaluation_results": []}
 
-    # Determine how many attempts to make based on config
     n_attempts = config.get("N_PASS_ATTEMPTS", 1)
-    # For hard question identification, a different key might be used
     if 'MAX_ATTEMPTS_PER_QUESTION' in config.get('HARD_QUESTION_IDENTIFICATION_CONFIG', {}):
         n_attempts = config['HARD_QUESTION_IDENTIFICATION_CONFIG']['MAX_ATTEMPTS_PER_QUESTION']
 
-    model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    # MODIFIED: Use generic model name key
+    model_name = config.get('MODEL_NAME_FINAL_SOLVER')
     temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
     
     solution_attempts = []
@@ -250,11 +235,10 @@ def solve(
 
     for i in range(n_attempts):
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
-        response = gemini_manager.generate_content(prompt, model_name, temperature)
+        # MODIFIED: Call the generic api_manager
+        response = api_manager.generate_content(prompt, model_name, temperature)
         
         if response['status'] != 'SUCCESS':
-            # API error during generation. Halt all processing for this question.
-            # The error is already printed by api_manager, so we just log and return.
             error_str = f"Error on attempt {i+1}: {response['error_message']}"
             solution_attempts.append(error_str)
             logger.error(f"API generation failed for query. Halting. Error: {error_str}")
@@ -269,16 +253,15 @@ def solve(
         solution_attempts.append(solution_text)
         print(f"       Attempt {i+1} successful.")
 
-        # --- Online Evaluation Logic ---
         if online_eval_enabled:
             print(f"       -> Performing online evaluation for attempt {i+1}...")
+            # MODIFIED: Pass the generic api_manager to the evaluation function
             is_correct, eval_status = evaluate_single_answer_with_llm(
-                solution_text, ground_truth, gemini_manager, config
+                solution_text, ground_truth, api_manager, config
             )
             evaluation_results.append({"is_correct": is_correct, "status": eval_status})
 
             if eval_status != "SUCCESS":
-                # Evaluation itself failed. Halt all processing for this question.
                 logger.error(f"Online evaluation failed with status '{eval_status}'. Halting for this query.")
                 return {
                     "status": "UN-EVALUABLE",
@@ -291,9 +274,8 @@ def solve(
 
             if stop_on_success and is_correct:
                 logger.info(f"Correct answer found on attempt {i+1}. Stopping further attempts as per config.")
-                break # Exit the loop early
+                break
         else:
-            # If online eval is off, append a placeholder.
             evaluation_results.append({"is_correct": None, "status": "NOT_EVALUATED"})
 
     return {

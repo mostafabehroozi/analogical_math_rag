@@ -4,10 +4,13 @@
 Evaluation module for the Analogical Reasoning RAG project.
 
 This file provides functions to:
-- Evaluate generated answers against ground truths using an LLM.
+- Evaluate generated answers against ground truths using a generic LLM.
 - Parse and analyze detailed JSON logs from experiment runs, accommodating
   both pre-computed online evaluations and traditional batch evaluations.
 - Calculate Pass@K metrics and generate a summary DataFrame.
+
+This version is updated to be provider-agnostic, working with any API manager
+that follows the project's standard interface.
 """
 
 import logging
@@ -18,7 +21,6 @@ from tqdm import tqdm
 from typing import List, Dict, Any, Tuple, Optional
 
 # Import our custom modules
-from src.api_manager import GeminiAPIManager
 from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -28,12 +30,12 @@ EvaluationResult = Tuple[Optional[bool], str]
 def evaluate_single_answer_with_llm(
     model_answer: str,
     ground_truth: str,
-    gemini_manager: GeminiAPIManager,
+    api_manager: Any,  # MODIFIED: Generic API manager
     config: Dict[str, Any]
 ) -> EvaluationResult:
     """
     Evaluates a single model-generated answer against a ground truth using an LLM.
-    This function is now called directly by the `solve` step for online evaluation.
+    This function is provider-agnostic and can be called directly for online evaluation.
 
     Returns:
         A tuple containing:
@@ -45,14 +47,15 @@ def evaluate_single_answer_with_llm(
     if not model_answer or not isinstance(model_answer, str) or model_answer.startswith("Error:"):
         return None, "EMPTY_ANSWER"
 
-    evaluator_model = config['GEMINI_MODEL_NAME_EVALUATOR']
+    # MODIFIED: Use generic model name key
+    evaluator_model = config.get('MODEL_NAME_EVALUATOR')
     evaluator_temp = config['DEFAULT_EVALUATOR_TEMPERATURE']
 
     prompt = create_evaluation_prompt(model_answer, ground_truth)
-    response = gemini_manager.generate_content(prompt, evaluator_model, evaluator_temp)
+    # MODIFIED: Call the generic api_manager
+    response = api_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
     if response['status'] != 'SUCCESS':
-        # --- NEW: Enhanced Error Printing ---
         print(f"--- ERROR during LLM-based EVALUATION ---")
         print(f"    - Error: {response.get('error_message', 'No error message provided.')}")
         print(f"-----------------------------------------")
@@ -64,20 +67,21 @@ def evaluate_single_answer_with_llm(
     if eval_match:
         return eval_match.group(1).lower() == 'true', "SUCCESS"
     else:
+        logger.warning(f"Could not parse 'true' or 'false' from evaluator output: {raw_text[:200]}")
         return None, "PARSING_FAILED"
 
 def analyze_experiment_logs(
     all_experiments_logs: Dict[str, List[Dict]],
     ground_truths: List[str],
-    gemini_manager: GeminiAPIManager,
+    api_manager: Any,  # MODIFIED: Generic API manager
     config: Dict[str, Any]
 ) -> pd.DataFrame:
     """
     Analyzes the complete logs from all experiments to calculate Pass@K metrics.
 
-    This function is now dual-mode:
+    This function is dual-mode and provider-agnostic:
     1. If online evaluation was enabled, it directly uses the results from the logs.
-    2. If online evaluation was disabled, it performs the evaluation in a batch.
+    2. If online evaluation was disabled, it performs the evaluation in a batch using the provided api_manager.
     """
     logger = logging.getLogger(__name__)
     analysis_summary = []
@@ -94,7 +98,6 @@ def analyze_experiment_logs(
         n_attempts = exp_config.get("N_PASS_ATTEMPTS", 1)
         pass_k_values = sorted([k for k in pass_k_values_to_report if 0 < k <= n_attempts])
         
-        # --- NEW: Check if online evaluation was performed ---
         online_eval_was_enabled = exp_config.get("ONLINE_EVALUATION_ENABLED", False)
         
         eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
@@ -102,7 +105,6 @@ def analyze_experiment_logs(
 
         if online_eval_was_enabled:
             logger.info("Online evaluation was enabled. Using pre-computed results from run logs.")
-            # Convert the run logs directly into the detailed_evaluations format
             detailed_evaluations = []
             for log in query_logs:
                 hard_list_idx = log["target_query_original_hard_list_idx"]
@@ -114,7 +116,7 @@ def analyze_experiment_logs(
                     "evaluation_status_list": [res.get("status") for res in online_results],
                     "attempts": log["llm_final_solution_attempts_texts"]
                 })
-            save_json(detailed_evaluations, eval_file_path) # Save for consistency and potential retries
+            save_json(detailed_evaluations, eval_file_path)
         
         else:
             logger.info("Online evaluation was disabled. Performing batch evaluation.")
@@ -129,7 +131,10 @@ def analyze_experiment_logs(
                     
                     is_correct_list, status_list = [], []
                     for attempt in solution_attempts:
-                        is_correct, status = evaluate_single_answer_with_llm(attempt, ground_truth, gemini_manager, config)
+                        # MODIFIED: Pass the generic api_manager
+                        is_correct, status = evaluate_single_answer_with_llm(
+                            attempt, ground_truth, api_manager, config
+                        )
                         is_correct_list.append(is_correct)
                         status_list.append(status)
 

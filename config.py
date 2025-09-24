@@ -6,6 +6,8 @@ Central configuration file for the Analogical Reasoning RAG project.
 This file defines all parameters, file paths, model settings, and control flags
 for the entire pipeline. By modifying this file, you can easily run different
 experiments without changing the core logic of the source code.
+
+This version has been updated to support multiple API providers (Gemini and AvalAI).
 """
 
 import os
@@ -32,21 +34,42 @@ CONFIG = {
     "RESULTS_DIR": RESULTS_DIR,
 
     # --- 3. API & Model Settings ---
+    "API_PROVIDER": "GEMINI",  # <-- MASTER SWITCH: "GEMINI" or "AVALAI"
+
+    # --- 3.1. Gemini Provider Settings ---
+    # (These settings are used only if API_PROVIDER is "GEMINI")
     "GEMINI_API_KEYS": [
         # Add your Gemini API keys here.
         # e.g., "AIzaSy...",
     ],
     "GEMINI_MODEL_QUOTAS": {
         "gemini-1.5-flash": {"delay_seconds": 4, "rpd": 500},
-        "gemini-2.5-flash": {"delay_seconds": 15, "rpd": 200},
-        "gemini-2.5-pro": {"delay_seconds": 20, "rpd": 25},
+        # Add other Gemini models as needed
     },
-    "GLOBAL_API_CALL_DELAY_SECONDS": 5,
+    "GEMINI_MODEL_NAME_ADAPTATION": "gemini-1.5-flash",
+    "GEMINI_MODEL_NAME_FINAL_SOLVER": "gemini-1.5-flash",
+    "GEMINI_MODEL_NAME_EVALUATOR": "gemini-1.5-flash",
 
-    # Model names for different pipeline stages.
-    "GEMINI_MODEL_NAME_ADAPTATION": "gemini-2.5-flash",
-    "GEMINI_MODEL_NAME_FINAL_SOLVER": "gemini-2.5-flash",
-    "GEMINI_MODEL_NAME_EVALUATOR": "gemini-2.5-flash",
+    # --- 3.2. AvalAI (OpenAI-Compatible) Provider Settings ---
+    # (These settings are used only if API_PROVIDER is "AVALAI")
+    "AVALAI_CONFIG": {
+        "API_KEY": "YOUR_AVALAI_API_KEY_HERE",
+        "BASE_URL": "https://api.avalai.ir/v1",
+    },
+    "AVALAI_MODEL_QUOTAS": {
+        "openai.gpt-oss-20b-1:0": {"delay_seconds": 2, "rpd": 1000},
+        # Add other AvalAI models as needed
+    },
+    "AVALAI_MODEL_NAME_ADAPTATION": "openai.gpt-oss-20b-1:0",
+    "AVALAI_MODEL_NAME_FINAL_SOLVER": "openai.gpt-oss-20b-1:0",
+    "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
+
+    # NOTE: The notebooks will dynamically select the correct model names based on the
+    # API_PROVIDER setting. The code will use generic keys like 'MODEL_NAME_ADAPTATION'
+    # which will be populated at runtime.
+
+    # --- 3.3. Global & Temperature Settings (Provider Agnostic) ---
+    "GLOBAL_API_CALL_DELAY_SECONDS": 5,
 
     # Default temperature settings for different LLM tasks.
     "DEFAULT_ADAPTATION_TEMPERATURE": 0.0,
@@ -86,14 +109,11 @@ CONFIG = {
     "N_PASS_ATTEMPTS": 3,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
-    # --- NEW: Online Evaluation & Early Stopping ---
-    # Master switch for real-time evaluation. If False, evaluation happens in a batch at the end.
+    # --- 7. Online Evaluation & Early Stopping ---
     "ONLINE_EVALUATION_ENABLED": False,
-    # If True (and online evaluation is enabled), stop generating attempts after the first correct answer.
-    # WARNING: This is incompatible with Pass@K analysis and should be False for formal experiments.
     "STOP_ON_FIRST_SUCCESS": False,
 
-    # --- 7. Prompt Template Selection ---
+    # --- 8. Prompt Template Selection ---
     "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
     "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
@@ -101,7 +121,7 @@ CONFIG = {
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
 
-    # --- 8. Hugging Face Hub Synchronization ---
+    # --- 9. Hugging Face Hub Synchronization ---
     "PERSIST_RESULTS_ONLINE": True,
     "HF_SYNC_TOKEN": "YOUR_HUGGING_FACE_TOKEN_HERE",
     "HF_HUB_USERNAME": "your-hf-username-here",
@@ -110,21 +130,12 @@ CONFIG = {
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
 
-    # --- 9. Hard Question Identification Settings ---
-    # This section contains parameters specifically for the `identify_hard_questions.ipynb` notebook.
+    # --- 10. Hard Question Identification Settings ---
     "HARD_QUESTION_IDENTIFICATION_CONFIG": {
-        # --- NEW: A specific name for this identification run for clearer file naming ---
         "RUN_NAME": "baseline_hard_question_run",
-        
-        # Number of questions to randomly select from the dataset if no specific indices are provided.
         "NUM_RANDOM_SAMPLES": 100,
-        # (Optional) Path to a JSON file containing a specific list of question indices to process.
-        # If this is provided, NUM_RANDOM_SAMPLES will be ignored.
-        "TARGET_INDICES_FILE_PATH": None, # e.g., os.path.join(DATA_DIR, "my_target_indices.json")
-        # The number of attempts the model gets to solve a question before it is classified as "hard".
+        "TARGET_INDICES_FILE_PATH": None,
         "MAX_ATTEMPTS_PER_QUESTION": 5,
-        
-        # --- NEW: Filename prefixes for dynamic naming ---
         "LOG_FILENAME_PREFIX": "hard_question_identification_log",
         "OUTPUT_FILENAME_PREFIX": "identified_hard_question_indices"
     }
