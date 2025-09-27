@@ -8,6 +8,7 @@ This file contains the API manager classes responsible for:
 - Handling rate limiting.
 - Making API calls with robust error handling.
 - Returning a standardized, structured response for consistent control flow.
+- NEW: Provides detailed, configurable console logging for all API calls.
 
 Currently supported providers:
 - GeminiAPIManager: For Google's Gemini models.
@@ -19,7 +20,6 @@ import logging
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional, Any
 
-# NEW: Import the OpenAI library and its potential error types.
 import openai
 import google.generativeai as genai
 
@@ -31,7 +31,8 @@ class GeminiAPIManager:
     """
     Manages API keys, rate limits, and calls to the Google Gemini API.
     """
-    def __init__(self, api_keys: List[str], model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0):
+    # MODIFIED: Added config parameter to __init__
+    def __init__(self, api_keys: List[str], model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
         """
         Initializes the Gemini API manager.
 
@@ -39,6 +40,7 @@ class GeminiAPIManager:
             api_keys (List[str]): A list of Gemini API keys.
             model_quotas (Dict): A dictionary defining per-model rate limits (delay, rpd).
             global_delay_seconds (int): A minimum delay between any two API calls.
+            config (Optional[Dict]): The main configuration dictionary to read control flags.
         """
         self.logger = logging.getLogger(__name__)
 
@@ -57,6 +59,9 @@ class GeminiAPIManager:
         
         self.current_key_index: int = 0
         self._lock = False
+
+        # NEW: Store the print details flag from config
+        self.print_details = config.get("PRINT_API_CALL_DETAILS", False) if config else False
 
         self.logger.info(f"GeminiAPIManager initialized with {len(self.api_keys_list)} keys.")
         
@@ -125,10 +130,28 @@ class GeminiAPIManager:
         
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
         """Generates content using the Gemini API, handling key selection, rate limiting, and errors."""
+        
+        # NEW: Print request details if enabled
+        if self.print_details:
+            print("\n" + "--- [API Call Start: Gemini] ---")
+            print(f"Model: {model_name}, Temperature: {temperature}")
+            print("Prompt Sent:")
+            print(prompt)
+            print("----------------------------------")
+
         api_key, sleep_time = self._get_available_key_and_sleep_time(model_name)
 
         if api_key is None:
-            return {"status": "FAILURE", "text": None, "error_message": f"All API keys are rate-limited for model '{model_name}'. Please wait."}
+            error_msg = f"All API keys are rate-limited for model '{model_name}'. Please wait."
+            if self.print_details:
+                print("\n" + "!!! [API Call FAILED: Gemini] !!!")
+                print(f"Model: {model_name}")
+                print(f"Error Type: Rate Limiting")
+                print(f"Error Details: {error_msg}")
+                print("--- Prompt that caused the error ---")
+                print(prompt)
+                print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+            return {"status": "FAILURE", "text": None, "error_message": error_msg}
 
         key_for_log = f"...{api_key[-4:]}"
         if sleep_time > 0:
@@ -147,14 +170,30 @@ class GeminiAPIManager:
 
             if not response.parts:
                 block_reason = response.prompt_feedback.block_reason.name if hasattr(response.prompt_feedback, 'block_reason') else "Unknown"
+                if self.print_details:
+                    print("\n" + "!!! [API Call BLOCKED: Gemini] !!!")
+                    print(f"Reason: {block_reason}")
+                    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
                 return {"status": "BLOCKED", "text": None, "error_message": f"Response was empty or blocked. Reason: {block_reason}."}
             
-            print(f"    LLM Response (truncated): {response.text[:100]}...")
+            if self.print_details:
+                print("--- [API Call SUCCESS: Gemini] ---")
+                print(f"Response (truncated): {response.text[:200]}...")
+                print("----------------------------------\n")
+            
             return {"status": "SUCCESS", "text": response.text, "error_message": None}
 
         except Exception as e:
             self.logger.error(f"Gemini API call with key {key_for_log} FAILED. Error: {e}", exc_info=True)
             self._record_api_call(api_key, model_name)
+            if self.print_details:
+                print("\n" + "!!! [API Call FAILED: Gemini] !!!")
+                print(f"Model: {model_name}")
+                print(f"Error Type: {type(e).__name__}")
+                print(f"Error Details (Full, Un-truncated):\n{repr(e)}")
+                print("--- Prompt that caused the error ---")
+                print(prompt)
+                print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
             return {"status": "ERROR", "text": None, "error_message": f"An API error occurred: {type(e).__name__} - {e}"}
 
 
@@ -163,7 +202,8 @@ class AvalAIAPIManager:
     """
     Manages API calls to an OpenAI-compatible endpoint like AvalAI.
     """
-    def __init__(self, api_key: str, base_url: str, model_quotas: Dict[str, Dict[str, Any]]):
+    # MODIFIED: Added config parameter to __init__
+    def __init__(self, api_key: str, base_url: str, model_quotas: Dict[str, Dict[str, Any]], config: Optional[Dict[str, Any]] = None):
         """
         Initializes the OpenAI-compatible API manager.
 
@@ -171,6 +211,7 @@ class AvalAIAPIManager:
             api_key (str): The API key for the service.
             base_url (str): The base URL of the API endpoint.
             model_quotas (Dict): Configuration for rate limiting (e.g., delay).
+            config (Optional[Dict]): The main configuration dictionary to read control flags.
         """
         self.logger = logging.getLogger(__name__)
 
@@ -182,11 +223,13 @@ class AvalAIAPIManager:
         self.model_quotas = model_quotas
         self.last_call_timestamp: float = 0
         
+        # NEW: Store the print details flag from config
+        self.print_details = config.get("PRINT_API_CALL_DETAILS", False) if config else False
+        
         self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url}")
 
     def _apply_rate_limit(self) -> None:
         """Applies a simple delay-based rate limit."""
-        # Using a simple global delay for this provider. Can be expanded.
         delay_seconds = self.model_quotas.get("default", {}).get("delay_seconds", 1)
         
         time_since_last_call = time.time() - self.last_call_timestamp
@@ -203,37 +246,65 @@ class AvalAIAPIManager:
         """
         self._apply_rate_limit()
 
+        # NEW: Print request details if enabled
+        if self.print_details:
+            print("\n" + "--- [API Call Start: AvalAI] ---")
+            print(f"Model: {model_name}, Temperature: {temperature}")
+            print("Prompt Sent:")
+            print(prompt)
+            print("----------------------------------")
+
         try:
             self.logger.info(f"Calling OpenAI-compatible model '{model_name}'.")
             
             completion = self.client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    # A system prompt could be added here if needed in the future
                     {"role": "user", "content": prompt}
                 ],
                 temperature=temperature
             )
             
-            # Record the successful call time
             self.last_call_timestamp = time.time()
 
             if not completion.choices:
                 self.logger.warning(f"API call to '{model_name}' returned no choices.")
+                if self.print_details:
+                    print("\n" + "!!! [API Call BLOCKED: AvalAI] !!!")
+                    print("Reason: No choices were returned by the API.")
+                    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
                 return {"status": "BLOCKED", "text": None, "error_message": "Response was empty or blocked (no choices returned)."}
 
             response_text = completion.choices[0].message.content
-            print(f"    LLM Response (truncated): {response_text[:100]}...")
+            if self.print_details:
+                print("--- [API Call SUCCESS: AvalAI] ---")
+                print(f"Response (truncated): {response_text[:200]}...")
+                print("----------------------------------\n")
+
             return {"status": "SUCCESS", "text": response_text, "error_message": None}
 
         except openai.APIError as e:
-            # Handle API-specific errors
             self.logger.error(f"OpenAI API call FAILED. Status: {e.status_code}, Response: {e.response}", exc_info=True)
             self.last_call_timestamp = time.time()
+            if self.print_details:
+                print("\n" + "!!! [API Call FAILED: AvalAI (APIError)] !!!")
+                print(f"Model: {model_name}")
+                print(f"Status Code: {e.status_code}")
+                print(f"Error Details (Full, Un-truncated Response from Server):\n{e.response}")
+                print("--- Prompt that caused the error ---")
+                print(prompt)
+                print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
             return {"status": "ERROR", "text": None, "error_message": f"An API error occurred: {type(e).__name__} - {e}"}
         
         except Exception as e:
-            # Handle other errors like connection issues
             self.logger.error(f"An unexpected error occurred during the OpenAI API call: {e}", exc_info=True)
             self.last_call_timestamp = time.time()
+            if self.print_details:
+                print("\n" + "!!! [API Call FAILED: AvalAI (General Error)] !!!")
+                print(f"Model: {model_name}")
+                print(f"Error Type: {type(e).__name__}")
+                print(f"Error Details (Full, Un-truncated):\n{repr(e)}")
+                print("--- Prompt that caused the error ---")
+                print(prompt)
+                print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
             return {"status": "ERROR", "text": None, "error_message": f"An unexpected error occurred: {type(e).__name__} - {e}"}

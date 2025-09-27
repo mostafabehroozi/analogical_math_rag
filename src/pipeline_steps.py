@@ -97,7 +97,7 @@ def adapt(
     retrieved_indices: List[int],
     exemplar_questions: List[str],
     exemplar_solutions: List[str],
-    api_manager: Any,  # MODIFIED: Accepts a generic API manager
+    api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Performs standardization and transformation on a list of retrieved exemplars."""
@@ -105,7 +105,6 @@ def adapt(
     logger.info("Starting adaptation step.")
     adapted_texts = []
     
-    # MODIFIED: Select model name based on the configured provider
     provider = config.get("API_PROVIDER", "gemini").lower()
     if provider == "avalai":
         model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
@@ -126,7 +125,8 @@ def adapt(
             print(f"    -> Standardizing exemplar {idx}...")
             prompt = create_standardization_prompt(current_text)
             
-            # MODIFIED: Use the generic api_manager
+            # NEW: Add contextual print before the API call
+            print(f"      [API Context] Calling LLM for: Standardization (Exemplar #{idx})")
             response = api_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
@@ -138,7 +138,8 @@ def adapt(
             print(f"    -> Transforming exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text)
             
-            # MODIFIED: Use the generic api_manager
+            # NEW: Add contextual print before the API call
+            print(f"      [API Context] Calling LLM for: Transformation (Exemplar #{idx})")
             response = api_manager.generate_content(prompt, model_name, temperature)
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
@@ -156,7 +157,7 @@ def merge(
     target_query: str,
     adapted_texts: List[str],
     embedding_model: SentenceTransformer,
-    api_manager: Any,  # MODIFIED: Accepts a generic API manager
+    api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Iteratively merges a list of adapted exemplars down to a target count."""
@@ -170,10 +171,8 @@ def merge(
     current_texts = list(adapted_texts)
     target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
     
-    # MODIFIED: Select model name based on the configured provider
     provider = config.get("API_PROVIDER", "gemini").lower()
     if provider == "avalai":
-        # Merging uses the same model as adaptation
         model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
     else:
         model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
@@ -184,6 +183,7 @@ def merge(
     while len(current_texts) > target_count and len(current_texts) >= 2:
         iteration += 1
         logger.info(f"Merge iteration {iteration}: Merging from {len(current_texts)} samples.")
+        print(f"    -> Merging {len(current_texts)} samples down...")
         
         pair_to_merge = [current_texts.pop(0), current_texts.pop(0)]
         
@@ -192,7 +192,8 @@ def merge(
             logger.error(f"Failed to create merging prompt: {prompt}")
             break
             
-        # MODIFIED: Use the generic api_manager
+        # NEW: Add contextual print before the API call
+        print(f"      [API Context] Calling LLM for: Merging (Iteration #{iteration})")
         response = api_manager.generate_content(prompt, model_name, temperature)
         if response['status'] == 'SUCCESS':
             current_texts.append(response['text'])
@@ -207,7 +208,7 @@ def merge(
 def solve(
     target_query: str,
     final_exemplars: List[str],
-    api_manager: Any,  # MODIFIED: Accepts a generic API manager
+    api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Generates the final solution(s) for the target query using the processed exemplars."""
@@ -227,7 +228,6 @@ def solve(
 
     n_attempts = config.get("N_PASS_ATTEMPTS", 1)
     
-    # MODIFIED: Select model name based on the configured provider
     provider = config.get("API_PROVIDER", "gemini").lower()
     if provider == "avalai":
         model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
@@ -242,7 +242,8 @@ def solve(
         logger.info(f"Generating attempt {i+1}/{n_attempts}.")
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
         
-        # MODIFIED: Use the generic api_manager
+        # NEW: Add contextual print before the API call
+        print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
         response = api_manager.generate_content(prompt, model_name, temperature)
         
         if response['status'] == 'SUCCESS':

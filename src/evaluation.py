@@ -29,7 +29,7 @@ EvaluationResult = Tuple[Optional[bool], str]
 def evaluate_single_answer_with_llm(
     model_answer: str,
     ground_truth: str,
-    api_manager: Any,  # MODIFIED: Accepts a generic API manager
+    api_manager: Any,
     config: Dict[str, Any]
 ) -> EvaluationResult:
     """
@@ -45,7 +45,6 @@ def evaluate_single_answer_with_llm(
     if not model_answer or not isinstance(model_answer, str) or model_answer.startswith("Error:"):
         return None, "EMPTY_ANSWER"
 
-    # MODIFIED: Select evaluator model name based on the configured provider
     provider = config.get("API_PROVIDER", "gemini").lower()
     if provider == "avalai":
         evaluator_model = config['AVALAI_MODEL_NAME_EVALUATOR']
@@ -56,7 +55,8 @@ def evaluate_single_answer_with_llm(
 
     prompt = create_evaluation_prompt(model_answer, ground_truth)
     
-    # MODIFIED: Use the generic api_manager
+    # NEW: Add contextual print before the API call
+    print(f"      [API Context] Calling LLM for: Evaluation")
     response = api_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
     if response['status'] != 'SUCCESS':
@@ -67,7 +67,9 @@ def evaluate_single_answer_with_llm(
         return None, "API_ERROR"
 
     raw_text = response['text'].strip()
-    print(f"    Evaluator LLM Raw Output: {raw_text}")
+    
+    # This print is kept as it shows the raw output for successful parsing checks.
+    print(f"      Evaluator LLM Raw Output: {raw_text}") 
     logger.debug(f"Evaluator raw response: '{raw_text}'")
 
     eval_match = re.search(r"Evaluation:\s*(true|false)", raw_text, re.IGNORECASE)
@@ -83,7 +85,7 @@ def evaluate_single_answer_with_llm(
 def analyze_experiment_logs(
     all_experiments_logs: Dict[str, List[Dict]],
     ground_truths: List[str],
-    api_manager: Any,  # MODIFIED: Accepts a generic API manager
+    api_manager: Any,
     config: Dict[str, Any]
 ) -> pd.DataFrame:
     """
@@ -137,7 +139,6 @@ def analyze_experiment_logs(
                 for i, attempt in enumerate(solution_attempts):
                     print(f"    -> Evaluating attempt {i+1}/{len(solution_attempts)} for query #{hard_list_idx}")
                     
-                    # MODIFIED: Pass the generic api_manager down
                     is_correct, status = evaluate_single_answer_with_llm(attempt, ground_truth, api_manager, config)
 
                     if status != "SUCCESS":

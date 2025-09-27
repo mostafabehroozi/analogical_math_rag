@@ -30,6 +30,7 @@ RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
 CONFIG = {
     # --- 2. Logging & Control Settings ---
     "VERBOSE_LOGGING": True,  # Master switch for detailed print statements to the console.
+    "PRINT_API_CALL_DETAILS": True, # NEW: Master switch to print detailed API call info (prompt, response, errors) to the console.
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "LOGS_DIR": LOGS_DIR, # Directory where detailed run logs will be saved.
     "OUTPUTS_DIR": OUTPUTS_DIR,
