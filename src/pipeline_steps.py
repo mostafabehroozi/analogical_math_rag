@@ -10,18 +10,19 @@ broken down into modular, sequential steps:
 3.  merge: Iteratively combines adapted exemplars into a more potent one.
 4.  solve: Generates the final answer using the processed exemplars.
 
-Each function is designed to be called in sequence by the orchestration module
-and is now API provider-agnostic.
+This version is updated to handle structured, detailed API error responses.
+When an API call fails, the step captures the error information and continues
+where possible, allowing the orchestrator to log partial results and enable
+targeted retries.
 """
 
 import logging
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Union
 
 # Import our custom modules
-# No specific API manager is imported; the object is passed into the functions.
 from src.prompts import (
     EXEMPLAR_FORMAT,
     create_standardization_prompt,
@@ -31,7 +32,7 @@ from src.prompts import (
     create_final_reasoning_prompt_simple
 )
 
-# --- Utility Function for Embedding Generation ---
+# --- Utility Function for Embedding Generation (No changes needed) ---
 def _generate_embeddings(
     texts: List[str],
     embedding_model: SentenceTransformer,
@@ -53,7 +54,6 @@ def _generate_embeddings(
 
 
 # --- 1. RETRIEVAL STEP (No changes needed, does not use an LLM API) ---
-
 def retrieve(
     target_query: str,
     embedding_model: SentenceTransformer,
@@ -90,8 +90,7 @@ def retrieve(
     }
 
 
-# --- 2. ADAPTATION STEP ---
-
+# --- 2. ADAPTATION STEP (MODIFIED for error handling) ---
 def adapt(
     target_query: str,
     retrieved_indices: List[int],
@@ -100,17 +99,18 @@ def adapt(
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Performs standardization and transformation on a list of retrieved exemplars."""
+    """
+    Performs standardization and transformation on retrieved exemplars.
+    Captures failures for individual exemplars without halting the entire step.
+    """
     logger = logging.getLogger(__name__)
     logger.info("Starting adaptation step.")
-    adapted_texts = []
+    
+    successful_texts = []
+    failed_adaptations = []
     
     provider = config.get("API_PROVIDER", "gemini").lower()
-    if provider == "avalai":
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    else:
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    
+    model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_ADAPTATION']
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
     apply_standardize = config.get('APPLY_STANDARDIZATION', False)
     apply_transform = config.get('APPLY_TRANSFORMATION', False)
@@ -120,39 +120,59 @@ def adapt(
         original_solution = exemplar_solutions[idx]
         current_text = EXEMPLAR_FORMAT.format(question=original_question, solution=original_solution)
         
-        if apply_standardize:
+        step_failed = False
+
+        if apply_standardize and not step_failed:
             logger.info(f"Applying standardization to exemplar index {idx}.")
             print(f"    -> Standardizing exemplar {idx}...")
             prompt = create_standardization_prompt(current_text)
             
-            # NEW: Add contextual print before the API call
             print(f"      [API Context] Calling LLM for: Standardization (Exemplar #{idx})")
             response = api_manager.generate_content(prompt, model_name, temperature)
+            
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                logger.warning(f"Standardization failed for exemplar {idx}: {response['error_message']}. Using original text.")
+                logger.warning(f"Standardization failed for exemplar {idx}: {response['error_message']}")
+                failed_adaptations.append({"source_index": idx, "failed_at_step": "standardization", "error_info": response})
+                step_failed = True
 
-        if apply_transform:
+        if apply_transform and not step_failed:
             logger.info(f"Applying transformation to exemplar index {idx}.")
             print(f"    -> Transforming exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text)
             
-            # NEW: Add contextual print before the API call
             print(f"      [API Context] Calling LLM for: Transformation (Exemplar #{idx})")
             response = api_manager.generate_content(prompt, model_name, temperature)
+
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                logger.warning(f"Transformation failed for exemplar {idx}: {response['error_message']}. Using text from previous step.")
+                logger.warning(f"Transformation failed for exemplar {idx}: {response['error_message']}")
+                failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation", "error_info": response})
+                step_failed = True
         
-        adapted_texts.append(current_text)
+        if not step_failed:
+            successful_texts.append(current_text)
 
-    return {"status": "SUCCESS", "adapted_texts": adapted_texts}
+    # Determine overall status of the adaptation step
+    if not retrieved_indices:
+        final_status = "SUCCESS" # Nothing to do is a success
+    elif not successful_texts and failed_adaptations:
+        final_status = "FAILURE" # All attempts failed
+    elif successful_texts and failed_adaptations:
+        final_status = "PARTIAL_SUCCESS" # Some succeeded, some failed
+    else:
+        final_status = "SUCCESS" # All succeeded
+
+    return {
+        "status": final_status,
+        "adapted_texts": successful_texts,
+        "failed_adaptations": failed_adaptations
+    }
 
 
-# --- 3. MERGING STEP ---
-
+# --- 3. MERGING STEP (MODIFIED for error handling) ---
 def merge(
     target_query: str,
     adapted_texts: List[str],
@@ -160,23 +180,23 @@ def merge(
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Iteratively merges a list of adapted exemplars down to a target count."""
+    """
+    Iteratively merges adapted exemplars. If a merge fails, the pair is discarded
+    and the process continues.
+    """
     logger = logging.getLogger(__name__)
+    target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
+
     if not config.get('APPLY_MERGING', False):
         logger.info("APPLY_MERGING is False. Skipping merge step.")
-        target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
-        return {"status": "SKIPPED", "merged_texts": adapted_texts[:target_count]}
+        return {"status": "SKIPPED", "merged_texts": adapted_texts[:target_count], "failed_merges": []}
 
     logger.info("Starting merging step.")
     current_texts = list(adapted_texts)
-    target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
+    failed_merges = []
     
     provider = config.get("API_PROVIDER", "gemini").lower()
-    if provider == "avalai":
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    else:
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-        
+    model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_ADAPTATION']
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
     
     iteration = 0
@@ -190,67 +210,70 @@ def merge(
         prompt = create_merging_prompt(target_query, pair_to_merge)
         if "Error:" in prompt:
             logger.error(f"Failed to create merging prompt: {prompt}")
-            break
+            failed_merges.append({"pair_to_merge": pair_to_merge, "error_info": {"error_message": "Prompt creation failed."}})
+            continue
             
-        # NEW: Add contextual print before the API call
         print(f"      [API Context] Calling LLM for: Merging (Iteration #{iteration})")
         response = api_manager.generate_content(prompt, model_name, temperature)
+        
         if response['status'] == 'SUCCESS':
             current_texts.append(response['text'])
         else:
             logger.warning(f"Merging failed: {response['error_message']}. Discarding pair.")
+            failed_merges.append({"pair_to_merge": pair_to_merge, "error_info": response})
 
-    return {"status": "SUCCESS", "merged_texts": current_texts}
+    return {"status": "SUCCESS", "merged_texts": current_texts, "failed_merges": failed_merges}
 
 
-# --- 4. SOLVER STEP ---
-
+# --- 4. SOLVER STEP (MODIFIED for error handling) ---
 def solve(
     target_query: str,
     final_exemplars: List[str],
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Generates the final solution(s) for the target query using the processed exemplars."""
+    """
+    Generates final solution(s). If an attempt fails due to an API error,
+    the error details are saved instead of a text solution for that attempt.
+    """
     logger = logging.getLogger(__name__)
     logger.info("Starting final solver step.")
     
-    if final_exemplars:
-        prompt = create_final_reasoning_prompt(target_query, final_exemplars)
-        logger.info("Using retrieval-augmented prompt for the solver.")
-    else:
-        prompt = create_final_reasoning_prompt_simple(target_query)
-        logger.info("Using simple prompt for the solver (no retrieval).")
+    prompt = create_final_reasoning_prompt(target_query, final_exemplars) if final_exemplars else create_final_reasoning_prompt_simple(target_query)
+    logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
     if "Error:" in prompt:
-        logger.error(f"Failed to create final reasoning prompt: {prompt}")
-        return {"status": "FAILURE", "solution_attempts": [prompt]}
+        error_msg = f"Failed to create final reasoning prompt: {prompt}"
+        logger.error(error_msg)
+        return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": {"error_message": error_msg}}]}
 
     n_attempts = config.get("N_PASS_ATTEMPTS", 1)
     
     provider = config.get("API_PROVIDER", "gemini").lower()
-    if provider == "avalai":
-        model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    else:
-        model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-        
+    model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_FINAL_SOLVER']
     temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
     
-    solution_attempts = []
+    solution_attempts: List[Union[str, Dict]] = []
+    
     logger.info(f"Generating {n_attempts} solution attempts for Pass@{n_attempts}.")
     for i in range(n_attempts):
         logger.info(f"Generating attempt {i+1}/{n_attempts}.")
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
         
-        # NEW: Add contextual print before the API call
         print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
         response = api_manager.generate_content(prompt, model_name, temperature)
         
         if response['status'] == 'SUCCESS':
             solution_attempts.append(response['text'])
         else:
-            error_str = f"Error on attempt {i+1}: {response['error_message']}"
-            solution_attempts.append(error_str)
-            logger.warning(error_str)
+            logger.warning(f"Error on solution attempt {i+1}: {response['error_message']}")
+            # Append the structured error dictionary for this attempt
+            solution_attempts.append({
+                "status": "FAILURE",
+                "attempt_number": i + 1,
+                "error_info": response
+            })
 
+    # The step is a "SUCCESS" if it completed all attempts, even if some failed.
+    # The list of attempts itself contains the fine-grained success/failure status.
     return {"status": "SUCCESS", "solution_attempts": solution_attempts}
