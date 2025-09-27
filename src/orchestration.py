@@ -7,6 +7,8 @@ This module chains together the individual steps from `pipeline_steps.py` to
 run the full RAG pipeline. It manages running experiments for multiple queries
 and configurations, and handles the saving and loading of results for
 pausing and resuming.
+
+This version is updated to be API provider-agnostic.
 """
 
 import logging
@@ -18,9 +20,8 @@ import numpy as np
 
 # Import our custom modules
 from src.pipeline_steps import retrieve, adapt, merge, solve
-from src.api_manager import GeminiAPIManager
+# No specific API manager is imported here; the object is passed in.
 from src.utils import save_json, load_json
-# --- NEW: Import for periodic synchronization ---
 from src.hf_sync import periodic_sync_check
 
 def run_pipeline_for_single_query(
@@ -29,7 +30,7 @@ def run_pipeline_for_single_query(
     config: Dict[str, Any],
     embedding_model: SentenceTransformer,
     exemplar_data: Dict[str, Any],
-    gemini_manager: GeminiAPIManager
+    api_manager: Any  # MODIFIED: Accepts any API manager instance
 ) -> Dict[str, Any]:
     """
     Executes the full RAG pipeline for a single 'hard question'.
@@ -45,7 +46,6 @@ def run_pipeline_for_single_query(
         "target_query_original_hard_list_idx": hard_list_idx,
         "target_query_text": target_query,
         "config_flags_used": {
-            # NEW: Added USE_RETRIEVAL flag to the log for clarity.
             "USE_RETRIEVAL": config.get('USE_RETRIEVAL'),
             "APPLY_STANDARDIZATION": config.get('APPLY_STANDARDIZATION'),
             "APPLY_TRANSFORMATION": config.get('APPLY_TRANSFORMATION'),
@@ -58,7 +58,6 @@ def run_pipeline_for_single_query(
         "steps": {}
     }
 
-    # --- MODIFIED: Conditional execution based on USE_RETRIEVAL flag ---
     if config.get('USE_RETRIEVAL', True):
         # Step 1: Retrieve
         print("\n[STEP 1] RETRIEVE")
@@ -84,7 +83,7 @@ def run_pipeline_for_single_query(
             retrieved_indices=retrieval_result['retrieved_indices'],
             exemplar_questions=exemplar_data['questions'],
             exemplar_solutions=exemplar_data['solutions'],
-            gemini_manager=gemini_manager,
+            api_manager=api_manager,  # MODIFIED: Pass the generic manager
             config=config
         )
         run_log['steps']['adaptation'] = adapt_result
@@ -97,7 +96,7 @@ def run_pipeline_for_single_query(
             target_query=target_query,
             adapted_texts=adapt_result['adapted_texts'],
             embedding_model=embedding_model,
-            gemini_manager=gemini_manager,
+            api_manager=api_manager,  # MODIFIED: Pass the generic manager
             config=config
         )
         run_log['steps']['merging'] = merge_result
@@ -106,7 +105,6 @@ def run_pipeline_for_single_query(
         for i, text in enumerate(merge_result.get('merged_texts', [])):
             print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
         
-        # The final exemplars come from the merging step.
         final_exemplars_for_solve = merge_result['merged_texts']
         
     else:
@@ -115,15 +113,14 @@ def run_pipeline_for_single_query(
         run_log['steps']['retrieval'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
         run_log['steps']['adaptation'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
         run_log['steps']['merging'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
-        # Pass an empty list to the solver.
         final_exemplars_for_solve = []
 
     # Step 4: Solve
     print("\n[STEP 4] SOLVE")
     solve_result = solve(
         target_query=target_query,
-        final_exemplars=final_exemplars_for_solve, # Use the variable set in the if/else block
-        gemini_manager=gemini_manager,
+        final_exemplars=final_exemplars_for_solve,
+        api_manager=api_manager,  # MODIFIED: Pass the generic manager
         config=config
     )
     run_log['steps']['solving'] = solve_result
@@ -142,7 +139,7 @@ def run_experiments(
     hard_questions: List[str],
     embedding_model: SentenceTransformer,
     exemplar_data: Dict[str, Any],
-    gemini_manager: GeminiAPIManager
+    api_manager: Any  # MODIFIED: Accepts any API manager instance
 ) -> Dict[str, List[Dict]]:
     """
     Orchestrates running multiple experiments with different configurations.
@@ -177,7 +174,6 @@ def run_experiments(
             all_results[exp_name] = run_logs
             continue
 
-        # --- MODIFIED: Use enumerate to get a loop counter for periodic sync ---
         for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
             single_run_log = run_pipeline_for_single_query(
                 hard_list_idx=original_idx,
@@ -185,18 +181,14 @@ def run_experiments(
                 config=current_config,
                 embedding_model=embedding_model,
                 exemplar_data=exemplar_data,
-                gemini_manager=gemini_manager
+                api_manager=api_manager  # MODIFIED: Pass the generic manager
             )
             run_logs.append(single_run_log)
             
-            # Save progress locally
             save_json(run_logs, log_file_path)
             
-            # --- NEW: Call the periodic sync check ---
-            # This will trigger an upload to the Hub if the interval is reached.
             periodic_sync_check(loop_idx, current_config)
 
-        # Final local save at the end of the experiment
         save_json(run_logs, log_file_path)
         logger.info(f"########## Finished Experiment: {exp_name} ##########")
         all_results[exp_name] = run_logs

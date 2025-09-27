@@ -4,8 +4,11 @@
 Central configuration file for the Analogical Reasoning RAG project.
 
 This file defines all parameters, file paths, model settings, and control flags
-for the entire pipeline. By modifying this file, you can easily run different
-experiments without changing the core logic of the source code.
+for the entire pipeline. It now supports multiple API providers (Gemini and
+OpenAI-compatible services like AvalAI).
+
+By modifying this file, you can easily switch between API providers and run
+different experiments without changing the core logic of the source code.
 """
 
 import os
@@ -32,7 +35,13 @@ CONFIG = {
     "OUTPUTS_DIR": OUTPUTS_DIR,
     "RESULTS_DIR": RESULTS_DIR,
 
-    # --- 3. API & Model Settings ---
+    # --- 3. API Provider Selection ---
+    # NEW: Master switch to select the API provider.
+    # Options: "gemini" or "avalai"
+    "API_PROVIDER": "gemini",
+
+    # --- 4. Gemini API Settings ---
+    # These settings are used ONLY if API_PROVIDER is set to "gemini".
     "GEMINI_API_KEYS": [
         # Add your Gemini API keys here.
         # e.g., "AIzaSy...",
@@ -50,16 +59,31 @@ CONFIG = {
     "GEMINI_MODEL_NAME_FINAL_SOLVER": "gemini-2.5-flash", # For generating the final solution.
     "GEMINI_MODEL_NAME_EVALUATOR": "gemini-2.5-flash",    # For LLM-based evaluation.
 
-    # Default temperature settings for different LLM tasks.
+    # --- 5. AvalAI (OpenAI-Compatible) API Settings ---
+    # NEW: These settings are used ONLY if API_PROVIDER is set to "avalai".
+    "AVALAI_API_KEY": "YOUR_AVALAI_API_KEY_HERE",
+    "AVALAI_BASE_URL": "https://api.avalai.ir/v1",
+
+    # Simple rate limiting for AvalAI. Can be expanded if needed.
+    "AVALAI_MODEL_QUOTAS": {
+        "default": {"delay_seconds": 2} # A simple 2-second delay between calls.
+    },
+
+    # Model names for AvalAI. Replace with any supported model.
+    "AVALAI_MODEL_NAME_ADAPTATION": "openai.gpt-oss-20b-1:0",
+    "AVALAI_MODEL_NAME_FINAL_SOLVER": "openai.gpt-oss-20b-1:0",
+    "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
+
+    # --- 6. Generic LLM Temperature Settings ---
+    # These settings are provider-agnostic and will be used by whichever manager is active.
     "DEFAULT_ADAPTATION_TEMPERATURE": 0.0,   # Low temp for deterministic tasks like reformatting.
     "DEFAULT_FINAL_SOLVER_TEMPERATURE": 1.0, # High temp for creative/diverse single-pass solutions.
     "DEFAULT_PASS_N_SOLVER_TEMPERATURE": 1.0,# High temp for generating diverse attempts in Pass@N.
     "DEFAULT_EVALUATOR_TEMPERATURE": 0.0,    # Low temp for deterministic, consistent evaluation.
 
-    # --- 4. File Paths, Data & Embedding Settings ---
+    # --- 7. File Paths, Data & Embedding Settings ---
     "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',
     
-    # MODIFIED: Input data source now points to a file with indices, not full questions.
     "HARD_QUESTIONS_INDICES_PATH": os.path.join(DATA_DIR, "hard_question_indices.json"),
     "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
     
@@ -76,8 +100,8 @@ CONFIG = {
     "ADVANCED_RAG_FULL_LOG_PATH": os.path.join(RESULTS_DIR, "advanced_rag_pipeline_full_log.json"),
     "ADVANCED_RAG_EVALUATION_RESULTS_PATH": os.path.join(RESULTS_DIR, "advanced_rag_evaluation_results.pkl"),
 
-    # --- 5. Pipeline Step Control Flags & Parameters ---
-    "USE_RETRIEVAL": True, # NEW: Master switch for the retrieval process.
+    # --- 8. Pipeline Step Control Flags & Parameters ---
+    "USE_RETRIEVAL": True,
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
     "APPLY_STANDARDIZATION": False,
     "APPLY_TRANSFORMATION": False,
@@ -86,44 +110,25 @@ CONFIG = {
     "FINAL_K_SELECTION_ADAPTATION": 1,
     "TARGET_ADAPTED_SAMPLES_MERGING": 1,
 
-    # --- 6. Pass@N & Evaluation Settings ---
+    # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
-    # --- 7. Prompt Template Selection ---
+    # --- 10. Prompt Template Selection ---
     "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
     "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v1",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
-    # NEW: Prompt for when retrieval is turned off.
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
 
-    # --- 8. Hugging Face Hub Synchronization ---
-    # Master switch to enable or disable the entire synchronization feature.
+    # --- 11. Hugging Face Hub Synchronization ---
     "PERSIST_RESULTS_ONLINE": True,
-
-    # This token is specifically for the synchronization process.
-    # PASTE YOUR HUGGING FACE TOKEN HERE (e.g., "hf_...").
     "HF_SYNC_TOKEN": "YOUR_HUGGING_FACE_TOKEN_HERE",
-    
-    # Your Hugging Face username. The repo will be created under this account.
-    # IMPORTANT: Change this to your actual username.
     "HF_HUB_USERNAME": "your-hf-username-here",
-    
-    # The name of the dataset repository on the Hub where results will be stored.
     "HF_HUB_REPO_NAME": "analogical-math-rag-results",
-    
-    # Set to True to download a specific version of the repository workspace.
     "HF_SYNC_REVISION_ENABLED": False,
-    
-    # The git revision (branch, tag, or commit hash) to download.
-    # This is ONLY used if HF_SYNC_REVISION_ENABLED is set to True.
-    # Examples: "main", "v1.0", "a1b2c3d4e5f6..."
     "HF_SYNC_REVISION_ID": "main",
-    
-    # How often to sync the local workspace to the Hub.
-    # A sync will occur after this many queries are processed in a loop.
     "HF_SYNC_INTERVAL": 10,
 
 } # This closes the main CONFIG dictionary

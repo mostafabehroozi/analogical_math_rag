@@ -1,39 +1,46 @@
 # src/api_manager.py
 
 """
-API management module for interacting with the Google Gemini API.
+API management module for interacting with various LLM providers.
 
-This file contains the GeminiAPIManager class, which is responsible for:
-- Managing a pool of API keys.
-- Handling rate limiting (per-key, daily, and global).
-- Rotating keys in a round-robin fashion.
+This file contains the API manager classes responsible for:
+- Managing API credentials and endpoints.
+- Handling rate limiting.
 - Making API calls with robust error handling.
-- Returning structured responses for better control flow in the pipeline.
+- Returning a standardized, structured response for consistent control flow.
+
+Currently supported providers:
+- GeminiAPIManager: For Google's Gemini models.
+- AvalAIAPIManager: For OpenAI-compatible endpoints like AvalAI.
 """
 
 import time
 import logging
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional, Any
+
+# NEW: Import the OpenAI library and its potential error types.
+import openai
 import google.generativeai as genai
 
-# Define a type hint for the structured response for clarity.
-GeminiResponse = Dict[str, Any]
+# Define a generic type hint for the structured response for clarity.
+APIResponse = Dict[str, Any]
+
 
 class GeminiAPIManager:
     """
-    Manages API keys, rate limits, and calls to the Gemini API.
+    Manages API keys, rate limits, and calls to the Google Gemini API.
     """
     def __init__(self, api_keys: List[str], model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0):
         """
-        Initializes the API manager.
+        Initializes the Gemini API manager.
 
         Args:
             api_keys (List[str]): A list of Gemini API keys.
             model_quotas (Dict): A dictionary defining per-model rate limits (delay, rpd).
             global_delay_seconds (int): A minimum delay between any two API calls.
         """
-        self.logger = logging.getLogger(__name__) # Get a logger instance for this module.
+        self.logger = logging.getLogger(__name__)
 
         if not api_keys:
             self.logger.critical("GeminiAPIManager initialized with an empty list of API keys. All calls will fail.")
@@ -44,124 +51,86 @@ class GeminiAPIManager:
         self.global_delay_seconds: int = global_delay_seconds
         
         # Internal state for tracking key usage
-        self.key_usage_timestamps: Dict[Tuple[str, str], float] = {}  # (api_key, model_name) -> last_call_timestamp
-        self.key_daily_counts: Dict[Tuple[str, str, str], int] = {}    # (api_key, model_name, date_str) -> count
+        self.key_usage_timestamps: Dict[Tuple[str, str], float] = {}
+        self.key_daily_counts: Dict[Tuple[str, str, str], int] = {}
         self.last_global_call_timestamp: float = 0
         
         self.current_key_index: int = 0
-        self._lock = False # A simple, non-thread-safe lock for key rotation.
+        self._lock = False
 
         self.logger.info(f"GeminiAPIManager initialized with {len(self.api_keys_list)} keys.")
         
-        # Perform an initial configuration test with the first key.
         try:
             genai.configure(api_key=self.api_keys_list[0])
             self.logger.info("Initial Gemini API configuration with the first key was successful.")
         except Exception as e:
             self.logger.error(f"Initial Gemini API configuration failed. Error: {e}", exc_info=True)
-            # We don't raise an error here, allowing initialization, but calls will likely fail.
 
     def _get_current_date_str(self) -> str:
         """Returns the current UTC date as a formatted string."""
         return datetime.utcnow().strftime('%Y-%m-%d')
 
     def _get_available_key_and_sleep_time(self, model_name: str) -> Tuple[Optional[str], float]:
-        """
-        Finds an available API key and calculates the necessary sleep time.
-        This is the core rate-limiting logic.
-        """
+        """Finds an available API key and calculates the necessary sleep time."""
         if not self.api_keys_list:
-            return None, 3600 # No keys to use.
+            return None, 3600
 
         if self._lock:
-            self.logger.warning("Key selection is locked; another process is likely choosing a key. Waiting.")
-            return None, 5 # Wait a short time if locked.
+            self.logger.warning("Key selection is locked; waiting.")
+            return None, 5
 
         self._lock = True
-        
         current_time_val = time.time()
-        
-        # --- 1. Global Delay Calculation ---
         time_since_last_global_call = current_time_val - self.last_global_call_timestamp
         global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global_call)
         
         num_keys = len(self.api_keys_list)
         start_index = self.current_key_index
-
         model_specific_quotas = self.model_quotas.get(model_name, {})
         required_per_key_delay = model_specific_quotas.get("delay_seconds", 1)
         max_rpd = model_specific_quotas.get("rpd", float('inf'))
 
-        # --- 2. Iterate through keys to find a valid one ---
         for i in range(num_keys):
             key_idx = (start_index + i) % num_keys
             current_api_key = self.api_keys_list[key_idx]
             
-            # Check daily limit (RPD - Requests Per Day)
             current_date_str = self._get_current_date_str()
             daily_usage_key = (current_api_key, model_name, current_date_str)
             current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
-
             if current_daily_calls >= max_rpd:
-                self.logger.debug(f"Key ...{current_api_key[-4:]} has reached its daily limit for {model_name}.")
-                continue # Try the next key.
+                continue
 
-            # Check per-key delay (RPM - Requests Per Minute, translated to seconds)
             last_call_timestamp_key = (current_api_key, model_name)
             last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
             time_since_last_call = current_time_val - last_call_time
             per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
             
-            # The final sleep duration is the maximum of the global and per-key requirements.
             final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
-
-            self.current_key_index = (key_idx + 1) % num_keys # Rotate to the next key for the next call
+            self.current_key_index = (key_idx + 1) % num_keys
             self._lock = False
             return current_api_key, final_sleep_duration
 
-        # If the loop completes, no key was available.
         self._lock = False
-        self.logger.warning(f"All {num_keys} API keys are currently rate-limited or have exceeded daily quotas for model '{model_name}'.")
-        return None, 3600 # Return a long sleep time.
+        self.logger.warning(f"All {num_keys} API keys are rate-limited for model '{model_name}'.")
+        return None, 3600
 
     def _record_api_call(self, api_key: str, model_name: str) -> None:
         """Records the timestamp and increments the daily count for a given key and model."""
         current_time = time.time()
         self.last_global_call_timestamp = current_time
-        
-        # Record timestamp for per-key delay
         self.key_usage_timestamps[(api_key, model_name)] = current_time
-        
-        # Increment daily count
         current_date_str = self._get_current_date_str()
         daily_usage_key = (api_key, model_name, current_date_str)
         self.key_daily_counts[daily_usage_key] = self.key_daily_counts.get(daily_usage_key, 0) + 1
         
-    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> GeminiResponse:
-        """
-        Generates content using the Gemini API, handling key selection, rate limiting, and errors.
-        This is the primary public method for this class.
-
-        Args:
-            prompt (str): The prompt to send to the model.
-            model_name (str): The name of the model to use.
-            temperature (Optional[float]): The generation temperature.
-
-        Returns:
-            GeminiResponse: A structured dictionary containing the status, text, and any errors.
-        """
+    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
+        """Generates content using the Gemini API, handling key selection, rate limiting, and errors."""
         api_key, sleep_time = self._get_available_key_and_sleep_time(model_name)
 
         if api_key is None:
-            return {
-                "status": "FAILURE", "text": None,
-                "error_message": f"All API keys are currently rate-limited for model '{model_name}'. Please wait.",
-                "model_name": model_name, "api_key_used": None, "raw_response": None
-            }
+            return {"status": "FAILURE", "text": None, "error_message": f"All API keys are rate-limited for model '{model_name}'. Please wait."}
 
         key_for_log = f"...{api_key[-4:]}"
-        self.logger.info(f"Selected API key {key_for_log} for model '{model_name}'.")
-
         if sleep_time > 0:
             self.logger.info(f"Rate limit requires sleeping for {sleep_time:.2f}s.")
             print(f"Sleeping for {sleep_time:.2f} seconds due to rate limiting.")
@@ -170,40 +139,101 @@ class GeminiAPIManager:
         try:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(model_name)
-
             generation_config = genai.types.GenerationConfig(temperature=temperature) if temperature is not None else None
             
-            self.logger.info(f"Calling model '{model_name}' with temp={temperature if temperature is not None else 'default'}.")
+            self.logger.info(f"Calling Gemini model '{model_name}' with key {key_for_log}.")
             response = model.generate_content(prompt, generation_config=generation_config)
-            
-            # An API call attempt was made, so record it.
             self._record_api_call(api_key, model_name)
 
             if not response.parts:
-                block_reason = "Unknown"
-                if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'):
-                    block_reason = response.prompt_feedback.block_reason.name
-                self.logger.warning(f"API call with key {key_for_log} was BLOCKED. Reason: {block_reason}.")
-                return {
-                    "status": "BLOCKED", "text": None,
-                    "error_message": f"Response was empty or blocked. Reason: {block_reason}.",
-                    "model_name": model_name, "api_key_used": key_for_log, "raw_response": response
-                }
+                block_reason = response.prompt_feedback.block_reason.name if hasattr(response.prompt_feedback, 'block_reason') else "Unknown"
+                return {"status": "BLOCKED", "text": None, "error_message": f"Response was empty or blocked. Reason: {block_reason}."}
             
-            self.logger.info(f"API call with key {key_for_log} successful.")
             print(f"    LLM Response (truncated): {response.text[:100]}...")
-            return {
-                "status": "SUCCESS", "text": response.text, "error_message": None,
-                "model_name": model_name, "api_key_used": key_for_log, "raw_response": response
-            }
+            return {"status": "SUCCESS", "text": response.text, "error_message": None}
 
         except Exception as e:
-            self.logger.error(f"API call with key {key_for_log} FAILED. Error: {type(e).__name__} - {e}", exc_info=True)
-            # Record the attempt even if it failed to prevent hammering a failing key.
+            self.logger.error(f"Gemini API call with key {key_for_log} FAILED. Error: {e}", exc_info=True)
             self._record_api_call(api_key, model_name)
-            return {
-                "status": "ERROR", "text": None,
-                "error_message": f"An API error occurred: {type(e).__name__} - {e}",
-                "model_name": model_name, "api_key_used": key_for_log, "raw_response": None
-            }
-    
+            return {"status": "ERROR", "text": None, "error_message": f"An API error occurred: {type(e).__name__} - {e}"}
+
+
+# --- NEW: Manager for OpenAI-compatible APIs like AvalAI ---
+class AvalAIAPIManager:
+    """
+    Manages API calls to an OpenAI-compatible endpoint like AvalAI.
+    """
+    def __init__(self, api_key: str, base_url: str, model_quotas: Dict[str, Dict[str, Any]]):
+        """
+        Initializes the OpenAI-compatible API manager.
+
+        Args:
+            api_key (str): The API key for the service.
+            base_url (str): The base URL of the API endpoint.
+            model_quotas (Dict): Configuration for rate limiting (e.g., delay).
+        """
+        self.logger = logging.getLogger(__name__)
+
+        if not api_key or not base_url:
+            self.logger.critical("AvalAIAPIManager initialized with missing API key or base URL.")
+            raise ValueError("API key and base URL cannot be empty for AvalAIAPIManager.")
+        
+        self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        self.model_quotas = model_quotas
+        self.last_call_timestamp: float = 0
+        
+        self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url}")
+
+    def _apply_rate_limit(self) -> None:
+        """Applies a simple delay-based rate limit."""
+        # Using a simple global delay for this provider. Can be expanded.
+        delay_seconds = self.model_quotas.get("default", {}).get("delay_seconds", 1)
+        
+        time_since_last_call = time.time() - self.last_call_timestamp
+        sleep_needed = max(0, delay_seconds - time_since_last_call)
+        
+        if sleep_needed > 0:
+            self.logger.info(f"Rate limit requires sleeping for {sleep_needed:.2f}s.")
+            print(f"Sleeping for {sleep_needed:.2f} seconds due to rate limiting.")
+            time.sleep(sleep_needed)
+
+    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
+        """
+        Generates content using an OpenAI-compatible API, handling rate limiting and errors.
+        """
+        self._apply_rate_limit()
+
+        try:
+            self.logger.info(f"Calling OpenAI-compatible model '{model_name}'.")
+            
+            completion = self.client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    # A system prompt could be added here if needed in the future
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=temperature
+            )
+            
+            # Record the successful call time
+            self.last_call_timestamp = time.time()
+
+            if not completion.choices:
+                self.logger.warning(f"API call to '{model_name}' returned no choices.")
+                return {"status": "BLOCKED", "text": None, "error_message": "Response was empty or blocked (no choices returned)."}
+
+            response_text = completion.choices[0].message.content
+            print(f"    LLM Response (truncated): {response_text[:100]}...")
+            return {"status": "SUCCESS", "text": response_text, "error_message": None}
+
+        except openai.APIError as e:
+            # Handle API-specific errors
+            self.logger.error(f"OpenAI API call FAILED. Status: {e.status_code}, Response: {e.response}", exc_info=True)
+            self.last_call_timestamp = time.time()
+            return {"status": "ERROR", "text": None, "error_message": f"An API error occurred: {type(e).__name__} - {e}"}
+        
+        except Exception as e:
+            # Handle other errors like connection issues
+            self.logger.error(f"An unexpected error occurred during the OpenAI API call: {e}", exc_info=True)
+            self.last_call_timestamp = time.time()
+            return {"status": "ERROR", "text": None, "error_message": f"An unexpected error occurred: {type(e).__name__} - {e}"}

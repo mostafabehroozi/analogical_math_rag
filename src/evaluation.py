@@ -7,6 +7,8 @@ This file provides functions to:
 - Evaluate generated answers against ground truths using an LLM.
 - Parse and analyze the detailed JSON logs from experiment runs.
 - Calculate Pass@K metrics and generate a summary DataFrame.
+
+This version is updated to be API provider-agnostic.
 """
 
 import logging
@@ -17,18 +19,17 @@ from tqdm import tqdm
 from typing import List, Dict, Any, Tuple, Optional
 
 # Import our custom modules
-from src.api_manager import GeminiAPIManager
+# No specific API manager is imported; the object is passed into the functions.
 from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 
-# --- NEW: More descriptive return type for fine-grained evaluation status ---
 EvaluationResult = Tuple[Optional[bool], str]
 
 def evaluate_single_answer_with_llm(
     model_answer: str,
     ground_truth: str,
-    gemini_manager: GeminiAPIManager,
+    api_manager: Any,  # MODIFIED: Accepts a generic API manager
     config: Dict[str, Any]
 ) -> EvaluationResult:
     """
@@ -44,20 +45,25 @@ def evaluate_single_answer_with_llm(
     if not model_answer or not isinstance(model_answer, str) or model_answer.startswith("Error:"):
         return None, "EMPTY_ANSWER"
 
-    evaluator_model = config['GEMINI_MODEL_NAME_EVALUATOR']
+    # MODIFIED: Select evaluator model name based on the configured provider
+    provider = config.get("API_PROVIDER", "gemini").lower()
+    if provider == "avalai":
+        evaluator_model = config['AVALAI_MODEL_NAME_EVALUATOR']
+    else:
+        evaluator_model = config['GEMINI_MODEL_NAME_EVALUATOR']
+    
     evaluator_temp = config['DEFAULT_EVALUATOR_TEMPERATURE']
 
     prompt = create_evaluation_prompt(model_answer, ground_truth)
-    response = gemini_manager.generate_content(prompt, evaluator_model, evaluator_temp)
+    
+    # MODIFIED: Use the generic api_manager
+    response = api_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
-    # --- ADVANCED ERROR HANDLING ---
-    # Handle non-success statuses from the API manager explicitly.
     if response['status'] != 'SUCCESS':
         error_msg = response['error_message']
         logger.warning(f"LLM-based evaluation API call failed with status '{response['status']}': {error_msg}")
         if response['status'] == 'BLOCKED':
             return None, "API_BLOCKED"
-        # Covers 'FAILURE' (e.g., rate limits) and 'ERROR'
         return None, "API_ERROR"
 
     raw_text = response['text'].strip()
@@ -77,7 +83,7 @@ def evaluate_single_answer_with_llm(
 def analyze_experiment_logs(
     all_experiments_logs: Dict[str, List[Dict]],
     ground_truths: List[str],
-    gemini_manager: GeminiAPIManager,
+    api_manager: Any,  # MODIFIED: Accepts a generic API manager
     config: Dict[str, Any]
 ) -> pd.DataFrame:
     """
@@ -101,7 +107,6 @@ def analyze_experiment_logs(
         pass_k_values = sorted([k for k in pass_k_values_to_report if 0 < k <= n_attempts])
 
         pass_k_counts = {k: 0 for k in pass_k_values}
-        # --- NEW: Counters for fine-grained error analysis ---
         error_counts = {"API_BLOCKED": 0, "API_ERROR": 0, "PARSING_FAILED": 0, "EMPTY_ANSWER": 0}
         total_valid_queries = 0
 
@@ -130,11 +135,11 @@ def analyze_experiment_logs(
                 status_list = []
 
                 for i, attempt in enumerate(solution_attempts):
-                    # --- IMPROVED CONSOLE LOGGING ---
                     print(f"    -> Evaluating attempt {i+1}/{len(solution_attempts)} for query #{hard_list_idx}")
-                    is_correct, status = evaluate_single_answer_with_llm(attempt, ground_truth, gemini_manager, config)
+                    
+                    # MODIFIED: Pass the generic api_manager down
+                    is_correct, status = evaluate_single_answer_with_llm(attempt, ground_truth, api_manager, config)
 
-                    # Log a warning if the evaluation itself failed
                     if status != "SUCCESS":
                          print(f"       WARNING: Evaluation attempt failed with status: {status}")
                          logger.warning(f"Evaluation for query {hard_list_idx}, attempt {i+1} failed with status: {status}")
@@ -145,32 +150,26 @@ def analyze_experiment_logs(
                 detailed_evaluations.append({
                     "hard_list_idx": hard_list_idx,
                     "is_correct_list": is_correct_list,
-                    "evaluation_status_list": status_list, # Store the new status info
+                    "evaluation_status_list": status_list,
                     "attempts": solution_attempts
                 })
 
                 save_json(detailed_evaluations, eval_file_path)
                 periodic_sync_check(loop_idx, config)
 
-        # Final local save
         save_json(detailed_evaluations, eval_file_path)
 
-        # Calculate final metrics from the complete list of evaluations
         for eval_result in detailed_evaluations:
-            # An attempt is valid if it was generated (not an error string)
             if eval_result.get("attempts"):
                 total_valid_queries += 1
                 is_correct_list = eval_result["is_correct_list"]
                 status_list = eval_result["evaluation_status_list"]
 
-                # Increment error counters
                 for status in status_list:
                     if status in error_counts:
                         error_counts[status] += 1
 
-                # Calculate Pass@K
                 for k in pass_k_values:
-                    # A query passes at k if any of the first k attempts are True
                     if any(res for res in is_correct_list[:k] if res is True):
                         pass_k_counts[k] += 1
 
@@ -184,7 +183,6 @@ def analyze_experiment_logs(
             summary_row[f"pass@{k}_count"] = count
             summary_row[f"pass@{k}_accuracy (%)"] = round(accuracy, 2)
 
-        # --- NEW: Add detailed error counts to the final summary ---
         summary_row.update(error_counts)
         analysis_summary.append(summary_row)
 
