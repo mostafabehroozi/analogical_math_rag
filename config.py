@@ -31,6 +31,7 @@ CONFIG = {
     # --- 2. Logging & Control Settings ---
     "VERBOSE_LOGGING": True,  # Master switch for detailed print statements to the console.
     "PRINT_API_CALL_DETAILS": True, # NEW: Master switch to print detailed API call info (prompt, response, errors) to the console.
+    "API_RESPONSE_TRUNCATION_LENGTH": 50, # NEW: Control truncation for successful API responses.
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "LOGS_DIR": LOGS_DIR, # Directory where detailed run logs will be saved.
     "OUTPUTS_DIR": OUTPUTS_DIR,

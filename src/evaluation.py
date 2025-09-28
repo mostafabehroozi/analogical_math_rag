@@ -67,7 +67,9 @@ def evaluate_single_answer_with_llm(
 
     raw_text = response.get('text', '').strip()
     
-    print(f"      Evaluator LLM Raw Output: {raw_text}") 
+    # MODIFIED: Truncate this print statement for consistency
+    trunc_len = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
+    print(f"      Evaluator LLM Raw Output: {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}") 
     logger.debug(f"Evaluator raw response: '{raw_text}'")
 
     eval_match = re.search(r"Evaluation:\s*(true|false)", raw_text, re.IGNORECASE)
@@ -179,4 +181,6 @@ def analyze_experiment_logs(
                     # Normalize API statuses for counting
                     if status.startswith("API_"):
                         error_key = status.replace("API_", "")
-    
+                        # Continue with the rest of the original code...
+                        # (This part of the file was cut off in the original prompt,
+                        # but the logic for the modification is complete.)  
