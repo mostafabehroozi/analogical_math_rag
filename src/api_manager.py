@@ -161,6 +161,9 @@ class GeminiAPIManager:
             print(f"Sleeping for {sleep_time:.2f} seconds due to rate limiting.")
             time.sleep(sleep_time)
 
+        # <<< FIX: Initialize a variable to hold the exception >>>
+        caught_exception = None
+
         try:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(model_name)
@@ -190,20 +193,25 @@ class GeminiAPIManager:
         # --- NEW: Granular Exception Handling ---
         except google_exceptions.ResourceExhausted as e:
             status, error_type, msg = "RATE_LIMITED", "ResourceExhausted", f"Gemini API rate limit exceeded: {e}"
+            caught_exception = e # <<< FIX: Capture the exception >>>
         except google_exceptions.InvalidArgument as e:
             status, error_type, msg = "ERROR", "InvalidArgument", f"Invalid argument sent to Gemini API: {e}"
+            caught_exception = e # <<< FIX: Capture the exception >>>
         except Exception as e:
             status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the Gemini API: {e}"
+            caught_exception = e # <<< FIX: Capture the exception >>>
         
         # This block runs for any of the above exceptions
         self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {error_type}. Error: {msg}", exc_info=True)
         self._record_api_call(api_key, model_name) # Record call even on failure to respect rate limits
         if self.print_details:
             print(f"\n!!! [API Call FAILED: Gemini] !!!")
-            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(e)}")
+            # <<< FIX: Use the captured exception variable >>>
+            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
             print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
         
-        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(e)}
+        # <<< FIX: Use the captured exception variable >>>
+        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
 
 
 class AvalAIAPIManager:
@@ -256,6 +264,9 @@ class AvalAIAPIManager:
             print(prompt)
             print("----------------------------------")
 
+        # <<< FIX: Initialize a variable to hold the exception >>>
+        caught_exception = None
+
         try:
             self.logger.info(f"Calling OpenAI-compatible model '{model_name}'.")
             
@@ -285,21 +296,28 @@ class AvalAIAPIManager:
         # --- NEW: Granular Exception Handling ---
         except openai.RateLimitError as e:
             status, error_type, msg = "RATE_LIMITED", "RateLimitError", f"OpenAI API rate limit exceeded: {e}"
+            caught_exception = e # <<< FIX: Capture the exception >>>
         except openai.APIStatusError as e:
             status, error_type, msg = "ERROR", "APIStatusError", f"OpenAI API returned an error status {e.status_code}: {e.response}"
+            caught_exception = e # <<< FIX: Capture the exception >>>
         except openai.APITimeoutError as e:
             status, error_type, msg = "ERROR", "APITimeoutError", f"OpenAI API request timed out: {e}"
+            caught_exception = e # <<< FIX: Capture the exception >>>
         except openai.APIConnectionError as e:
             status, error_type, msg = "ERROR", "APIConnectionError", f"Failed to connect to OpenAI API: {e}"
+            caught_exception = e # <<< FIX: Capture the exception >>>
         except Exception as e:
             status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the OpenAI API: {e}"
+            caught_exception = e # <<< FIX: Capture the exception >>>
 
         # This block runs for any of the above exceptions
         self.last_call_timestamp = time.time()
         self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
         if self.print_details:
             print(f"\n!!! [API Call FAILED: AvalAI] !!!")
-            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(e)}")
+            # <<< FIX: Use the captured exception variable >>>
+            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
             print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
         
-        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(e)}
+        # <<< FIX: Use the captured exception variable >>>
+        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
