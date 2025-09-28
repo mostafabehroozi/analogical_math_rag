@@ -218,7 +218,8 @@ class AvalAIAPIManager:
     """
     Manages API calls to an OpenAI-compatible endpoint like AvalAI with enhanced error handling.
     """
-    def __init__(self, api_key: str, base_url: str, model_quotas: Dict[str, Dict[str, Any]], config: Optional[Dict[str, Any]] = None):
+    # MODIFIED: Added global_delay_seconds to the constructor signature
+    def __init__(self, api_key: str, base_url: str, model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
         """
         Initializes the OpenAI-compatible API manager.
 
@@ -226,6 +227,7 @@ class AvalAIAPIManager:
             api_key (str): The API key for the service.
             base_url (str): The base URL of the API endpoint.
             model_quotas (Dict): Configuration for rate limiting (e.g., delay).
+            global_delay_seconds (int): A minimum delay between any two API calls.
             config (Optional[Dict]): The main configuration dictionary to read control flags.
         """
         self.logger = logging.getLogger(__name__)
@@ -236,7 +238,11 @@ class AvalAIAPIManager:
         
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
         self.model_quotas = model_quotas
-        self.last_call_timestamp: float = 0
+        
+        # MODIFIED: Added tracking for both global and per-model delays
+        self.global_delay_seconds = global_delay_seconds
+        self.last_global_call_timestamp: float = 0
+        self.last_model_call_timestamps: Dict[str, float] = {}
         
         self.print_details = config.get("PRINT_API_CALL_DETAILS", False) if config else False
         # NEW: Read truncation length from config
@@ -244,20 +250,43 @@ class AvalAIAPIManager:
         
         self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url}")
 
-    def _apply_rate_limit(self) -> None:
-        """Applies a simple delay-based rate limit."""
-        delay_seconds = self.model_quotas.get("default", {}).get("delay_seconds", 1)
-        time_since_last_call = time.time() - self.last_call_timestamp
-        sleep_needed = max(0, delay_seconds - time_since_last_call)
+    # MODIFIED: Rewrote this function to handle both global and per-model delays
+    def _apply_rate_limit(self, model_name: str) -> None:
+        """Applies both global and model-specific delays, taking the max of the two."""
+        current_time = time.time()
+
+        # 1. Calculate global sleep time needed
+        time_since_last_global = current_time - self.last_global_call_timestamp
+        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
+
+        # 2. Calculate model-specific sleep time needed
+        # Fallback to 'default' if the specific model_name is not in the quotas
+        model_specific_quotas = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
+        model_delay_seconds = model_specific_quotas.get("delay_seconds", 1)
         
-        if sleep_needed > 0:
-            self.logger.info(f"Rate limit requires sleeping for {sleep_needed:.2f}s.")
-            print(f"Sleeping for {sleep_needed:.2f} seconds due to rate limiting.")
-            time.sleep(sleep_needed)
+        last_call_for_model = self.last_model_call_timestamps.get(model_name, 0)
+        time_since_last_model_call = current_time - last_call_for_model
+        model_sleep_needed = max(0, model_delay_seconds - time_since_last_model_call)
+        
+        # 3. Determine the final sleep duration
+        final_sleep_duration = max(global_sleep_needed, model_sleep_needed)
+        
+        if final_sleep_duration > 0:
+            self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s (Global: {global_sleep_needed:.2f}s, Model: {model_sleep_needed:.2f}s).")
+            print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
+            time.sleep(final_sleep_duration)
+
+    # NEW: Helper function to record timestamps after a call
+    def _record_api_call(self, model_name: str) -> None:
+        """Records timestamps for both global and per-model rate limiting."""
+        current_time = time.time()
+        self.last_global_call_timestamp = current_time
+        self.last_model_call_timestamps[model_name] = current_time
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
         """Generates content using an OpenAI-compatible API, handling rate limiting and specific errors."""
-        self._apply_rate_limit()
+        # MODIFIED: Pass model_name to the rate limiting function
+        self._apply_rate_limit(model_name)
 
         if self.print_details:
             print("\n" + "--- [API Call Start: AvalAI] ---")
@@ -277,7 +306,8 @@ class AvalAIAPIManager:
                 temperature=temperature
             )
             
-            self.last_call_timestamp = time.time()
+            # MODIFIED: Record the call timestamps after a successful call
+            self._record_api_call(model_name)
 
             if not completion.choices:
                 error_msg = "Response was empty or blocked (no choices returned)."
@@ -313,7 +343,8 @@ class AvalAIAPIManager:
             caught_exception = e
 
         # This block runs for any of the above exceptions (error printing is unchanged)
-        self.last_call_timestamp = time.time()
+        # MODIFIED: Record timestamps even on failure to prevent rapid retries on broken endpoints
+        self._record_api_call(model_name)
         self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
         if self.print_details:
             print(f"\n!!! [API Call FAILED: AvalAI] !!!")
