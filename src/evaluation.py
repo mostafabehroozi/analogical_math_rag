@@ -23,11 +23,10 @@ from typing import List, Dict, Any, Tuple, Optional, Union
 from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
-from src.api_manager import APIResponse  # Import the structured response type
+from src.api_manager import APIResponse # Import the structured response type
 
 # Define a more specific type for the result of a single evaluation
 EvaluationResult = Tuple[Optional[bool], str, Optional[APIResponse]]
-
 
 def evaluate_single_answer_with_llm(
     model_answer: str,
@@ -54,10 +53,9 @@ def evaluate_single_answer_with_llm(
     evaluator_model = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_EVALUATOR']
     evaluator_temp = config['DEFAULT_EVALUATOR_TEMPERATURE']
 
-    # MODIFIED: Pass the 'config' dictionary to the prompt creator.
-    # This allows it to use the prompt template specified in the experiment config.
+    # Pass the 'config' dictionary to the prompt creator.
     prompt = create_evaluation_prompt(model_answer, ground_truth, config)
-
+    
     print(f"      [API Context] Calling LLM for: Evaluation")
     response = api_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
@@ -68,10 +66,10 @@ def evaluate_single_answer_with_llm(
         return None, f"API_{response['status']}", response
 
     raw_text = response.get('text', '').strip()
-
-    # MODIFIED: Truncate this print statement for consistency
+    
+    # Truncate this print statement for consistency
     trunc_len = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
-    print(f"      Evaluator LLM Raw Output: {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}")
+    print(f"      Evaluator LLM Raw Output: {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}") 
     logger.debug(f"Evaluator raw response: '{raw_text}'")
 
     eval_match = re.search(r"Evaluation:\s*(true|false)", raw_text, re.IGNORECASE)
@@ -83,7 +81,6 @@ def evaluate_single_answer_with_llm(
     else:
         logger.warning(f"Could not parse 'Evaluation:' line from LLM response. Treating as failure.")
         return None, "PARSING_FAILED", None
-
 
 def analyze_experiment_logs(
     all_experiments_logs: Dict[str, List[Dict]],
@@ -112,8 +109,7 @@ def analyze_experiment_logs(
         pass_k_values = sorted([k for k in pass_k_values_to_report if 0 < k <= n_attempts_config])
 
         pass_k_counts = {k: 0 for k in pass_k_values}
-        # Updated to handle more specific error statuses
-        error_counts = {"API_BLOCKED": 0, "API_ERROR": 0, "API_RATE_LIMITED": 0, "PARSING_FAILED": 0, "EMPTY_ANSWER": 0}
+        error_counts = {"API_BLOCKED": 0, "API_ERROR": 0, "API_RATE_LIMITED": 0, "PARSING_FAILED": 0, "EMPTY_ANSWER": 0, "GENERATION_FAILED": 0}
         total_valid_queries = 0
 
         eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
@@ -123,16 +119,17 @@ def analyze_experiment_logs(
         evaluated_indices = {eval_log['hard_list_idx'] for eval_log in detailed_evaluations}
         logger.info(f"Loaded {len(detailed_evaluations)} existing evaluation results for '{exp_name}'.")
 
+        # This part correctly identifies which logs haven't been evaluated yet
         logs_to_process = [log for log in query_logs if log["target_query_original_hard_list_idx"] not in evaluated_indices]
 
         if not logs_to_process:
             logger.info(f"All query logs for '{exp_name}' have already been evaluated. Moving to summary.")
         else:
+            # This loop evaluates any new, unprocessed logs
             for loop_idx, log in enumerate(tqdm(logs_to_process, desc=f"Evaluating {exp_name}")):
                 hard_list_idx = log["target_query_original_hard_list_idx"]
                 ground_truth = ground_truths[hard_list_idx]
-
-                # IMPORTANT: This now comes from the 'solving' step in the main run log
+                
                 solution_attempts = log.get("steps", {}).get("solving", {}).get("solution_attempts", [])
 
                 is_correct_list = []
@@ -140,20 +137,18 @@ def analyze_experiment_logs(
                 api_error_details = []
 
                 for i, attempt in enumerate(solution_attempts):
-                    # Check if the attempt was a successful generation (a string)
                     if isinstance(attempt, str):
                         print(f"    -> Evaluating attempt {i+1}/{len(solution_attempts)} for query #{hard_list_idx}")
                         is_correct, status, error_info = evaluate_single_answer_with_llm(attempt, ground_truth, api_manager, config)
                         if status != "SUCCESS":
                             print(f"       WARNING: Evaluation attempt failed with status: {status}")
                             logger.warning(f"Evaluation for query {hard_list_idx}, attempt {i+1} failed with status: {status}")
-
-                    # Check if the generation itself failed (a dict)
+                    
                     elif isinstance(attempt, dict) and attempt.get('status') == 'FAILURE':
                         is_correct, status, error_info = None, "GENERATION_FAILED", attempt.get("error_info")
                         print(f"    -> Skipping evaluation for attempt {i+1} (generation failed).")
-
-                    else:  # Should not happen, but good to handle
+                    
+                    else:
                         is_correct, status, error_info = None, "INVALID_ATTEMPT_FORMAT", None
 
                     is_correct_list.append(is_correct)
@@ -164,65 +159,50 @@ def analyze_experiment_logs(
                     "hard_list_idx": hard_list_idx,
                     "is_correct_list": is_correct_list,
                     "evaluation_status_list": status_list,
-                    "evaluation_error_details": api_error_details,  # Store detailed errors
-                    "attempts": solution_attempts  # Store the original attempts (mix of str/dict)
+                    "evaluation_error_details": api_error_details,
+                    "attempts": solution_attempts
                 })
 
                 save_json(detailed_evaluations, eval_file_path)
                 periodic_sync_check(loop_idx, config)
 
+        # Ensure the final list is saved
         save_json(detailed_evaluations, eval_file_path)
 
-        # Recalculate summary from the full (potentially updated) evaluation list
+        # --- THIS IS THE MISSING LOGIC THAT WAS RESTORED ---
+        # This part now runs on the complete `detailed_evaluations` list (both old and new)
         for eval_result in detailed_evaluations:
             if eval_result.get("attempts"):
                 total_valid_queries += 1
                 is_correct_list = eval_result["is_correct_list"]
                 status_list = eval_result["evaluation_status_list"]
 
+                # Tally all evaluation statuses/errors
                 for status in status_list:
-                    # Normalize API statuses for counting
                     if status.startswith("API_"):
                         error_key = status.replace("API_", "")
                         if error_key in error_counts:
-                            error_counts[error_key] = error_counts.get(error_key, 0) + 1
-                        else:
-                            error_counts["API_ERROR"] = error_counts.get("API_ERROR", 0) + 1  # Count as generic API error
+                            error_counts[error_key] += 1
                     elif status in error_counts:
-                        error_counts[status] = error_counts.get(status, 0) + 1
+                        error_counts[status] += 1
 
-                # Find the highest K for which the problem was solved
-                solved_at_k = None
+                # Calculate Pass@K
                 for k in pass_k_values:
+                    # Check if any of the first 'k' attempts were successful (True)
                     if any(is_correct_list[:k]):
-                        solved_at_k = k
-                        break
-
-                if solved_at_k is not None:
-                    pass_k_counts[solved_at_k] += 1
-
-        # Summarize results for this experiment
-        experiment_summary = {
+                        pass_k_counts[k] += 1
+        
+        # Compile the summary dictionary for this specific experiment
+        exp_summary = {
             "experiment_name": exp_name,
-            "total_queries": len(query_logs),
-            "valid_queries": total_valid_queries,
+            "num_questions_evaluated": total_valid_queries,
+            # Calculate and add Pass@K scores
+            **{f"pass@{k}": (pass_k_counts[k] / total_valid_queries if total_valid_queries > 0 else 0) for k in pass_k_values},
+            # Add all error counts
+            **{f"errors_{key.lower()}": count for key, count in error_counts.items()}
         }
-
-        # Add Pass@K metrics to the summary
-        for k in pass_k_values:
-            experiment_summary[f"pass@{k}"] = pass_k_counts[k] / total_valid_queries if total_valid_queries > 0 else 0
-
-        # Add error statistics to the summary
-        for error_type, count in error_counts.items():
-            experiment_summary[f"{error_type}_errors"] = count
-
-        analysis_summary.append(experiment_summary)
-
-    # After processing all experiments, create the summary DataFrame
-    if analysis_summary:
-        summary_df = pd.DataFrame(analysis_summary)
-    else:
-        logger.warning("No experiment summaries were generated. Returning an empty DataFrame.")
-        summary_df = pd.DataFrame()  # Return an empty DataFrame
-
-    return summary_df
+        analysis_summary.append(exp_summary)
+        
+    # After processing all experiments, create and return the final DataFrame.
+    # This is the crucial return statement that was missing.
+    return pd.DataFrame(analysis_summary)
