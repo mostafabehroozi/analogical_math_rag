@@ -67,9 +67,9 @@ def evaluate_single_answer_with_llm(
 
     raw_text = response.get('text', '').strip()
     
-    # Truncate this print statement for consistency
+    # MODIFIED: Truncate the raw evaluator output before printing
     trunc_len = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
-    print(f"      Evaluator LLM Raw Output: {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}") 
+    print(f"      Evaluator LLM Raw Output (truncated): {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}") 
     logger.debug(f"Evaluator raw response: '{raw_text}'")
 
     eval_match = re.search(r"Evaluation:\s*(true|false)", raw_text, re.IGNORECASE)

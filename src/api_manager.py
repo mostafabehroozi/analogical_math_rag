@@ -150,8 +150,9 @@ class GeminiAPIManager:
         if self.print_details:
             print("\n" + "--- [API Call Start: Gemini] ---")
             print(f"Model: {model_name}, Temperature: {temperature}")
-            print("Prompt Sent:")
-            print(prompt)
+            # MODIFIED: Print truncated prompt
+            print("Prompt Sent (truncated):")
+            print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
         api_key, sleep_time = self._get_available_key_and_sleep_time(model_name)
@@ -221,6 +222,7 @@ class GeminiAPIManager:
         if self.print_details:
             print(f"\n!!! [API Call FAILED: Gemini] !!!")
             print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
+            # MODIFIED: Print full prompt only on error
             print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
         
         return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
@@ -316,8 +318,9 @@ class AvalAIAPIManager:
         if self.print_details:
             print("\n" + "--- [API Call Start: AvalAI] ---")
             print(f"Model: {model_name}, Temperature: {temperature}")
-            print("Prompt Sent:")
-            print(prompt)
+            # MODIFIED: Print truncated prompt
+            print("Prompt Sent (truncated):")
+            print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
         caught_exception = None
@@ -367,6 +370,7 @@ class AvalAIAPIManager:
         if self.print_details:
             print(f"\n!!! [API Call FAILED: AvalAI] !!!")
             print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
+            # MODIFIED: Print full prompt only on error
             print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
         
         return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
