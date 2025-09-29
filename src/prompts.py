@@ -8,7 +8,7 @@ prompts used in the pipeline. It uses a registry pattern to allow for easy
 management and selection of different prompt versions via the main configuration.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Any
 
 # --- NEW: Standard format for a question-solution pair ---
 # This will be used to create a consistent text block for exemplars.
@@ -255,18 +255,24 @@ def create_final_reasoning_prompt(main_question_text: str, final_adapted_samples
         adapted_samples_block=samples_block.strip()
     )
 
-# NEW: Function for the simple solver prompt
-def create_final_reasoning_prompt_simple(main_question_text: str) -> str:
+# MODIFIED: Function for the simple solver prompt
+def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[str, Any]) -> str:
     """Creates the final prompt for the solver LLM without any adapted samples."""
-    template_name = "final_solver_simple_v1"
+    # This line now dynamically gets the template name from the config,
+    # falling back to the default if it's not specified in the experiment.
+    template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE", "final_solver_simple_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(
         main_question_text=main_question_text
     )
 
-def create_evaluation_prompt(model_answer: str, ground_truth: str) -> str:
+# MODIFIED: Function for the evaluation prompt
+def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any]) -> str:
     """Creates the prompt for the evaluator LLM."""
-    template = PROMPT_TEMPLATES["evaluator_v1"]
+    # This line now dynamically gets the template name from the config,
+    # falling back to the default if it's not specified in the experiment.
+    template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
+    template = PROMPT_TEMPLATES[template_name]
     return template.format(
         model_answer=model_answer,
         ground_truth=ground_truth

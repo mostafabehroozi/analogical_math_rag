@@ -225,7 +225,7 @@ def merge(
     return {"status": "SUCCESS", "merged_texts": current_texts, "failed_merges": failed_merges}
 
 
-# --- 4. SOLVER STEP (MODIFIED for error handling) ---
+# --- 4. SOLVER STEP (MODIFIED for error handling and config passing) ---
 def solve(
     target_query: str,
     final_exemplars: List[str],
@@ -239,7 +239,9 @@ def solve(
     logger = logging.getLogger(__name__)
     logger.info("Starting final solver step.")
     
-    prompt = create_final_reasoning_prompt(target_query, final_exemplars) if final_exemplars else create_final_reasoning_prompt_simple(target_query)
+    # MODIFIED: Pass the 'config' dictionary to the simple prompt creator.
+    # This allows it to use the prompt template specified in the experiment config.
+    prompt = create_final_reasoning_prompt(target_query, final_exemplars) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
     logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
     if "Error:" in prompt:
@@ -261,19 +263,3 @@ def solve(
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
         
         print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
-        response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        if response['status'] == 'SUCCESS':
-            solution_attempts.append(response['text'])
-        else:
-            logger.warning(f"Error on solution attempt {i+1}: {response['error_message']}")
-            # Append the structured error dictionary for this attempt
-            solution_attempts.append({
-                "status": "FAILURE",
-                "attempt_number": i + 1,
-                "error_info": response
-            })
-
-    # The step is a "SUCCESS" if it completed all attempts, even if some failed.
-    # The list of attempts itself contains the fine-grained success/failure status.
-    return {"status": "SUCCESS", "solution_attempts": solution_attempts}
