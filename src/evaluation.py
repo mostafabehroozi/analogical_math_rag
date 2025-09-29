@@ -23,10 +23,11 @@ from typing import List, Dict, Any, Tuple, Optional, Union
 from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
-from src.api_manager import APIResponse # Import the structured response type
+from src.api_manager import APIResponse  # Import the structured response type
 
 # Define a more specific type for the result of a single evaluation
 EvaluationResult = Tuple[Optional[bool], str, Optional[APIResponse]]
+
 
 def evaluate_single_answer_with_llm(
     model_answer: str,
@@ -35,7 +36,6 @@ def evaluate_single_answer_with_llm(
     config: Dict[str, Any]
 ) -> EvaluationResult:
     """
-
     Evaluates a single model-generated answer against a ground truth using an LLM.
 
     Returns:
@@ -57,7 +57,7 @@ def evaluate_single_answer_with_llm(
     # MODIFIED: Pass the 'config' dictionary to the prompt creator.
     # This allows it to use the prompt template specified in the experiment config.
     prompt = create_evaluation_prompt(model_answer, ground_truth, config)
-    
+
     print(f"      [API Context] Calling LLM for: Evaluation")
     response = api_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
@@ -68,10 +68,10 @@ def evaluate_single_answer_with_llm(
         return None, f"API_{response['status']}", response
 
     raw_text = response.get('text', '').strip()
-    
+
     # MODIFIED: Truncate this print statement for consistency
     trunc_len = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
-    print(f"      Evaluator LLM Raw Output: {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}") 
+    print(f"      Evaluator LLM Raw Output: {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}")
     logger.debug(f"Evaluator raw response: '{raw_text}'")
 
     eval_match = re.search(r"Evaluation:\s*(true|false)", raw_text, re.IGNORECASE)
@@ -83,6 +83,7 @@ def evaluate_single_answer_with_llm(
     else:
         logger.warning(f"Could not parse 'Evaluation:' line from LLM response. Treating as failure.")
         return None, "PARSING_FAILED", None
+
 
 def analyze_experiment_logs(
     all_experiments_logs: Dict[str, List[Dict]],
@@ -130,7 +131,7 @@ def analyze_experiment_logs(
             for loop_idx, log in enumerate(tqdm(logs_to_process, desc=f"Evaluating {exp_name}")):
                 hard_list_idx = log["target_query_original_hard_list_idx"]
                 ground_truth = ground_truths[hard_list_idx]
-                
+
                 # IMPORTANT: This now comes from the 'solving' step in the main run log
                 solution_attempts = log.get("steps", {}).get("solving", {}).get("solution_attempts", [])
 
@@ -146,13 +147,13 @@ def analyze_experiment_logs(
                         if status != "SUCCESS":
                             print(f"       WARNING: Evaluation attempt failed with status: {status}")
                             logger.warning(f"Evaluation for query {hard_list_idx}, attempt {i+1} failed with status: {status}")
-                    
+
                     # Check if the generation itself failed (a dict)
                     elif isinstance(attempt, dict) and attempt.get('status') == 'FAILURE':
                         is_correct, status, error_info = None, "GENERATION_FAILED", attempt.get("error_info")
                         print(f"    -> Skipping evaluation for attempt {i+1} (generation failed).")
-                    
-                    else: # Should not happen, but good to handle
+
+                    else:  # Should not happen, but good to handle
                         is_correct, status, error_info = None, "INVALID_ATTEMPT_FORMAT", None
 
                     is_correct_list.append(is_correct)
@@ -163,8 +164,8 @@ def analyze_experiment_logs(
                     "hard_list_idx": hard_list_idx,
                     "is_correct_list": is_correct_list,
                     "evaluation_status_list": status_list,
-                    "evaluation_error_details": api_error_details, # Store detailed errors
-                    "attempts": solution_attempts # Store the original attempts (mix of str/dict)
+                    "evaluation_error_details": api_error_details,  # Store detailed errors
+                    "attempts": solution_attempts  # Store the original attempts (mix of str/dict)
                 })
 
                 save_json(detailed_evaluations, eval_file_path)
@@ -183,6 +184,45 @@ def analyze_experiment_logs(
                     # Normalize API statuses for counting
                     if status.startswith("API_"):
                         error_key = status.replace("API_", "")
-                        # (The rest of this file was truncated in the original prompt, but the fixes are complete.)
-                        # The logic to handle the rest of the summary calculation would follow here.
-                        # The key modification has been applied successfully.
+                        if error_key in error_counts:
+                            error_counts[error_key] = error_counts.get(error_key, 0) + 1
+                        else:
+                            error_counts["API_ERROR"] = error_counts.get("API_ERROR", 0) + 1  # Count as generic API error
+                    elif status in error_counts:
+                        error_counts[status] = error_counts.get(status, 0) + 1
+
+                # Find the highest K for which the problem was solved
+                solved_at_k = None
+                for k in pass_k_values:
+                    if any(is_correct_list[:k]):
+                        solved_at_k = k
+                        break
+
+                if solved_at_k is not None:
+                    pass_k_counts[solved_at_k] += 1
+
+        # Summarize results for this experiment
+        experiment_summary = {
+            "experiment_name": exp_name,
+            "total_queries": len(query_logs),
+            "valid_queries": total_valid_queries,
+        }
+
+        # Add Pass@K metrics to the summary
+        for k in pass_k_values:
+            experiment_summary[f"pass@{k}"] = pass_k_counts[k] / total_valid_queries if total_valid_queries > 0 else 0
+
+        # Add error statistics to the summary
+        for error_type, count in error_counts.items():
+            experiment_summary[f"{error_type}_errors"] = count
+
+        analysis_summary.append(experiment_summary)
+
+    # After processing all experiments, create the summary DataFrame
+    if analysis_summary:
+        summary_df = pd.DataFrame(analysis_summary)
+    else:
+        logger.warning("No experiment summaries were generated. Returning an empty DataFrame.")
+        summary_df = pd.DataFrame()  # Return an empty DataFrame
+
+    return summary_df
