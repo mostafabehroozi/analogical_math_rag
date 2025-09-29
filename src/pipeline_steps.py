@@ -32,7 +32,7 @@ from src.prompts import (
     create_final_reasoning_prompt_simple
 )
 
-# --- Utility Function for Embedding Generation (No changes needed) ---
+# --- Utility Function for Embedding Generation ---
 def _generate_embeddings(
     texts: List[str],
     embedding_model: SentenceTransformer,
@@ -53,7 +53,7 @@ def _generate_embeddings(
         return np.array([])
 
 
-# --- 1. RETRIEVAL STEP (No changes needed, does not use an LLM API) ---
+# --- 1. RETRIEVAL STEP ---
 def retrieve(
     target_query: str,
     embedding_model: SentenceTransformer,
@@ -90,7 +90,7 @@ def retrieve(
     }
 
 
-# --- 2. ADAPTATION STEP (MODIFIED for error handling) ---
+# --- 2. ADAPTATION STEP ---
 def adapt(
     target_query: str,
     retrieved_indices: List[int],
@@ -155,15 +155,14 @@ def adapt(
         if not step_failed:
             successful_texts.append(current_text)
 
-    # Determine overall status of the adaptation step
     if not retrieved_indices:
-        final_status = "SUCCESS" # Nothing to do is a success
+        final_status = "SUCCESS"
     elif not successful_texts and failed_adaptations:
-        final_status = "FAILURE" # All attempts failed
+        final_status = "FAILURE"
     elif successful_texts and failed_adaptations:
-        final_status = "PARTIAL_SUCCESS" # Some succeeded, some failed
+        final_status = "PARTIAL_SUCCESS"
     else:
-        final_status = "SUCCESS" # All succeeded
+        final_status = "SUCCESS"
 
     return {
         "status": final_status,
@@ -172,7 +171,7 @@ def adapt(
     }
 
 
-# --- 3. MERGING STEP (MODIFIED for error handling) ---
+# --- 3. MERGING STEP ---
 def merge(
     target_query: str,
     adapted_texts: List[str],
@@ -225,7 +224,7 @@ def merge(
     return {"status": "SUCCESS", "merged_texts": current_texts, "failed_merges": failed_merges}
 
 
-# --- 4. SOLVER STEP (MODIFIED for error handling and config passing) ---
+# --- 4. SOLVER STEP ---
 def solve(
     target_query: str,
     final_exemplars: List[str],
@@ -239,8 +238,6 @@ def solve(
     logger = logging.getLogger(__name__)
     logger.info("Starting final solver step.")
     
-    # MODIFIED: Pass the 'config' dictionary to the simple prompt creator.
-    # This allows it to use the prompt template specified in the experiment config.
     prompt = create_final_reasoning_prompt(target_query, final_exemplars) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
     logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
@@ -263,3 +260,18 @@ def solve(
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
         
         print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
+        
+        # --- THIS IS THE MISSING LOGIC THAT WAS RESTORED ---
+        response = api_manager.generate_content(prompt, model_name, temperature)
+        
+        if response['status'] == 'SUCCESS':
+            solution_attempts.append(response['text'])
+        else:
+            # If the API call fails, append a dictionary with error details
+            # instead of the solution text. This is crucial for error handling.
+            solution_attempts.append({
+                "status": "FAILURE",
+                "error_info": response
+            })
+            
+    return {"status": "SUCCESS", "solution_attempts": solution_attempts}

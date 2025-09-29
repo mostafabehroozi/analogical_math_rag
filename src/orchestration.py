@@ -154,8 +154,9 @@ def run_pipeline_for_single_query(
         
         run_log['llm_final_solution_attempts_texts'] = solution_texts # Note: This only contains successful ones now
         
-        if run_log.get('pipeline_status') != "FAILURE: Adaptation failed for all exemplars.":
-             run_log['pipeline_status'] = "SUCCESS" # Mark as success if it reaches the end
+        # Check if a critical failure happened before this step. If not, mark as SUCCESS.
+        if "FAILURE" not in run_log['pipeline_status']:
+             run_log['pipeline_status'] = "SUCCESS"
     else:
         # Mark solve as skipped if a prior step failed critically
         run_log['steps']['solving'] = {"status": "SKIPPED", "reason": "Pipeline halted due to critical failure in a prior step."}
@@ -174,7 +175,6 @@ def run_experiments(
 ) -> Dict[str, List[Dict]]:
     """
     Orchestrates running multiple experiments with different configurations.
-    (No significant changes needed here, as the single-query function now handles all logic)
     """
     logger = logging.getLogger(__name__)
     all_results = {}
