@@ -205,7 +205,7 @@ Output format:
 
 
 Question:
-{Insert Question Here}
+{main_question_text}
 
 Your output:"""
 }
