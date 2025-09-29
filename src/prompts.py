@@ -173,7 +173,41 @@ Ground Truth:
 {ground_truth}
 ---
 Begin Output:
-"""
+""" ,
+
+
+    "solveablelity_filter" : """You are a filtering assistant for building a math benchmark.
+
+Task: Decide if the given math question can be solved by an isolated LLM with only the text of the question as input.
+
+Rules:
+
+*  Answer yes if the question:
+
+  * Contains all needed information in plain text (numbers, words, symbols).
+  * Does not require any external data.
+
+*  Answer no if the question:
+
+  * Refers to images, diagrams, graphs, tables, audio, or any non-textual input.
+  * Refers to external resources (links, websites, files).
+  * Requires missing context not present in the text itself.
+
+Important:
+
+* Ignore the question’s difficulty, grammar, or factual accuracy.
+* Do not explain. Do not output anything except one word.
+
+Output format:
+
+* Only one lowercase word: yes or no.
+
+
+
+Question:
+{Insert Question Here}
+
+Your output:"""
 }
 
 
