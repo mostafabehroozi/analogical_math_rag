@@ -27,7 +27,7 @@ import openai
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 
-# --- NEW: Formally define the structured API response using TypedDict ---
+# --- Formally define the structured API response using TypedDict ---
 # This improves code clarity and enables static analysis.
 class APIResponse(TypedDict):
     """A standardized structure for all API call results."""
@@ -70,9 +70,14 @@ class GeminiAPIManager:
         self.current_key_index: int = 0
         self._lock = False
 
+        # --- Read control flags from config ---
         self.print_details = config.get("PRINT_API_CALL_DETAILS", False) if config else False
-        # NEW: Read truncation length from config
         self.truncation_length = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50) if config else 50
+        
+        # --- NEW: Timing Checkpoint Feature ---
+        self._print_timing_checkpoints = config.get("PRINT_API_TIMING_CHECKPOINTS", False) if config else False
+        self._last_checkpoint_timestamp: Optional[float] = None
+        # --- End of Timing Checkpoint Feature ---
 
         self.logger.info(f"GeminiAPIManager initialized with {len(self.api_keys_list)} keys.")
         
@@ -88,7 +93,6 @@ class GeminiAPIManager:
 
     def _get_available_key_and_sleep_time(self, model_name: str) -> Tuple[Optional[str], float]:
         """Finds an available API key and calculates the necessary sleep time."""
-        # This internal logic remains unchanged as it's for proactive rate limiting.
         if not self.api_keys_list:
             return None, 3600
 
@@ -163,6 +167,17 @@ class GeminiAPIManager:
             print(f"Sleeping for {sleep_time:.2f} seconds due to rate limiting.")
             time.sleep(sleep_time)
 
+        # --- NEW: Timing Checkpoint Logic ---
+        # This occurs after any sleep but before the API call is attempted.
+        current_call_start_time = time.time()
+        if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
+            elapsed = current_call_start_time - self._last_checkpoint_timestamp
+            print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
+        
+        # Update the timestamp for the *next* call's calculation.
+        self._last_checkpoint_timestamp = current_call_start_time
+        # --- End of Timing Checkpoint Logic ---
+
         caught_exception = None
 
         try:
@@ -186,13 +201,11 @@ class GeminiAPIManager:
             response_text = response.text
             if self.print_details:
                 print("--- [API Call SUCCESS: Gemini] ---")
-                # MODIFIED: Use the configured truncation length
                 print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
                 print("----------------------------------\n")
             
             return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
 
-        # --- Granular Exception Handling ---
         except google_exceptions.ResourceExhausted as e:
             status, error_type, msg = "RATE_LIMITED", "ResourceExhausted", f"Gemini API rate limit exceeded: {e}"
             caught_exception = e
@@ -203,7 +216,6 @@ class GeminiAPIManager:
             status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the Gemini API: {e}"
             caught_exception = e
         
-        # This block runs for any of the above exceptions (error printing is unchanged)
         self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {error_type}. Error: {msg}", exc_info=True)
         self._record_api_call(api_key, model_name) 
         if self.print_details:
@@ -218,7 +230,6 @@ class AvalAIAPIManager:
     """
     Manages API calls to an OpenAI-compatible endpoint like AvalAI with enhanced error handling.
     """
-    # MODIFIED: Added global_delay_seconds to the constructor signature
     def __init__(self, api_key: str, base_url: str, model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
         """
         Initializes the OpenAI-compatible API manager.
@@ -239,36 +250,42 @@ class AvalAIAPIManager:
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
         self.model_quotas = model_quotas
         
-        # MODIFIED: Added tracking for both global and per-model delays
         self.global_delay_seconds = global_delay_seconds
         self.last_global_call_timestamp: float = 0
         self.last_model_call_timestamps: Dict[str, float] = {}
         
+        # --- Read control flags from config ---
         self.print_details = config.get("PRINT_API_CALL_DETAILS", False) if config else False
-        # NEW: Read truncation length from config
         self.truncation_length = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50) if config else 50
+
+        # --- NEW: Timing Checkpoint Feature ---
+        self._print_timing_checkpoints = config.get("PRINT_API_TIMING_CHECKPOINTS", False) if config else False
+        self._last_checkpoint_timestamp: Optional[float] = None
+        # --- End of Timing Checkpoint Feature ---
         
         self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url}")
 
-    # MODIFIED: Rewrote this function to handle both global and per-model delays
-    def _apply_rate_limit(self, model_name: str) -> None:
-        """Applies both global and model-specific delays, taking the max of the two."""
-        current_time = time.time()
+    def _apply_rate_limit_and_record(self, model_name: str) -> None:
+        """
+        Applies rate limiting delays and then immediately records the timestamps
+        for the upcoming API call. This ensures the delay is measured from the
+        start of one call to the start of the next.
+        """
+        current_time_before_sleep = time.time()
 
-        # 1. Calculate global sleep time needed
-        time_since_last_global = current_time - self.last_global_call_timestamp
+        # 1. Calculate global sleep time needed based on the time before sleeping
+        time_since_last_global = current_time_before_sleep - self.last_global_call_timestamp
         global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
 
         # 2. Calculate model-specific sleep time needed
-        # Fallback to 'default' if the specific model_name is not in the quotas
         model_specific_quotas = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
         model_delay_seconds = model_specific_quotas.get("delay_seconds", 1)
         
         last_call_for_model = self.last_model_call_timestamps.get(model_name, 0)
-        time_since_last_model_call = current_time - last_call_for_model
+        time_since_last_model_call = current_time_before_sleep - last_call_for_model
         model_sleep_needed = max(0, model_delay_seconds - time_since_last_model_call)
         
-        # 3. Determine the final sleep duration
+        # 3. Determine the final sleep duration and perform the sleep
         final_sleep_duration = max(global_sleep_needed, model_sleep_needed)
         
         if final_sleep_duration > 0:
@@ -276,17 +293,25 @@ class AvalAIAPIManager:
             print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
             time.sleep(final_sleep_duration)
 
-    # NEW: Helper function to record timestamps after a call
-    def _record_api_call(self, model_name: str) -> None:
-        """Records timestamps for both global and per-model rate limiting."""
-        current_time = time.time()
-        self.last_global_call_timestamp = current_time
-        self.last_model_call_timestamps[model_name] = current_time
+        # 4. Get the timestamp after any required sleep
+        current_call_start_time = time.time()
+        
+        # --- NEW: Timing Checkpoint Logic ---
+        if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
+            elapsed = current_call_start_time - self._last_checkpoint_timestamp
+            print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
+        
+        # Update the checkpoint timestamp for the next call's calculation.
+        self._last_checkpoint_timestamp = current_call_start_time
+        # --- End of Timing Checkpoint Logic ---
+
+        # 5. CRITICAL FIX: Record timestamps for rate-limiting *after* sleeping but *before* the API call.
+        self.last_global_call_timestamp = current_call_start_time
+        self.last_model_call_timestamps[model_name] = current_call_start_time
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
         """Generates content using an OpenAI-compatible API, handling rate limiting and specific errors."""
-        # MODIFIED: Pass model_name to the rate limiting function
-        self._apply_rate_limit(model_name)
+        self._apply_rate_limit_and_record(model_name)
 
         if self.print_details:
             print("\n" + "--- [API Call Start: AvalAI] ---")
@@ -305,9 +330,6 @@ class AvalAIAPIManager:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature
             )
-            
-            # MODIFIED: Record the call timestamps after a successful call
-            self._record_api_call(model_name)
 
             if not completion.choices:
                 error_msg = "Response was empty or blocked (no choices returned)."
@@ -319,7 +341,6 @@ class AvalAIAPIManager:
             response_text = completion.choices[0].message.content
             if self.print_details:
                 print("--- [API Call SUCCESS: AvalAI] ---")
-                # MODIFIED: Use the configured truncation length
                 print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
                 print("----------------------------------\n")
 
@@ -342,9 +363,6 @@ class AvalAIAPIManager:
             status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the OpenAI API: {e}"
             caught_exception = e
 
-        # This block runs for any of the above exceptions (error printing is unchanged)
-        # MODIFIED: Record timestamps even on failure to prevent rapid retries on broken endpoints
-        self._record_api_call(model_name)
         self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
         if self.print_details:
             print(f"\n!!! [API Call FAILED: AvalAI] !!!")
