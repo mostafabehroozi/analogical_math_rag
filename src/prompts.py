@@ -207,11 +207,30 @@ Output format:
 Question:
 {main_question_text}
 
-Your output:"""
+Your output:""",
+
+    # --- NEW TEMPLATE FOR DUPLICATE QUESTION CHECKING ---
+    "duplicate_question_check_v1": """You are a text comparison assistant. Your task is to determine if the 'Main Question' is identical to ANY of the questions in the 'Retrieved Questions' list.
+
+**Rules:**
+1.  Compare the text of the 'Main Question' against each 'Retrieved Question' verbatim.
+2.  Ignore differences in whitespace, capitalization, or minor punctuation unless they change the meaning.
+3.  If you find an exact match, your job is done.
+4.  Your entire output must be a single word: **yes** or **no**. Do not provide any explanation.
+
+---
+**Main Question:**
+{main_question_text}
+---
+**Retrieved Questions:**
+{retrieved_questions_block}
+---
+**Is there an exact match? (yes/no):**
+""",
 }
 
 
-# --- 2. Prompt Creation Functions (MODIFIED) ---
+# --- 2. Prompt Creation Functions ---
 
 def create_standardization_prompt(original_example: str) -> str:
     """Creates a prompt for the 'standardization' step."""
@@ -255,25 +274,34 @@ def create_final_reasoning_prompt(main_question_text: str, final_adapted_samples
         adapted_samples_block=samples_block.strip()
     )
 
-# MODIFIED: Function for the simple solver prompt
 def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[str, Any]) -> str:
     """Creates the final prompt for the solver LLM without any adapted samples."""
-    # This line now dynamically gets the template name from the config,
-    # falling back to the default if it's not specified in the experiment.
     template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE", "final_solver_simple_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(
         main_question_text=main_question_text
     )
 
-# MODIFIED: Function for the evaluation prompt
 def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any]) -> str:
     """Creates the prompt for the evaluator LLM."""
-    # This line now dynamically gets the template name from the config,
-    # falling back to the default if it's not specified in the experiment.
     template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(
         model_answer=model_answer,
         ground_truth=ground_truth
+    )
+
+# --- NEW FUNCTION FOR DUPLICATE QUESTION CHECKING ---
+def create_duplicate_check_prompt(main_question_text: str, retrieved_questions: List[str]) -> str:
+    """Creates the prompt for the duplicate question check."""
+    template = PROMPT_TEMPLATES["duplicate_question_check_v1"]
+    
+    # Format the list of retrieved questions into a numbered block
+    retrieved_block = ""
+    for i, q in enumerate(retrieved_questions):
+        retrieved_block += f"{i+1}. {q}\n"
+        
+    return template.format(
+        main_question_text=main_question_text,
+        retrieved_questions_block=retrieved_block.strip()
     )

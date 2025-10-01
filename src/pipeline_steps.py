@@ -17,6 +17,7 @@ targeted retries.
 """
 
 import logging
+import re  # <-- ADDED for regex parsing
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
@@ -29,7 +30,8 @@ from src.prompts import (
     create_transformation_prompt,
     create_merging_prompt,
     create_final_reasoning_prompt,
-    create_final_reasoning_prompt_simple
+    create_final_reasoning_prompt_simple,
+    create_duplicate_check_prompt  # <-- ADDED for the new feature
 )
 
 # --- Utility Function for Embedding Generation ---
@@ -234,10 +236,52 @@ def solve(
     """
     Generates final solution(s). If an attempt fails due to an API error,
     the error details are saved instead of a text solution for that attempt.
+    
+    MODIFIED: Can also be used to run a classification task like duplicate checking.
     """
     logger = logging.getLogger(__name__)
     logger.info("Starting final solver step.")
     
+    # --- NEW: LOGIC FOR DUPLICATE QUESTION CHECKING ---
+    final_solver_prompt_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER")
+    if final_solver_prompt_name == "duplicate_question_check_v1":
+        logger.info("Running in 'Duplicate Question Check' mode.")
+        
+        retrieved_questions = []
+        for exemplar_text in final_exemplars:
+            match = re.search(r"Question:\s*(.*?)\s*Rationale and Answer:", exemplar_text, re.DOTALL)
+            if match:
+                retrieved_questions.append(match.group(1).strip())
+        
+        if not retrieved_questions:
+            logger.warning("Duplicate check mode ran but no retrieved questions were found to check.")
+            return {"status": "SUCCESS", "solution_attempts": ["no_retrieval"]}
+
+        prompt = create_duplicate_check_prompt(target_query, retrieved_questions)
+        
+        provider = config.get("API_PROVIDER", "gemini").lower()
+        model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_ADAPTATION']
+        temperature = 0.0 # Low temp for deterministic classification
+        
+        print("    -> Checking for duplicate questions...")
+        print("      [API Context] Calling LLM for: Duplicate Check")
+        response = api_manager.generate_content(prompt, model_name, temperature)
+
+        if response['status'] == 'SUCCESS':
+            classification = response['text'].strip().lower()
+            if "yes" in classification:
+                result = "yes"
+            elif "no" in classification:
+                result = "no"
+            else:
+                result = "parsing_failed"
+            return {"status": "SUCCESS", "solution_attempts": [result]}
+        else:
+            # If the API call fails, log the failure details
+            return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": response}]}
+    # --- END OF NEW LOGIC ---
+
+    # --- Original Solver Logic ---
     prompt = create_final_reasoning_prompt(target_query, final_exemplars) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
     logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
@@ -261,14 +305,11 @@ def solve(
         
         print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
         
-        # --- THIS IS THE MISSING LOGIC THAT WAS RESTORED ---
         response = api_manager.generate_content(prompt, model_name, temperature)
         
         if response['status'] == 'SUCCESS':
             solution_attempts.append(response['text'])
         else:
-            # If the API call fails, append a dictionary with error details
-            # instead of the solution text. This is crucial for error handling.
             solution_attempts.append({
                 "status": "FAILURE",
                 "error_info": response
