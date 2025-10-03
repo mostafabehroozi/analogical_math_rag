@@ -3,29 +3,33 @@
 """
 Prompt engineering module for the Analogical Reasoning RAG project.
 
-This file contains all prompt templates and functions for creating the specific
-prompts used in the pipeline. It uses a registry pattern to allow for easy
-management and selection of different prompt versions via the main configuration.
+This file centralizes all prompt templates and the functions that construct
+the final prompts used in the pipeline. It employs a registry pattern
+(the `PROMPT_TEMPLATES` dictionary) to allow for easy management, versioning,
+and selection of different prompt variations via the main configuration file.
+
+This rewritten version includes hardened instructions in key templates to ensure
+LLMs adhere strictly to the expected output format, reducing parsing errors
+in downstream pipeline steps.
 """
 
 from typing import List, Dict, Any
 
-# --- NEW: Standard format for a question-solution pair ---
-# This will be used to create a consistent text block for exemplars.
+# Define the standard text format for a question-solution pair.
+# This ensures consistency when constructing and parsing exemplars.
 EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
 
 # --- 1. Prompt Template Registry ---
+# A dictionary holding all versioned prompt templates for the project.
 PROMPT_TEMPLATES: Dict[str, str] = {
-    "standardization_v1": """You are a helpful math assistant.
 
+    "standardization_v1": """You are a helpful math assistant.
 Your task is to rewrite the following solved math example into a **clear, well-structured, and standardized format** that is easier for a language model to learn from.
 
 Make the question and its reasoning more readable, formal, and useful for solving similar problems — **without changing the logic, reasoning steps, or final answer**.
 
 ---
-
 **Guidelines**:
-
 1. Keep the original reasoning process and final answer exactly the same — only improve the writing and formatting.
 2. Use correct grammar, clean math language, and consistent formatting.
 3. Write the reasoning step by step in a formal, easy-to-follow style.
@@ -34,13 +38,11 @@ Make the question and its reasoning more readable, formal, and useful for solvin
 6. Do **not** add extra comments or explanations outside the rewritten version.
 
 ---
-
 **Original Example (Input)**:
 {original_example}
 
 ---
-
-**Output Format (Strictly follow this format)**:
+**Output Format (Strictly follow this format, including the exact headers 'Question:', 'Rationale:', and 'Final Answer:')**:
 
 Question: [Your rewritten question]
 
@@ -65,7 +67,7 @@ Your task is to transform the **Sample's Rationale** into a version that is more
 4. Do not alter the core logic to solve the **Main Question**, nor modify the **Sample's Question** or its **Final Answer** (as presented in the 'Sample to Transform').
 5. Ensure the transformed rationale clearly conveys the reasoning flow.
 
-**Output Format (Strictly follow this format):**
+**Output Format (Strictly follow this format, including the exact headers 'Question:' and 'Rationale and Answer:')**:
 Question: [Original Question from the 'Sample to Transform']
 Rationale and Answer: [Transformed Rationale, followed by the Original Answer from the 'Sample to Transform']
 """,
@@ -120,7 +122,6 @@ Final Answer:
 **Your Solution:**
 """,
     
-    # NEW: Simple prompt for solving without retrieval.
     "final_solver_simple_v1": """**Objective:**
 Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
 
@@ -173,43 +174,8 @@ Ground Truth:
 {ground_truth}
 ---
 Begin Output:
-""" ,
+""",
 
-
-    "solveablelity_filter" : """You are a filtering assistant for building a math benchmark.
-
-Task: Decide if the given math question can be solved by an isolated LLM with only the text of the question as input.
-
-Rules:
-
-*  Answer yes if the question:
-
-  * Contains all needed information in plain text (numbers, words, symbols).
-  * Does not require any external data.
-
-*  Answer no if the question:
-
-  * Refers to images, diagrams, graphs, tables, audio, or any non-textual input.
-  * Refers to external resources (links, websites, files).
-  * Requires missing context not present in the text itself.
-
-Important:
-
-* Ignore the question’s difficulty, grammar, or factual accuracy.
-* Do not explain. Do not output anything except one word.
-
-Output format:
-
-* Only one lowercase word: yes or no.
-
-
-
-Question:
-{main_question_text}
-
-Your output:""",
-
-    # --- NEW TEMPLATE FOR DUPLICATE QUESTION CHECKING ---
     "duplicate_question_check_v1": """You are a text comparison assistant. Your task is to determine if the 'Main Question' is identical to ANY of the questions in the 'Retrieved Questions' list.
 
 **Rules:**
@@ -231,77 +197,56 @@ Your output:""",
 
 
 # --- 2. Prompt Creation Functions ---
+# These functions abstract the process of selecting and formatting a template.
 
 def create_standardization_prompt(original_example: str) -> str:
-    """Creates a prompt for the 'standardization' step."""
+    """Creates a prompt for the 'standardization' pipeline step."""
     template = PROMPT_TEMPLATES["standardization_v1"]
-    return template.format(
-        original_example=original_example
-    )
+    return template.format(original_example=original_example)
 
 def create_transformation_prompt(target_query: str, text_to_transform: str) -> str:
-    """Creates a prompt for the 'transformation' step."""
+    """Creates a prompt for the 'transformation' pipeline step."""
     template = PROMPT_TEMPLATES["transformation_v1"]
-    return template.format(
-        target_query=target_query,
-        text_to_transform=text_to_transform
-    )
+    return template.format(target_query=target_query, text_to_transform=text_to_transform)
 
 def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str:
-    """Creates a prompt for the 'merging' step."""
+    """Creates a prompt for the 'merging' pipeline step."""
     if len(samples_to_merge) != 2:
+        # This guard clause prevents errors if the merging logic provides the wrong number of samples.
         return "Error: create_merging_prompt requires exactly two samples."
     
     template = PROMPT_TEMPLATES["merging_v1"]
-    return template.format(
-        target_query=target_query,
-        sample_1=samples_to_merge[0],
-        sample_2=samples_to_merge[1]
-    )
+    return template.format(target_query=target_query, sample_1=samples_to_merge[0], sample_2=samples_to_merge[1])
 
 def create_final_reasoning_prompt(main_question_text: str, final_adapted_samples: List[str]) -> str:
-    """Creates the final prompt for the solver LLM, including adapted samples."""
+    """Creates the final prompt for the solver, including adapted samples (RAG)."""
     if not final_adapted_samples:
-        return "Error: At least one adapted sample is required for the final reasoning prompt."
+        return "Error: At least one adapted sample is required for the standard final reasoning prompt."
 
     samples_block = ""
     for i, sample_text in enumerate(final_adapted_samples):
         samples_block += f"\n**Adapted Sample {i+1}:**\n{sample_text}\n"
     
     template = PROMPT_TEMPLATES["final_solver_v1"]
-    return template.format(
-        main_question_text=main_question_text,
-        adapted_samples_block=samples_block.strip()
-    )
+    return template.format(main_question_text=main_question_text, adapted_samples_block=samples_block.strip())
 
 def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[str, Any]) -> str:
-    """Creates the final prompt for the solver LLM without any adapted samples."""
+    """Creates the final prompt for the solver without any adapted samples (No RAG)."""
     template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE", "final_solver_simple_v1")
     template = PROMPT_TEMPLATES[template_name]
-    return template.format(
-        main_question_text=main_question_text
-    )
+    return template.format(main_question_text=main_question_text)
 
 def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any]) -> str:
     """Creates the prompt for the evaluator LLM."""
     template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
     template = PROMPT_TEMPLATES[template_name]
-    return template.format(
-        model_answer=model_answer,
-        ground_truth=ground_truth
-    )
+    return template.format(model_answer=model_answer, ground_truth=ground_truth)
 
-# --- NEW FUNCTION FOR DUPLICATE QUESTION CHECKING ---
 def create_duplicate_check_prompt(main_question_text: str, retrieved_questions: List[str]) -> str:
-    """Creates the prompt for the duplicate question check."""
+    """Creates the prompt for the special duplicate question check task."""
     template = PROMPT_TEMPLATES["duplicate_question_check_v1"]
     
-    # Format the list of retrieved questions into a numbered block
-    retrieved_block = ""
-    for i, q in enumerate(retrieved_questions):
-        retrieved_block += f"{i+1}. {q}\n"
+    # Format the list of retrieved questions into a numbered block for the LLM.
+    retrieved_block = "\n".join(f"{i+1}. {q}" for i, q in enumerate(retrieved_questions))
         
-    return template.format(
-        main_question_text=main_question_text,
-        retrieved_questions_block=retrieved_block.strip()
-    )
+    return template.format(main_question_text=main_question_text, retrieved_questions_block=retrieved_block.strip())

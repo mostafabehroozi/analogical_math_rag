@@ -3,15 +3,15 @@
 """
 API management module for interacting with various LLM providers.
 
-This file contains the API manager classes responsible for:
-- Managing API credentials and endpoints.
-- Handling rate limiting.
+This module contains the API manager classes responsible for:
+- Managing API credentials, endpoints, and key rotation.
+- Handling provider-specific and global rate limiting.
 - Making API calls with robust, granular error handling.
 - Returning a standardized, structured response for consistent control flow.
 - Providing detailed, configurable console logging for all API calls.
 
-This version implements specific exception handling to return rich error details,
-enabling more sophisticated retry and debugging logic in the main pipeline.
+This rewritten version includes critical efficiency fixes for error handling,
+improved rate-limiting logic, and enhanced documentation for maintainability.
 
 Currently supported providers:
 - GeminiAPIManager: For Google's Gemini models.
@@ -27,8 +27,7 @@ import openai
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 
-# --- Formally define the structured API response using TypedDict ---
-# This improves code clarity and enables static analysis.
+# Formally define the structured API response using TypedDict for clarity and static analysis.
 class APIResponse(TypedDict):
     """A standardized structure for all API call results."""
     status: str  # e.g., "SUCCESS", "ERROR", "BLOCKED", "RATE_LIMITED"
@@ -47,40 +46,36 @@ class GeminiAPIManager:
         Initializes the Gemini API manager.
 
         Args:
-            api_keys (List[str]): A list of Gemini API keys.
-            model_quotas (Dict): A dictionary defining per-model rate limits (delay, rpd).
-            global_delay_seconds (int): A minimum delay between any two API calls.
+            api_keys (List[str]): A list of Gemini API keys for rotation.
+            model_quotas (Dict): Defines per-model rate limits (delay_seconds, rpd).
+            global_delay_seconds (int): A minimum delay between any two API calls, across all keys.
             config (Optional[Dict]): The main configuration dictionary to read control flags.
         """
         self.logger = logging.getLogger(__name__)
 
         if not api_keys:
             self.logger.critical("GeminiAPIManager initialized with an empty list of API keys. All calls will fail.")
-            raise ValueError("API keys list cannot be empty.")
+            raise ValueError("API keys list cannot be empty for GeminiAPIManager.")
 
         self.api_keys_list: List[str] = api_keys
         self.model_quotas: Dict[str, Dict[str, Any]] = model_quotas
         self.global_delay_seconds: int = global_delay_seconds
         
-        # Internal state for tracking key usage
+        # Internal state for tracking key usage and rate limits
         self.key_usage_timestamps: Dict[Tuple[str, str], float] = {}
         self.key_daily_counts: Dict[Tuple[str, str, str], int] = {}
         self.last_global_call_timestamp: float = 0
-        
         self.current_key_index: int = 0
-        self._lock = False
+        self._lock = False # A simple lock to prevent race conditions in key selection
 
-        # --- Read control flags from config ---
-        self.print_details = config.get("PRINT_API_CALL_DETAILS", False) if config else False
-        self.truncation_length = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50) if config else 50
-        
-        # --- NEW: Timing Checkpoint Feature ---
-        self._print_timing_checkpoints = config.get("PRINT_API_TIMING_CHECKPOINTS", False) if config else False
+        # Read control flags from config, with safe defaults
+        cfg = config or {}
+        self.print_details = cfg.get("PRINT_API_CALL_DETAILS", False)
+        self.truncation_length = cfg.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
+        self._print_timing_checkpoints = cfg.get("PRINT_API_TIMING_CHECKPOINTS", False)
         self._last_checkpoint_timestamp: Optional[float] = None
-        # --- End of Timing Checkpoint Feature ---
 
         self.logger.info(f"GeminiAPIManager initialized with {len(self.api_keys_list)} keys.")
-        
         try:
             genai.configure(api_key=self.api_keys_list[0])
             self.logger.info("Initial Gemini API configuration with the first key was successful.")
@@ -88,69 +83,79 @@ class GeminiAPIManager:
             self.logger.error(f"Initial Gemini API configuration failed. Error: {e}", exc_info=True)
 
     def _get_current_date_str(self) -> str:
-        """Returns the current UTC date as a formatted string."""
+        """Returns the current UTC date as a formatted string ('YYYY-MM-DD')."""
         return datetime.utcnow().strftime('%Y-%m-%d')
 
     def _get_available_key_and_sleep_time(self, model_name: str) -> Tuple[Optional[str], float]:
-        """Finds an available API key and calculates the necessary sleep time."""
+        """
+        Finds the next available API key and calculates the necessary sleep time.
+        
+        This method iterates through the key ring, checking both per-key/per-model
+        delays and daily request quotas. It also respects the global delay.
+        """
         if not self.api_keys_list:
             return None, 3600
 
         if self._lock:
             self.logger.warning("Key selection is locked; waiting.")
             return None, 5
-
         self._lock = True
-        current_time_val = time.time()
-        time_since_last_global_call = current_time_val - self.last_global_call_timestamp
-        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global_call)
-        
-        num_keys = len(self.api_keys_list)
-        start_index = self.current_key_index
-        model_specific_quotas = self.model_quotas.get(model_name, {})
-        required_per_key_delay = model_specific_quotas.get("delay_seconds", 1)
-        max_rpd = model_specific_quotas.get("rpd", float('inf'))
 
-        for i in range(num_keys):
-            key_idx = (start_index + i) % num_keys
-            current_api_key = self.api_keys_list[key_idx]
+        try:
+            current_time = time.time()
+            time_since_last_global = current_time - self.last_global_call_timestamp
+            global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
             
-            current_date_str = self._get_current_date_str()
-            daily_usage_key = (current_api_key, model_name, current_date_str)
-            current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
-            if current_daily_calls >= max_rpd:
-                continue
+            num_keys = len(self.api_keys_list)
+            model_quotas = self.model_quotas.get(model_name, {})
+            required_delay = model_quotas.get("delay_seconds", 1)
+            max_rpd = model_quotas.get("rpd", float('inf'))
 
-            last_call_timestamp_key = (current_api_key, model_name)
-            last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
-            time_since_last_call = current_time_val - last_call_time
-            per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
-            
-            final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
-            self.current_key_index = (key_idx + 1) % num_keys
+            for i in range(num_keys):
+                key_idx = (self.current_key_index + i) % num_keys
+                api_key = self.api_keys_list[key_idx]
+                
+                # Check daily quota
+                date_str = self._get_current_date_str()
+                daily_usage_key = (api_key, model_name, date_str)
+                if self.key_daily_counts.get(daily_usage_key, 0) >= max_rpd:
+                    continue # This key has hit its daily limit for this model
+
+                # Check time-based delay
+                last_call_key = (api_key, model_name)
+                time_since_last_call = current_time - self.key_usage_timestamps.get(last_call_key, 0)
+                per_key_sleep_needed = max(0, required_delay - time_since_last_call)
+                
+                # The final sleep time is the max of the global and per-key requirements
+                final_sleep = max(global_sleep_needed, per_key_sleep_needed)
+                self.current_key_index = (key_idx + 1) % num_keys
+                return api_key, final_sleep
+
+            self.logger.warning(f"All {num_keys} API keys are currently rate-limited for model '{model_name}'.")
+            return None, 3600
+        finally:
             self._lock = False
-            return current_api_key, final_sleep_duration
-
-        self._lock = False
-        self.logger.warning(f"All {num_keys} API keys are rate-limited for model '{model_name}'.")
-        return None, 3600
 
     def _record_api_call(self, api_key: str, model_name: str) -> None:
         """Records the timestamp and increments the daily count for a given key and model."""
         current_time = time.time()
         self.last_global_call_timestamp = current_time
         self.key_usage_timestamps[(api_key, model_name)] = current_time
-        current_date_str = self._get_current_date_str()
-        daily_usage_key = (api_key, model_name, current_date_str)
+        
+        date_str = self._get_current_date_str()
+        daily_usage_key = (api_key, model_name, date_str)
         self.key_daily_counts[daily_usage_key] = self.key_daily_counts.get(daily_usage_key, 0) + 1
         
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
-        """Generates content using the Gemini API, handling key selection, rate limiting, and specific errors."""
+        """
+        Generates content using the Gemini API, handling key selection, rate limiting, and errors.
         
+        This method orchestrates the entire call process, from getting a valid key to
+        handling specific exceptions and returning a standardized response.
+        """
         if self.print_details:
             print("\n" + "--- [API Call Start: Gemini] ---")
             print(f"Model: {model_name}, Temperature: {temperature}")
-            # MODIFIED: Print truncated prompt
             print("Prompt Sent (truncated):")
             print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
@@ -158,46 +163,41 @@ class GeminiAPIManager:
         api_key, sleep_time = self._get_available_key_and_sleep_time(model_name)
 
         if api_key is None:
-            error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
-            if self.print_details:
-                print(f"\n!!! [API Call FAILED: Gemini] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-            return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
+            msg = f"All API keys are proactively rate-limited for model '{model_name}'."
+            if self.print_details: print(f"\n!!! [API Call FAILED: Gemini] !!!\nError Type: ProactiveRateLimit\nDetails: {msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+            return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": msg, "error_details": None}
 
         if sleep_time > 0:
             self.logger.info(f"Rate limit requires sleeping for {sleep_time:.2f}s.")
             print(f"Sleeping for {sleep_time:.2f} seconds due to rate limiting.")
             time.sleep(sleep_time)
 
-        # --- NEW: Timing Checkpoint Logic ---
-        # This occurs after any sleep but before the API call is attempted.
-        current_call_start_time = time.time()
+        # Timing checkpoint logic (occurs after sleep, before the call)
+        call_start_time = time.time()
         if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-            elapsed = current_call_start_time - self._last_checkpoint_timestamp
+            elapsed = call_start_time - self._last_checkpoint_timestamp
             print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-        
-        # Update the timestamp for the *next* call's calculation.
-        self._last_checkpoint_timestamp = current_call_start_time
-        # --- End of Timing Checkpoint Logic ---
+        self._last_checkpoint_timestamp = call_start_time
 
         caught_exception = None
-
         try:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(model_name)
-            generation_config = genai.types.GenerationConfig(temperature=temperature) if temperature is not None else None
+            gen_config = genai.types.GenerationConfig(temperature=temperature) if temperature is not None else None
             
             self.logger.info(f"Calling Gemini model '{model_name}' with key ending in ...{api_key[-4:]}.")
-            response = model.generate_content(prompt, generation_config=generation_config)
+            response = model.generate_content(prompt, generation_config=gen_config)
+            
+            # CRITICAL FIX: Record the call ONLY after a successful API response.
             self._record_api_call(api_key, model_name)
 
             if not response.parts:
-                block_reason = "Unknown"
+                reason = "Unknown"
                 if response.prompt_feedback and response.prompt_feedback.block_reason:
-                    block_reason = response.prompt_feedback.block_reason.name
-                error_msg = f"Response was empty or blocked. Reason: {block_reason}."
-                if self.print_details:
-                    print(f"\n!!! [API Call BLOCKED: Gemini] !!!\nReason: {block_reason}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": error_msg, "error_details": str(response.prompt_feedback)}
+                    reason = response.prompt_feedback.block_reason.name
+                msg = f"Response was empty or blocked. Reason: {reason}."
+                if self.print_details: print(f"\n!!! [API Call BLOCKED: Gemini] !!!\nReason: {reason}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": msg, "error_details": str(response.prompt_feedback)}
             
             response_text = response.text
             if self.print_details:
@@ -208,29 +208,27 @@ class GeminiAPIManager:
             return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
 
         except google_exceptions.ResourceExhausted as e:
-            status, error_type, msg = "RATE_LIMITED", "ResourceExhausted", f"Gemini API rate limit exceeded: {e}"
+            status, etype, msg = "RATE_LIMITED", "ResourceExhausted", f"Gemini API rate limit exceeded: {e}"
             caught_exception = e
         except google_exceptions.InvalidArgument as e:
-            status, error_type, msg = "ERROR", "InvalidArgument", f"Invalid argument sent to Gemini API: {e}"
+            status, etype, msg = "ERROR", "InvalidArgument", f"Invalid argument to Gemini API (check API key or prompt content): {e}"
             caught_exception = e
         except Exception as e:
-            status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the Gemini API: {e}"
+            status, etype, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the Gemini API: {e}"
             caught_exception = e
         
-        self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {error_type}. Error: {msg}", exc_info=True)
-        self._record_api_call(api_key, model_name) 
+        self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {etype}. Error: {msg}", exc_info=True)
         if self.print_details:
             print(f"\n!!! [API Call FAILED: Gemini] !!!")
-            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
-            # MODIFIED: Print full prompt only on error
+            print(f"Model: {model_name}\nError Type: {etype}\nError Details:\n{repr(caught_exception)}")
             print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
         
-        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
+        return {"status": status, "text": None, "error_type": etype, "error_message": msg, "error_details": repr(caught_exception)}
 
 
 class AvalAIAPIManager:
     """
-    Manages API calls to an OpenAI-compatible endpoint like AvalAI with enhanced error handling.
+    Manages API calls to an OpenAI-compatible endpoint like AvalAI with robust error handling.
     """
     def __init__(self, api_key: str, base_url: str, model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
         """
@@ -239,92 +237,79 @@ class AvalAIAPIManager:
         Args:
             api_key (str): The API key for the service.
             base_url (str): The base URL of the API endpoint.
-            model_quotas (Dict): Configuration for rate limiting (e.g., delay).
+            model_quotas (Dict): Configuration for rate limiting (e.g., delay_seconds).
             global_delay_seconds (int): A minimum delay between any two API calls.
             config (Optional[Dict]): The main configuration dictionary to read control flags.
         """
         self.logger = logging.getLogger(__name__)
 
-        if not api_key or not base_url:
-            self.logger.critical("AvalAIAPIManager initialized with missing API key or base URL.")
-            raise ValueError("API key and base URL cannot be empty for AvalAIAPIManager.")
+        if not api_key or "YOUR_AVALAI_API_KEY" in api_key or not base_url:
+            self.logger.critical("AvalAIAPIManager initialized with missing or placeholder API key/base URL.")
+            raise ValueError("API key and base URL must be valid for AvalAIAPIManager.")
         
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
         self.model_quotas = model_quotas
-        
         self.global_delay_seconds = global_delay_seconds
+        
+        # Internal state for rate limiting
         self.last_global_call_timestamp: float = 0
         self.last_model_call_timestamps: Dict[str, float] = {}
         
-        # --- Read control flags from config ---
-        self.print_details = config.get("PRINT_API_CALL_DETAILS", False) if config else False
-        self.truncation_length = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50) if config else 50
-
-        # --- NEW: Timing Checkpoint Feature ---
-        self._print_timing_checkpoints = config.get("PRINT_API_TIMING_CHECKPOINTS", False) if config else False
+        cfg = config or {}
+        self.print_details = cfg.get("PRINT_API_CALL_DETAILS", False)
+        self.truncation_length = cfg.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
+        self._print_timing_checkpoints = cfg.get("PRINT_API_TIMING_CHECKPOINTS", False)
         self._last_checkpoint_timestamp: Optional[float] = None
-        # --- End of Timing Checkpoint Feature ---
         
         self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url}")
 
     def _apply_rate_limit_and_record(self, model_name: str) -> None:
         """
-        Applies rate limiting delays and then immediately records the timestamps
-        for the upcoming API call. This ensures the delay is measured from the
-        start of one call to the start of the next.
+        Calculates and applies the necessary sleep time, then records timestamps for the upcoming call.
         """
-        current_time_before_sleep = time.time()
+        time_before_sleep = time.time()
 
-        # 1. Calculate global sleep time needed based on the time before sleeping
-        time_since_last_global = current_time_before_sleep - self.last_global_call_timestamp
-        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
+        # Calculate required sleep based on time *before* sleeping
+        global_sleep = max(0, self.global_delay_seconds - (time_before_sleep - self.last_global_call_timestamp))
+        
+        model_quotas = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
+        model_delay = model_quotas.get("delay_seconds", 1)
+        model_sleep = max(0, model_delay - (time_before_sleep - self.last_model_call_timestamps.get(model_name, 0)))
+        
+        final_sleep = max(global_sleep, model_sleep)
+        
+        if final_sleep > 0:
+            self.logger.info(f"Rate limit requires sleeping for {final_sleep:.2f}s (Global: {global_sleep:.2f}s, Model: {model_sleep:.2f}s).")
+            print(f"Sleeping for {final_sleep:.2f} seconds due to rate limiting.")
+            time.sleep(final_sleep)
 
-        # 2. Calculate model-specific sleep time needed
-        model_specific_quotas = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
-        model_delay_seconds = model_specific_quotas.get("delay_seconds", 1)
+        # Get the timestamp *after* any sleep to mark the true start of the call attempt
+        call_start_time = time.time()
         
-        last_call_for_model = self.last_model_call_timestamps.get(model_name, 0)
-        time_since_last_model_call = current_time_before_sleep - last_call_for_model
-        model_sleep_needed = max(0, model_delay_seconds - time_since_last_model_call)
-        
-        # 3. Determine the final sleep duration and perform the sleep
-        final_sleep_duration = max(global_sleep_needed, model_sleep_needed)
-        
-        if final_sleep_duration > 0:
-            self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s (Global: {global_sleep_needed:.2f}s, Model: {model_sleep_needed:.2f}s).")
-            print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
-            time.sleep(final_sleep_duration)
-
-        # 4. Get the timestamp after any required sleep
-        current_call_start_time = time.time()
-        
-        # --- NEW: Timing Checkpoint Logic ---
+        # Timing checkpoint logic
         if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-            elapsed = current_call_start_time - self._last_checkpoint_timestamp
+            elapsed = call_start_time - self._last_checkpoint_timestamp
             print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
         
-        # Update the checkpoint timestamp for the next call's calculation.
-        self._last_checkpoint_timestamp = current_call_start_time
-        # --- End of Timing Checkpoint Logic ---
-
-        # 5. CRITICAL FIX: Record timestamps for rate-limiting *after* sleeping but *before* the API call.
-        self.last_global_call_timestamp = current_call_start_time
-        self.last_model_call_timestamps[model_name] = current_call_start_time
+        # Record timestamps for rate-limiting *after* sleeping but *before* the API call.
+        self._last_checkpoint_timestamp = call_start_time
+        self.last_global_call_timestamp = call_start_time
+        self.last_model_call_timestamps[model_name] = call_start_time
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
-        """Generates content using an OpenAI-compatible API, handling rate limiting and specific errors."""
+        """
+        Generates content using an OpenAI-compatible API, handling rate limiting and errors.
+        """
         self._apply_rate_limit_and_record(model_name)
 
         if self.print_details:
             print("\n" + "--- [API Call Start: AvalAI] ---")
             print(f"Model: {model_name}, Temperature: {temperature}")
-            # MODIFIED: Print truncated prompt
             print("Prompt Sent (truncated):")
             print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
         caught_exception = None
-
         try:
             self.logger.info(f"Calling OpenAI-compatible model '{model_name}'.")
             
@@ -335,11 +320,9 @@ class AvalAIAPIManager:
             )
 
             if not completion.choices:
-                error_msg = "Response was empty or blocked (no choices returned)."
-                self.logger.warning(f"API call to '{model_name}' returned no choices.")
-                if self.print_details:
-                    print(f"\n!!! [API Call BLOCKED: AvalAI] !!!\nReason: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": error_msg, "error_details": None}
+                msg = "Response was empty or blocked (no choices returned)."
+                if self.print_details: print(f"\n!!! [API Call BLOCKED: AvalAI] !!!\nReason: {msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": msg, "error_details": None}
 
             response_text = completion.choices[0].message.content
             if self.print_details:
@@ -349,28 +332,26 @@ class AvalAIAPIManager:
 
             return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
 
-        # --- Granular Exception Handling ---
         except openai.RateLimitError as e:
-            status, error_type, msg = "RATE_LIMITED", "RateLimitError", f"OpenAI API rate limit exceeded: {e}"
+            status, etype, msg = "RATE_LIMITED", "RateLimitError", f"OpenAI API rate limit exceeded: {e}"
             caught_exception = e
         except openai.APIStatusError as e:
-            status, error_type, msg = "ERROR", "APIStatusError", f"OpenAI API returned an error status {e.status_code}: {e.response}"
+            status, etype, msg = "ERROR", "APIStatusError", f"OpenAI API returned an error status {e.status_code}: {e.response}"
             caught_exception = e
         except openai.APITimeoutError as e:
-            status, error_type, msg = "ERROR", "APITimeoutError", f"OpenAI API request timed out: {e}"
+            status, etype, msg = "ERROR", "APITimeoutError", f"OpenAI API request timed out: {e}"
             caught_exception = e
         except openai.APIConnectionError as e:
-            status, error_type, msg = "ERROR", "APIConnectionError", f"Failed to connect to OpenAI API: {e}"
+            status, etype, msg = "ERROR", "APIConnectionError", f"Failed to connect to OpenAI API: {e}"
             caught_exception = e
         except Exception as e:
-            status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the OpenAI API: {e}"
+            status, etype, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the OpenAI API: {e}"
             caught_exception = e
 
-        self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
+        self.logger.error(f"OpenAI API call FAILED. Type: {etype}. Error: {msg}", exc_info=True)
         if self.print_details:
             print(f"\n!!! [API Call FAILED: AvalAI] !!!")
-            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
-            # MODIFIED: Print full prompt only on error
+            print(f"Model: {model_name}\nError Type: {etype}\nError Details:\n{repr(caught_exception)}")
             print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
         
-        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
+        return {"status": status, "text": None, "error_type": etype, "error_message": msg, "error_details": repr(caught_exception)}
