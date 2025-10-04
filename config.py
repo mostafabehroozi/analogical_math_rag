@@ -31,7 +31,7 @@ CONFIG = {
     # --- 2. Logging & Control Settings ---
     "VERBOSE_LOGGING": True,  # Master switch for detailed print statements to the console.
     "PRINT_API_CALL_DETAILS": True, # Master switch to print detailed API call info (prompt, response, errors) to the console.
-    "PRINT_API_TIMING_CHECKPOINTS": True, # NEW: Prints the time elapsed between the start of consecutive API calls.
+    "PRINT_API_TIMING_CHECKPOINTS": True, # Prints the time elapsed between the start of consecutive API calls.
     "API_RESPONSE_TRUNCATION_LENGTH": 50, # Control truncation for successful API responses.
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "LOGS_DIR": LOGS_DIR, # Directory where detailed run logs will be saved.
@@ -39,7 +39,7 @@ CONFIG = {
     "RESULTS_DIR": RESULTS_DIR,
 
     # --- 3. API Provider Selection ---
-    # NEW: Master switch to select the API provider.
+    # Master switch to select the API provider.
     # Options: "gemini" or "avalai"
     "API_PROVIDER": "gemini",
 
@@ -51,19 +51,20 @@ CONFIG = {
     ],
     # Per-model and global rate limiting settings.
     "GEMINI_MODEL_QUOTAS": {
-        "gemini-1.5-flash": {"delay_seconds": 4, "rpd": 500},
-        "gemini-2.5-flash": {"delay_seconds": 15, "rpd": 200},
-        "gemini-2.5-pro": {"delay_seconds": 20, "rpd": 25},
+        # MODIFIED: These model names can be updated to match the new format
+        "models/gemma-2-9b-it": {"delay_seconds": 4, "rpd": 500},
+        "models/gemma-2-27b-it": {"delay_seconds": 20, "rpd": 100},
     },
     "GLOBAL_API_CALL_DELAY_SECONDS": 5, # A minimum delay between any two API calls, regardless of the key.
 
-    # Names of the models to be used for different pipeline stages.
-    "GEMINI_MODEL_NAME_ADAPTATION": "gemini-2.5-flash",    # For transformation, summarization, merging.
-    "GEMINI_MODEL_NAME_FINAL_SOLVER": "gemini-2.5-flash", # For generating the final solution.
-    "GEMINI_MODEL_NAME_EVALUATOR": "gemini-2.5-flash",    # For LLM-based evaluation.
+    # MODIFIED: Names of the models to be used for different pipeline stages.
+    # Using the new, fully-qualified model name format.
+    "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-2-9b-it",    # For transformation, summarization, merging. A faster model is often sufficient.
+    "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-2-27b-it", # For generating the final solution. A more powerful model is better here.
+    "GEMINI_MODEL_NAME_EVALUATOR": "models/gemma-2-9b-it",    # For LLM-based evaluation. A faster model is sufficient.
 
     # --- 5. AvalAI (OpenAI-Compatible) API Settings ---
-    # NEW: These settings are used ONLY if API_PROVIDER is set to "avalai".
+    # These settings are used ONLY if API_PROVIDER is set to "avalai".
     "AVALAI_API_KEY": "YOUR_AVALAI_API_KEY_HERE",
     "AVALAI_BASE_URL": "https://api.avalai.ir/v1",
 
@@ -77,12 +78,20 @@ CONFIG = {
     "AVALAI_MODEL_NAME_FINAL_SOLVER": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
 
-    # --- 6. Generic LLM Temperature Settings ---
+    # --- 6. Generic LLM Generation Settings ---
     # These settings are provider-agnostic and will be used by whichever manager is active.
+    
+    # Temperature Settings
     "DEFAULT_ADAPTATION_TEMPERATURE": 0.0,   # Low temp for deterministic tasks like reformatting.
     "DEFAULT_FINAL_SOLVER_TEMPERATURE": 1.0, # High temp for creative/diverse single-pass solutions.
     "DEFAULT_PASS_N_SOLVER_TEMPERATURE": 1.0,# High temp for generating diverse attempts in Pass@N.
     "DEFAULT_EVALUATOR_TEMPERATURE": 0.0,    # Low temp for deterministic, consistent evaluation.
+
+    # NEW: Max Output Tokens Settings
+    # These will be used to construct the `GenerationConfig` for Gemini calls.
+    "DEFAULT_ADAPTATION_MAX_TOKENS": 10000,   # Adaptation tasks (standardization, transformation) are usually short.
+    "DEFAULT_FINAL_SOLVER_MAX_TOKENS": 10000, # Allow plenty of room for complex reasoning and step-by-step solutions.
+    "DEFAULT_EVALUATOR_MAX_TOKENS": 10000,     # Evaluation produces a very short, structured response.
 
     # --- 7. File Paths, Data & Embedding Settings ---
     "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',
