@@ -72,15 +72,15 @@ Question: [Original Question from the 'Sample to Transform']
 Rationale and Answer: [Transformed Rationale, followed by the Original Answer from the 'Sample to Transform']
 """,
 
-    "merging_v1": """You are provided with a main question and two adapted samples, each consisting of a question and its rationale plus answer. Your task is to merge these samples into a single, more potent sample. Combine their rationales into a cohesive and concise rationale that is highly relevant to solving the main question. The merged sample must retain the same format and preserve critical reasoning.
+    "merging_v1": """You are provided with a main question and two samples, each consisting of a question and its rationale plus answer. Your task is to merge these samples into a single, more potent sample. Combine their rationales into a cohesive and concise rationale that is highly relevant to solving the main question. The merged sample must retain the same format and preserve critical reasoning.
 
 **Main Question:**
 {target_query}
 
-**Adapted Sample 1:**
+**Sample 1:**
 {sample_1}
 
-**Adapted Sample 2:**
+**Sample 2:**
 {sample_2}
 
 **Instructions:**
@@ -122,6 +122,34 @@ Final Answer:
 **Your Solution:**
 """,
     
+    # --- NEW: final_solver_v2 Template ---
+    "final_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+
+
+<Instructions>
+Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
     "final_solver_simple_v1": """**Objective:**
 Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
 
@@ -218,17 +246,37 @@ def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str
     template = PROMPT_TEMPLATES["merging_v1"]
     return template.format(target_query=target_query, sample_1=samples_to_merge[0], sample_2=samples_to_merge[1])
 
-def create_final_reasoning_prompt(main_question_text: str, final_adapted_samples: List[str]) -> str:
-    """Creates the final prompt for the solver, including adapted samples (RAG)."""
-    if not final_adapted_samples:
-        return "Error: At least one adapted sample is required for the standard final reasoning prompt."
+def create_final_reasoning_prompt(main_question_text: str, final_examples: List[str], config: Dict[str, Any]) -> str:
+    """
+    Creates the final prompt for the solver, including processed examples (RAG).
+    This function now dynamically selects the template and formats the examples
+    based on the template's requirements.
+    """
+    if not final_examples:
+        return "Error: At least one example is required for the RAG-based final reasoning prompt."
 
-    samples_block = ""
-    for i, sample_text in enumerate(final_adapted_samples):
-        samples_block += f"\n**Adapted Sample {i+1}:**\n{sample_text}\n"
+    template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER", "final_solver_v2")
+    template = PROMPT_TEMPLATES[template_name]
     
-    template = PROMPT_TEMPLATES["final_solver_v1"]
-    return template.format(main_question_text=main_question_text, adapted_samples_block=samples_block.strip())
+    # --- MODIFIED: Dynamic block creation based on template ---
+    if template_name == "final_solver_v2":
+        # Format for the new v2 template with XML-style tags
+        examples_block = ""
+        for i, sample_text in enumerate(final_examples):
+            examples_block += f"<Example {i+1}>\n{sample_text}\n</Example {i+1}>\n\n"
+        return template.format(main_question_text=main_question_text, examples_block=examples_block.strip())
+    
+    elif template_name == "final_solver_v1":
+        # Original formatting for the v1 template
+        samples_block = ""
+        for i, sample_text in enumerate(final_examples):
+            samples_block += f"\n**Adapted Sample {i+1}:**\n{sample_text}\n"
+        return template.format(main_question_text=main_question_text, adapted_samples_block=samples_block.strip())
+    
+    else:
+        # Fallback or error for unknown templates
+        return f"Error: Unknown final solver template '{template_name}' specified in config."
+
 
 def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[str, Any]) -> str:
     """Creates the final prompt for the solver without any adapted samples (No RAG)."""

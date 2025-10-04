@@ -130,7 +130,8 @@ CONFIG = {
     "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
     "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
-    "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v1",
+    # MODIFIED: Default solver prompt is now v2.
+    "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
 

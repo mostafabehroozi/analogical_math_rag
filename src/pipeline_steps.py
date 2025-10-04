@@ -282,7 +282,8 @@ def solve(
     # --- END OF NEW LOGIC ---
 
     # --- Original Solver Logic ---
-    prompt = create_final_reasoning_prompt(target_query, final_exemplars) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
+    # MODIFIED: Pass config to the prompt creation function
+    prompt = create_final_reasoning_prompt(target_query, final_exemplars, config) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
     logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
     if "Error:" in prompt:
