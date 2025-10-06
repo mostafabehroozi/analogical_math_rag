@@ -52,8 +52,7 @@ CONFIG = {
     # Per-model and global rate limiting settings.
     "GEMINI_MODEL_QUOTAS": {
         # MODIFIED: These model names can be updated to match the new format
-        "models/gemma-2-9b-it": {"delay_seconds": 4, "rpd": 500},
-        "models/gemma-2-27b-it": {"delay_seconds": 20, "rpd": 100},
+        "models/gemma-3-27b-it": {"delay_seconds": 20, "rpd": 100},
     },
     "GLOBAL_API_CALL_DELAY_SECONDS": 5, # A minimum delay between any two API calls, regardless of the key.
 
