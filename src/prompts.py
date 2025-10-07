@@ -98,6 +98,68 @@ Question: [New Merged Question]
 Rationale and Answer: [Merged Rationale and Answer]
 """,
 
+    "merging_2" : """You are an expert in analogical reasoning for mathematical problem-solving.  
+Your task is to merge two solved math problems into a single new, synthesized problem-solution pair that will serve as a strong exemplar for solving a target question.  
+
+These two input samples are called Parent Sample A and Parent Sample B, because they will be merged to form one new "child" example.   
+The child example should combine the most relevant and valuable reasoning patterns from its parents in a coherent, context-aware manner.
+
+
+<Your Objective> 
+Create a new merged example that:
+1. Retains the core reasoning structures and mathematical logic from both Parent A and Parent B.
+2. Selectively integrates only the parts most relevant to the Target Question. 
+3. Produces a new, logically consistent and useful exemplar that the LLM can learn from for analogical reasoning.
+</Your Objective> 
+
+
+</Core Guidelines> 
+1. Principled Construction from Parent Materials   
+- Use the reasoning chains, strategies, and key steps from both parents.  
+- Avoid inventing completely new mathematical methods.  
+- Preserve the internal logic and structure of the parent materials.
+
+2. Guided by the Target Question   
+- The merge must be performed in the context of the Target Question.   
+- Keep and emphasize the parts of each parent that are most helpful for solving the target question.   
+- If one parent is much more relevant, prioritize it — the merge does not need to be symmetrical.
+
+3. Coherence and Controlled Generation  
+- You may add minor connective text to make the final reasoning smooth and clear.  
+- The merged result must be mathematically correct, coherent, and self-contained.
+
+4. Superficial Re-contextualization 
+- Adapt the merged sample’s phrasing and structure so it stylistically resembles the Target Question.  
+- Do not alter the core mathematics — only adjust presentation and framing.
+
+5. Relevance-Driven Asymmetry 
+- It is acceptable if the final merged sample resembles one parent more than the other.  
+- Discard irrelevant parts. The goal is maximum usefulness, not balance. 
+</Core Guidelines> 
+
+
+</Input Materials>  
+Parent Sample A: 
+{sample_1}
+
+Parent Sample B:
+{sample_2}
+
+Target Question: 
+{target_query}
+</Input Materials> 
+
+
+<Output Instructions> 
+You must output ONLY in the following format.   
+Do not include any explanations, comments, or text outside this format.  
+
+Output Format (Strictly follow this format):  
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output Instructions> 
+""",
+
     "final_solver_v1": """**Objective:**
 Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
 
