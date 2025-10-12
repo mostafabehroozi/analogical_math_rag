@@ -98,7 +98,7 @@ Question: [New Merged Question]
 Rationale and Answer: [Merged Rationale and Answer]
 """,
 
-    "merging_2" : """You are an expert in analogical reasoning for mathematical problem-solving.  
+    "merging_v2" : """You are an expert in analogical reasoning for mathematical problem-solving.  
 Your task is to merge two solved math problems into a single new, synthesized problem-solution pair that will serve as a strong exemplar for solving a target question.  
 
 These two input samples are called Parent Sample A and Parent Sample B, because they will be merged to form one new "child" example.   
