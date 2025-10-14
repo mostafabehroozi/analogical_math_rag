@@ -72,6 +72,86 @@ Question: [Original Question from the 'Sample to Transform']
 Rationale and Answer: [Transformed Rationale, followed by the Original Answer from the 'Sample to Transform']
 """,
 
+    "transformation_light":"""<Objective>
+Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
+
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question’s area, structure, or style — while still preserving the sample’s original reasoning path and final answer.
+</Objective>
+
+
+
+<Transformation Guidelines>
+Target-Directed Adaptation:
+-Transform the sample in a way that brings it conceptually and structurally closer to the Target Question.
+-Think of this as reframing the sample so it feels like it belongs to the same world or problem type as the Target Question.
+-Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.
+
+Preserve Core Reasoning:
+-Keep the logical relations, steps, and reasoning strategy intact.
+-Do not change the essential operations or the fundamental reasoning pattern that lead to the solution. The method of solving should be identical.
+
+Avoid Deep or Complex Alterations:
+-Do not transform very deep or complex internal structures (like full reasoning chains or logic patterns).
+-Instead, you may adjust surface-level or moderately deep aspects — such as the domain, quantities, entities, or context in both the question and the rationale.
+
+Maintain Naturalness and Clarity:
+-The transformed question and its rationale must sound natural, be solvable, and be clearly written.
+-The transformed rationale should flow logically and directly solve the transformed question.
+
+Keep the Final Answer Unchanged:
+-The final numerical or categorical answer at the end of the rationale must not be changed. It should remain exactly as it was in the original sample.
+
+</Transformation Guidelines>
+</Example Transformation>
+<Example Input>
+Target Question: A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
+
+Sample to Transform:
+
+Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
+
+Rationale:
+To find the remaining cookies, we first need to calculate how many cookies were sold.
+The baker sold 7 boxes, and each box contains 6 cookies.
+Total cookies sold = 7 boxes * 6 cookies/box = 42 cookies.
+The baker started with 50 cookies.
+Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
+
+Final Answer: 8
+</Example Input>
+</Example Output>
+Question: A scientist starts with 28 test tubes for an analysis. She arranges them into racks, with each rack holding 4 test tubes. If she uses 5 full racks for her experiment, how many test tubes are left unused?
+
+Rationale:
+To find the remaining test tubes, we first need to calculate how many test tubes were used.
+The scientist used 5 racks, and each rack contains 4 test tubes.
+Total test tubes used = 5 racks * 4 test tubes/rack = 20 test tubes.
+The scientist started with 28 test tubes.
+Remaining test tubes = Initial amount - Amount used = 28 - 20 = 8 test tubes.
+
+Final Answer: 8
+</Example Output>
+</Example Transformation>
+
+<Task>
+<Input>
+Target Question: 
+{target_query}
+
+Sample to Transform:
+{text_to_transform}
+</Input>
+
+<Output>
+Question: [Your Transformed question]
+
+Rationale: [Your Transformed reasoning]
+
+Final Answer: [Your (may Transformed)clean and direct final answer]
+</Output>
+</Task>
+""",
+
     "merging_v1": """You are provided with a main question and two samples, each consisting of a question and its rationale plus answer. Your task is to merge these samples into a single, more potent sample. Combine their rationales into a cohesive and concise rationale that is highly relevant to solving the main question. The merged sample must retain the same format and preserve critical reasoning.
 
 **Main Question:**
