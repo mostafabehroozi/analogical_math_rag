@@ -374,9 +374,14 @@ def create_standardization_prompt(original_example: str) -> str:
     template = PROMPT_TEMPLATES["standardization_v1"]
     return template.format(original_example=original_example)
 
-def create_transformation_prompt(target_query: str, text_to_transform: str) -> str:
-    """Creates a prompt for the 'transformation' pipeline step."""
-    template = PROMPT_TEMPLATES["transformation_v1"]
+def create_transformation_prompt(target_query: str, text_to_transform: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt for the 'transformation' pipeline step.
+    This function now dynamically selects the template based on the config.
+    """
+    # Dynamically get the template name from the config, with a fallback to "transformation_v1".
+    template_name = config.get("PROMPT_TEMPLATE_TRANSFORMATION", "transformation_v1")
+    template = PROMPT_TEMPLATES[template_name]
     return template.format(target_query=target_query, text_to_transform=text_to_transform)
 
 def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str:

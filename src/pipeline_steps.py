@@ -142,8 +142,7 @@ def adapt(
         if apply_transform and not step_failed:
             logger.info(f"Applying transformation to exemplar index {idx}.")
             print(f"    -> Transforming exemplar {idx}...")
-            prompt = create_transformation_prompt(target_query, current_text)
-            
+            prompt = create_transformation_prompt(target_query, current_text, config)
             print(f"      [API Context] Calling LLM for: Transformation (Exemplar #{idx})")
             response = api_manager.generate_content(prompt, model_name, temperature)
 
