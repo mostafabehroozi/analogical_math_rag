@@ -143,11 +143,11 @@ Sample to Transform:
 </Input>
 
 <Output>
-Question: [Your Transformed question]
+- Do not include any explanations, comments, or text outside this format.  
 
-Rationale: [Your Transformed reasoning]
-
-Final Answer: [Your (may Transformed)clean and direct final answer]
+Output Format (Strictly follow this format):  
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
 </Output>
 </Task>
 """,
@@ -193,7 +193,7 @@ Create a new merged example that:
 </Your Objective> 
 
 
-</Core Guidelines> 
+<Core Guidelines> 
 1. Principled Construction from Parent Materials   
 - Use the reasoning chains, strategies, and key steps from both parents.  
 - Avoid inventing completely new mathematical methods.  
