@@ -51,63 +51,43 @@ Rationale: [Your rewritten reasoning here, written clearly and step by step]
 Final Answer: [Your clean and direct final answer]
 """,
 
-    "transformation_v1": """You are provided with a **Main Question** and a **Sample to Transform**.
-Your task is to transform the **Sample's Rationale** into a version that is more aligned with the **Main Question**, while ensuring it remains accurate to its own question.
-
-**Main Question:**
-{target_query}
-
-**Sample to Transform:**
-{text_to_transform}
-
-**Instructions for Transforming the Sample's Rationale:**
-1. Analyze the **Sample's Rationale** in the context of its own question to understand its core reasoning.
-2. Rewrite the rationale, prioritizing elements most transferable to solving the **Main Question**.
-3. Use clear, straightforward language.
-4. Do not alter the core logic to solve the **Main Question**, nor modify the **Sample's Question** or its **Final Answer** (as presented in the 'Sample to Transform').
-5. Ensure the transformed rationale clearly conveys the reasoning flow.
-
-**Output Format (Strictly follow this format, including the exact headers 'Question:' and 'Rationale and Answer:')**:
-Question: [Original Question from the 'Sample to Transform']
-Rationale and Answer: [Transformed Rationale, followed by the Original Answer from the 'Sample to Transform']
-""",
-
-    "transformation_light":"""<Objective>
+    "transformation_shallow" : """<Objective>
 Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
-
-The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question’s area, structure, or style — while still preserving the sample’s original reasoning path and final answer.
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question’s theme, context, or style — while strictly preserving the sample’s original reasoning path and final answer.
 </Objective>
-
-
 
 <Transformation Guidelines>
 Target-Directed Adaptation:
--Transform the sample in a way that brings it conceptually and structurally closer to the Target Question.
--Think of this as reframing the sample so it feels like it belongs to the same world or problem type as the Target Question.
--Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.
+- Adapt the sample's theme, context, and entities to mirror those in the Target Question.
+- Think of this as reframing the sample so it feels like it belongs to the same world or problem type as the Target Question.
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.
+
 
 Preserve Core Reasoning:
--Keep the logical relations, steps, and reasoning strategy intact.
--Do not change the essential operations or the fundamental reasoning pattern that lead to the solution. The method of solving should be identical.
+- The underlying logical pathway and mathematical operations must remain identical.
+- Do not alter the sequence of steps, the problem-solving strategy, or how one calculation leads to the next. The core method of solving must be perfectly preserved.
 
-Avoid Deep or Complex Alterations:
--Do not transform very deep or complex internal structures (like full reasoning chains or logic patterns).
--Instead, you may adjust surface-level or moderately deep aspects — such as the domain, quantities, entities, or context in both the question and the rationale.
+Restrict Transformations to the Surface Level:
+- Your transformations must be limited to the surface and contextual layers of the problem.
+- This includes changing nouns (entities, objects), numbers and quantities (while ensuring the logic and final answer are preserved), and the overall setting or story.
+- Do not change the fundamental problem structure or the reasoning schema. The goal is to change the "story" of the problem, not the "logic" of the solution.
 
-Maintain Naturalness and Clarity:
--The transformed question and its rationale must sound natural, be solvable, and be clearly written.
--The transformed rationale should flow logically and directly solve the transformed question.
+Maintain Naturalness, Clarity, and Safety:
+- The transformed question and rationale must remain natural, realistic, and logically coherent.
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., “a cat eats an apple to calculate distance”).
+- If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes.
+- Always prioritize clarity, realism, and logical consistency over aggressive transformation.
 
 Keep the Final Answer Unchanged:
--The final numerical or categorical answer at the end of the rationale must not be changed. It should remain exactly as it was in the original sample.
+- The final numerical or categorical answer at the end of the rationale must not be changed. It should remain exactly as it was in the original sample.
 
 </Transformation Guidelines>
 </Example Transformation>
+
 <Example Input>
 Target Question: A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
 
 Sample to Transform:
-
 Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
 
 Rationale:
@@ -119,6 +99,7 @@ Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
 
 Final Answer: 8
 </Example Input>
+
 </Example Output>
 Question: A scientist starts with 28 test tubes for an analysis. She arranges them into racks, with each rack holding 4 test tubes. If she uses 5 full racks for her experiment, how many test tubes are left unused?
 
@@ -135,7 +116,7 @@ Final Answer: 8
 
 <Task>
 <Input>
-Target Question: 
+Target Question:
 {target_query}
 
 Sample to Transform:
@@ -143,14 +124,175 @@ Sample to Transform:
 </Input>
 
 <Output>
-- Do not include any explanations, comments, or text outside this format.  
+- Do not include any explanations, comments, or text outside this format.
 
-Output Format (Strictly follow this format):  
+Output Format (Strictly follow this format):
 Question: [New Merged Question]
 Rationale and Answer: [Merged Rationale and Answer]
 </Output>
 </Task>
 """,
+    "transformation_complete":"""<Objective>
+Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
+The transformation should be holistic, aiming to align the sample with the Target Question on multiple levels—from surface features like entities and context to deeper conceptual and structural similarities. The goal is to reframe the sample to make its reasoning pattern as clear and applicable as possible for solving the Target Question, while strictly preserving the sample's original reasoning process and final answer.
+</Objective>
+
+<Transformation Guidelines>
+Target-Directed Adaptation:
+- Transform the sample in a way that brings it conceptually, thematically, and structurally closer to the Target Question.
+- Think of this as reframing the sample so it feels like it belongs to the same problem family or domain as the Target Question.
+- Any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.
+
+Depth-Aware Adaptation:
+- Transformations can occur at any depth. Shallow changes (e.g., swapping entities, adjusting context) are often safer and should be prioritized when they effectively create a strong analogy.
+- Moderately deep changes (e.g., altering the scenario to match the target's domain) are also encouraged.
+- Deeper structural or conceptual transformations are permissible but should only be performed if they are meaningful, non-disruptive, and significantly improve the analogical link without corrupting the core logic.
+- Gently favor shallow-to-mid-level adaptations, as they are less likely to introduce errors, but do not avoid deeper changes if the opportunity for a safe and powerful transformation exists.
+
+Preserve Core Reasoning:
+- The fundamental logical steps, mathematical operations, and the overall reasoning strategy of the sample must remain completely intact.
+- The method of solving the problem is the core pattern to be preserved; do not alter how the solution is derived.
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed question and rationale must be natural, realistic, and logically coherent.
+- Avoid any nonsensical or forced transformations. If a meaningful adaptation is not possible at a certain depth, it is better to keep that part of the sample closer to the original.
+- Always prioritize logical consistency and clarity over aggressive or risky transformations.
+
+Keep the Final Answer Unchanged:
+- The final numerical or categorical answer at the end of the rationale must not be changed. It must remain exactly as it was in the original sample.
+
+</Transformation Guidelines>
+</Example Transformation>
+
+<Example Input>
+Target Question: A spaceship has 120 units of fuel. Its main engine consumes 15 units per hour, and its auxiliary systems consume 5 units per hour. How many hours can the spaceship operate before running out of fuel?
+
+Sample to Transform:
+
+Question: A charity has a fund of $5,000. It spends $400 per month on rent and $100 per month on utilities. How many months can the charity operate before the fund is depleted?
+
+Rationale:
+To find out how long the fund will last, we first need to calculate the total monthly expenses.
+The total monthly expense is the sum of rent and utilities.
+Total expenses per month = $400 (rent) + $100 (utilities) = $500.
+The total fund is $5,000.
+Number of months the fund will last = Total fund / Total monthly expenses = $5,000 / $500 = 10 months.
+
+Final Answer: 10
+</Example Input>
+
+</Example Output>
+Question: A research station has a 5000-liter water tank. The main water purifier processes 400 liters per day, and a secondary filtration system uses an additional 100 liters per day. For how many days will the water supply last?
+
+Rationale:
+To find out how long the water supply will last, we first need to calculate the total daily water consumption.
+The total daily consumption is the sum of water for the purifier and the filtration system.
+Total consumption per day = 400 liters (purifier) + 100 liters (filtration) = 500 liters.
+The total water supply is 5000 liters.
+Number of days the supply will last = Total supply / Total daily consumption = 5000 / 500 = 10 days.
+
+Final Answer: 10
+</Example Output>
+</Example Transformation>
+
+<Task>
+<Input>
+Target Question:
+{target_query}
+
+Sample to Transform:
+{text_to_transform}
+</Input>
+
+<Output>
+- Do not include any explanations, comments, or text outside this format.
+
+Output Format (Strictly follow this format):
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output>
+</Task>""" ,
+    
+    "transformation_shallow-&-moderately-deep" : """<Objective>   
+Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question’s area, structure, or style — while still preserving the sample’s original reasoning path and final answer.
+</Objective>
+
+<Transformation Guidelines>  
+Target-Directed Adaptation:  
+- Transform the sample in a way that brings it conceptually and structurally closer to the Target Question.  
+- Think of this as reframing the sample so it feels like it belongs to the same world or problem type as the Target Question.  
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.  
+
+Preserve Core Reasoning:
+- Keep the logical relations, steps, and reasoning strategy intact. 
+- Do not change the essential operations or the fundamental reasoning pattern that lead to the solution. The method of solving should be identical. 
+
+Avoid Deep or Complex Alterations:
+- Do not transform very deep or complex internal structures (like full reasoning chains or logic patterns). 
+- Instead, you may adjust surface-level or moderately deep aspects — such as the domain, quantities, entities, or context in both the question and the rationale. 
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed question and rationale must remain natural, realistic, and logically coherent. 
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., “a cat eats an apple to calculate distance”). 
+- If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes. 
+- Always prioritize clarity, realism, and logical consistency over aggressive transformation. 
+
+Keep the Final Answer Unchanged:
+- The final numerical or categorical answer at the end of the rationale must not be changed. It should remain exactly as it was in the original sample.
+
+</Transformation Guidelines>
+</Example Transformation>
+
+<Example Input>
+Target Question: A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
+
+Sample to Transform:
+
+Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
+
+Rationale:
+To find the remaining cookies, we first need to calculate how many cookies were sold.
+The baker sold 7 boxes, and each box contains 6 cookies.
+Total cookies sold = 7 boxes * 6 cookies/box = 42 cookies.
+The baker started with 50 cookies.
+Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
+
+Final Answer: 8
+</Example Input>
+
+</Example Output>
+Question: A scientist starts with 28 test tubes for an analysis. She arranges them into racks, with each rack holding 4 test tubes. If she uses 5 full racks for her experiment, how many test tubes are left unused?
+
+Rationale:
+To find the remaining test tubes, we first need to calculate how many test tubes were used.
+The scientist used 5 racks, and each rack contains 4 test tubes.
+Total test tubes used = 5 racks * 4 test tubes/rack = 20 test tubes.
+The scientist started with 28 test tubes.
+Remaining test tubes = Initial amount - Amount used = 28 - 20 = 8 test tubes.
+
+Final Answer: 8
+</Example Output>
+</Example Transformation>
+
+<Task>  
+<Input>  
+Target Question:  
+{target_query}  
+
+Sample to Transform:
+{text_to_transform}
+</Input>
+
+<Output>  
+- Do not include any explanations, comments, or text outside this format.  
+
+Output Format (Strictly follow this format):
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output>
+</Task>
+""" ,
 
     "merging_v1": """You are provided with a main question and two samples, each consisting of a question and its rationale plus answer. Your task is to merge these samples into a single, more potent sample. Combine their rationales into a cohesive and concise rationale that is highly relevant to solving the main question. The merged sample must retain the same format and preserve critical reasoning.
 
