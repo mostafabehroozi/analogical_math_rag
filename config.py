@@ -127,7 +127,7 @@ CONFIG = {
 
     # --- 10. Prompt Template Selection ---
     "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
-    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_light",
+    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_complete",
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
     # MODIFIED: Default solver prompt is now v2.
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
