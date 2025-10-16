@@ -74,7 +74,7 @@ Restrict Transformations to the Surface Level:
 
 Maintain Naturalness, Clarity, and Safety:
 - The transformed question and rationale must remain natural, realistic, and logically coherent.
-- Avoid any unnatural, illogical, or meaningless transformations (e.g., “a cat eats an apple to calculate distance”).
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., “a cat eats an apple”).
 - If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes.
 - Always prioritize clarity, realism, and logical consistency over aggressive transformation.
 
@@ -211,7 +211,8 @@ Output Format (Strictly follow this format):
 Question: [New Merged Question]
 Rationale and Answer: [Merged Rationale and Answer]
 </Output>
-</Task>""" ,
+</Task>
+""" ,
     
     "transformation_shallow-&-moderately-deep" : """<Objective>   
 Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
@@ -234,7 +235,7 @@ Avoid Deep or Complex Alterations:
 
 Maintain Naturalness, Clarity, and Safety:
 - The transformed question and rationale must remain natural, realistic, and logically coherent. 
-- Avoid any unnatural, illogical, or meaningless transformations (e.g., “a cat eats an apple to calculate distance”). 
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., “a cat eats an apple”). 
 - If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes. 
 - Always prioritize clarity, realism, and logical consistency over aggressive transformation. 
 
