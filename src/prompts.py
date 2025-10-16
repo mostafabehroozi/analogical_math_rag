@@ -50,7 +50,28 @@ Rationale: [Your rewritten reasoning here, written clearly and step by step]
 
 Final Answer: [Your clean and direct final answer]
 """,
+    
+    "transformation_v1": """You are provided with a **Main Question** and a **Sample to Transform**.
+Your task is to transform the **Sample's Rationale** into a version that is more aligned with the **Main Question**, while ensuring it remains accurate to its own question.
 
+**Main Question:**
+{target_query}
+
+**Sample to Transform:**
+{text_to_transform}
+
+**Instructions for Transforming the Sample's Rationale:**
+1. Analyze the **Sample's Rationale** in the context of its own question to understand its core reasoning.
+2. Rewrite the rationale, prioritizing elements most transferable to solving the **Main Question**.
+3. Use clear, straightforward language.
+4. Do not alter the core logic to solve the **Main Question**, nor modify the **Sample's Question** or its **Final Answer** (as presented in the 'Sample to Transform').
+5. Ensure the transformed rationale clearly conveys the reasoning flow.
+
+**Output Format (Strictly follow this format, including the exact headers 'Question:' and 'Rationale and Answer:')**:
+Question: [Original Question from the 'Sample to Transform']
+Rationale and Answer: [Transformed Rationale, followed by the Original Answer from the 'Sample to Transform']
+""",
+    
     "transformation_shallow" : """<Objective>
 Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
 The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question’s theme, context, or style — while strictly preserving the sample’s original reasoning path and final answer.
