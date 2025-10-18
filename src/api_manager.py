@@ -94,60 +94,93 @@ class GeminiAPIManager:
     def _get_current_date_str(self) -> str:
         """Returns the current UTC date as a formatted string."""
         return datetime.utcnow().strftime('%Y-%m-%d')
+    
+    #======================================================================
+    # --- START OF REWRITTEN RATE-LIMITING LOGIC ---
+    #======================================================================
 
-    def _get_available_key_and_sleep_time(self, model_name: str) -> Tuple[Optional[str], float]:
-        """Finds an available API key and calculates the necessary sleep time."""
+    def _select_key_and_apply_delay(self, model_name: str) -> Optional[str]:
+        """
+        Finds an available API key, applies the necessary rate-limiting delay,
+        and records the call's start timestamp. This method centralizes the
+        entire pre-call process to ensure correct timing.
+
+        Returns:
+            Optional[str]: The selected API key, or None if all keys are rate-limited.
+        """
         if not self.api_keys_list:
-            return None, 3600
+            return None
 
         if self._lock:
             self.logger.warning("Key selection is locked; waiting.")
-            return None, 5
+            return None # Force a retry by returning no key
 
         self._lock = True
-        current_time_val = time.time()
-        time_since_last_global_call = current_time_val - self.last_global_call_timestamp
-        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global_call)
-        
-        num_keys = len(self.api_keys_list)
-        start_index = self.current_key_index
-        model_specific_quotas = self.model_quotas.get(model_name, {})
-        required_per_key_delay = model_specific_quotas.get("delay_seconds", 1)
-        max_rpd = model_specific_quotas.get("rpd", float('inf'))
+        try:
+            current_time_before_sleep = time.time()
+            time_since_last_global_call = current_time_before_sleep - self.last_global_call_timestamp
+            global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global_call)
 
-        for i in range(num_keys):
-            key_idx = (start_index + i) % num_keys
-            current_api_key = self.api_keys_list[key_idx]
-            
-            current_date_str = self._get_current_date_str()
-            daily_usage_key = (current_api_key, model_name, current_date_str)
-            current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
-            if current_daily_calls >= max_rpd:
-                continue
+            num_keys = len(self.api_keys_list)
+            start_index = self.current_key_index
+            model_specific_quotas = self.model_quotas.get(model_name, {})
+            required_per_key_delay = model_specific_quotas.get("delay_seconds", 1)
+            max_rpd = model_specific_quotas.get("rpd", float('inf'))
 
-            last_call_timestamp_key = (current_api_key, model_name)
-            last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
-            time_since_last_call = current_time_val - last_call_time
-            per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
-            
-            final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
-            self.current_key_index = (key_idx + 1) % num_keys
+            for i in range(num_keys):
+                key_idx = (start_index + i) % num_keys
+                current_api_key = self.api_keys_list[key_idx]
+
+                current_date_str = self._get_current_date_str()
+                daily_usage_key = (current_api_key, model_name, current_date_str)
+                current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
+                if current_daily_calls >= max_rpd:
+                    continue
+
+                last_call_timestamp_key = (current_api_key, model_name)
+                last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
+                time_since_last_call = current_time_before_sleep - last_call_time
+                per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
+
+                final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
+
+                if final_sleep_duration > 0:
+                    self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s.")
+                    print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
+                    time.sleep(final_sleep_duration)
+
+                # --- CORRECTED TIMESTAMPING LOGIC ---
+                # Record the timestamp *after* sleeping and *before* the API call.
+                current_call_start_time = time.time()
+                
+                # Handle Timing Checkpoint
+                if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
+                    elapsed = current_call_start_time - self._last_checkpoint_timestamp
+                    print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
+                self._last_checkpoint_timestamp = current_call_start_time
+                
+                # Record timestamps for rate limiting
+                self.last_global_call_timestamp = current_call_start_time
+                self.key_usage_timestamps[(current_api_key, model_name)] = current_call_start_time
+                
+                self.current_key_index = (key_idx + 1) % num_keys
+                return current_api_key
+
+            self.logger.warning(f"All {num_keys} API keys are rate-limited for model '{model_name}'.")
+            return None
+        finally:
             self._lock = False
-            return current_api_key, final_sleep_duration
 
-        self._lock = False
-        self.logger.warning(f"All {num_keys} API keys are rate-limited for model '{model_name}'.")
-        return None, 3600
-
-    def _record_api_call(self, api_key: str, model_name: str) -> None:
-        """Records the timestamp and increments the daily count for a given key and model."""
-        current_time = time.time()
-        self.last_global_call_timestamp = current_time
-        self.key_usage_timestamps[(api_key, model_name)] = current_time
+    def _increment_daily_usage(self, api_key: str, model_name: str) -> None:
+        """Increments the daily call count for a given key and model."""
         current_date_str = self._get_current_date_str()
         daily_usage_key = (api_key, model_name, current_date_str)
         self.key_daily_counts[daily_usage_key] = self.key_daily_counts.get(daily_usage_key, 0) + 1
         
+    #======================================================================
+    # --- END OF REWRITTEN RATE-LIMITING LOGIC ---
+    #======================================================================
+
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
         """Generates content using the Gemini API, handling key selection, rate limiting, and specific errors."""
         
@@ -158,7 +191,8 @@ class GeminiAPIManager:
             print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
-        api_key, sleep_time = self._get_available_key_and_sleep_time(model_name)
+        # The new method handles key selection, sleeping, and timestamping.
+        api_key = self._select_key_and_apply_delay(model_name)
 
         if api_key is None:
             error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
@@ -166,27 +200,9 @@ class GeminiAPIManager:
                 print(f"\n!!! [API Call FAILED: Gemini] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
             return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
 
-        if sleep_time > 0:
-            self.logger.info(f"Rate limit requires sleeping for {sleep_time:.2f}s.")
-            print(f"Sleeping for {sleep_time:.2f} seconds due to rate limiting.")
-            time.sleep(sleep_time)
-
-        # --- Timing Checkpoint Logic ---
-        current_call_start_time = time.time()
-        if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-            elapsed = current_call_start_time - self._last_checkpoint_timestamp
-            print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-        
-        self._last_checkpoint_timestamp = current_call_start_time
-        # --- End of Timing Checkpoint Logic ---
-
         caught_exception = None
 
         try:
-            #======================================================================
-            # --- START OF MODIFIED API CALL LOGIC ---
-            #======================================================================
-            
             # 1. Determine which max_tokens setting to use based on the model name
             max_tokens = None
             if model_name == self.config.get('GEMINI_MODEL_NAME_FINAL_SOLVER'):
@@ -217,11 +233,7 @@ class GeminiAPIManager:
                 generation_config=generation_config
             )
 
-            #======================================================================
-            # --- END OF MODIFIED API CALL LOGIC ---
-            #======================================================================
-
-            self._record_api_call(api_key, model_name)
+            self._increment_daily_usage(api_key, model_name)
 
             if not response.parts:
                 block_reason = "Unknown"
@@ -251,7 +263,7 @@ class GeminiAPIManager:
             caught_exception = e
         
         self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {error_type}. Error: {msg}", exc_info=True)
-        self._record_api_call(api_key, model_name) 
+        self._increment_daily_usage(api_key, model_name) 
         if self.print_details:
             print(f"\n!!! [API Call FAILED: Gemini] !!!")
             print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
