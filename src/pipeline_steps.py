@@ -17,7 +17,7 @@ targeted retries.
 """
 
 import logging
-import re  # <-- ADDED for regex parsing
+import re
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
@@ -31,8 +31,11 @@ from src.prompts import (
     create_merging_prompt,
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple,
-    create_duplicate_check_prompt  # <-- ADDED for the new feature
+    create_duplicate_check_prompt
 )
+# MODIFIED: Import manager classes for type checking
+from src.api_manager import GeminiAPIManager, AvalAIAPIManager
+
 
 # --- Utility Function for Embedding Generation ---
 def _generate_embeddings(
@@ -111,8 +114,14 @@ def adapt(
     successful_texts = []
     failed_adaptations = []
     
-    provider = config.get("API_PROVIDER", "gemini").lower()
-    model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_ADAPTATION']
+    # MODIFIED: Determine model name based on the type of the provided API manager
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+    else:
+        raise TypeError(f"Unsupported API manager type for adaptation: {type(api_manager)}")
+        
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
     apply_standardize = config.get('APPLY_STANDARDIZATION', False)
     apply_transform = config.get('APPLY_TRANSFORMATION', False)
@@ -195,8 +204,14 @@ def merge(
     current_texts = list(adapted_texts)
     failed_merges = []
     
-    provider = config.get("API_PROVIDER", "gemini").lower()
-    model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_ADAPTATION']
+    # MODIFIED: Determine model name based on the type of the provided API manager
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+    else:
+        raise TypeError(f"Unsupported API manager type for merging: {type(api_manager)}")
+        
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
     
     iteration = 0
@@ -258,8 +273,14 @@ def solve(
 
         prompt = create_duplicate_check_prompt(target_query, retrieved_questions)
         
-        provider = config.get("API_PROVIDER", "gemini").lower()
-        model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_ADAPTATION']
+        # MODIFIED: Determine model name based on manager type (uses adaptation model)
+        if isinstance(api_manager, GeminiAPIManager):
+            model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+        elif isinstance(api_manager, AvalAIAPIManager):
+            model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+        else:
+            raise TypeError(f"Unsupported API manager type for duplicate check: {type(api_manager)}")
+            
         temperature = 0.0 # Low temp for deterministic classification
         
         print("    -> Checking for duplicate questions...")
@@ -281,7 +302,6 @@ def solve(
     # --- END OF NEW LOGIC ---
 
     # --- Original Solver Logic ---
-    # MODIFIED: Pass config to the prompt creation function
     prompt = create_final_reasoning_prompt(target_query, final_exemplars, config) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
     logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
@@ -292,8 +312,14 @@ def solve(
 
     n_attempts = config.get("N_PASS_ATTEMPTS", 1)
     
-    provider = config.get("API_PROVIDER", "gemini").lower()
-    model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_FINAL_SOLVER']
+    # MODIFIED: Determine model name based on the type of the provided API manager
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    else:
+        raise TypeError(f"Unsupported API manager type for solver: {type(api_manager)}")
+        
     temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
     
     solution_attempts: List[Union[str, Dict]] = []

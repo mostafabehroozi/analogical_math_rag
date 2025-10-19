@@ -30,7 +30,7 @@ def run_pipeline_for_single_query(
     config: Dict[str, Any],
     embedding_model: SentenceTransformer,
     exemplar_data: Dict[str, Any],
-    api_manager: Any
+    api_managers: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
     Executes the full RAG pipeline for a single 'hard question', now with
@@ -60,6 +60,13 @@ def run_pipeline_for_single_query(
         "steps": {}
     }
 
+    # --- MODIFIED: Select API managers based on config ---
+    provider_for_adapt = config.get('API_PROVIDER_ADAPTATION', 'gemini')
+    manager_for_adapt = api_managers[provider_for_adapt]
+
+    provider_for_solve = config.get('API_PROVIDER_SOLVER', 'gemini')
+    manager_for_solve = api_managers[provider_for_solve]
+    
     # --- Pipeline Execution with Failure Checks ---
     final_exemplars_for_solve = []
     pipeline_halted = False
@@ -91,7 +98,7 @@ def run_pipeline_for_single_query(
                 retrieved_indices=retrieval_result['retrieved_indices'],
                 exemplar_questions=exemplar_data['questions'],
                 exemplar_solutions=exemplar_data['solutions'],
-                api_manager=api_manager,
+                api_manager=manager_for_adapt, # Use the selected manager
                 config=config
             )
             run_log['steps']['adaptation'] = adapt_result
@@ -113,7 +120,7 @@ def run_pipeline_for_single_query(
                 target_query=target_query,
                 adapted_texts=adapt_result['adapted_texts'],
                 embedding_model=embedding_model,
-                api_manager=api_manager,
+                api_manager=manager_for_adapt, # Use the selected manager
                 config=config
             )
             run_log['steps']['merging'] = merge_result
@@ -137,7 +144,7 @@ def run_pipeline_for_single_query(
         solve_result = solve(
             target_query=target_query,
             final_exemplars=final_exemplars_for_solve,
-            api_manager=api_manager,
+            api_manager=manager_for_solve, # Use the selected manager
             config=config
         )
         run_log['steps']['solving'] = solve_result
@@ -171,7 +178,7 @@ def run_experiments(
     hard_questions: List[str],
     embedding_model: SentenceTransformer,
     exemplar_data: Dict[str, Any],
-    api_manager: Any
+    api_managers: Dict[str, Any]
 ) -> Dict[str, List[Dict]]:
     """
     Orchestrates running multiple experiments with different configurations.
@@ -213,7 +220,7 @@ def run_experiments(
                 config=current_config,
                 embedding_model=embedding_model,
                 exemplar_data=exemplar_data,
-                api_manager=api_manager
+                api_managers=api_managers
             )
             run_logs.append(single_run_log)
             
