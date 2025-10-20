@@ -30,7 +30,7 @@ def retry_failed_generation_pipelines(
     hard_questions: List[str],
     embedding_model: Any,
     exemplar_data: Dict[str, Any],
-    api_manager: Any
+    api_managers: Dict[str, Any]
 ) -> Dict[str, List[Dict]]:
     """
     Identifies and retries generation pipelines that failed partway through.
@@ -78,7 +78,7 @@ def retry_failed_generation_pipelines(
                 config=current_config,
                 embedding_model=embedding_model,
                 exemplar_data=exemplar_data,
-                api_manager=api_manager
+                api_managers=api_managers
             )
             
             # Replace the old failed log with the new one
@@ -101,7 +101,7 @@ def retry_failed_generation_pipelines(
 def retry_failed_evaluations(
     all_experiments_logs: Dict[str, List[Dict]],
     ground_truths: List[str],
-    api_manager: Any,
+    api_managers: Dict[str, Any],
     config: Dict[str, Any]
 ) -> None:
     """
@@ -125,6 +125,10 @@ def retry_failed_evaluations(
 
         logger.info(f"--- Retrying evaluations for Experiment: {exp_name} ---")
         
+        # MODIFIED: Select the correct API manager for evaluation based on the config
+        provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
+        manager_for_eval = api_managers[provider_for_eval]
+
         # Find all attempts across all queries that did not succeed
         retries_needed = []
         for eval_idx, log in enumerate(detailed_evaluations):
@@ -148,15 +152,16 @@ def retry_failed_evaluations(
             if isinstance(attempt_text_or_dict, str):
                 print(f"    -> Retrying evaluation for query #{hard_list_idx}, attempt #{attempt_idx + 1}")
                 
-                is_correct, new_status, new_error_details = evaluate_single_answer_with_llm(
-                    attempt_text_or_dict, ground_truth, api_manager, config
+                # MODIFIED: Use the selected manager for evaluation
+                eval_result = evaluate_single_answer_with_llm(
+                    attempt_text_or_dict, ground_truth, manager_for_eval, config
                 )
                 
                 # Update the log in place
-                log["is_correct_list"][attempt_idx] = is_correct
-                log["evaluation_status_list"][attempt_idx] = new_status
-                log["evaluation_error_details"][attempt_idx] = new_error_details
-                print(f"       New status: {new_status}")
+                log["is_correct_list"][attempt_idx] = eval_result["is_correct"]
+                log["evaluation_status_list"][attempt_idx] = eval_result["status"]
+                log["evaluation_error_details"][attempt_idx] = eval_result["error_details"]
+                print(f"       New status: {eval_result['status']}")
 
             # Persist changes after each retry
             save_json(detailed_evaluations, eval_file_path)
@@ -169,7 +174,7 @@ def retry_failed_evaluations(
     logger.info("Finished retrying all failed evaluations across all experiments.")
 
 
-# --- UPGRADED: Comprehensive Error Reporting ---
+# --- UPGRADed: Comprehensive Error Reporting ---
 
 def generate_error_report(
     all_experiments_logs: Dict[str, List[Dict]],

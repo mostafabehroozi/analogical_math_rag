@@ -41,7 +41,13 @@ CONFIG = {
     # --- 3. API Provider Selection ---
     # Master switch to select the API provider.
     # Options: "gemini" or "avalai"
-    "API_PROVIDER": "gemini",
+    # "API_PROVIDER": "gemini", # DEPRECATED: Provider is now set per-step.
+
+    # MODIFIED: Define which API provider to use for each major stage of the pipeline.
+    # Options: "gemini" or "avalai"
+    "API_PROVIDER_ADAPTATION": "gemini",  # For standardization, transformation, merging
+    "API_PROVIDER_SOLVER": "gemini",      # For generating the final solution
+    "API_PROVIDER_EVALUATOR": "gemini",   # For LLM-based evaluation
 
     # --- 4. Gemini API Settings ---
     # These settings are used ONLY if API_PROVIDER is set to "gemini".

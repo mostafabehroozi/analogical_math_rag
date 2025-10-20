@@ -28,7 +28,8 @@ from typing import List, Dict, Any, Tuple, Optional, TypedDict
 from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
-from src.api_manager import APIResponse
+# MODIFIED: Import manager classes for type checking and APIResponse type
+from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager
 
 # Define a structured type for the result of a single LLM-based evaluation
 # This improves clarity over a simple Tuple.
@@ -68,9 +69,14 @@ def evaluate_single_answer_with_llm(
     if not model_answer or not isinstance(model_answer, str):
         return {"is_correct": None, "status": "EMPTY_ANSWER", "error_details": None}
 
-    # Determine which LLM model to use for evaluation based on the active provider
-    provider = config.get("API_PROVIDER", "gemini").lower()
-    evaluator_model = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_EVALUATOR']
+    # MODIFIED: Determine which LLM model to use based on the type of the active manager
+    if isinstance(api_manager, GeminiAPIManager):
+        evaluator_model = config['GEMINI_MODEL_NAME_EVALUATOR']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        evaluator_model = config['AVALAI_MODEL_NAME_EVALUATOR']
+    else:
+        raise TypeError(f"Unsupported API manager type for evaluation: {type(api_manager)}")
+        
     evaluator_temp = config['DEFAULT_EVALUATOR_TEMPERATURE']
 
     prompt = create_evaluation_prompt(model_answer, ground_truth, config)
@@ -104,7 +110,7 @@ def evaluate_single_answer_with_llm(
 def analyze_experiment_logs(
     all_experiments_logs: Dict[str, List[Dict]],
     ground_truths: List[str],
-    api_manager: Any,
+    api_managers: Dict[str, Any],
     config: Dict[str, Any]
 ) -> pd.DataFrame:
     """
@@ -119,7 +125,7 @@ def analyze_experiment_logs(
     Args:
         all_experiments_logs (Dict): A dictionary mapping experiment names to their run logs.
         ground_truths (List[str]): A list of ground truth solutions, indexed by `hard_list_idx`.
-        api_manager (Any): The instantiated API manager.
+        api_managers (Dict[str, Any]): The dictionary of instantiated API managers.
         config (Dict[str, Any]): The global configuration dictionary.
 
     Returns:
@@ -156,6 +162,11 @@ def analyze_experiment_logs(
             logger.info(f"All query logs for '{exp_name}' have already been evaluated. Proceeding to summary.")
         else:
             logger.info(f"Found {len(logs_to_process)} new query logs to evaluate for '{exp_name}'.")
+
+            # --- MODIFIED: Select the correct API manager for evaluation ---
+            provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
+            manager_for_eval = api_managers[provider_for_eval]
+            
             for loop_idx, log in enumerate(tqdm(logs_to_process, desc=f"Evaluating {exp_name}")):
                 hard_list_idx = log["target_query_original_hard_list_idx"]
                 ground_truth = ground_truths[hard_list_idx]
@@ -168,7 +179,7 @@ def analyze_experiment_logs(
                     # Case 1: Generation was successful (attempt is a string)
                     if isinstance(attempt, str):
                         print(f"    -> Evaluating attempt {i+1}/{len(solution_attempts)} for query #{hard_list_idx}")
-                        eval_result = evaluate_single_answer_with_llm(attempt, ground_truth, api_manager, config)
+                        eval_result = evaluate_single_answer_with_llm(attempt, ground_truth, manager_for_eval, config)
                         if eval_result["status"] != "SUCCESS":
                             print(f"       WARNING: Evaluation attempt failed with status: {eval_result['status']}")
                         
