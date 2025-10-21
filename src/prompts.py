@@ -533,20 +533,34 @@ Begin Output:
 # --- 2. Prompt Creation Functions ---
 # These functions abstract the process of selecting and formatting a template.
 
-def create_standardization_prompt(original_example: str) -> str:
-    """Creates a prompt for the 'standardization' pipeline step."""
+def create_normalization_prompt(original_example: str) -> str:
+    """Creates a prompt for the 'normalization' pipeline step."""
     template = PROMPT_TEMPLATES["standardization_v1"]
     return template.format(original_example=original_example)
 
-def create_transformation_prompt(target_query: str, text_to_transform: str, config: Dict[str, Any]) -> str:
+# Alias for backward compatibility
+create_standardization_prompt = create_normalization_prompt
+
+def create_transformation_prompt(target_query: str, text_to_transform: str, config: Dict[str, Any], template_key_name: str) -> str:
     """
-    Creates a prompt for the 'transformation' pipeline step.
-    This function now dynamically selects the template based on the config.
+    Creates a prompt for a 'transformation' pipeline step using a dynamically specified template key.
+    
+    Args:
+        target_query (str): The main question the transformation is being guided by.
+        text_to_transform (str): The exemplar text to be transformed.
+        config (Dict[str, Any]): The main configuration dictionary.
+        template_key_name (str): The key in the config that holds the name of the prompt template to use
+                                 (e.g., "PROMPT_TEMPLATE_TRANSFORMATION_1").
     """
-    # Dynamically get the template name from the config, with a fallback to "transformation_v1".
-    template_name = config.get("PROMPT_TEMPLATE_TRANSFORMATION", "transformation_v1")
+    # Dynamically get the template name from the config using the provided key.
+    template_name = config.get(template_key_name, "transformation_v1") # Fallback to a default.
+    
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' specified by key '{template_key_name}' not found in registry."
+        
     template = PROMPT_TEMPLATES[template_name]
     return template.format(target_query=target_query, text_to_transform=text_to_transform)
+
 
 def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str:
     """Creates a prompt for the 'merging' pipeline step."""
