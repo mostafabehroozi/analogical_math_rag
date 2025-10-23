@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import List, Tuple, Dict, Optional, Any, TypedDict
 
 import openai
+import ollama  # NEW: Import for local LLM support
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 
@@ -402,6 +403,82 @@ class AvalAIAPIManager:
         self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
         if self.print_details:
             print(f"\n!!! [API Call FAILED: AvalAI] !!!")
+            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
+            print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+        
+        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
+
+
+class OllamaAPIManager:
+    """
+    Manages API calls to a local Ollama instance, conforming to the standard manager interface.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initializes the Ollama API manager.
+
+        Args:
+            config (Dict[str, Any]): The main configuration dictionary.
+        """
+        self.logger = logging.getLogger(__name__)
+        self.config = config
+
+        base_url = self.config.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        
+        try:
+            self.client = ollama.Client(host=base_url)
+            # A simple check to see if the server is responsive
+            self.client.list()
+            self.logger.info(f"OllamaAPIManager initialized and connected to endpoint: {base_url}")
+        except Exception as e:
+            self.logger.critical(f"Failed to connect to Ollama server at {base_url}. Please ensure Ollama is running. Error: {e}")
+            raise ConnectionError(f"Could not connect to Ollama at {base_url}") from e
+
+        # Read control flags from config for consistent logging
+        self.print_details = self.config.get("PRINT_API_CALL_DETAILS", False)
+        self.truncation_length = self.config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
+        
+    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
+        """Generates content using a local Ollama model."""
+        if self.print_details:
+            print("\n" + "--- [API Call Start: Ollama] ---")
+            print(f"Model: {model_name}, Temperature: {temperature}")
+            print(f"Prompt Sent (truncated): {prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
+            print("----------------------------------")
+
+        caught_exception = None
+        try:
+            options = {}
+            if temperature is not None:
+                options['temperature'] = temperature
+
+            self.logger.info(f"Calling Ollama model '{model_name}'.")
+            
+            response = self.client.generate(
+                model=model_name,
+                prompt=prompt,
+                options=options
+            )
+            
+            response_text = response['response']
+            
+            if self.print_details:
+                print("--- [API Call SUCCESS: Ollama] ---")
+                print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
+                print("----------------------------------\n")
+
+            return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
+
+        except ollama.ResponseError as e:
+            status, error_type, msg = "ERROR", "OllamaResponseError", f"Ollama API returned an error: {e.error}"
+            caught_exception = e
+        except Exception as e: # Catches connection errors etc.
+            status, error_type, msg = "ERROR", "OllamaConnectionError", f"An unexpected error occurred with the Ollama client: {e}"
+            caught_exception = e
+
+        self.logger.error(f"Ollama API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
+        if self.print_details:
+            print(f"\n!!! [API Call FAILED: Ollama] !!!")
             print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
             print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
         

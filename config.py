@@ -44,7 +44,7 @@ CONFIG = {
     # "API_PROVIDER": "gemini", # DEPRECATED: Provider is now set per-step.
 
     # MODIFIED: Define which API provider to use for each major stage of the pipeline.
-    # Options: "gemini" or "avalai"
+    # Options: "gemini", "avalai", or "ollama"
     "API_PROVIDER_ADAPTATION": "gemini",  # For normalization, transformations, merging
     "API_PROVIDER_SOLVER": "gemini",      # For generating the final solution
     "API_PROVIDER_EVALUATOR": "gemini",   # For LLM-based evaluation
@@ -82,6 +82,15 @@ CONFIG = {
     "AVALAI_MODEL_NAME_ADAPTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_FINAL_SOLVER": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
+
+    # --- 5b. Ollama (Local LLM) Settings ---
+    # These settings are used if any API_PROVIDER_* is set to "ollama".
+    "OLLAMA_BASE_URL": "http://localhost:11434", # Default URL for a local Ollama instance.
+
+    # Model names for Ollama. Replace with any models you have pulled (e.g., 'llama2', 'mistral').
+    "OLLAMA_MODEL_NAME_ADAPTATION": "llama2:7b",
+    "OLLAMA_MODEL_NAME_FINAL_SOLVER": "llama2:13b",
+    "OLLAMA_MODEL_NAME_EVALUATOR": "llama2:7b",
 
     # --- 6. Generic LLM Generation Settings ---
     # These settings are provider-agnostic and will be used by whichever manager is active.
