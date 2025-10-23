@@ -128,6 +128,8 @@ CONFIG = {
     "APPLY_TRANSFORMATION_2": False,        # NEW: Controls the second transformation step.
     "APPLY_TRANSFORMATION_3": False,        # NEW: Controls the third transformation step.
     "APPLY_MERGING": False,
+
+    "DEFER_SOLVE_STEP": False, # NEW: If True, runs all intermediate steps for all questions first, then all solve steps.
     
     "TOP_N_CANDIDATES_RETRIEVAL": 1,
     "FINAL_K_SELECTION_ADAPTATION": 1,
