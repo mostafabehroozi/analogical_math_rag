@@ -26,7 +26,7 @@ from typing import List, Dict, Any, Union
 # Import our custom modules
 from src.prompts import (
     EXEMPLAR_FORMAT,
-    create_standardization_prompt,
+    create_normalization_prompt,
     create_transformation_prompt,
     create_merging_prompt,
     create_final_reasoning_prompt,
@@ -95,7 +95,7 @@ def retrieve(
     }
 
 
-# --- 2. ADAPTATION STEP ---
+# --- 2. ADAPTATION STEP (REWRITTEN) ---
 def adapt(
     target_query: str,
     retrieved_indices: List[int],
@@ -105,26 +105,19 @@ def adapt(
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Performs standardization and transformation on retrieved exemplars.
+    Performs a multi-stage adaptation on retrieved exemplars:
+    Normalization -> Transformation 1 -> Transformation 2 -> Transformation 3.
     Captures failures for individual exemplars without halting the entire step.
     """
     logger = logging.getLogger(__name__)
-    logger.info("Starting adaptation step.")
+    logger.info("Starting multi-stage adaptation step.")
     
     successful_texts = []
     failed_adaptations = []
     
-    # MODIFIED: Determine model name based on the type of the provided API manager
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    else:
-        raise TypeError(f"Unsupported API manager type for adaptation: {type(api_manager)}")
-        
+    provider = config.get("API_PROVIDER", "gemini").lower()
+    model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_ADAPTATION']
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
-    apply_standardize = config.get('APPLY_STANDARDIZATION', False)
-    apply_transform = config.get('APPLY_TRANSFORMATION', False)
 
     for idx in retrieved_indices:
         original_question = exemplar_questions[idx]
@@ -133,38 +126,71 @@ def adapt(
         
         step_failed = False
 
-        if apply_standardize and not step_failed:
-            logger.info(f"Applying standardization to exemplar index {idx}.")
-            print(f"    -> Standardizing exemplar {idx}...")
-            prompt = create_standardization_prompt(current_text)
+        # --- Step 1: Normalization (formerly Standardization) ---
+        if config.get('APPLY_NORMALIZATION', False) and not step_failed:
+            logger.info(f"Applying normalization to exemplar index {idx}.")
+            print(f"    -> Normalizing exemplar {idx}...")
+            prompt = create_normalization_prompt(current_text)
             
-            print(f"      [API Context] Calling LLM for: Standardization (Exemplar #{idx})")
+            print(f"      [API Context] Calling LLM for: Normalization (Exemplar #{idx})")
             response = api_manager.generate_content(prompt, model_name, temperature)
             
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                logger.warning(f"Standardization failed for exemplar {idx}: {response['error_message']}")
-                failed_adaptations.append({"source_index": idx, "failed_at_step": "standardization", "error_info": response})
+                logger.warning(f"Normalization failed for exemplar {idx}: {response['error_message']}")
+                failed_adaptations.append({"source_index": idx, "failed_at_step": "normalization", "error_info": response})
                 step_failed = True
 
-        if apply_transform and not step_failed:
-            logger.info(f"Applying transformation to exemplar index {idx}.")
-            print(f"    -> Transforming exemplar {idx}...")
-            prompt = create_transformation_prompt(target_query, current_text, config)
-            print(f"      [API Context] Calling LLM for: Transformation (Exemplar #{idx})")
+        # --- Step 2: Transformation 1 ---
+        if config.get('APPLY_TRANSFORMATION_1', False) and not step_failed:
+            logger.info(f"Applying transformation 1 to exemplar index {idx}.")
+            print(f"    -> Applying Transformation 1 to exemplar {idx}...")
+            prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_1")
+            print(f"      [API Context] Calling LLM for: Transformation 1 (Exemplar #{idx})")
             response = api_manager.generate_content(prompt, model_name, temperature)
 
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                logger.warning(f"Transformation failed for exemplar {idx}: {response['error_message']}")
-                failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation", "error_info": response})
+                logger.warning(f"Transformation 1 failed for exemplar {idx}: {response['error_message']}")
+                failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_1", "error_info": response})
+                step_failed = True
+        
+        # --- Step 3: Transformation 2 ---
+        if config.get('APPLY_TRANSFORMATION_2', False) and not step_failed:
+            logger.info(f"Applying transformation 2 to exemplar index {idx}.")
+            print(f"    -> Applying Transformation 2 to exemplar {idx}...")
+            prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_2")
+            print(f"      [API Context] Calling LLM for: Transformation 2 (Exemplar #{idx})")
+            response = api_manager.generate_content(prompt, model_name, temperature)
+
+            if response['status'] == 'SUCCESS':
+                current_text = response['text']
+            else:
+                logger.warning(f"Transformation 2 failed for exemplar {idx}: {response['error_message']}")
+                failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_2", "error_info": response})
+                step_failed = True
+
+        # --- Step 4: Transformation 3 ---
+        if config.get('APPLY_TRANSFORMATION_3', False) and not step_failed:
+            logger.info(f"Applying transformation 3 to exemplar index {idx}.")
+            print(f"    -> Applying Transformation 3 to exemplar {idx}...")
+            prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_3")
+            print(f"      [API Context] Calling LLM for: Transformation 3 (Exemplar #{idx})")
+            response = api_manager.generate_content(prompt, model_name, temperature)
+
+            if response['status'] == 'SUCCESS':
+                current_text = response['text']
+            else:
+                logger.warning(f"Transformation 3 failed for exemplar {idx}: {response['error_message']}")
+                failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_3", "error_info": response})
                 step_failed = True
         
         if not step_failed:
             successful_texts.append(current_text)
 
+    # Determine final status based on outcomes
     if not retrieved_indices:
         final_status = "SUCCESS"
     elif not successful_texts and failed_adaptations:

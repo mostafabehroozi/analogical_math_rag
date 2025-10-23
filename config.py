@@ -41,7 +41,13 @@ CONFIG = {
     # --- 3. API Provider Selection ---
     # Master switch to select the API provider.
     # Options: "gemini" or "avalai"
-    "API_PROVIDER": "gemini",
+    # "API_PROVIDER": "gemini", # DEPRECATED: Provider is now set per-step.
+
+    # MODIFIED: Define which API provider to use for each major stage of the pipeline.
+    # Options: "gemini" or "avalai"
+    "API_PROVIDER_ADAPTATION": "gemini",  # For normalization, transformations, merging
+    "API_PROVIDER_SOLVER": "gemini",      # For generating the final solution
+    "API_PROVIDER_EVALUATOR": "gemini",   # For LLM-based evaluation
 
     # --- 4. Gemini API Settings ---
     # These settings are used ONLY if API_PROVIDER is set to "gemini".
@@ -88,7 +94,7 @@ CONFIG = {
 
     # NEW: Max Output Tokens Settings
     # These will be used to construct the `GenerationConfig` for Gemini calls.
-    "DEFAULT_ADAPTATION_MAX_TOKENS": 10000,   # Adaptation tasks (standardization, transformation) are usually short.
+    "DEFAULT_ADAPTATION_MAX_TOKENS": 10000,   # Adaptation tasks (normalization, transformation) are usually short.
     "DEFAULT_FINAL_SOLVER_MAX_TOKENS": 10000, # Allow plenty of room for complex reasoning and step-by-step solutions.
     "DEFAULT_EVALUATOR_MAX_TOKENS": 10000,     # Evaluation produces a very short, structured response.
 
@@ -114,9 +120,15 @@ CONFIG = {
     # --- 8. Pipeline Step Control Flags & Parameters ---
     "USE_RETRIEVAL": True,
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
-    "APPLY_STANDARDIZATION": False,
-    "APPLY_TRANSFORMATION": False,
+    
+    # MODIFIED: Granular adaptation steps
+    "APPLY_NORMALIZATION": False,           # Renamed from APPLY_STANDARDIZATION
+    "APPLY_TRANSFORMATION": False,          # DEPRECATED: Replaced by granular transformation flags.
+    "APPLY_TRANSFORMATION_1": False,        # NEW: Controls the first transformation step.
+    "APPLY_TRANSFORMATION_2": False,        # NEW: Controls the second transformation step.
+    "APPLY_TRANSFORMATION_3": False,        # NEW: Controls the third transformation step.
     "APPLY_MERGING": False,
+    
     "TOP_N_CANDIDATES_RETRIEVAL": 1,
     "FINAL_K_SELECTION_ADAPTATION": 1,
     "TARGET_ADAPTED_SAMPLES_MERGING": 1,
@@ -126,8 +138,16 @@ CONFIG = {
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
     # --- 10. Prompt Template Selection ---
-    "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
-    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",
+    "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",  # Renamed
+    "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1", # Kept for backward compatibility, but normalization is preferred.
+    
+    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",  # DEPRECATED: Replaced by granular transformation flags.
+    
+    # NEW: Select a prompt for each transformation step independently
+    "PROMPT_TEMPLATE_TRANSFORMATION_1": "transformation_shallow",
+    "PROMPT_TEMPLATE_TRANSFORMATION_2": "transformation_shallow-&-moderately-deep",
+    "PROMPT_TEMPLATE_TRANSFORMATION_3": "transformation_complete",
+    
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
     # MODIFIED: Default solver prompt is now v2.
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
