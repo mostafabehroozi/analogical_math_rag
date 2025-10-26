@@ -29,7 +29,7 @@ from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 # MODIFIED: Import manager classes for type checking and APIResponse type
-from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager
+from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
 # Define a structured type for the result of a single LLM-based evaluation
 # This improves clarity over a simple Tuple.
@@ -74,6 +74,8 @@ def evaluate_single_answer_with_llm(
         evaluator_model = config['GEMINI_MODEL_NAME_EVALUATOR']
     elif isinstance(api_manager, AvalAIAPIManager):
         evaluator_model = config['AVALAI_MODEL_NAME_EVALUATOR']
+    elif isinstance(api_manager, OllamaAPIManager):
+        evaluator_model = config['OLLAMA_MODEL_NAME_EVALUATOR']
     else:
         raise TypeError(f"Unsupported API manager type for evaluation: {type(api_manager)}")
         

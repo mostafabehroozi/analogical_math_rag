@@ -34,7 +34,7 @@ from src.prompts import (
     create_duplicate_check_prompt
 )
 # MODIFIED: Import manager classes for type checking
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager
+from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
 
 # --- Utility Function for Embedding Generation ---
@@ -115,8 +115,16 @@ def adapt(
     successful_texts = []
     failed_adaptations = []
     
-    provider = config.get("API_PROVIDER", "gemini").lower()
-    model_name = config[f'{"AVALAI" if provider == "avalai" else "GEMINI"}_MODEL_NAME_ADAPTATION']
+    # MODIFIED: Determine model name based on the type of the provided API manager
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
+    else:
+        raise TypeError(f"Unsupported API manager type for adaptation: {type(api_manager)}")
+        
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
 
     for idx in retrieved_indices:
@@ -235,6 +243,8 @@ def merge(
         model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
     elif isinstance(api_manager, AvalAIAPIManager):
         model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
     else:
         raise TypeError(f"Unsupported API manager type for merging: {type(api_manager)}")
         
@@ -304,6 +314,8 @@ def solve(
             model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
         elif isinstance(api_manager, AvalAIAPIManager):
             model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+        elif isinstance(api_manager, OllamaAPIManager):
+            model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
         else:
             raise TypeError(f"Unsupported API manager type for duplicate check: {type(api_manager)}")
             
@@ -343,6 +355,8 @@ def solve(
         model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
     elif isinstance(api_manager, AvalAIAPIManager):
         model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
     else:
         raise TypeError(f"Unsupported API manager type for solver: {type(api_manager)}")
         
