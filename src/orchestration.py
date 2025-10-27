@@ -32,7 +32,7 @@ from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 
 # Import our custom modules
-from src.pipeline_steps import retrieve, adapt, merge, solve
+from src.pipeline_steps import retrieve, adapt, merge, solve, generate_synthetic_samples # <-- MODIFIED IMPORT
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 
@@ -77,9 +77,11 @@ def run_pipeline_for_single_query(
             "target_query_text": target_query,
             "config_flags_used": {
                 key: config.get(key) for key in [
-                    "USE_RETRIEVAL", "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
+                    "USE_RETRIEVAL", "SELF_SAMPLING", # <-- Added SELF_SAMPLING to logged configs
+                    "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
                     "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3", "APPLY_MERGING",
                     "DEFER_SOLVE_STEP", "TOP_N_CANDIDATES_RETRIEVAL", "N_PASS_ATTEMPTS",
+                    "N_SELF_SAMPLES", # <-- Added N_SELF_SAMPLES to logged configs
                     "DEFAULT_PASS_N_SOLVER_TEMPERATURE"
                 ]
             },
@@ -97,7 +99,7 @@ def run_pipeline_for_single_query(
     final_exemplars_for_solve = []
     pipeline_halted = False
 
-    # --- Phase 1: Intermediate Steps (Retrieve, Adapt, Merge) ---
+    # --- Phase 1: Intermediate Steps (Retrieve, Adapt, Merge, OR Self-Sample) ---
     if run_mode in ['full', 'intermediate']:
         if config.get('USE_RETRIEVAL', True):
             # Step 1: Retrieve
@@ -149,8 +151,31 @@ def run_pipeline_for_single_query(
                 for i, text in enumerate(merge_result.get('merged_texts', [])):
                     print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
                 final_exemplars_for_solve = merge_result['merged_texts']
+
+        # <<< --- START OF NEW LOGIC --- >>>
+        elif config.get('SELF_SAMPLING', False):
+            print("\n[STEP 1] GENERATE SYNTHETIC SAMPLES (Self-Sampling Mode)")
+            # Use the powerful solver's manager for this creative task
+            sampling_result = generate_synthetic_samples(
+                target_query=target_query,
+                api_manager=manager_for_solve,
+                config=config
+            )
+            run_log['steps']['self_sampling'] = sampling_result
+            if "FAILURE" in sampling_result['status']:
+                run_log['pipeline_status'] = "FAILURE: Self-sampling failed for all attempts."
+                logger.error(run_log['pipeline_status'])
+                print("  -> Self-Sampling FAILED for all attempts. Halting pipeline.")
+                pipeline_halted = True
+            else:
+                final_exemplars_for_solve = sampling_result['synthetic_samples']
+                print(f"  -> Generated {len(final_exemplars_for_solve)} synthetic samples.")
+                if sampling_result['status'] == 'PARTIAL_SUCCESS':
+                    print(f"  -> WARNING: {len(sampling_result['failed_generations'])} sample generations failed.")
+        # <<< --- END OF NEW LOGIC --- >>>
+        
         else:
-            print("\n[STEP 1, 2, 3] RETRIEVE, ADAPT, MERGE SKIPPED (USE_RETRIEVAL is False).")
+            print("\n[STEP 1, 2, 3] SKIPPED (USE_RETRIEVAL and SELF_SAMPLING are False).")
             run_log['steps']['retrieval'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
             run_log['steps']['adaptation'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
             run_log['steps']['merging'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
@@ -160,7 +185,11 @@ def run_pipeline_for_single_query(
         print("\n[STEP 1, 2, 3] SKIPPED (Running in solve_only mode). Loading intermediate results.")
         pipeline_halted = "FAILURE" in run_log.get("pipeline_status", "")
         if not pipeline_halted:
-            final_exemplars_for_solve = run_log.get('steps', {}).get('merging', {}).get('merged_texts', [])
+            # Handle loading exemplars from either RAG or Self-Sampling
+            if 'merging' in run_log.get('steps', {}):
+                final_exemplars_for_solve = run_log.get('steps', {}).get('merging', {}).get('merged_texts', [])
+            elif 'self_sampling' in run_log.get('steps', {}):
+                 final_exemplars_for_solve = run_log.get('steps', {}).get('self_sampling', {}).get('synthetic_samples', [])
             print(f"  -> Loaded {len(final_exemplars_for_solve)} exemplars for solving.")
         else:
             print("  -> Prior step failed, solve will be skipped.")

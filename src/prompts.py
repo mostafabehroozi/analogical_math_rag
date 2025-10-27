@@ -479,6 +479,25 @@ Final Answer:
 **Your Solution:**
 """,
 
+    # NEW: Template for the Self-Sampling generation step
+    "self_sampling_generator_v1": """**Objective:**
+Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
+
+**Required Output Format (Strictly Adhere):**
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+
+---
+**Inputs:**
+**Main Question:**
+{main_question_text}
+---
+**Your Solution:**
+""",
+
     "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
 Both 'Model Output' and 'Ground Truth' may contain intermediate steps (Chain-of-Thought) leading to a final answer.
 
@@ -606,6 +625,13 @@ def create_final_reasoning_prompt(main_question_text: str, final_examples: List[
 def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[str, Any]) -> str:
     """Creates the final prompt for the solver without any adapted samples (No RAG)."""
     template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE", "final_solver_simple_v1")
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question_text)
+
+# NEW: Function to create the prompt for generating synthetic samples
+def create_self_sampling_generation_prompt(main_question_text: str, config: Dict[str, Any]) -> str:
+    """Creates the prompt for generating a single synthetic sample."""
+    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR", "self_sampling_generator_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question_text)
 

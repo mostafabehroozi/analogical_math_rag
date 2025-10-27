@@ -129,6 +129,9 @@ CONFIG = {
     # --- 8. Pipeline Step Control Flags & Parameters ---
     "USE_RETRIEVAL": True,
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
+
+    # NEW: Self-Sampling Control
+    "SELF_SAMPLING": False, # If True and USE_RETRIEVAL is False, generate synthetic samples.
     
     # MODIFIED: Granular adaptation steps
     "APPLY_NORMALIZATION": False,           # Renamed from APPLY_STANDARDIZATION
@@ -148,6 +151,9 @@ CONFIG = {
     "N_PASS_ATTEMPTS": 3,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
+    # NEW: Self-Sampling Parameter
+    "N_SELF_SAMPLES": 3, # Number of synthetic samples to generate in self-sampling mode.
+
     # --- 10. Prompt Template Selection ---
     "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",  # Renamed
     "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1", # Kept for backward compatibility, but normalization is preferred.
@@ -162,6 +168,10 @@ CONFIG = {
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
     # MODIFIED: Default solver prompt is now v2.
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
+
+    # NEW: Prompt for generating synthetic samples
+    "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator_v1",
+
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
 
