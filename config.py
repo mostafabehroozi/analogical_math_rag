@@ -139,6 +139,15 @@ CONFIG = {
     "APPLY_TRANSFORMATION_1": False,        # NEW: Controls the first transformation step.
     "APPLY_TRANSFORMATION_2": False,        # NEW: Controls the second transformation step.
     "APPLY_TRANSFORMATION_3": False,        # NEW: Controls the third transformation step.
+
+    # --- NEW: Analogical Adaptation Step ---
+    "APPLY_ANALOGICAL_ADAPTATION": False,   # Master switch for the new intermediate step.
+    # Defines how to group adapted samples for the intermediate reasoning step. Indices are 1-based.
+    # Example: [[1, 2], [3]] means group the 1st & 2nd samples together, and the 3rd sample alone.
+    "ANALOGICAL_ADAPTATION_GROUPING": [[1, 2], [3, 4], [5]],
+    # Number of new synthetic exemplars to generate for EACH group defined above.
+    "ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP": 2,
+
     "APPLY_MERGING": False,
 
     "DEFER_SOLVE_STEP": False, # NEW: If True, runs all intermediate steps for all questions first, then all solve steps.

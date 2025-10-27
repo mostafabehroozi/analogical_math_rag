@@ -215,6 +215,103 @@ def adapt(
         "failed_adaptations": failed_adaptations
     }
 
+
+# --- NEW: ANALOGICAL ADAPTATION STEP ---
+def analogical_adaptation(
+    target_query: str,
+    adapted_texts: List[str],
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Performs an intermediate analogical reasoning step to generate new, synthetic exemplars.
+    Groups adapted samples according to the config, has an LLM solve the main query using
+    each group, and collects the N generated solutions to pass to the next step.
+    """
+    logger = logging.getLogger(__name__)
+
+    # 1. Guard Clause: Skip if the feature is disabled in the config.
+    if not config.get('APPLY_ANALOGICAL_ADAPTATION', False):
+        logger.info("APPLY_ANALOGICAL_ADAPTATION is False. Skipping this step.")
+        # Pass the input texts directly to the next step without modification.
+        return {"status": "SKIPPED", "newly_generated_exemplars": adapted_texts, "failed_generations": []}
+
+    logger.info("Starting analogical adaptation step.")
+    
+    # 2. Get parameters from config.
+    grouping_config = config.get("ANALOGICAL_ADAPTATION_GROUPING", [])
+    samples_per_group = config.get("ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP", 1)
+    
+    # Use the powerful solver model and high temperature for this creative step.
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    else:
+        raise TypeError(f"Unsupported API manager type for analogical adaptation: {type(api_manager)}")
+        
+    temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
+
+    all_new_exemplars = []
+    failed_generations = []
+
+    # 3. Process each group defined in the configuration.
+    for i, group_indices in enumerate(grouping_config):
+        group_num = i + 1
+        print(f"    -> Processing Analogical Group #{group_num} with indices {group_indices}...")
+        
+        # 4. Select the samples for the current group.
+        # Convert 1-based config indices to 0-based list indices.
+        current_group_samples = []
+        for idx in group_indices:
+            if 0 < idx <= len(adapted_texts):
+                current_group_samples.append(adapted_texts[idx - 1])
+            else:
+                logger.warning(f"Index {idx} in group {group_num} is out of bounds for adapted_texts list (size: {len(adapted_texts)}). Skipping this index.")
+        
+        if not current_group_samples:
+            logger.warning(f"Group {group_num} is empty after index validation. Skipping generation for this group.")
+            continue
+
+        # 5. Generate N samples for this group.
+        for j in range(samples_per_group):
+            sample_num = j + 1
+            print(f"      -> Generating synthetic sample {sample_num}/{samples_per_group} for group #{group_num}...")
+            
+            # Use the existing final reasoning prompt for this intermediate task.
+            prompt = create_final_reasoning_prompt(target_query, current_group_samples, config)
+            
+            print(f"        [API Context] Calling LLM for: Analogical Adaptation (Group #{group_num}, Sample #{sample_num})")
+            response = api_manager.generate_content(prompt, model_name, temperature)
+
+            if response['status'] == 'SUCCESS':
+                # Format the successful generation into a standard exemplar format.
+                formatted_exemplar = EXEMPLAR_FORMAT.format(
+                    question=target_query, 
+                    solution=response['text']
+                )
+                all_new_exemplars.append(formatted_exemplar)
+            else:
+                logger.warning(f"Analogical adaptation failed for group {group_num}, sample {sample_num}: {response['error_message']}")
+                failed_generations.append({"group_num": group_num, "sample_num": sample_num, "error_info": response})
+
+    # 6. Determine final status and return structured output.
+    if not all_new_exemplars and failed_generations:
+        final_status = "FAILURE"
+    elif all_new_exemplars and failed_generations:
+        final_status = "PARTIAL_SUCCESS"
+    else:
+        final_status = "SUCCESS"
+        
+    return {
+        "status": final_status,
+        "newly_generated_exemplars": all_new_exemplars,
+        "failed_generations": failed_generations
+    }
+
+
 # <<< --- START OF NEW CODE --- >>>
 # --- 2b. SELF-SAMPLING STEP ---
 def generate_synthetic_samples(

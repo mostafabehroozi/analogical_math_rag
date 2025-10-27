@@ -32,7 +32,7 @@ from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 
 # Import our custom modules
-from src.pipeline_steps import retrieve, adapt, merge, solve, generate_synthetic_samples # <-- MODIFIED IMPORT
+from src.pipeline_steps import retrieve, adapt, analogical_adaptation, merge, solve, generate_synthetic_samples # <-- MODIFIED IMPORT
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 
@@ -79,7 +79,11 @@ def run_pipeline_for_single_query(
                 key: config.get(key) for key in [
                     "USE_RETRIEVAL", "SELF_SAMPLING", # <-- Added SELF_SAMPLING to logged configs
                     "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
-                    "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3", "APPLY_MERGING",
+                    "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3",
+                    "APPLY_ANALOGICAL_ADAPTATION", # <-- ADDED
+                    "ANALOGICAL_ADAPTATION_GROUPING", # <-- ADDED
+                    "ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP", # <-- ADDED
+                    "APPLY_MERGING",
                     "DEFER_SOLVE_STEP", "TOP_N_CANDIDATES_RETRIEVAL", "N_PASS_ATTEMPTS",
                     "N_SELF_SAMPLES", # <-- Added N_SELF_SAMPLES to logged configs
                     "DEFAULT_PASS_N_SOLVER_TEMPERATURE"
@@ -118,6 +122,9 @@ def run_pipeline_for_single_query(
             else:
                 print(f"  -> Retrieved indices: {retrieval_result['retrieved_indices']}")
 
+            # This variable will hold the list of texts as it's passed through intermediate steps
+            texts_for_next_step = []
+
             # Step 2: Adapt
             if not pipeline_halted:
                 print("\n[STEP 2] ADAPT")
@@ -137,12 +144,39 @@ def run_pipeline_for_single_query(
                         print(f"  -> Adapted text #{i+1} (start): '{text[:120]}...'")
                     if adapt_result['status'] == 'PARTIAL_SUCCESS':
                         print(f"  -> WARNING: Adaptation partially succeeded. {len(adapt_result.get('failed_adaptations', []))} exemplars failed.")
-            
+                    texts_for_next_step = adapt_result.get('adapted_texts', [])
+
+            # Step 2.5: Analogical Adaptation (NEW STEP)
+            if not pipeline_halted:
+                print("\n[STEP 2.5] ANALOGICAL ADAPTATION")
+                analogical_adapt_result = analogical_adaptation(
+                    target_query=target_query,
+                    adapted_texts=texts_for_next_step,
+                    api_manager=manager_for_solve, # Use the powerful solver's manager
+                    config=config
+                )
+                run_log['steps']['analogical_adaptation'] = analogical_adapt_result
+                
+                if analogical_adapt_result['status'] == 'SKIPPED':
+                    print("  -> Analogical Adaptation was SKIPPED as per config.")
+                    # The original texts are passed through, so texts_for_next_step is unchanged.
+                elif "FAILURE" in analogical_adapt_result['status']:
+                    run_log['pipeline_status'] = "FAILURE: Analogical Adaptation failed for all groups."
+                    logger.error(run_log['pipeline_status'])
+                    print("  -> Analogical Adaptation FAILED for all groups. Halting pipeline.")
+                    pipeline_halted = True
+                else:
+                    # On success or partial success, use the newly generated exemplars
+                    texts_for_next_step = analogical_adapt_result['newly_generated_exemplars']
+                    print(f"  -> Generated {len(texts_for_next_step)} new exemplars via analogical adaptation.")
+                    if analogical_adapt_result['status'] == 'PARTIAL_SUCCESS':
+                        print(f"  -> WARNING: {len(analogical_adapt_result.get('failed_generations', []))} generations failed.")
+
             # Step 3: Merge
             if not pipeline_halted:
                 print("\n[STEP 3] MERGE")
                 merge_result = merge(
-                    target_query=target_query, adapted_texts=adapt_result['adapted_texts'],
+                    target_query=target_query, adapted_texts=texts_for_next_step,
                     embedding_model=embedding_model, api_manager=manager_for_adapt, config=config
                 )
                 run_log['steps']['merging'] = merge_result
