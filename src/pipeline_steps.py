@@ -31,7 +31,8 @@ from src.prompts import (
     create_merging_prompt,
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple,
-    create_duplicate_check_prompt
+    create_duplicate_check_prompt,
+    create_self_sampling_generation_prompt # <-- ADDED THIS IMPORT
 )
 # MODIFIED: Import manager classes for type checking
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
@@ -213,6 +214,71 @@ def adapt(
         "adapted_texts": successful_texts,
         "failed_adaptations": failed_adaptations
     }
+
+# <<< --- START OF NEW CODE --- >>>
+# --- 2b. SELF-SAMPLING STEP ---
+def generate_synthetic_samples(
+    target_query: str,
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Generates N synthetic exemplars by having an LLM solve the target query multiple times.
+    This is used when USE_RETRIEVAL is False and SELF_SAMPLING is True.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting self-sampling step to generate synthetic exemplars.")
+
+    n_samples = config.get("N_SELF_SAMPLES", 3)
+    
+    # We use the powerful solver model and high temperature for diverse outputs
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    else:
+        raise TypeError(f"Unsupported API manager type for self-sampling: {type(api_manager)}")
+        
+    temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
+    
+    prompt = create_self_sampling_generation_prompt(target_query, config)
+
+    synthetic_samples = []
+    failed_generations = []
+
+    for i in range(n_samples):
+        print(f"    -> Generating synthetic sample {i+1}/{n_samples}...")
+        print(f"      [API Context] Calling LLM for: Synthetic Sample Generation (Attempt #{i+1})")
+        
+        response = api_manager.generate_content(prompt, model_name, temperature)
+
+        if response['status'] == 'SUCCESS':
+            # Format the successful generation into a standard exemplar format
+            formatted_exemplar = EXEMPLAR_FORMAT.format(
+                question=target_query, 
+                solution=response['text']
+            )
+            synthetic_samples.append(formatted_exemplar)
+        else:
+            logger.warning(f"Synthetic sample generation failed for attempt {i+1}: {response['error_message']}")
+            failed_generations.append({"attempt_number": i+1, "error_info": response})
+    
+    # Determine the final status
+    if not synthetic_samples and failed_generations:
+        final_status = "FAILURE"
+    elif synthetic_samples and failed_generations:
+        final_status = "PARTIAL_SUCCESS"
+    else:
+        final_status = "SUCCESS"
+
+    return {
+        "status": final_status,
+        "synthetic_samples": synthetic_samples,
+        "failed_generations": failed_generations
+    }
+# <<< --- END OF NEW CODE --- >>>
 
 
 # --- 3. MERGING STEP ---
