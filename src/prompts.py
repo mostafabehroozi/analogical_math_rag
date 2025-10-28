@@ -521,7 +521,7 @@ Main Question:
 {main_question_text}
 
 Your Solution:
-"""
+""" ,
 
     "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
 Both 'Model Output' and 'Ground Truth' may contain intermediate steps (Chain-of-Thought) leading to a final answer.
