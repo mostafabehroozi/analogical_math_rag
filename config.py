@@ -175,6 +175,10 @@ CONFIG = {
     "PROMPT_TEMPLATE_TRANSFORMATION_3": "transformation_complete",
     
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
+    
+    # NEW: Prompt for the intermediate analogical adaptation step
+    "PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION": "analogical_adaptation_v1",
+
     # MODIFIED: Default solver prompt is now v2.
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
 

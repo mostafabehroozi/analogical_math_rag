@@ -456,6 +456,31 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
+    # NEW: Template for the analogical adaptation step
+    "analogical_adaptation_v1": """You are an expert in analogical reasoning. Your task is to solve the Main Question by drawing meaningful analogies from the provided solved examples.
+The goal is to generate a new, high-quality solved example that can be used to help solve the Main Question later. Your output should be a complete, step-by-step rationale and a final answer.
+
+<Instructions>
+Carefully analyze each provided example. Pinpoint common reasoning steps, patterns, and strategies. Use these insights to construct a robust solution for the Main Question. Your generated solution will serve as a new synthetic exemplar.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Generated Exemplar (Strictly follow this format)>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your Generated Exemplar (Strictly follow this format)>
+""",
+
     "final_solver_simple_v1": """**Objective:**
 Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
 
@@ -614,6 +639,26 @@ def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str
     
     template = PROMPT_TEMPLATES["merging_v1"]
     return template.format(target_query=target_query, sample_1=samples_to_merge[0], sample_2=samples_to_merge[1])
+
+def create_analogical_adaptation_prompt(main_question_text: str, examples: List[str], config: Dict[str, Any]) -> str:
+    """
+    Creates the prompt for the intermediate analogical adaptation step, which generates new exemplars.
+    """
+    if not examples:
+        return "Error: At least one example is required for the analogical adaptation prompt."
+
+    template_name = config.get("PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION", "analogical_adaptation_v1")
+    template = PROMPT_TEMPLATES.get(template_name)
+
+    if not template:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+
+    # Format the examples into a block, similar to the final solver
+    examples_block = ""
+    for i, sample_text in enumerate(examples):
+        examples_block += f"<Example {i+1}>\n{sample_text}\n</Example {i+1}>\n\n"
+        
+    return template.format(main_question_text=main_question_text, examples_block=examples_block.strip())
 
 def create_final_reasoning_prompt(main_question_text: str, final_examples: List[str], config: Dict[str, Any]) -> str:
     """

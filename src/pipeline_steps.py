@@ -32,7 +32,8 @@ from src.prompts import (
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple,
     create_duplicate_check_prompt,
-    create_self_sampling_generation_prompt # <-- ADDED THIS IMPORT
+    create_self_sampling_generation_prompt,
+    create_analogical_adaptation_prompt
 )
 # MODIFIED: Import manager classes for type checking
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
@@ -280,8 +281,8 @@ def analogical_adaptation(
             sample_num = j + 1
             print(f"      -> Generating synthetic sample {sample_num}/{samples_per_group} for group #{group_num}...")
             
-            # Use the existing final reasoning prompt for this intermediate task.
-            prompt = create_final_reasoning_prompt(target_query, current_group_samples, config)
+            # Use the new, dedicated prompt for this intermediate task.
+            prompt = create_analogical_adaptation_prompt(target_query, current_group_samples, config)
             
             print(f"        [API Context] Calling LLM for: Analogical Adaptation (Group #{group_num}, Sample #{sample_num})")
             response = api_manager.generate_content(prompt, model_name, temperature)
