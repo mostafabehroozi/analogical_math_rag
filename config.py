@@ -179,7 +179,7 @@ CONFIG = {
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
 
     # NEW: Prompt for generating synthetic samples
-    "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator_v1",
+    "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator_v2",
 
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
