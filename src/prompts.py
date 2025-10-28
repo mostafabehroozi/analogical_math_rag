@@ -498,6 +498,31 @@ Final Answer:
 **Your Solution:**
 """,
 
+    "self_sampling_generator_v2":"""Objective:
+Your task is to solve the Main Question by providing a formal, step-by-step solution and a final answer. The solution should be presented in an academic, textbook-style format.
+
+Style Guidelines:
+
+Avoid conversational language: Do not use phrases like "Let's start by...", "Now, we will...", or any chatbot-like pleasantries.
+
+Be direct and concise: Focus on showing the mathematical steps, formulas, and calculations directly.
+
+Formal Tone: The entire output should be objective and formal, as if written in a mathematics textbook.
+
+Required Output Format (Strictly Adhere):
+Solution:
+[Your step-by-step solution, presenting the mathematical derivation directly.]
+
+Final Answer:
+[Your final answer to the Main Question.]
+
+Inputs:
+Main Question:
+{main_question_text}
+
+Your Solution:
+"""
+
     "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
 Both 'Model Output' and 'Ground Truth' may contain intermediate steps (Chain-of-Thought) leading to a final answer.
 
