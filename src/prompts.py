@@ -548,6 +548,23 @@ Main Question:
 Your Solution:
 """ ,
 
+    "self_sampling_augmentor_v1": """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
+
+**Instructions:**
+1.  Read the 'Base Question' to understand its core mathematical concept, structure, and context.
+2.  Create {n_samples} new questions that use the same reasoning pattern but with different numbers, entities (e.g., names, objects), and scenarios.
+3.  **Crucially, you must NOT provide any rationale or answer.** Your output should consist ONLY of the generated question statements.
+4.  Ensure the generated questions are unique from each other and from the base question.
+5.  Present your output as a numbered list.
+
+---
+**Base Question:**
+{main_question_text}
+---
+
+**Your Output (ONLY the {n_samples} numbered questions):**
+""",
+
     "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
 Both 'Model Output' and 'Ground Truth' may contain intermediate steps (Chain-of-Thought) leading to a final answer.
 
@@ -704,6 +721,12 @@ def create_self_sampling_generation_prompt(main_question_text: str, config: Dict
     template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR", "self_sampling_generator_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question_text)
+
+def create_self_sampling_augmentation_prompt(main_question_text: str, n_samples: int, config: Dict[str, Any]) -> str:
+    """Creates the prompt for augmenting a question into N distinct versions."""
+    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR", "self_sampling_augmentor_v1")
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question_text, n_samples=n_samples)
 
 def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any]) -> str:
     """Creates the prompt for the evaluator LLM."""

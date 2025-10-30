@@ -132,6 +132,7 @@ CONFIG = {
 
     # NEW: Self-Sampling Control
     "SELF_SAMPLING": False, # If True and USE_RETRIEVAL is False, generate synthetic samples.
+    "APPLY_SELF_SAMPLING_AUGMENTATION": False, # NEW: If True, generate N distinct questions first.
     
     # MODIFIED: Granular adaptation steps
     "APPLY_NORMALIZATION": False,           # Renamed from APPLY_STANDARDIZATION
@@ -184,6 +185,7 @@ CONFIG = {
 
     # NEW: Prompt for generating synthetic samples
     "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator_v2",
+    "PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR": "self_sampling_augmentor_v1", # NEW
 
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",

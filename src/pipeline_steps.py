@@ -33,6 +33,7 @@ from src.prompts import (
     create_final_reasoning_prompt_simple,
     create_duplicate_check_prompt,
     create_self_sampling_generation_prompt,
+    create_self_sampling_augmentation_prompt,
     create_analogical_adaptation_prompt
 )
 # MODIFIED: Import manager classes for type checking
@@ -321,12 +322,11 @@ def generate_synthetic_samples(
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Generates N synthetic exemplars by having an LLM solve the target query multiple times.
-    This is used when USE_RETRIEVAL is False and SELF_SAMPLING is True.
+    Generates N synthetic exemplars. Supports two modes:
+    1. Standard: Solves the same target query N times.
+    2. Augmented: Generates N distinct questions first, then solves each one.
     """
     logger = logging.getLogger(__name__)
-    logger.info("Starting self-sampling step to generate synthetic exemplars.")
-
     n_samples = config.get("N_SELF_SAMPLES", 3)
     
     # We use the powerful solver model and high temperature for diverse outputs
@@ -341,27 +341,69 @@ def generate_synthetic_samples(
         
     temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
     
-    prompt = create_self_sampling_generation_prompt(target_query, config)
-
     synthetic_samples = []
     failed_generations = []
-
-    for i in range(n_samples):
-        print(f"    -> Generating synthetic sample {i+1}/{n_samples}...")
-        print(f"      [API Context] Calling LLM for: Synthetic Sample Generation (Attempt #{i+1})")
+    
+    # --- AUGMENTED MODE ---
+    if config.get('APPLY_SELF_SAMPLING_AUGMENTATION', False):
+        logger.info("Starting AUGMENTED self-sampling to generate distinct exemplars.")
+        print("\n[STEP 1a] AUGMENT: Generating distinct question variations...")
         
-        response = api_manager.generate_content(prompt, model_name, temperature)
+        # Step A: Generate N distinct questions
+        aug_prompt = create_self_sampling_augmentation_prompt(target_query, n_samples, config)
+        print("  [API Context] Calling LLM for: Question Augmentation")
+        aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
 
-        if response['status'] == 'SUCCESS':
-            # Format the successful generation into a standard exemplar format
-            formatted_exemplar = EXEMPLAR_FORMAT.format(
-                question=target_query, 
-                solution=response['text']
-            )
-            synthetic_samples.append(formatted_exemplar)
-        else:
-            logger.warning(f"Synthetic sample generation failed for attempt {i+1}: {response['error_message']}")
-            failed_generations.append({"attempt_number": i+1, "error_info": response})
+        if aug_response['status'] != 'SUCCESS':
+            logger.error(f"Question augmentation failed: {aug_response['error_message']}")
+            return {"status": "FAILURE", "synthetic_samples": [], "failed_generations": [{"attempt_number": "N/A", "failed_at_step": "augmentation", "error_info": aug_response}]}
+        
+        # Parse the augmented questions from the response
+        # Try to find lines that start with a number and a dot
+        augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
+        if not augmented_questions:
+             logger.warning("Could not parse augmented questions from LLM response using regex. Falling back to splitting by newline.")
+             # Fallback: Split by newline and filter empty lines if regex fails
+             augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
+
+        # Ensure we don't process more than requested if the LLM over-generated
+        augmented_questions = augmented_questions[:n_samples]
+        print(f"  -> Generated {len(augmented_questions)} augmented questions. Now solving each one...")
+
+        # Step B: Solve each augmented question
+        for i, aug_question in enumerate(augmented_questions):
+            print(f"    -> [STEP 1b] SOLVE: Solving augmented sample {i+1}/{len(augmented_questions)}...")
+            
+            solve_prompt = create_self_sampling_generation_prompt(aug_question, config)
+            print(f"      [API Context] Calling LLM for: Solving Augmented Question (Attempt #{i+1})")
+            
+            solve_response = api_manager.generate_content(solve_prompt, model_name, temperature)
+
+            if solve_response['status'] == 'SUCCESS':
+                # Format using the AUGMENTED question, not the original target query
+                formatted_exemplar = EXEMPLAR_FORMAT.format(question=aug_question, solution=solve_response['text'])
+                synthetic_samples.append(formatted_exemplar)
+            else:
+                logger.warning(f"Augmented sample solution failed for attempt {i+1}: {solve_response['error_message']}")
+                failed_generations.append({"attempt_number": i+1, "failed_at_step": "solving_augmented", "error_info": solve_response})
+
+    # --- STANDARD MODE ---
+    else:
+        logger.info("Starting STANDARD self-sampling to generate synthetic exemplars.")
+        prompt = create_self_sampling_generation_prompt(target_query, config)
+        for i in range(n_samples):
+            print(f"    -> Generating synthetic sample {i+1}/{n_samples}...")
+            print(f"      [API Context] Calling LLM for: Synthetic Sample Generation (Attempt #{i+1})")
+            
+            response = api_manager.generate_content(prompt, model_name, temperature)
+
+            if response['status'] == 'SUCCESS':
+                # Format using the ORIGINAL target query
+                formatted_exemplar = EXEMPLAR_FORMAT.format(question=target_query, solution=response['text'])
+                synthetic_samples.append(formatted_exemplar)
+            else:
+                logger.warning(f"Synthetic sample generation failed for attempt {i+1}: {response['error_message']}")
+                failed_generations.append({"attempt_number": i+1, "error_info": response})
     
     # Determine the final status
     if not synthetic_samples and failed_generations:
