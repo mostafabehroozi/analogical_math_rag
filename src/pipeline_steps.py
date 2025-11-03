@@ -61,6 +61,53 @@ def _generate_embeddings(
         return np.array([])
 
 
+# <<< --- START OF NEW HELPER FUNCTION --- >>>
+def _select_most_dissimilar_questions(
+    questions: List[str],
+    embedding_model: SentenceTransformer,
+    n_to_select: int
+) -> List[str]:
+    """
+    Selects N questions from a list of K questions that are most dissimilar to each other.
+    Uses a greedy iterative approach.
+    """
+    logger = logging.getLogger(__name__)
+    if not questions or len(questions) <= n_to_select:
+        return questions
+
+    logger.info(f"Selecting {n_to_select} most dissimilar questions from a pool of {len(questions)}.")
+
+    # 1. Embed all questions
+    embeddings = _generate_embeddings(questions, embedding_model)
+    if embeddings.size == 0:
+        logger.error("Failed to generate embeddings for dissimilarity selection. Returning original subset.")
+        return questions[:n_to_select]
+
+    # 2. Start with a random question
+    selected_indices = [np.random.randint(0, len(questions))]
+    
+    # 3. Iteratively add the question that is furthest from the currently selected set
+    for _ in range(n_to_select - 1):
+        # Calculate similarities between all questions and the already selected ones
+        sim_matrix = cosine_similarity(embeddings, embeddings[selected_indices])
+        
+        # For each question, find its highest similarity to any question already in the selected set
+        min_distances = np.max(sim_matrix, axis=1)
+        
+        # Invalidate already selected indices by setting their distance to a high value
+        min_distances[selected_indices] = 2.0 # Cosine similarity is <= 1, so 2 is a safe "infinity"
+        
+        # Select the question with the lowest max similarity (i.e., the one most "distant")
+        next_index = np.argmin(min_distances)
+        selected_indices.append(next_index)
+        
+    selected_questions = [questions[i] for i in selected_indices]
+    logger.info(f"Selected indices for maximum dissimilarity: {selected_indices}")
+    
+    return selected_questions
+# <<< --- END OF NEW HELPER FUNCTION --- >>>
+
+
 # --- 1. RETRIEVAL STEP ---
 def retrieve(
     target_query: str,
@@ -373,8 +420,14 @@ def analogical_adaptation(
         print("\n    -> Augmenting target query for group matching...")
         num_groups = len(grouping_config)
         
+        # --- MODIFIED: Oversampling logic ---
+        questions_to_generate = num_groups
+        if config.get('APPLY_AUGMENTATION_OVERSAMPLING', False):
+            questions_to_generate = config.get('AUGMENTATION_OVERSAMPLING_K', num_groups)
+            print(f"      -> Oversampling enabled. Will generate {questions_to_generate} questions for {num_groups} groups.")
+
         # 1. Generate augmented questions
-        aug_prompt = create_self_sampling_augmentation_prompt(target_query, num_groups, config)
+        aug_prompt = create_self_sampling_augmentation_prompt(target_query, questions_to_generate, config)
         aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
         
         if aug_response['status'] != 'SUCCESS':
@@ -386,7 +439,7 @@ def analogical_adaptation(
              augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
 
         if len(augmented_questions) < num_groups:
-             logger.warning(f"LLM generated {len(augmented_questions)} questions, but {num_groups} were expected. Matching may be incomplete.")
+             logger.warning(f"LLM generated {len(augmented_questions)} questions, but {questions_to_generate} were expected. Matching may be incomplete.")
         
         # 2. Match groups to augmented questions
         matched_group_aq_pairs = _match_groups_to_augmented_questions(
@@ -458,17 +511,18 @@ def analogical_adaptation(
     }
 
 
-# <<< --- START OF NEW CODE --- >>>
-# --- 2b. SELF-SAMPLING STEP ---
+# --- 2b. SELF-SAMPLING STEP (MODIFIED) ---
 def generate_synthetic_samples(
     target_query: str,
     api_manager: Any,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    embedding_model: SentenceTransformer
 ) -> Dict[str, Any]:
     """
     Generates N synthetic exemplars. Supports two modes:
     1. Standard: Solves the same target query N times.
     2. Augmented: Generates N distinct questions first, then solves each one.
+    MODIFIED: Supports oversampling (generating K > N) and selecting the N most dissimilar questions.
     """
     logger = logging.getLogger(__name__)
     n_samples = config.get("N_SELF_SAMPLES", 3)
@@ -493,8 +547,14 @@ def generate_synthetic_samples(
         logger.info("Starting AUGMENTED self-sampling to generate distinct exemplars.")
         print("\n[STEP 1a] AUGMENT: Generating distinct question variations...")
         
-        # Step A: Generate N distinct questions
-        aug_prompt = create_self_sampling_augmentation_prompt(target_query, n_samples, config)
+        # --- MODIFIED: Oversampling logic ---
+        questions_to_generate = n_samples
+        if config.get('APPLY_AUGMENTATION_OVERSAMPLING', False):
+            questions_to_generate = config.get('AUGMENTATION_OVERSAMPLING_K', n_samples)
+            print(f"  -> Oversampling enabled. Will generate {questions_to_generate} questions to select {n_samples} from.")
+
+        # Step A: Generate K distinct questions
+        aug_prompt = create_self_sampling_augmentation_prompt(target_query, questions_to_generate, config)
         print("  [API Context] Calling LLM for: Question Augmentation")
         aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
 
@@ -503,16 +563,23 @@ def generate_synthetic_samples(
             return {"status": "FAILURE", "synthetic_samples": [], "failed_generations": [{"attempt_number": "N/A", "failed_at_step": "augmentation", "error_info": aug_response}]}
         
         # Parse the augmented questions from the response
-        # Try to find lines that start with a number and a dot
         augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
         if not augmented_questions:
              logger.warning("Could not parse augmented questions from LLM response using regex. Falling back to splitting by newline.")
-             # Fallback: Split by newline and filter empty lines if regex fails
              augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
 
-        # Ensure we don't process more than requested if the LLM over-generated
+        # --- MODIFIED: Selection logic ---
+        if config.get('APPLY_AUGMENTATION_OVERSAMPLING', False) and len(augmented_questions) > n_samples:
+            print(f"  -> Selecting {n_samples} most dissimilar questions from the {len(augmented_questions)} generated ones...")
+            augmented_questions = _select_most_dissimilar_questions(
+                questions=augmented_questions,
+                embedding_model=embedding_model,
+                n_to_select=n_samples
+            )
+
+        # Ensure we don't process more than requested if the LLM over-generated or after selection
         augmented_questions = augmented_questions[:n_samples]
-        print(f"  -> Generated {len(augmented_questions)} augmented questions. Now solving each one...")
+        print(f"  -> Final set of {len(augmented_questions)} augmented questions selected. Now solving each one...")
 
         # Step B: Solve each augmented question
         for i, aug_question in enumerate(augmented_questions):
@@ -562,7 +629,6 @@ def generate_synthetic_samples(
         "synthetic_samples": synthetic_samples,
         "failed_generations": failed_generations
     }
-# <<< --- END OF NEW CODE --- >>>
 
 
 # --- 3. MERGING STEP ---

@@ -134,6 +134,10 @@ CONFIG = {
     "SELF_SAMPLING": False, # If True and USE_RETRIEVAL is False, generate synthetic samples.
     "APPLY_SELF_SAMPLING_AUGMENTATION": False, # NEW: If True, generate N distinct questions first.
     
+    # NEW: Oversampling feature for augmentation
+    "APPLY_AUGMENTATION_OVERSAMPLING": False, # If True, generate K questions and select N from them.
+    "AUGMENTATION_OVERSAMPLING_K": 10,        # The number of questions (K) to generate in the oversampling pool.
+
     # MODIFIED: Granular adaptation steps
     "APPLY_NORMALIZATION": False,           # Renamed from APPLY_STANDARDIZATION
     "APPLY_TRANSFORMATION": False,          # DEPRECATED: Replaced by granular transformation flags.

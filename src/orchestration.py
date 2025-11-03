@@ -191,14 +191,14 @@ def run_pipeline_for_single_query(
                     print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
                 final_exemplars_for_solve = merge_result['merged_texts']
 
-        # <<< --- START OF NEW LOGIC --- >>>
         elif config.get('SELF_SAMPLING', False):
             print("\n[STEP 1] GENERATE SYNTHETIC SAMPLES (Self-Sampling Mode)")
             # Use the powerful solver's manager for this creative task
             sampling_result = generate_synthetic_samples(
                 target_query=target_query,
                 api_manager=manager_for_solve,
-                config=config
+                config=config,
+                embedding_model=embedding_model # <-- MODIFIED: Pass embedding model
             )
             run_log['steps']['self_sampling'] = sampling_result
             if "FAILURE" in sampling_result['status']:
@@ -211,7 +211,6 @@ def run_pipeline_for_single_query(
                 print(f"  -> Generated {len(final_exemplars_for_solve)} synthetic samples.")
                 if sampling_result['status'] == 'PARTIAL_SUCCESS':
                     print(f"  -> WARNING: {len(sampling_result['failed_generations'])} sample generations failed.")
-        # <<< --- END OF NEW LOGIC --- >>>
         
         else:
             print("\n[STEP 1, 2, 3] SKIPPED (USE_RETRIEVAL and SELF_SAMPLING are False).")
