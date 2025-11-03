@@ -143,6 +143,10 @@ CONFIG = {
 
     # --- NEW: Analogical Adaptation Step ---
     "APPLY_ANALOGICAL_ADAPTATION": False,   # Master switch for the new intermediate step.
+    
+    # NEW: Master switch for the augmentation feature within analogical adaptation
+    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION": False,
+    
     # Defines how to group adapted samples for the intermediate reasoning step. Indices are 1-based.
     # Example: [[1, 2], [3]] means group the 1st & 2nd samples together, and the 3rd sample alone.
     "ANALOGICAL_ADAPTATION_GROUPING": [[1, 2], [3, 4], [5]],

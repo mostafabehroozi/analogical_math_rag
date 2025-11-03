@@ -81,6 +81,7 @@ def run_pipeline_for_single_query(
                     "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
                     "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3",
                     "APPLY_ANALOGICAL_ADAPTATION", # <-- ADDED
+                    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION", # <-- ADDED
                     "ANALOGICAL_ADAPTATION_GROUPING", # <-- ADDED
                     "ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP", # <-- ADDED
                     "APPLY_MERGING",
@@ -153,7 +154,11 @@ def run_pipeline_for_single_query(
                     target_query=target_query,
                     adapted_texts=texts_for_next_step,
                     api_manager=manager_for_solve, # Use the powerful solver's manager
-                    config=config
+                    config=config,
+                    # --- PASS NEW ARGUMENTS ---
+                    retrieval_result=retrieval_result,
+                    exemplar_data=exemplar_data,
+                    embedding_model=embedding_model
                 )
                 run_log['steps']['analogical_adaptation'] = analogical_adapt_result
                 

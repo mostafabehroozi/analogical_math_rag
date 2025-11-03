@@ -457,28 +457,33 @@ Final Answer:
 """,
 
     # NEW: Template for the analogical adaptation step
-    "analogical_adaptation_v1": """You are an expert in analogical reasoning. Your task is to solve the Main Question by drawing meaningful analogies from the provided solved examples.
-The goal is to generate a new, high-quality solved example that can be used to help solve the Main Question later. Your output should be a complete, step-by-step rationale and a final answer.
+    "self_sampling_augmentor_v1": """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
 
 <Instructions>
-Carefully analyze each provided example. Pinpoint common reasoning steps, patterns, and strategies. Use these insights to construct a robust solution for the Main Question. Your generated solution will serve as a new synthetic exemplar.
+1. Read the 'Base Question' to understand its core mathematical concept, structure, and context.
+2. Create {n_samples} new questions that use the same reasoning pattern but with different numbers, entities (e.g., names, objects), and scenarios.
+3. Crucially, you must NOT provide any rationale or answer. Your output should consist ONLY of the generated question statements.
+4. Ensure the generated questions are unique from each other and from the base question.
+5. Present your output as a numbered list, as shown in the example.
 </Instructions>
 
-<Solved Examples>
-{examples_block}
-</Solved Examples>
+<Example>
+<Base Question>
+A farmer has 50 apples. He sells 20 to a market and then buys 10 more from his neighbor. How many apples does he have now?
+</Base Question>
+<Your Output (for n_samples = 2)>
+1. A student has 80 pencils. She gives 30 to her friends and then her teacher gives her 15 more. How many pencils does she have now?
+2. A painter has 120 ml of blue paint. He uses 50 ml for a canvas and then mixes in 25 ml more from another tube. How much blue paint does he have now?
+</Your Output>
+</Example>
 
-<Main Question to Solve>
+<Task>
+<Base Question>
 {main_question_text}
-</Main Question to Solve>
+</Base Question>
+</Task>
 
-<Your Generated Exemplar (Strictly follow this format)>
-Rationale:
-[Your step-by-step rationale for the Main Question]
-
-Final Answer:
-[Your final answer to the Main Question]
-</Your Generated Exemplar (Strictly follow this format)>
+<Your Output (ONLY the {n_samples} numbered questions)>
 """,
 
     "final_solver_simple_v1": """**Objective:**
@@ -548,19 +553,28 @@ Main Question:
 Your Solution:
 """ ,
 
-    "self_sampling_augmentor_v1": """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
+    "self_sampling_augmentor_v1" : """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
 
-**Instructions:**
+Instructions:
 1.  Read the 'Base Question' to understand its core mathematical concept, structure, and context.
 2.  Create {n_samples} new questions that use the same reasoning pattern but with different numbers, entities (e.g., names, objects), and scenarios.
 3.  **Crucially, you must NOT provide any rationale or answer.** Your output should consist ONLY of the generated question statements.
 4.  Ensure the generated questions are unique from each other and from the base question.
-5.  Present your output as a numbered list.
+5.  Present your output as a numbered list, as shown in the example below.
 
----
+
+Example:
+**Base Question:**
+A farmer has 50 apples. He sells 20 to a market and then buys 10 more from his neighbor. How many apples does he have now?
+
+**Your Output (for n_samples = 2):**
+1. A student has 80 pencils. She gives 30 to her friends and then her teacher gives her 15 more. How many pencils does she have now?
+2. A painter has 120 ml of blue paint. He uses 50 ml for a canvas and then mixes in 25 ml more from another tube. How much blue paint does he have now?
+
+
+**Your Task:**
 **Base Question:**
 {main_question_text}
----
 
 **Your Output (ONLY the {n_samples} numbered questions):**
 """,

@@ -21,7 +21,7 @@ import re
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Tuple
 
 # Import our custom modules
 from src.prompts import (
@@ -218,17 +218,124 @@ def adapt(
     }
 
 
-# --- NEW: ANALOGICAL ADAPTATION STEP ---
+# --- NEW HELPER FUNCTION FOR AUGMENTED ANALOGICAL ADAPTATION ---
+def _match_groups_to_augmented_questions(
+    augmented_questions: List[str],
+    retrieved_indices: List[int],
+    grouping_config: List[List[int]],
+    exemplar_data: Dict[str, Any],
+    embedding_model: SentenceTransformer
+) -> List[Tuple[List[int], str]]:
+    """
+    Matches groups of retrieved samples to augmented questions based on similarity.
+
+    Returns:
+        A list of tuples, where each tuple is (group_indices, matched_augmented_question).
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting sophisticated matching of groups to augmented questions.")
+
+    # 1. Embed all augmented questions
+    aq_embeddings = _generate_embeddings(augmented_questions, embedding_model)
+    if aq_embeddings.size == 0:
+        logger.error("Failed to generate embeddings for augmented questions. Cannot perform matching.")
+        return []
+
+    # 2. Get embeddings for all unique retrieved samples. Indices in grouping_config are 1-based from retrieved list.
+    retrieved_indices_map = {orig_idx: i for i, orig_idx in enumerate(retrieved_indices)}
+    retrieved_embeddings = exemplar_data['embeddings'][retrieved_indices]
+
+    # 3. Calculate the M x K similarity matrix (Augmented Questions vs. Retrieved Samples)
+    similarity_matrix = cosine_similarity(aq_embeddings, retrieved_embeddings)
+
+    # 4. Prepare for iterative matching
+    # Map 1-based config indices to 0-based matrix column indices
+    unmatched_groups = [
+        [retrieved_indices_map[config_idx-1] for config_idx in group if (config_idx-1) in retrieved_indices_map]
+        for group in grouping_config
+    ]
+    unmatched_groups = [g for g in unmatched_groups if g] # Filter out empty/invalid groups
+
+    available_aq_indices = list(range(len(augmented_questions)))
+    matched_pairs = []
+
+    # Make a copy for manipulation
+    temp_similarity_matrix = np.copy(similarity_matrix)
+
+    while unmatched_groups and available_aq_indices:
+        # A. Find the global best match in the current matrix
+        max_val = -np.inf
+        best_aq_idx, best_sample_idx = -1, -1
+
+        # Only consider available AQs
+        if temp_similarity_matrix.size > 0:
+             max_val = np.max(temp_similarity_matrix)
+             coords = np.where(temp_similarity_matrix == max_val)
+             best_aq_idx, best_sample_idx = coords[0][0], coords[1][0]
+
+        if best_aq_idx == -1 or max_val == -np.inf:
+            logger.warning("Could not find a best match in the remaining matrix. Breaking loop.")
+            break
+            
+        matched_aq = augmented_questions[best_aq_idx]
+
+        # B. Identify candidate groups containing the best-matched sample
+        candidate_groups = [g for g in unmatched_groups if best_sample_idx in g]
+        
+        chosen_group = None
+        if len(candidate_groups) == 1:
+            chosen_group = candidate_groups[0]
+            logger.info(f"Simple match: AQ '{matched_aq[:30]}...' matched to group with sample index {retrieved_indices[best_sample_idx]}.")
+        elif len(candidate_groups) > 1:
+            # C. Tie-breaker logic
+            group_backup_scores = {}
+            # Consider AQs other than the one we just matched
+            other_aq_indices = [idx for idx in available_aq_indices if idx != best_aq_idx]
+            
+            for group in candidate_groups:
+                other_members = [m for m in group if m != best_sample_idx]
+                if not other_members or not other_aq_indices:
+                    group_backup_scores[tuple(group)] = -1.0 # No backup, very low score
+                    continue
+                
+                # Find the max similarity for any other member against any remaining AQ
+                backup_score = np.max(similarity_matrix[np.ix_(other_aq_indices, other_members)])
+                group_backup_scores[tuple(group)] = backup_score
+            
+            # Choose the group with the LOWEST backup score
+            worst_group_tuple = min(group_backup_scores, key=group_backup_scores.get)
+            chosen_group = list(worst_group_tuple)
+            logger.info(f"Tie-breaker: AQ '{matched_aq[:30]}...' matched to group with sample index {retrieved_indices[best_sample_idx]} (backup score: {group_backup_scores[worst_group_tuple]:.4f}).")
+
+        # D. Update and prepare for next iteration
+        if chosen_group:
+            # Convert 0-based indices back to 1-based for the final output
+            original_group_config_indices = [retrieved_indices.index(retrieved_indices[i]) + 1 for i in chosen_group]
+            matched_pairs.append((original_group_config_indices, matched_aq))
+            unmatched_groups.remove(chosen_group)
+            
+        # Invalidate the matched AQ row for the next iteration
+        temp_similarity_matrix[best_aq_idx, :] = -np.inf
+        if best_aq_idx in available_aq_indices:
+             available_aq_indices.remove(best_aq_idx)
+             
+    return matched_pairs
+
+
+# --- MODIFIED: ANALOGICAL ADAPTATION STEP ---
 def analogical_adaptation(
     target_query: str,
     adapted_texts: List[str],
     api_manager: Any,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    # --- NEW PARAMETERS ---
+    retrieval_result: Dict[str, Any],
+    exemplar_data: Dict[str, Any],
+    embedding_model: SentenceTransformer
 ) -> Dict[str, Any]:
     """
     Performs an intermediate analogical reasoning step to generate new, synthetic exemplars.
-    Groups adapted samples according to the config, has an LLM solve the main query using
-    each group, and collects the N generated solutions to pass to the next step.
+    MODIFIED: Supports augmenting the target query and matching to retrieved groups.
     """
     logger = logging.getLogger(__name__)
 
@@ -258,11 +365,48 @@ def analogical_adaptation(
 
     all_new_exemplars = []
     failed_generations = []
+    
+    loop_iterator: List[Tuple[int, List[int], str]] = []
 
-    # 3. Process each group defined in the configuration.
-    for i, group_indices in enumerate(grouping_config):
-        group_num = i + 1
-        print(f"    -> Processing Analogical Group #{group_num} with indices {group_indices}...")
+    # --- NEW: AUGMENTATION & MATCHING LOGIC ---
+    if config.get('APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION', False):
+        print("\n    -> Augmenting target query for group matching...")
+        num_groups = len(grouping_config)
+        
+        # 1. Generate augmented questions
+        aug_prompt = create_self_sampling_augmentation_prompt(target_query, num_groups, config)
+        aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
+        
+        if aug_response['status'] != 'SUCCESS':
+            logger.error(f"Target query augmentation failed: {aug_response['error_message']}")
+            return {"status": "FAILURE", "error_info": aug_response, "newly_generated_exemplars": [], "failed_generations": []}
+
+        augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
+        if not augmented_questions:
+             augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
+
+        if len(augmented_questions) < num_groups:
+             logger.warning(f"LLM generated {len(augmented_questions)} questions, but {num_groups} were expected. Matching may be incomplete.")
+        
+        # 2. Match groups to augmented questions
+        matched_group_aq_pairs = _match_groups_to_augmented_questions(
+            augmented_questions=augmented_questions,
+            retrieved_indices=retrieval_result['retrieved_indices'],
+            grouping_config=grouping_config,
+            exemplar_data=exemplar_data,
+            embedding_model=embedding_model
+        )
+        
+        # This becomes the loop iterator instead of the raw config
+        loop_iterator = [(i + 1, group_indices, matched_aq) for i, (group_indices, matched_aq) in enumerate(matched_group_aq_pairs)]
+        
+    else:
+        # Standard behavior: use the original target_query for all groups
+        loop_iterator = [(i + 1, group_indices, target_query) for i, group_indices in enumerate(grouping_config)]
+
+    # 3. Process each group using its assigned target query.
+    for group_num, group_indices, current_target_query in loop_iterator:
+        print(f"    -> Processing Analogical Group #{group_num} with target: '{current_target_query[:60]}...'")
         
         # 4. Select the samples for the current group.
         # Convert 1-based config indices to 0-based list indices.
@@ -283,7 +427,7 @@ def analogical_adaptation(
             print(f"      -> Generating synthetic sample {sample_num}/{samples_per_group} for group #{group_num}...")
             
             # Use the new, dedicated prompt for this intermediate task.
-            prompt = create_analogical_adaptation_prompt(target_query, current_group_samples, config)
+            prompt = create_analogical_adaptation_prompt(current_target_query, current_group_samples, config)
             
             print(f"        [API Context] Calling LLM for: Analogical Adaptation (Group #{group_num}, Sample #{sample_num})")
             response = api_manager.generate_content(prompt, model_name, temperature)
@@ -291,7 +435,7 @@ def analogical_adaptation(
             if response['status'] == 'SUCCESS':
                 # Format the successful generation into a standard exemplar format.
                 formatted_exemplar = EXEMPLAR_FORMAT.format(
-                    question=target_query, 
+                    question=current_target_query, 
                     solution=response['text']
                 )
                 all_new_exemplars.append(formatted_exemplar)
