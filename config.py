@@ -21,7 +21,6 @@ BASE_OUTPUT_DIR = "/kaggle/working/"
 # Define subdirectories for organized output.
 DATA_DIR = os.path.join(BASE_OUTPUT_DIR, "data")
 OUTPUTS_DIR = os.path.join(BASE_OUTPUT_DIR, "outputs")
-LOGS_DIR = os.path.join(OUTPUTS_DIR, "logs")
 EMBEDDINGS_DIR = os.path.join(OUTPUTS_DIR, "embeddings")
 RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
 
@@ -29,12 +28,10 @@ RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
 
 CONFIG = {
     # --- 2. Logging & Control Settings ---
-    "VERBOSE_LOGGING": True,  # Master switch for detailed print statements to the console.
     "PRINT_API_CALL_DETAILS": True, # Master switch to print detailed API call info (prompt, response, errors) to the console.
     "PRINT_API_TIMING_CHECKPOINTS": True, # Prints the time elapsed between the start of consecutive API calls.
     "API_RESPONSE_TRUNCATION_LENGTH": 50, # Control truncation for successful API responses.
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
-    "LOGS_DIR": LOGS_DIR, # Directory where detailed run logs will be saved.
     "OUTPUTS_DIR": OUTPUTS_DIR,
     "RESULTS_DIR": RESULTS_DIR,
 
@@ -216,7 +213,7 @@ def setup_directories():
     This function should be called once at the beginning of a run.
     """
     print("--- Setting up project directories ---")
-    for dir_path in [DATA_DIR, OUTPUTS_DIR, LOGS_DIR, EMBEDDINGS_DIR, RESULTS_DIR]:
+    for dir_path in [DATA_DIR, OUTPUTS_DIR, EMBEDDINGS_DIR, RESULTS_DIR]:
         try:
             os.makedirs(dir_path, exist_ok=True)
             print(f"Directory ensured: {dir_path}")

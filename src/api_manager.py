@@ -20,7 +20,6 @@ Currently supported providers:
 """
 
 import time
-import logging
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional, Any, TypedDict
 
@@ -54,10 +53,8 @@ class GeminiAPIManager:
             global_delay_seconds (int): A minimum delay between any two API calls.
             config (Optional[Dict]): The main configuration dictionary to read control flags.
         """
-        self.logger = logging.getLogger(__name__)
-
         if not api_keys:
-            self.logger.critical("GeminiAPIManager initialized with an empty list of API keys. All calls will fail.")
+            print("CRITICAL: GeminiAPIManager initialized with an empty list of API keys. All calls will fail.")
             raise ValueError("API keys list cannot be empty.")
 
         self.api_keys_list: List[str] = api_keys
@@ -83,14 +80,11 @@ class GeminiAPIManager:
         self._print_timing_checkpoints = self.config.get("PRINT_API_TIMING_CHECKPOINTS", False)
         self._last_checkpoint_timestamp: Optional[float] = None
         # --- End of Timing Checkpoint Feature ---
-
-        self.logger.info(f"GeminiAPIManager initialized with {len(self.api_keys_list)} keys.")
         
         try:
             genai.configure(api_key=self.api_keys_list[0])
-            self.logger.info("Initial Gemini API configuration with the first key was successful.")
         except Exception as e:
-            self.logger.error(f"Initial Gemini API configuration failed. Error: {e}", exc_info=True)
+            print(f"ERROR: Initial Gemini API configuration failed. Error: {e}")
 
     def _get_current_date_str(self) -> str:
         """Returns the current UTC date as a formatted string."""
@@ -113,7 +107,7 @@ class GeminiAPIManager:
             return None
 
         if self._lock:
-            self.logger.warning("Key selection is locked; waiting.")
+            # self.logger.warning("Key selection is locked; waiting.")
             return None # Force a retry by returning no key
 
         self._lock = True
@@ -146,7 +140,6 @@ class GeminiAPIManager:
                 final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
 
                 if final_sleep_duration > 0:
-                    self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s.")
                     print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
                     time.sleep(final_sleep_duration)
 
@@ -167,7 +160,7 @@ class GeminiAPIManager:
                 self.current_key_index = (key_idx + 1) % num_keys
                 return current_api_key
 
-            self.logger.warning(f"All {num_keys} API keys are rate-limited for model '{model_name}'.")
+            print(f"Warning: All {num_keys} API keys are rate-limited for model '{model_name}'.")
             return None
         finally:
             self._lock = False
@@ -227,8 +220,6 @@ class GeminiAPIManager:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(model_name)
             
-            self.logger.info(f"Calling Gemini model '{model_name}' with key ending in ...{api_key[-4:]} and config: {generation_config_params}")
-            
             response = model.generate_content(
                 prompt,
                 generation_config=generation_config
@@ -263,7 +254,6 @@ class GeminiAPIManager:
             status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the Gemini API: {e}"
             caught_exception = e
         
-        self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {error_type}. Error: {msg}", exc_info=True)
         self._increment_daily_usage(api_key, model_name) 
         if self.print_details:
             print(f"\n!!! [API Call FAILED: Gemini] !!!")
@@ -288,10 +278,8 @@ class AvalAIAPIManager:
             global_delay_seconds (int): A minimum delay between any two API calls.
             config (Optional[Dict]): The main configuration dictionary to read control flags.
         """
-        self.logger = logging.getLogger(__name__)
-
         if not api_key or not base_url:
-            self.logger.critical("AvalAIAPIManager initialized with missing API key or base URL.")
+            print("CRITICAL: AvalAIAPIManager initialized with missing API key or base URL.")
             raise ValueError("API key and base URL cannot be empty for AvalAIAPIManager.")
         
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
@@ -310,8 +298,6 @@ class AvalAIAPIManager:
         self._last_checkpoint_timestamp: Optional[float] = None
         # --- End of Timing Checkpoint Feature ---
         
-        self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url}")
-
     def _apply_rate_limit_and_record(self, model_name: str) -> None:
         """
         Applies rate limiting delays and then immediately records the timestamps
@@ -332,7 +318,6 @@ class AvalAIAPIManager:
         final_sleep_duration = max(global_sleep_needed, model_sleep_needed)
         
         if final_sleep_duration > 0:
-            self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s (Global: {global_sleep_needed:.2f}s, Model: {model_sleep_needed:.2f}s).")
             print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
             time.sleep(final_sleep_duration)
 
@@ -361,8 +346,6 @@ class AvalAIAPIManager:
         caught_exception = None
 
         try:
-            self.logger.info(f"Calling OpenAI-compatible model '{model_name}'.")
-            
             completion = self.client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
@@ -371,7 +354,7 @@ class AvalAIAPIManager:
 
             if not completion.choices:
                 error_msg = "Response was empty or blocked (no choices returned)."
-                self.logger.warning(f"API call to '{model_name}' returned no choices.")
+                print(f"Warning: API call to '{model_name}' returned no choices.")
                 if self.print_details:
                     print(f"\n!!! [API Call BLOCKED: AvalAI] !!!\nReason: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
                 return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": error_msg, "error_details": None}
@@ -400,7 +383,6 @@ class AvalAIAPIManager:
             status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the OpenAI API: {e}"
             caught_exception = e
 
-        self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
         if self.print_details:
             print(f"\n!!! [API Call FAILED: AvalAI] !!!")
             print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
@@ -420,7 +402,6 @@ class OllamaAPIManager:
         Args:
             config (Dict[str, Any]): The main configuration dictionary.
         """
-        self.logger = logging.getLogger(__name__)
         self.config = config
 
         base_url = self.config.get("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -429,9 +410,8 @@ class OllamaAPIManager:
             self.client = ollama.Client(host=base_url)
             # A simple check to see if the server is responsive
             self.client.list()
-            self.logger.info(f"OllamaAPIManager initialized and connected to endpoint: {base_url}")
         except Exception as e:
-            self.logger.critical(f"Failed to connect to Ollama server at {base_url}. Please ensure Ollama is running. Error: {e}")
+            print(f"CRITICAL: Failed to connect to Ollama server at {base_url}. Please ensure Ollama is running. Error: {e}")
             raise ConnectionError(f"Could not connect to Ollama at {base_url}") from e
 
         # Read control flags from config for consistent logging
@@ -452,8 +432,6 @@ class OllamaAPIManager:
             if temperature is not None:
                 options['temperature'] = temperature
 
-            self.logger.info(f"Calling Ollama model '{model_name}'.")
-            
             response = self.client.generate(
                 model=model_name,
                 prompt=prompt,
@@ -476,7 +454,6 @@ class OllamaAPIManager:
             status, error_type, msg = "ERROR", "OllamaConnectionError", f"An unexpected error occurred with the Ollama client: {e}"
             caught_exception = e
 
-        self.logger.error(f"Ollama API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
         if self.print_details:
             print(f"\n!!! [API Call FAILED: Ollama] !!!")
             print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")

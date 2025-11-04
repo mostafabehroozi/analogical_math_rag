@@ -16,7 +16,6 @@ where possible, allowing the orchestrator to log partial results and enable
 targeted retries.
 """
 
-import logging
 import re
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -57,7 +56,7 @@ def _generate_embeddings(
             convert_to_numpy=True
         )
     except Exception as e:
-        logging.getLogger(__name__).error(f"Failed to generate embeddings: {e}", exc_info=True)
+        print(f"Error: Failed to generate embeddings: {e}")
         return np.array([])
 
 
@@ -71,16 +70,13 @@ def _select_most_dissimilar_questions(
     Selects N questions from a list of K questions that are most dissimilar to each other.
     Uses a greedy iterative approach.
     """
-    logger = logging.getLogger(__name__)
     if not questions or len(questions) <= n_to_select:
         return questions
-
-    logger.info(f"Selecting {n_to_select} most dissimilar questions from a pool of {len(questions)}.")
 
     # 1. Embed all questions
     embeddings = _generate_embeddings(questions, embedding_model)
     if embeddings.size == 0:
-        logger.error("Failed to generate embeddings for dissimilarity selection. Returning original subset.")
+        print("Error: Failed to generate embeddings for dissimilarity selection. Returning original subset.")
         return questions[:n_to_select]
 
     # 2. Start with a random question
@@ -102,7 +98,6 @@ def _select_most_dissimilar_questions(
         selected_indices.append(next_index)
         
     selected_questions = [questions[i] for i in selected_indices]
-    logger.info(f"Selected indices for maximum dissimilarity: {selected_indices}")
     
     return selected_questions
 # <<< --- END OF NEW HELPER FUNCTION --- >>>
@@ -117,12 +112,9 @@ def retrieve(
     top_k: int
 ) -> Dict[str, Any]:
     """Retrieves the top_k most relevant exemplars for a target query."""
-    logger = logging.getLogger(__name__)
-    logger.info(f"Starting retrieval for Top-{top_k} exemplars.")
-    
     query_embedding = _generate_embeddings([target_query], embedding_model)
     if query_embedding.size == 0:
-        logger.error("Failed to generate embedding for the target query. Retrieval cannot proceed.")
+        print("Error: Failed to generate embedding for the target query. Retrieval cannot proceed.")
         return {"status": "FAILURE", "retrieved_indices": [], "retrieved_exemplars": []}
     
     similarities = cosine_similarity(query_embedding, embedded_exemplars)[0]
@@ -137,8 +129,6 @@ def retrieve(
     top_k_indices = np.argpartition(similarities, -k_to_retrieve)[-k_to_retrieve:]
     top_k_indices = top_k_indices[np.argsort(similarities[top_k_indices])][::-1]
 
-    logger.info(f"Successfully retrieved indices: {top_k_indices.tolist()}")
-    
     return {
         "status": "SUCCESS",
         "retrieved_indices": top_k_indices.tolist(),
@@ -159,9 +149,6 @@ def adapt(
     Normalization -> Transformation 1 -> Transformation 2 -> Transformation 3.
     Captures failures for individual exemplars without halting the entire step.
     """
-    logger = logging.getLogger(__name__)
-    logger.info("Starting multi-stage adaptation step.")
-    
     successful_texts = []
     failed_adaptations = []
     
@@ -186,7 +173,6 @@ def adapt(
 
         # --- Step 1: Normalization (formerly Standardization) ---
         if config.get('APPLY_NORMALIZATION', False) and not step_failed:
-            logger.info(f"Applying normalization to exemplar index {idx}.")
             print(f"    -> Normalizing exemplar {idx}...")
             prompt = create_normalization_prompt(current_text)
             
@@ -196,13 +182,12 @@ def adapt(
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                logger.warning(f"Normalization failed for exemplar {idx}: {response['error_message']}")
+                print(f"Warning: Normalization failed for exemplar {idx}: {response['error_message']}")
                 failed_adaptations.append({"source_index": idx, "failed_at_step": "normalization", "error_info": response})
                 step_failed = True
 
         # --- Step 2: Transformation 1 ---
         if config.get('APPLY_TRANSFORMATION_1', False) and not step_failed:
-            logger.info(f"Applying transformation 1 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 1 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_1")
             print(f"      [API Context] Calling LLM for: Transformation 1 (Exemplar #{idx})")
@@ -211,13 +196,12 @@ def adapt(
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                logger.warning(f"Transformation 1 failed for exemplar {idx}: {response['error_message']}")
+                print(f"Warning: Transformation 1 failed for exemplar {idx}: {response['error_message']}")
                 failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_1", "error_info": response})
                 step_failed = True
         
         # --- Step 3: Transformation 2 ---
         if config.get('APPLY_TRANSFORMATION_2', False) and not step_failed:
-            logger.info(f"Applying transformation 2 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 2 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_2")
             print(f"      [API Context] Calling LLM for: Transformation 2 (Exemplar #{idx})")
@@ -226,13 +210,12 @@ def adapt(
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                logger.warning(f"Transformation 2 failed for exemplar {idx}: {response['error_message']}")
+                print(f"Warning: Transformation 2 failed for exemplar {idx}: {response['error_message']}")
                 failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_2", "error_info": response})
                 step_failed = True
 
         # --- Step 4: Transformation 3 ---
         if config.get('APPLY_TRANSFORMATION_3', False) and not step_failed:
-            logger.info(f"Applying transformation 3 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 3 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_3")
             print(f"      [API Context] Calling LLM for: Transformation 3 (Exemplar #{idx})")
@@ -241,7 +224,7 @@ def adapt(
             if response['status'] == 'SUCCESS':
                 current_text = response['text']
             else:
-                logger.warning(f"Transformation 3 failed for exemplar {idx}: {response['error_message']}")
+                print(f"Warning: Transformation 3 failed for exemplar {idx}: {response['error_message']}")
                 failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_3", "error_info": response})
                 step_failed = True
         
@@ -279,13 +262,10 @@ def _match_groups_to_augmented_questions(
     Returns:
         A list of tuples, where each tuple is (group_indices, matched_augmented_question).
     """
-    logger = logging.getLogger(__name__)
-    logger.info("Starting sophisticated matching of groups to augmented questions.")
-
     # 1. Embed all augmented questions
     aq_embeddings = _generate_embeddings(augmented_questions, embedding_model)
     if aq_embeddings.size == 0:
-        logger.error("Failed to generate embeddings for augmented questions. Cannot perform matching.")
+        print("Error: Failed to generate embeddings for augmented questions. Cannot perform matching.")
         return []
 
     # 2. Get embeddings for all unique retrieved samples. Indices in grouping_config are 1-based from retrieved list.
@@ -321,7 +301,7 @@ def _match_groups_to_augmented_questions(
              best_aq_idx, best_sample_idx = coords[0][0], coords[1][0]
 
         if best_aq_idx == -1 or max_val == -np.inf:
-            logger.warning("Could not find a best match in the remaining matrix. Breaking loop.")
+            print("Warning: Could not find a best match in the remaining matrix. Breaking loop.")
             break
             
         matched_aq = augmented_questions[best_aq_idx]
@@ -332,7 +312,6 @@ def _match_groups_to_augmented_questions(
         chosen_group = None
         if len(candidate_groups) == 1:
             chosen_group = candidate_groups[0]
-            logger.info(f"Simple match: AQ '{matched_aq[:30]}...' matched to group with sample index {retrieved_indices[best_sample_idx]}.")
         elif len(candidate_groups) > 1:
             # C. Tie-breaker logic
             group_backup_scores = {}
@@ -352,7 +331,6 @@ def _match_groups_to_augmented_questions(
             # Choose the group with the LOWEST backup score
             worst_group_tuple = min(group_backup_scores, key=group_backup_scores.get)
             chosen_group = list(worst_group_tuple)
-            logger.info(f"Tie-breaker: AQ '{matched_aq[:30]}...' matched to group with sample index {retrieved_indices[best_sample_idx]} (backup score: {group_backup_scores[worst_group_tuple]:.4f}).")
 
         # D. Update and prepare for next iteration
         if chosen_group:
@@ -384,16 +362,11 @@ def analogical_adaptation(
     Performs an intermediate analogical reasoning step to generate new, synthetic exemplars.
     MODIFIED: Supports augmenting the target query and matching to retrieved groups.
     """
-    logger = logging.getLogger(__name__)
-
     # 1. Guard Clause: Skip if the feature is disabled in the config.
     if not config.get('APPLY_ANALOGICAL_ADAPTATION', False):
-        logger.info("APPLY_ANALOGICAL_ADAPTATION is False. Skipping this step.")
         # Pass the input texts directly to the next step without modification.
         return {"status": "SKIPPED", "newly_generated_exemplars": adapted_texts, "failed_generations": []}
 
-    logger.info("Starting analogical adaptation step.")
-    
     # 2. Get parameters from config.
     grouping_config = config.get("ANALOGICAL_ADAPTATION_GROUPING", [])
     samples_per_group = config.get("ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP", 1)
@@ -431,7 +404,7 @@ def analogical_adaptation(
         aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
         
         if aug_response['status'] != 'SUCCESS':
-            logger.error(f"Target query augmentation failed: {aug_response['error_message']}")
+            print(f"Error: Target query augmentation failed: {aug_response['error_message']}")
             return {"status": "FAILURE", "error_info": aug_response, "newly_generated_exemplars": [], "failed_generations": []}
 
         augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
@@ -439,7 +412,7 @@ def analogical_adaptation(
              augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
 
         if len(augmented_questions) < num_groups:
-             logger.warning(f"LLM generated {len(augmented_questions)} questions, but {questions_to_generate} were expected. Matching may be incomplete.")
+             print(f"Warning: LLM generated {len(augmented_questions)} questions, but {questions_to_generate} were expected. Matching may be incomplete.")
         
         # 2. Match groups to augmented questions
         matched_group_aq_pairs = _match_groups_to_augmented_questions(
@@ -468,10 +441,10 @@ def analogical_adaptation(
             if 0 < idx <= len(adapted_texts):
                 current_group_samples.append(adapted_texts[idx - 1])
             else:
-                logger.warning(f"Index {idx} in group {group_num} is out of bounds for adapted_texts list (size: {len(adapted_texts)}). Skipping this index.")
+                print(f"Warning: Index {idx} in group {group_num} is out of bounds for adapted_texts list (size: {len(adapted_texts)}). Skipping this index.")
         
         if not current_group_samples:
-            logger.warning(f"Group {group_num} is empty after index validation. Skipping generation for this group.")
+            print(f"Warning: Group {group_num} is empty after index validation. Skipping generation for this group.")
             continue
 
         # 5. Generate N samples for this group.
@@ -493,7 +466,7 @@ def analogical_adaptation(
                 )
                 all_new_exemplars.append(formatted_exemplar)
             else:
-                logger.warning(f"Analogical adaptation failed for group {group_num}, sample {sample_num}: {response['error_message']}")
+                print(f"Warning: Analogical adaptation failed for group {group_num}, sample {sample_num}: {response['error_message']}")
                 failed_generations.append({"group_num": group_num, "sample_num": sample_num, "error_info": response})
 
     # 6. Determine final status and return structured output.
@@ -524,7 +497,6 @@ def generate_synthetic_samples(
     2. Augmented: Generates N distinct questions first, then solves each one.
     MODIFIED: Supports oversampling (generating K > N) and selecting the N most dissimilar questions.
     """
-    logger = logging.getLogger(__name__)
     n_samples = config.get("N_SELF_SAMPLES", 3)
     
     # We use the powerful solver model and high temperature for diverse outputs
@@ -544,7 +516,6 @@ def generate_synthetic_samples(
     
     # --- AUGMENTED MODE ---
     if config.get('APPLY_SELF_SAMPLING_AUGMENTATION', False):
-        logger.info("Starting AUGMENTED self-sampling to generate distinct exemplars.")
         print("\n[STEP 1a] AUGMENT: Generating distinct question variations...")
         
         # --- MODIFIED: Oversampling logic ---
@@ -559,13 +530,13 @@ def generate_synthetic_samples(
         aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
 
         if aug_response['status'] != 'SUCCESS':
-            logger.error(f"Question augmentation failed: {aug_response['error_message']}")
+            print(f"Error: Question augmentation failed: {aug_response['error_message']}")
             return {"status": "FAILURE", "synthetic_samples": [], "failed_generations": [{"attempt_number": "N/A", "failed_at_step": "augmentation", "error_info": aug_response}]}
         
         # Parse the augmented questions from the response
         augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
         if not augmented_questions:
-             logger.warning("Could not parse augmented questions from LLM response using regex. Falling back to splitting by newline.")
+             print("Warning: Could not parse augmented questions from LLM response using regex. Falling back to splitting by newline.")
              augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
 
         # --- MODIFIED: Selection logic ---
@@ -595,12 +566,11 @@ def generate_synthetic_samples(
                 formatted_exemplar = EXEMPLAR_FORMAT.format(question=aug_question, solution=solve_response['text'])
                 synthetic_samples.append(formatted_exemplar)
             else:
-                logger.warning(f"Augmented sample solution failed for attempt {i+1}: {solve_response['error_message']}")
+                print(f"Warning: Augmented sample solution failed for attempt {i+1}: {solve_response['error_message']}")
                 failed_generations.append({"attempt_number": i+1, "failed_at_step": "solving_augmented", "error_info": solve_response})
 
     # --- STANDARD MODE ---
     else:
-        logger.info("Starting STANDARD self-sampling to generate synthetic exemplars.")
         prompt = create_self_sampling_generation_prompt(target_query, config)
         for i in range(n_samples):
             print(f"    -> Generating synthetic sample {i+1}/{n_samples}...")
@@ -613,7 +583,7 @@ def generate_synthetic_samples(
                 formatted_exemplar = EXEMPLAR_FORMAT.format(question=target_query, solution=response['text'])
                 synthetic_samples.append(formatted_exemplar)
             else:
-                logger.warning(f"Synthetic sample generation failed for attempt {i+1}: {response['error_message']}")
+                print(f"Warning: Synthetic sample generation failed for attempt {i+1}: {response['error_message']}")
                 failed_generations.append({"attempt_number": i+1, "error_info": response})
     
     # Determine the final status
@@ -643,14 +613,11 @@ def merge(
     Iteratively merges adapted exemplars. If a merge fails, the pair is discarded
     and the process continues.
     """
-    logger = logging.getLogger(__name__)
     target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
 
     if not config.get('APPLY_MERGING', False):
-        logger.info("APPLY_MERGING is False. Skipping merge step.")
         return {"status": "SKIPPED", "merged_texts": adapted_texts[:target_count], "failed_merges": []}
 
-    logger.info("Starting merging step.")
     current_texts = list(adapted_texts)
     failed_merges = []
     
@@ -669,14 +636,13 @@ def merge(
     iteration = 0
     while len(current_texts) > target_count and len(current_texts) >= 2:
         iteration += 1
-        logger.info(f"Merge iteration {iteration}: Merging from {len(current_texts)} samples.")
         print(f"    -> Merging {len(current_texts)} samples down...")
         
         pair_to_merge = [current_texts.pop(0), current_texts.pop(0)]
         
         prompt = create_merging_prompt(target_query, pair_to_merge)
         if "Error:" in prompt:
-            logger.error(f"Failed to create merging prompt: {prompt}")
+            print(f"Error: Failed to create merging prompt: {prompt}")
             failed_merges.append({"pair_to_merge": pair_to_merge, "error_info": {"error_message": "Prompt creation failed."}})
             continue
             
@@ -686,7 +652,7 @@ def merge(
         if response['status'] == 'SUCCESS':
             current_texts.append(response['text'])
         else:
-            logger.warning(f"Merging failed: {response['error_message']}. Discarding pair.")
+            print(f"Warning: Merging failed: {response['error_message']}. Discarding pair.")
             failed_merges.append({"pair_to_merge": pair_to_merge, "error_info": response})
 
     return {"status": "SUCCESS", "merged_texts": current_texts, "failed_merges": failed_merges}
@@ -705,14 +671,9 @@ def solve(
     
     MODIFIED: Can also be used to run a classification task like duplicate checking.
     """
-    logger = logging.getLogger(__name__)
-    logger.info("Starting final solver step.")
-    
     # --- NEW: LOGIC FOR DUPLICATE QUESTION CHECKING ---
     final_solver_prompt_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER")
     if final_solver_prompt_name == "duplicate_question_check_v1":
-        logger.info("Running in 'Duplicate Question Check' mode.")
-        
         retrieved_questions = []
         for exemplar_text in final_exemplars:
             match = re.search(r"Question:\s*(.*?)\s*Rationale and Answer:", exemplar_text, re.DOTALL)
@@ -720,7 +681,7 @@ def solve(
                 retrieved_questions.append(match.group(1).strip())
         
         if not retrieved_questions:
-            logger.warning("Duplicate check mode ran but no retrieved questions were found to check.")
+            print("Warning: Duplicate check mode ran but no retrieved questions were found to check.")
             return {"status": "SUCCESS", "solution_attempts": ["no_retrieval"]}
 
         prompt = create_duplicate_check_prompt(target_query, retrieved_questions)
@@ -757,11 +718,10 @@ def solve(
 
     # --- Original Solver Logic ---
     prompt = create_final_reasoning_prompt(target_query, final_exemplars, config) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
-    logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
     if "Error:" in prompt:
         error_msg = f"Failed to create final reasoning prompt: {prompt}"
-        logger.error(error_msg)
+        print(f"Error: {error_msg}")
         return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": {"error_message": error_msg}}]}
 
     n_attempts = config.get("N_PASS_ATTEMPTS", 1)
@@ -780,9 +740,7 @@ def solve(
     
     solution_attempts: List[Union[str, Dict]] = []
     
-    logger.info(f"Generating {n_attempts} solution attempts for Pass@{n_attempts}.")
     for i in range(n_attempts):
-        logger.info(f"Generating attempt {i+1}/{n_attempts}.")
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
         
         print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
