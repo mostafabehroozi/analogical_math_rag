@@ -268,8 +268,13 @@ def run_experiments(
     """
     Orchestrates running multiple experiments with different configurations.
     Supports both standard and cross-experiment deferred execution modes.
+    
+    MODIFIED: This function now saves individual log files for each query to prevent
+    performance degradation from rewriting a single large log file. It assembles
+    the final results dictionary at the end for downstream compatibility.
     """
     all_results = {}
+    results_dir = global_config['RESULTS_DIR']
 
     # --- REWRITTEN LOGIC: Check for and handle cross-experiment deferred execution ---
     is_cross_experiment_defer_enabled = any(
@@ -285,26 +290,31 @@ def run_experiments(
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
             
-            # Only run intermediate steps for experiments that are actually deferred
             if not current_config.get('DEFER_SOLVE_STEP', False):
                 print(f"Warning: Experiment '{exp_name}' does not have DEFER_SOLVE_STEP enabled. It will be SKIPPED in this run.")
                 continue
 
-            log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
-            
-            run_logs = load_json(log_file_path) or []
-            completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE'}
-            queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
+            exp_log_dir = os.path.join(results_dir, exp_name)
+            os.makedirs(exp_log_dir, exist_ok=True)
+
+            queries_to_process = []
+            for idx, q_text in enumerate(hard_questions):
+                query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                if os.path.exists(query_log_path):
+                    log_data = load_json(query_log_path)
+                    if log_data and log_data.get('pipeline_status') == 'INTERMEDIATE_COMPLETE':
+                        continue # Skip if intermediate is already done
+                queries_to_process.append((idx, q_text))
 
             if queries_to_process:
                 for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
+                    query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
                     intermediate_log = run_pipeline_for_single_query(
                         hard_list_idx=original_idx, target_query=query_text, config=current_config,
                         embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                         run_mode='intermediate'
                     )
-                    run_logs.append(intermediate_log)
-                    save_json(run_logs, log_file_path)
+                    save_json(intermediate_log, query_log_path)
                     periodic_sync_check(loop_idx, current_config)
 
         print("\n" + "#"*25 + " PHASE 1 COMPLETE " + "#"*25)
@@ -316,37 +326,32 @@ def run_experiments(
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
 
-            # Only run solve steps for experiments that are deferred
             if not current_config.get('DEFER_SOLVE_STEP', False):
                 continue
             
-            log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
-
-            intermediate_logs = load_json(log_file_path) or []
-            logs_to_solve = [log for log in intermediate_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
+            exp_log_dir = os.path.join(results_dir, exp_name)
+            
+            logs_to_solve = []
+            for idx, q_text in enumerate(hard_questions):
+                query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                if os.path.exists(query_log_path):
+                    log_data = load_json(query_log_path)
+                    if log_data and log_data.get('pipeline_status') == 'INTERMEDIATE_COMPLETE':
+                        logs_to_solve.append(log_data)
             
             if logs_to_solve:
-                completed_logs_map = {log['target_query_original_hard_list_idx']: log for log in intermediate_logs if log.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'}
-
                 for loop_idx, log_to_solve in enumerate(tqdm(logs_to_solve, desc=f"{exp_name} - Phase 2: Solving")):
                     original_idx = log_to_solve['target_query_original_hard_list_idx']
                     query_text = log_to_solve['target_query_text']
+                    query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
                     
                     completed_log = run_pipeline_for_single_query(
                         hard_list_idx=original_idx, target_query=query_text, config=current_config,
                         embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                         run_mode='solve_only', existing_log=log_to_solve
                     )
-                    completed_logs_map[original_idx] = completed_log
-                    save_json(list(completed_logs_map.values()), log_file_path)
+                    save_json(completed_log, query_log_path)
                     periodic_sync_check(loop_idx, current_config)
-                
-                final_logs = list(completed_logs_map.values())
-            else:
-                 final_logs = intermediate_logs
-            
-            save_json(final_logs, log_file_path)
-            all_results[exp_name] = final_logs
 
         print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
 
@@ -356,74 +361,98 @@ def run_experiments(
             current_config = global_config.copy()
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
-            log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
             
-            # This logic handles both standard (non-deferred) and single-experiment deferred runs
+            exp_log_dir = os.path.join(results_dir, exp_name)
+            os.makedirs(exp_log_dir, exist_ok=True)
+            
             if not current_config.get('DEFER_SOLVE_STEP', False):
                 # --- Standard Mode: Run query-by-query ---
-                run_logs = load_json(log_file_path) or []
-                completed_indices = {log['target_query_original_hard_list_idx'] for log in run_logs}
-                queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_indices]
+                queries_to_process = []
+                for idx, q_text in enumerate(hard_questions):
+                    query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                    if not os.path.exists(query_log_path):
+                        queries_to_process.append((idx, q_text))
                 
-                if not queries_to_process:
-                    all_results[exp_name] = run_logs
-                    continue
-
-                for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
-                    single_run_log = run_pipeline_for_single_query(
-                        hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                        run_mode='full'
-                    )
-                    run_logs.append(single_run_log)
-                    save_json(run_logs, log_file_path)
-                    periodic_sync_check(loop_idx, current_config)
+                if queries_to_process:
+                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
+                        query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
+                        single_run_log = run_pipeline_for_single_query(
+                            hard_list_idx=original_idx, target_query=query_text, config=current_config,
+                            embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
+                            run_mode='full'
+                        )
+                        save_json(single_run_log, query_log_path)
+                        periodic_sync_check(loop_idx, current_config)
             else:
                 # --- Single-Experiment Deferred Mode ---
-                
                 # PHASE 1: Intermediate Steps
                 print(f"\n--- {exp_name}: STARTING PHASE 1 of 2 (Intermediate Steps) ---")
-                run_logs = load_json(log_file_path) or []
-                completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE'}
-                queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
+                queries_to_process_interm = []
+                for idx, q_text in enumerate(hard_questions):
+                    query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                    if not os.path.exists(query_log_path):
+                        queries_to_process_interm.append((idx, q_text))
 
-                if queries_to_process:
-                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
+                if queries_to_process_interm:
+                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process_interm, desc=f"{exp_name} - Phase 1: Intermediate")):
+                        query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
                         intermediate_log = run_pipeline_for_single_query(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                             run_mode='intermediate'
                         )
-                        run_logs.append(intermediate_log)
-                        save_json(run_logs, log_file_path)
+                        save_json(intermediate_log, query_log_path)
                         periodic_sync_check(loop_idx, current_config)
 
                 # PHASE 2: Final Solving Step
                 print(f"\n--- {exp_name}: STARTING PHASE 2 of 2 (Final Solving) ---")
-                intermediate_logs = load_json(log_file_path)
-                logs_to_solve = [log for log in intermediate_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
+                logs_to_solve = []
+                for idx in range(len(hard_questions)):
+                    query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                    if os.path.exists(query_log_path):
+                        log_data = load_json(query_log_path)
+                        if log_data and log_data.get('pipeline_status') == 'INTERMEDIATE_COMPLETE':
+                            logs_to_solve.append(log_data)
                 
                 if logs_to_solve:
-                    completed_logs_map = {log['target_query_original_hard_list_idx']: log for log in intermediate_logs if log.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'}
-
                     for loop_idx, log_to_solve in enumerate(tqdm(logs_to_solve, desc=f"{exp_name} - Phase 2: Solving")):
                         original_idx = log_to_solve['target_query_original_hard_list_idx']
                         query_text = log_to_solve['target_query_text']
+                        query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
                         
                         completed_log = run_pipeline_for_single_query(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                             run_mode='solve_only', existing_log=log_to_solve
                         )
-                        completed_logs_map[original_idx] = completed_log
-                        save_json(list(completed_logs_map.values()), log_file_path)
+                        save_json(completed_log, query_log_path)
                         periodic_sync_check(loop_idx, current_config)
-                    
-                    run_logs = list(completed_logs_map.values())
-                else:
-                     run_logs = intermediate_logs
-            
-            save_json(run_logs, log_file_path)
-            all_results[exp_name] = run_logs
         
+    # --- Final Assembly Step for Compatibility ---
+    # Load all individual logs to construct the final results object.
+    print("\n--- Assembling final results from individual logs ---")
+    for exp_overrides in experiment_configs:
+        exp_name = exp_overrides.get("experiment_name", "unnamed_experiment")
+        exp_log_dir = os.path.join(results_dir, exp_name)
+        
+        experiment_run_logs = []
+        if os.path.isdir(exp_log_dir):
+            for idx in range(len(hard_questions)):
+                query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                if os.path.exists(query_log_path):
+                    log_data = load_json(query_log_path)
+                    if log_data:
+                        experiment_run_logs.append(log_data)
+        
+        # Sort logs by the original index to maintain consistent order
+        experiment_run_logs.sort(key=lambda x: x.get('target_query_original_hard_list_idx', 0))
+        all_results[exp_name] = experiment_run_logs
+        
+        # OPTIONAL: Save the final monolithic log file for easier external analysis.
+        # This one-time write at the end has no performance impact on the run itself.
+        final_log_path = os.path.join(results_dir, f"{exp_name}_run_log.json")
+        if experiment_run_logs:
+            print(f"Saving final consolidated log for '{exp_name}' to {final_log_path}")
+            save_json(experiment_run_logs, final_log_path)
+
     return all_results
