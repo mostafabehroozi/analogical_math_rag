@@ -366,8 +366,10 @@ def run_experiments(
             exp_log_dir = os.path.join(results_dir, exp_name)
             os.makedirs(exp_log_dir, exist_ok=True)
             
+            # --- This logic branch handles experiments run in standard, non-deferred mode ---
             if not current_config.get('DEFER_SOLVE_STEP', False):
-                # --- Standard Mode: Run query-by-query ---
+                
+                # Check which queries need processing to allow for resuming a run
                 queries_to_process = []
                 for idx, q_text in enumerate(hard_questions):
                     query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
@@ -376,38 +378,21 @@ def run_experiments(
                 
                 if queries_to_process:
                     for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
-                        # <<< --- START OF DIAGNOSTIC TIMER ADDITIONS --- >>>
-                        loop_start_time = time.time()
-                        
                         query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
-
-                        # Time the actual pipeline work
-                        pipeline_start_time = time.time()
+                        
                         single_run_log = run_pipeline_for_single_query(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                             run_mode='full'
                         )
-                        pipeline_end_time = time.time()
-                        print(f"\n[DIAGNOSTIC] Time for run_pipeline_for_single_query (Query #{original_idx}): {pipeline_end_time - pipeline_start_time:.2f} seconds.")
-
+                        
+                        # Save the log for this single query. This is a fast operation.
                         save_json(single_run_log, query_log_path)
                         
-                        # Time the synchronization step
-                        sync_check_start_time = time.time()
                         periodic_sync_check(loop_idx, current_config)
-                        sync_check_end_time = time.time()
-                        # Only print sync time if a sync actually happened
-                        if (loop_idx + 1) % current_config.get("HF_SYNC_INTERVAL", 10) == 0:
-                            print(f"[DIAGNOSTIC] Time for periodic_sync_check: {sync_check_end_time - sync_check_start_time:.2f} seconds.")
-
-                        loop_end_time = time.time()
-                        print(f"[DIAGNOSTIC] Total time for loop iteration (Query #{original_idx}): {loop_end_time - loop_start_time:.2f} seconds.")
-                        print("-" * 80)
-                        # <<< --- END OF DIAGNOSTIC TIMER ADDITIONS --- >>>
 
             else:
-                # --- Single-Experiment Deferred Mode ---
+                # --- This logic branch handles single-experiment deferred mode ---
                 # PHASE 1: Intermediate Steps
                 print(f"\n--- {exp_name}: STARTING PHASE 1 of 2 (Intermediate Steps) ---")
                 queries_to_process_interm = []
