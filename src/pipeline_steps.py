@@ -103,6 +103,65 @@ def _select_most_dissimilar_questions(
 # <<< --- END OF NEW HELPER FUNCTION --- >>>
 
 
+# <<< --- START OF NEW HELPER FUNCTION FOR BATCH AUGMENTATION --- >>>
+def _generate_augmented_questions_in_batches(
+    base_query: str,
+    batch_config: List[int],
+    api_manager: Any,
+    model_name: str,
+    temperature: float,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Generates augmented questions in multiple batches via iterative API calls.
+    """
+    if not isinstance(batch_config, list) or len(batch_config) != 2:
+        error_msg = f"Invalid AUGMENTATION_BATCH_GENERATION config. Expected [int, int], got {batch_config}"
+        print(f"Error: {error_msg}")
+        return {"status": "FAILURE", "error_info": {"error_message": error_msg}, "augmented_questions": [], "failed_calls": []}
+
+    num_calls, questions_per_call = batch_config
+    all_augmented_questions = []
+    failed_calls = []
+
+    print(f"  -> Starting batch augmentation: {num_calls} calls, {questions_per_call} questions per call.")
+
+    for i in range(num_calls):
+        print(f"    -> Batch {i+1}/{num_calls}: Requesting {questions_per_call} questions...")
+        
+        aug_prompt = create_self_sampling_augmentation_prompt(base_query, questions_per_call, config)
+        print(f"      [API Context] Calling LLM for: Batch Augmentation (Call #{i+1})")
+        
+        aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
+
+        if aug_response['status'] == 'SUCCESS':
+            # Reuse the existing parsing logic
+            parsed_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
+            if not parsed_questions:
+                parsed_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
+            
+            all_augmented_questions.extend(parsed_questions)
+            print(f"      -> Success. Received {len(parsed_questions)} questions in this batch.")
+        else:
+            print(f"      -> WARNING: API call for batch {i+1} failed: {aug_response['error_message']}")
+            failed_calls.append({"batch_number": i + 1, "error_info": aug_response})
+
+    # Determine final status
+    if not all_augmented_questions and failed_calls:
+        final_status = "FAILURE"
+    elif all_augmented_questions and failed_calls:
+        final_status = "PARTIAL_SUCCESS"
+    else:
+        final_status = "SUCCESS"
+
+    return {
+        "status": final_status,
+        "augmented_questions": all_augmented_questions,
+        "failed_calls": failed_calls
+    }
+# <<< --- END OF NEW HELPER FUNCTION --- >>>
+
+
 # --- 1. RETRIEVAL STEP ---
 def retrieve(
     target_query: str,
@@ -400,19 +459,38 @@ def analogical_adaptation(
             print(f"      -> Oversampling enabled. Will generate {questions_to_generate} questions for {num_groups} groups.")
 
         # 1. Generate augmented questions
-        aug_prompt = create_self_sampling_augmentation_prompt(target_query, questions_to_generate, config)
-        aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
-        
-        if aug_response['status'] != 'SUCCESS':
-            print(f"Error: Target query augmentation failed: {aug_response['error_message']}")
-            return {"status": "FAILURE", "error_info": aug_response, "newly_generated_exemplars": [], "failed_generations": []}
+        augmented_questions = []
+        batch_generation_config = config.get("AUGMENTATION_BATCH_GENERATION")
 
-        augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
-        if not augmented_questions:
-             augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
+        # <<< --- START OF BATCH AUGMENTATION MODIFICATION --- >>>
+        if batch_generation_config:
+            # New Batch Mode
+            batch_result = _generate_augmented_questions_in_batches(
+                base_query=target_query, batch_config=batch_generation_config,
+                api_manager=api_manager, model_name=model_name,
+                temperature=temperature, config=config
+            )
+            if "FAILURE" in batch_result['status']:
+                print(f"Error: Batch query augmentation failed: {batch_result.get('error_info')}")
+                return {"status": "FAILURE", "error_info": batch_result, "newly_generated_exemplars": [], "failed_generations": []}
+            augmented_questions = batch_result['augmented_questions']
+        
+        else:
+            # Original Single-Call Mode
+            aug_prompt = create_self_sampling_augmentation_prompt(target_query, questions_to_generate, config)
+            aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
+            
+            if aug_response['status'] != 'SUCCESS':
+                print(f"Error: Target query augmentation failed: {aug_response['error_message']}")
+                return {"status": "FAILURE", "error_info": aug_response, "newly_generated_exemplars": [], "failed_generations": []}
+
+            augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
+            if not augmented_questions:
+                 augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
+        # <<< --- END OF BATCH AUGMENTATION MODIFICATION --- >>>
 
         if len(augmented_questions) < num_groups:
-             print(f"Warning: LLM generated {len(augmented_questions)} questions, but {questions_to_generate} were expected. Matching may be incomplete.")
+             print(f"Warning: LLM generated a total of {len(augmented_questions)} questions, but {questions_to_generate} were expected. Matching may be incomplete.")
         
         # 2. Match groups to augmented questions
         matched_group_aq_pairs = _match_groups_to_augmented_questions(
@@ -525,19 +603,37 @@ def generate_synthetic_samples(
             print(f"  -> Oversampling enabled. Will generate {questions_to_generate} questions to select {n_samples} from.")
 
         # Step A: Generate K distinct questions
-        aug_prompt = create_self_sampling_augmentation_prompt(target_query, questions_to_generate, config)
-        print("  [API Context] Calling LLM for: Question Augmentation")
-        aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
+        augmented_questions = []
+        batch_generation_config = config.get("AUGMENTATION_BATCH_GENERATION")
 
-        if aug_response['status'] != 'SUCCESS':
-            print(f"Error: Question augmentation failed: {aug_response['error_message']}")
-            return {"status": "FAILURE", "synthetic_samples": [], "failed_generations": [{"attempt_number": "N/A", "failed_at_step": "augmentation", "error_info": aug_response}]}
+        # <<< --- START OF BATCH AUGMENTATION MODIFICATION --- >>>
+        if batch_generation_config:
+            # New Batch Mode
+            batch_result = _generate_augmented_questions_in_batches(
+                base_query=target_query, batch_config=batch_generation_config,
+                api_manager=api_manager, model_name=model_name,
+                temperature=temperature, config=config
+            )
+            if "FAILURE" in batch_result['status']:
+                 return {"status": "FAILURE", "synthetic_samples": [], "failed_generations": [{"attempt_number": "N/A", "failed_at_step": "batch_augmentation", "error_info": batch_result}]}
+            augmented_questions = batch_result['augmented_questions']
         
-        # Parse the augmented questions from the response
-        augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
-        if not augmented_questions:
-             print("Warning: Could not parse augmented questions from LLM response using regex. Falling back to splitting by newline.")
-             augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
+        else:
+            # Original Single-Call Mode
+            aug_prompt = create_self_sampling_augmentation_prompt(target_query, questions_to_generate, config)
+            print("  [API Context] Calling LLM for: Question Augmentation")
+            aug_response = api_manager.generate_content(aug_prompt, model_name, temperature)
+
+            if aug_response['status'] != 'SUCCESS':
+                print(f"Error: Question augmentation failed: {aug_response['error_message']}")
+                return {"status": "FAILURE", "synthetic_samples": [], "failed_generations": [{"attempt_number": "N/A", "failed_at_step": "augmentation", "error_info": aug_response}]}
+            
+            # Parse the augmented questions from the response
+            augmented_questions = re.findall(r'^\d+\.\s*(.*)', aug_response['text'], re.MULTILINE)
+            if not augmented_questions:
+                 print("Warning: Could not parse augmented questions from LLM response using regex. Falling back to splitting by newline.")
+                 augmented_questions = [q.strip() for q in aug_response['text'].strip().split('\n') if q.strip()]
+        # <<< --- END OF BATCH AUGMENTATION MODIFICATION --- >>>
 
         # --- MODIFIED: Selection logic ---
         if config.get('APPLY_AUGMENTATION_OVERSAMPLING', False) and len(augmented_questions) > n_samples:

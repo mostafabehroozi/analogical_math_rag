@@ -135,6 +135,12 @@ CONFIG = {
     "APPLY_AUGMENTATION_OVERSAMPLING": False, # If True, generate K questions and select N from them.
     "AUGMENTATION_OVERSAMPLING_K": 10,        # The number of questions (K) to generate in the oversampling pool.
 
+    # NEW: Batch Augmentation Control
+    # Defines an iterative augmentation process. Format: [number_of_api_calls, questions_per_call]
+    # Example: [2, 3] means make 2 API calls, each asking for 3 questions, for a total of 6.
+    # Set to None or an empty list to disable and use the standard single-call method.
+    "AUGMENTATION_BATCH_GENERATION": None,
+
     # MODIFIED: Granular adaptation steps
     "APPLY_NORMALIZATION": False,           # Renamed from APPLY_STANDARDIZATION
     "APPLY_TRANSFORMATION": False,          # DEPRECATED: Replaced by granular transformation flags.
