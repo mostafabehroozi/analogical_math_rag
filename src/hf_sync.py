@@ -13,6 +13,7 @@ separate login step or reliance on cached credentials.
 
 Functions:
 - initialize_workspace: Downloads the remote repo to the local machine on startup.
+- sync_single_file_to_hub: Efficiently uploads a single file.
 - sync_workspace_to_hub: Uploads local output directories to the remote repo.
 - periodic_sync_check: A helper to trigger synchronization during long loops.
 """
@@ -86,11 +87,53 @@ def initialize_workspace(config: dict):
     except Exception as e:
         print(f"Error: An unexpected error occurred during workspace initialization: {e}")
 
+def sync_single_file_to_hub(config: dict, local_file_path: str):
+    """
+    Uploads a single local file to its corresponding path in the HF Hub repo.
+
+    This is an efficient, targeted operation for in-loop checkpointing.
+    """
+    if not config.get("PERSIST_RESULTS_ONLINE"):
+        return
+
+    hf_token, hf_username, repo_name = _get_hf_config(config)
+    if not all([hf_token, hf_username, repo_name]):
+        # Silently return as a warning would have been printed by the main sync function
+        return
+
+    if not os.path.exists(local_file_path):
+        print(f"Warning: Attempted to sync non-existent file: {local_file_path}")
+        return
+
+    repo_id = f"{hf_username}/{repo_name}"
+    local_outputs_dir = config["OUTPUTS_DIR"]
+
+    # Determine the destination path in the repository by making it relative
+    # to the main outputs directory.
+    # Example: /kaggle/working/outputs/exp_name/query_0.json -> exp_name/query_0.json
+    path_in_repo = os.path.relpath(local_file_path, local_outputs_dir)
+
+    print(f"  -> Syncing single file: '{path_in_repo}' to HF Hub...")
+
+    try:
+        api = HfApi(token=hf_token)
+        api.upload_file(
+            path_or_fileobj=local_file_path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=f"Sync: {os.path.basename(path_in_repo)}"
+        )
+    except Exception as e:
+        print(f"Error: Failed to sync single file '{local_file_path}' to Hub: {e}")
+
+
 def sync_workspace_to_hub(config: dict):
     """
     Uploads the entire local outputs directory to the Hugging Face Hub repo.
 
-    Uses the HF token directly from the provided configuration dictionary.
+    Uses the HF token directly from the provided configuration dictionary. This is
+    a robust but potentially slow operation, best used at the end of a process.
     """
     if not config.get("PERSIST_RESULTS_ONLINE"):
         return # Silently exit if persistence is disabled.
@@ -121,9 +164,9 @@ def sync_workspace_to_hub(config: dict):
     except Exception as e:
         print(f"Error: Failed to sync workspace to Hugging Face Hub: {e}")
 
-def periodic_sync_check(loop_counter: int, config: dict):
+def periodic_sync_check(loop_counter: int, config: dict, file_to_sync: str):
     """
-    Checks if a sync is needed based on the counter and sync interval.
+    Checks if a sync is needed and syncs ONLY the specified file.
     """
     if not config.get("PERSIST_RESULTS_ONLINE"):
         return
@@ -133,6 +176,8 @@ def periodic_sync_check(loop_counter: int, config: dict):
     # Sync after the specified number of items (e.g., if interval is 1, sync after item 1, 2, etc.)
     # We check (loop_counter + 1) because loops are often 0-indexed.
     if (loop_counter + 1) % sync_interval == 0:
-        print(f"\n--- Reached sync interval at item #{loop_counter + 1}. Syncing results to Hugging Face Hub. ---")
-        sync_workspace_to_hub(config)
+        print(f"\n--- Reached sync interval at item #{loop_counter + 1}. Syncing latest result file. ---")
+        # Call the new, efficient single-file sync function
+        # instead of the slow, full-directory sync.
+        sync_single_file_to_hub(config, local_file_path=file_to_sync)
         print("--- Sync complete. ---\n")

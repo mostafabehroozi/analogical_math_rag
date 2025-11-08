@@ -27,12 +27,12 @@ This optimizes API usage by batching all expensive 'solve' calls together.
 
 from tqdm import tqdm
 import os
-import time  # <-- ADDED FOR DIAGNOSTIC TIMING
+import time
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 
 # Import our custom modules
-from src.pipeline_steps import retrieve, adapt, analogical_adaptation, merge, solve, generate_synthetic_samples # <-- MODIFIED IMPORT
+from src.pipeline_steps import retrieve, adapt, analogical_adaptation, merge, solve, generate_synthetic_samples
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 
@@ -74,16 +74,16 @@ def run_pipeline_for_single_query(
             "target_query_text": target_query,
             "config_flags_used": {
                 key: config.get(key) for key in [
-                    "USE_RETRIEVAL", "SELF_SAMPLING", # <-- Added SELF_SAMPLING to logged configs
+                    "USE_RETRIEVAL", "SELF_SAMPLING",
                     "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
                     "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3",
-                    "APPLY_ANALOGICAL_ADAPTATION", # <-- ADDED
-                    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION", # <-- ADDED
-                    "ANALOGICAL_ADAPTATION_GROUPING", # <-- ADDED
-                    "ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP", # <-- ADDED
+                    "APPLY_ANALOGICAL_ADAPTATION",
+                    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION",
+                    "ANALOGICAL_ADAPTATION_GROUPING",
+                    "ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP",
                     "APPLY_MERGING",
                     "DEFER_SOLVE_STEP", "TOP_N_CANDIDATES_RETRIEVAL", "N_PASS_ATTEMPTS",
-                    "N_SELF_SAMPLES", # <-- Added N_SELF_SAMPLES to logged configs
+                    "N_SELF_SAMPLES",
                     "DEFAULT_PASS_N_SOLVER_TEMPERATURE"
                 ]
             },
@@ -195,7 +195,7 @@ def run_pipeline_for_single_query(
                 target_query=target_query,
                 api_manager=manager_for_solve,
                 config=config,
-                embedding_model=embedding_model # <-- MODIFIED: Pass embedding model
+                embedding_model=embedding_model
             )
             run_log['steps']['self_sampling'] = sampling_result
             if "FAILURE" in sampling_result['status']:
@@ -316,7 +316,7 @@ def run_experiments(
                         run_mode='intermediate'
                     )
                     save_json(intermediate_log, query_log_path)
-                    periodic_sync_check(loop_idx, current_config)
+                    periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
 
         print("\n" + "#"*25 + " PHASE 1 COMPLETE " + "#"*25)
         print("\n" + "#"*25 + " PHASE 2: EXECUTING FINAL SOLVE STEPS FOR ALL EXPERIMENTS " + "#"*25)
@@ -352,7 +352,7 @@ def run_experiments(
                         run_mode='solve_only', existing_log=log_to_solve
                     )
                     save_json(completed_log, query_log_path)
-                    periodic_sync_check(loop_idx, current_config)
+                    periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
 
         print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
 
@@ -389,7 +389,7 @@ def run_experiments(
                         # Save the log for this single query. This is a fast operation.
                         save_json(single_run_log, query_log_path)
                         
-                        periodic_sync_check(loop_idx, current_config)
+                        periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
 
             else:
                 # --- This logic branch handles single-experiment deferred mode ---
@@ -410,7 +410,7 @@ def run_experiments(
                             run_mode='intermediate'
                         )
                         save_json(intermediate_log, query_log_path)
-                        periodic_sync_check(loop_idx, current_config)
+                        periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
 
                 # PHASE 2: Final Solving Step
                 print(f"\n--- {exp_name}: STARTING PHASE 2 of 2 (Final Solving) ---")
@@ -434,7 +434,7 @@ def run_experiments(
                             run_mode='solve_only', existing_log=log_to_solve
                         )
                         save_json(completed_log, query_log_path)
-                        periodic_sync_check(loop_idx, current_config)
+                        periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
         
     # --- Final Assembly Step for Compatibility ---
     # Load all individual logs to construct the final results object.
