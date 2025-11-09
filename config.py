@@ -144,6 +144,26 @@ CONFIG = {
     "FINAL_K_SELECTION_ADAPTATION": 1,
     "TARGET_ADAPTED_SAMPLES_MERGING": 1,
 
+    # --- 8b. NEW FEATURES: Self-Sampling Configuration ---
+    "APPLY_SELF_SAMPLING": False,           # Enable self-sampling feature
+    "SELF_SAMPLING_N": 3,                   # Number of self-sampling attempts
+    "SELF_SAMPLING_TEMPERATURE": 0.7,       # Temperature for diversity in self-sampling
+
+    # --- 8c. NEW FEATURES: Analogical Adaptation Configuration ---
+    "APPLY_ANALOGICAL_ADAPTATION": False,   # Enable analogical reasoning as adaptation
+    "ANALOGICAL_GROUP_SETS": [(1, 2), (3, 4), (5, 6)],  # Grouping of retrieved samples (1-indexed)
+    "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,  # Number of attempts per group
+
+    # --- 8d. NEW FEATURES: Augmentation Configuration ---
+    "APPLY_SELF_SAMPLING_AUGMENTATION": False,          # Augment questions for self-sampling
+    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION": False,  # Augment for analogical adaptation
+
+    # --- 8e. NEW FEATURES: Selective Augmentation Sampling ---
+    "SELECTIVE_AUGMENTATION_SAMPLING": False,           # Enable selective augmentation
+    "AUGMENT_K": 10,                                    # Total augmentations generated
+    "AUGMENT_N": 3,                                     # Number to select from K
+    "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",     # "auto", "diversity", or "relevance"
+
     # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
@@ -164,6 +184,11 @@ CONFIG = {
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
+
+    # --- 10b. NEW FEATURES: Prompt Template Selection for New Features ---
+    "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator",
+    "PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR": "self_sampling_augmentor_v1",
+    "PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION": "analogical_adaptation_v1",
 
     # --- 11. Hugging Face Hub Synchronization ---
     "PERSIST_RESULTS_ONLINE": True,

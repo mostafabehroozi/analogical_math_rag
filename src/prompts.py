@@ -74,7 +74,7 @@ Rationale and Answer: [Transformed Rationale, followed by the Original Answer fr
     
     "transformation_shallow" : """<Objective>
 Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
-The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question’s theme, context, or style — while strictly preserving the sample’s original reasoning path and final answer.
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question's theme, context, or style — while strictly preserving the sample's original reasoning path and final answer.
 </Objective>
 
 <Transformation Guidelines>
@@ -95,7 +95,7 @@ Restrict Transformations to the Surface Level:
 
 Maintain Naturalness, Clarity, and Safety:
 - The transformed question and rationale must remain natural, realistic, and logically coherent.
-- Avoid any unnatural, illogical, or meaningless transformations (e.g., “a cat eats an apple”).
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., "a cat eats an apple").
 - If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes.
 - Always prioritize clarity, realism, and logical consistency over aggressive transformation.
 
@@ -237,7 +237,7 @@ Rationale and Answer: [Merged Rationale and Answer]
     
     "transformation_shallow-&-moderately-deep" : """<Objective>   
 Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
-The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question’s area, structure, or style — while still preserving the sample’s original reasoning path and final answer.
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question's area, structure, or style — while still preserving the sample's original reasoning path and final answer.
 </Objective>
 
 <Transformation Guidelines>  
@@ -256,7 +256,7 @@ Avoid Deep or Complex Alterations:
 
 Maintain Naturalness, Clarity, and Safety:
 - The transformed question and rationale must remain natural, realistic, and logically coherent. 
-- Avoid any unnatural, illogical, or meaningless transformations (e.g., “a cat eats an apple”). 
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., "a cat eats an apple"). 
 - If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes. 
 - Always prioritize clarity, realism, and logical consistency over aggressive transformation. 
 
@@ -373,7 +373,7 @@ Create a new merged example that:
 - The merged result must be mathematically correct, coherent, and self-contained.
 
 4. Superficial Re-contextualization 
-- Adapt the merged sample’s phrasing and structure so it stylistically resembles the Target Question.  
+- Adapt the merged sample's phrasing and structure so it stylistically resembles the Target Question.  
 - Do not alter the core mathematics — only adjust presentation and framing.
 
 5. Relevance-Driven Asymmetry 
@@ -527,6 +527,87 @@ Begin Output:
 ---
 **Is there an exact match? (yes/no):**
 """,
+
+    # --- NEW FEATURES: Self-Sampling Prompts ---
+    "self_sampling_generator": """Objective:
+Your task is to solve the Main Question by providing a formal, step-by-step solution and a final answer. The solution should be presented in an academic, textbook-style format.
+
+Style Guidelines:
+Avoid conversational language: Do not use phrases like "Let's start by...", "Now, we will...", or any chatbot-like pleasantries.
+Be direct and concise: Focus on showing the mathematical steps, formulas, and calculations directly.
+Formal Tone: The entire output should be objective and formal, as if written in a mathematics textbook.
+
+Required Output Format (Strictly Adhere):
+Solution:
+[Your step-by-step solution, presenting the mathematical derivation directly.]
+
+Final Answer:
+[Your final answer to the Main Question.]
+
+Inputs:
+Main Question:
+{main_question_text}
+
+Your Solution:
+""",
+
+    "self_sampling_augmentor_v1": """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
+
+<Instructions>
+1. Read the 'Base Question' to understand its core mathematical concept, structure, and context.
+2. Create {n_samples} new questions that use the same reasoning pattern but with different numbers, entities (e.g., names, objects), and scenarios.
+3. Crucially, you must NOT provide any rationale or answer. Your output should consist ONLY of the generated question statements.
+4. Ensure the generated questions are unique from each other and from the base question.
+5. Present your output as a numbered list, as shown in the example.
+</Instructions>
+
+<Example>
+<Base Question>
+A farmer has 50 apples. He sells 20 to a market and then buys 10 more from his neighbor. How many apples does he have now?
+</Base Question>
+
+<Your Output (for n_samples = 2)>
+1. A student has 80 pencils. She gives 30 to her friends and then her teacher gives her 15 more. How many pencils does she have now?
+2. A painter has 120 ml of blue paint. He uses 50 ml for a canvas and then mixes in 25 ml more from another tube. How much blue paint does he have now?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+
+<Your Output (ONLY the {n_samples} numbered questions)>
+""",
+
+    # --- NEW FEATURES: Analogical Adaptation Prompt ---
+    "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
+
+Your task is to solve the Main Question by using analogical reasoning based on the provided group of Solved Sample Problems.
+
+<Instructions>
+1. Carefully analyze each solved sample problem to understand its reasoning pattern, problem-solving strategy, and logical structure.
+2. Identify the core reasoning principles and mathematical techniques that can be transferred to the Main Question.
+3. Apply these analogical insights to solve the Main Question, adapting the reasoning patterns to fit the specific context and requirements of the Main Question.
+4. Present your solution in a clear, step-by-step format that shows how you applied analogical reasoning.
+5. Do NOT simply copy the solutions from the samples—adapt and apply their reasoning patterns intelligently.
+</Instructions>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Solved Sample Problems>
+{samples_block}
+</Solved Sample Problems>
+
+<Output Format (Strictly follow this format)>
+Question: [The Main Question]
+Rationale and Answer: [Your step-by-step solution using analogical reasoning from the samples, followed by the final answer]
+</Output Format>
+""",
+
 }
 
 
@@ -623,3 +704,72 @@ def create_duplicate_check_prompt(main_question_text: str, retrieved_questions: 
     retrieved_block = "\n".join(f"{i+1}. {q}" for i, q in enumerate(retrieved_questions))
         
     return template.format(main_question_text=main_question_text, retrieved_questions_block=retrieved_block.strip())
+
+
+# --- NEW FEATURES: Prompt Creation Functions ---
+
+def create_self_sampling_prompt(main_question: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt for the self-sampling step.
+    
+    Args:
+        main_question (str): The question to be solved via self-sampling.
+        config (Dict[str, Any]): The main configuration dictionary.
+    
+    Returns:
+        str: The formatted prompt for self-sampling.
+    """
+    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR", "self_sampling_generator")
+    
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question)
+
+
+def create_augmentation_prompt(main_question: str, n_samples: int, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt for generating augmented versions of a question.
+    
+    Args:
+        main_question (str): The base question to augment.
+        n_samples (int): The number of augmented questions to generate.
+        config (Dict[str, Any]): The main configuration dictionary.
+    
+    Returns:
+        str: The formatted prompt for augmentation.
+    """
+    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR", "self_sampling_augmentor_v1")
+    
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question, n_samples=n_samples)
+
+
+def create_analogical_adaptation_prompt(main_question: str, sample_group: List[str], config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt for the analogical adaptation step.
+    
+    Args:
+        main_question (str): The main question to solve using analogical reasoning.
+        sample_group (List[str]): A group of retrieved sample texts to use for analogical reasoning.
+        config (Dict[str, Any]): The main configuration dictionary.
+    
+    Returns:
+        str: The formatted prompt for analogical adaptation.
+    """
+    template_name = config.get("PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION", "analogical_adaptation_v1")
+    
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    
+    template = PROMPT_TEMPLATES[template_name]
+    
+    # Format the sample group with XML-style tags
+    samples_block = "\n\n".join([f"<Sample {i+1}>\n{s}\n</Sample {i+1}>" 
+                                  for i, s in enumerate(sample_group)])
+    
+    return template.format(main_question_text=main_question, samples_block=samples_block)

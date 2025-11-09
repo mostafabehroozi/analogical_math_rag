@@ -14,6 +14,9 @@ This version is updated to handle structured, detailed API error responses.
 When an API call fails, the step captures the error information and continues
 where possible, allowing the orchestrator to log partial results and enable
 targeted retries.
+
+This version also includes new, optional pipeline steps for self-sampling,
+augmentation, and analogical adaptation.
 """
 
 import logging
@@ -21,7 +24,7 @@ import re
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Tuple, Optional
 
 # Import our custom modules
 from src.prompts import (
@@ -31,7 +34,10 @@ from src.prompts import (
     create_merging_prompt,
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple,
-    create_duplicate_check_prompt
+    create_duplicate_check_prompt,
+    create_self_sampling_prompt,
+    create_augmentation_prompt,
+    create_analogical_adaptation_prompt,
 )
 # MODIFIED: Import manager classes for type checking
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
@@ -382,3 +388,260 @@ def solve(
             })
             
     return {"status": "SUCCESS", "solution_attempts": solution_attempts}
+
+
+# --- 5. NEW FEATURES: Self-Sampling, Augmentation, and Analogical Adaptation ---
+
+def self_sample(
+    target_query: str,
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Generates N synthetic exemplars by solving the target query N times.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting self-sampling step.")
+    
+    n_samples = config.get("SELF_SAMPLING_N", 3)
+    temperature = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
+    
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
+    else:
+        raise TypeError(f"Unsupported API manager type for self-sampling: {type(api_manager)}")
+
+    prompt = create_self_sampling_prompt(target_query, config)
+    
+    successful_texts = []
+    failed_samples = []
+    
+    for i in range(n_samples):
+        print(f"    -> Generating self-sample {i+1}/{n_samples} for query '{target_query[:50]}...'")
+        response = api_manager.generate_content(prompt, model_name, temperature)
+        
+        if response['status'] == 'SUCCESS':
+            # Format as standard exemplar
+            formatted_text = f"Question: {target_query}\nRationale and Answer: {response['text']}"
+            successful_texts.append(formatted_text)
+        else:
+            failed_samples.append({"sample_index": i, "error_info": response})
+    
+    if not successful_texts and failed_samples: status = "FAILURE"
+    elif successful_texts and failed_samples: status = "PARTIAL_SUCCESS"
+    else: status = "SUCCESS"
+    
+    return {"status": status, "self_sampled_texts": successful_texts, "failed_samples": failed_samples}
+
+def parse_numbered_questions(text: str) -> List[str]:
+    """Helper to parse a numbered list of questions from an LLM response."""
+    questions = []
+    # Regex to find lines starting with a number, period, and optional space
+    matches = re.findall(r'^\s*\d+\.\s*(.*)', text, re.MULTILINE)
+    for match in matches:
+        questions.append(match.strip())
+    return questions
+
+def augment_question(
+    target_query: str,
+    n_augmentations: int,
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Generates N augmented versions of the target query.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Generating {n_augmentations} augmented questions.")
+    
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
+    else:
+        raise TypeError(f"Unsupported API manager type for augmentation: {type(api_manager)}")
+        
+    temperature = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
+    prompt = create_augmentation_prompt(target_query, n_augmentations, config)
+    
+    print(f"    -> Generating {n_augmentations} augmented questions...")
+    response = api_manager.generate_content(prompt, model_name, temperature)
+    
+    if response['status'] != 'SUCCESS':
+        return {"status": "FAILURE", "augmented_questions": [], "error_info": response}
+    
+    augmented_questions = parse_numbered_questions(response['text'])
+    
+    if len(augmented_questions) < n_augmentations:
+        logger.warning(f"Augmentation expected {n_augmentations} questions, but only parsed {len(augmented_questions)}.")
+    
+    return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None}
+
+def _select_diverse_questions(questions: List[str], embeddings: np.ndarray, n: int) -> List[str]:
+    """Selects n questions with the lowest average pairwise similarity."""
+    if embeddings.shape[0] < n: return questions
+    
+    similarity_matrix = cosine_similarity(embeddings)
+    np.fill_diagonal(similarity_matrix, 0)
+    avg_similarities = similarity_matrix.mean(axis=1)
+    selected_indices = np.argsort(avg_similarities)[:n]
+    return [questions[i] for i in selected_indices]
+
+def _select_relevant_questions(aug_questions: List[str], aug_embeddings: np.ndarray, sample_embeddings: np.ndarray, n: int) -> List[str]:
+    """Selects n augmented questions most relevant to retrieved samples."""
+    if aug_embeddings.shape[0] < n: return aug_questions
+    
+    cross_similarity = cosine_similarity(aug_embeddings, sample_embeddings)
+    max_similarities = cross_similarity.max(axis=1)
+    selected_indices = np.argsort(max_similarities)[-n:][::-1] # Top N scores
+    return [aug_questions[i] for i in selected_indices]
+
+def select_augmented_questions(
+    augmented_questions: List[str],
+    config: Dict[str, Any],
+    embedding_model: SentenceTransformer,
+    retrieved_sample_texts: Optional[List[str]] = None
+) -> List[str]:
+    """
+    Selects N best augmented questions from a larger pool based on config mode.
+    """
+    logger = logging.getLogger(__name__)
+    target_n = config['AUGMENT_N']
+    mode = config['SELECTIVE_AUGMENTATION_SAMPLING_MODE']
+
+    if len(augmented_questions) <= target_n:
+        return augmented_questions
+
+    aug_embeddings = _generate_embeddings(augmented_questions, embedding_model)
+    if aug_embeddings.size == 0:
+        logger.error("Failed to generate embeddings for augmented questions. Cannot perform selection.")
+        return augmented_questions[:target_n]
+    
+    if mode == "diversity" or (mode == "auto" and retrieved_sample_texts is None):
+        logger.info(f"Selecting {target_n} most DIVERSE augmented questions.")
+        return _select_diverse_questions(augmented_questions, aug_embeddings, target_n)
+    
+    elif mode == "relevance" or (mode == "auto" and retrieved_sample_texts is not None):
+        logger.info(f"Selecting {target_n} most RELEVANT augmented questions.")
+        sample_embeddings = _generate_embeddings(retrieved_sample_texts, embedding_model)
+        if sample_embeddings.size == 0:
+            logger.error("Failed to generate embeddings for samples. Falling back to diversity selection.")
+            return _select_diverse_questions(augmented_questions, aug_embeddings, target_n)
+        return _select_relevant_questions(augmented_questions, aug_embeddings, sample_embeddings, target_n)
+    
+    return augmented_questions[:target_n]
+
+def _match_questions_to_groups(
+    augmented_questions: List[str],
+    retrieved_samples: List[str],
+    group_sets: List[Tuple[int, ...]],
+    embedding_model: SentenceTransformer
+) -> List[Tuple[str, Tuple[int, ...]]]:
+    """Matches each augmented question to the most relevant group."""
+    logger = logging.getLogger(__name__)
+    aug_embeddings = _generate_embeddings(augmented_questions, embedding_model)
+    sample_embeddings = _generate_embeddings(retrieved_samples, embedding_model)
+    
+    if aug_embeddings.size == 0 or sample_embeddings.size == 0: return []
+    
+    similarity_matrix = cosine_similarity(aug_embeddings, sample_embeddings)
+    
+    matched_pairs = []
+    used_groups = set()
+    
+    for i, aug_q in enumerate(augmented_questions):
+        similarities = similarity_matrix[i]
+        ranked_sample_indices = np.argsort(similarities)[::-1]
+        
+        for sample_idx in ranked_sample_indices:
+            sample_num = sample_idx + 1
+            found_match = False
+            for group in group_sets:
+                if sample_num in group and tuple(group) not in used_groups:
+                    matched_pairs.append((aug_q, group))
+                    used_groups.add(tuple(group))
+                    found_match = True
+                    break
+            if found_match: break
+    
+    logger.info(f"Matched {len(matched_pairs)} augmented questions to sample groups.")
+    return matched_pairs
+
+def analogical_adapt(
+    target_query: str,
+    retrieved_indices: List[int],
+    exemplar_data: Dict[str, Any],
+    api_manager: Any,
+    config: Dict[str, Any],
+    embedding_model: SentenceTransformer,
+    augmented_questions: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """
+    Performs analogical reasoning on groups of retrieved samples.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting analogical adaptation step.")
+    
+    n_sampling = config.get("ANALOGICAL_ADAPTATION_SAMPLING_N", 1)
+    group_sets = config.get("ANALOGICAL_GROUP_SETS", [])
+
+    if not group_sets:
+        logger.warning("ANALOGICAL_GROUP_SETS is empty. Skipping analogical adaptation.")
+        return {"status": "SKIPPED", "reason": "No groups defined."}
+
+    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
+    else: raise TypeError(f"Unsupported API manager type for analogical adaptation: {type(api_manager)}")
+        
+    temperature = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
+
+    # Build full text for retrieved samples
+    retrieved_samples_texts = [
+        EXEMPLAR_FORMAT.format(question=exemplar_data['questions'][i], solution=exemplar_data['solutions'][i])
+        for i in retrieved_indices
+    ]
+    
+    question_group_pairs = []
+    if config.get("APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION") and augmented_questions:
+        question_group_pairs = _match_questions_to_groups(augmented_questions, retrieved_samples_texts, group_sets, embedding_model)
+    else:
+        question_group_pairs = [(target_query, group) for group in group_sets]
+
+    successful_adaptations = []
+    failed_adaptations = []
+
+    for question_for_prompt, group_indices in question_group_pairs:
+        # Check if group indices are valid for the retrieved samples
+        if any(i > len(retrieved_samples_texts) for i in group_indices):
+            logger.warning(f"Group {group_indices} has an index out of bounds for the {len(retrieved_samples_texts)} retrieved samples. Skipping.")
+            continue
+        
+        sample_group_texts = [retrieved_samples_texts[i-1] for i in group_indices]
+        
+        for attempt in range(n_sampling):
+            print(f"    -> Analogical adaptation for group {group_indices}, attempt {attempt+1}/{n_sampling}...")
+            prompt = create_analogical_adaptation_prompt(question_for_prompt, sample_group_texts, config)
+            response = api_manager.generate_content(prompt, model_name, temperature)
+            
+            if response['status'] == 'SUCCESS':
+                successful_adaptations.append(response['text'])
+            else:
+                failed_adaptations.append({
+                    "group_indices": group_indices,
+                    "attempt": attempt,
+                    "question_used": question_for_prompt,
+                    "error_info": response
+                })
+
+    if not successful_adaptations and failed_adaptations: status = "FAILURE"
+    elif successful_adaptations and failed_adaptations: status = "PARTIAL_SUCCESS"
+    else: status = "SUCCESS"
+
+    return {"status": status, "analogically_adapted_texts": successful_adaptations, "failed_adaptations": failed_adaptations}
