@@ -41,6 +41,7 @@ from src.pipeline_steps import (
 )
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
+from src.prompts import EXEMPLAR_FORMAT
 
 def run_pipeline_for_single_query(
     hard_list_idx: int,
