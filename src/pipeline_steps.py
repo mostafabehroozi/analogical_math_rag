@@ -454,10 +454,15 @@ def augment_question(
 ) -> Dict[str, Any]:
     """
     Generates N augmented versions of the target query.
+    
+    Supports a multi-call schedule via the `AUGMENTATION_SCHEDULE` config.
+    If the schedule is defined (e.g., [2, 3]), it will make 2 API calls,
+    each requesting 3 questions. Otherwise, it falls back to a single call
+    for `n_augmentations` questions.
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"Generating {n_augmentations} augmented questions.")
-    
+
+    # --- Determine Model and Temperature ---
     if isinstance(api_manager, GeminiAPIManager):
         model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
     elif isinstance(api_manager, AvalAIAPIManager):
@@ -466,22 +471,64 @@ def augment_question(
         model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
     else:
         raise TypeError(f"Unsupported API manager type for augmentation: {type(api_manager)}")
-        
+    
     temperature = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
-    prompt = create_augmentation_prompt(target_query, n_augmentations, config)
     
-    print(f"    -> Generating {n_augmentations} augmented questions...")
-    response = api_manager.generate_content(prompt, model_name, temperature)
-    
-    if response['status'] != 'SUCCESS':
-        return {"status": "FAILURE", "augmented_questions": [], "error_info": response}
-    
-    augmented_questions = parse_numbered_questions(response['text'])
-    
-    if len(augmented_questions) < n_augmentations:
-        logger.warning(f"Augmentation expected {n_augmentations} questions, but only parsed {len(augmented_questions)}.")
-    
-    return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None}
+    # --- Check for Augmentation Schedule ---
+    schedule = config.get("AUGMENTATION_SCHEDULE")
+
+    # --- Path 1: Scheduled, Multi-Call Augmentation ---
+    if isinstance(schedule, list) and len(schedule) == 2:
+        num_calls, questions_per_call = schedule
+        logger.info(f"Using augmentation schedule: {num_calls} calls, {questions_per_call} questions per call.")
+        
+        all_augmented_questions = []
+        failed_calls = []
+
+        for i in range(num_calls):
+            print(f"    -> Generating augmented questions (Call {i+1}/{num_calls})...")
+            prompt = create_augmentation_prompt(target_query, questions_per_call, config)
+            response = api_manager.generate_content(prompt, model_name, temperature)
+
+            if response['status'] == 'SUCCESS':
+                parsed_qs = parse_numbered_questions(response['text'])
+                if len(parsed_qs) < questions_per_call:
+                    logger.warning(f"Augmentation call {i+1} expected {questions_per_call} questions, but only parsed {len(parsed_qs)}.")
+                all_augmented_questions.extend(parsed_qs)
+            else:
+                logger.error(f"Augmentation call {i+1}/{num_calls} failed: {response['error_message']}")
+                failed_calls.append({"call_index": i + 1, "error_info": response})
+
+        # Determine the final status based on the outcomes
+        status = "SUCCESS"
+        if failed_calls and not all_augmented_questions:
+            status = "FAILURE"
+        elif failed_calls:
+            status = "PARTIAL_SUCCESS"
+            
+        return {
+            "status": status, 
+            "augmented_questions": all_augmented_questions, 
+            "failed_calls": failed_calls
+        }
+
+    # --- Path 2: Fallback, Single-Call Augmentation ---
+    else:
+        logger.info(f"Generating {n_augmentations} augmented questions in a single call.")
+        prompt = create_augmentation_prompt(target_query, n_augmentations, config)
+        
+        print(f"    -> Generating {n_augmentations} augmented questions...")
+        response = api_manager.generate_content(prompt, model_name, temperature)
+        
+        if response['status'] != 'SUCCESS':
+            return {"status": "FAILURE", "augmented_questions": [], "error_info": response}
+        
+        augmented_questions = parse_numbered_questions(response['text'])
+        
+        if len(augmented_questions) < n_augmentations:
+            logger.warning(f"Augmentation expected {n_augmentations} questions, but only parsed {len(augmented_questions)}.")
+        
+        return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None}
 
 def _select_diverse_questions(questions: List[str], embeddings: np.ndarray, n: int) -> List[str]:
     """Selects n questions with the lowest average pairwise similarity."""

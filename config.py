@@ -160,7 +160,13 @@ CONFIG = {
 
     # --- 8e. NEW FEATURES: Selective Augmentation Sampling ---
     "SELECTIVE_AUGMENTATION_SAMPLING": False,           # Enable selective augmentation
-    "AUGMENT_K": 10,                                    # Total augmentations generated
+    
+    # NEW: Augmentation Schedule for multi-call generation
+    # If set, this overrides AUGMENT_K. Format: [number_of_calls, questions_per_call].
+    # Example: [2, 3] means 2 API calls, each generating 3 questions, for a total of 6.
+    "AUGMENTATION_SCHEDULE": None,
+    
+    "AUGMENT_K": 10,                                    # Total augmentations generated (used if AUGMENTATION_SCHEDULE is None)
     "AUGMENT_N": 3,                                     # Number to select from K
     "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",     # "auto", "diversity", or "relevance"
 
