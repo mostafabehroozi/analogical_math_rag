@@ -631,7 +631,7 @@ def analogical_adapt(
     elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
     else: raise TypeError(f"Unsupported API manager type for analogical adaptation: {type(api_manager)}")
         
-    temperature = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
+    temperature = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0))
 
     # Build full text for retrieved samples
     retrieved_samples_texts = [
