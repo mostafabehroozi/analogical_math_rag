@@ -590,34 +590,18 @@ def _match_questions_to_groups(
     group_sets: List[Tuple[int, ...]],
     embedding_model: SentenceTransformer
 ) -> List[Tuple[str, Tuple[int, ...]]]:
-    """Matches each augmented question to the most relevant group."""
+    """
+    Directly pairs each augmented question with a group from the config list.
+    This new logic allows for reusing identical group definitions.
+    """
     logger = logging.getLogger(__name__)
-    aug_embeddings = _generate_embeddings(augmented_questions, embedding_model)
-    sample_embeddings = _generate_embeddings(retrieved_samples, embedding_model)
     
-    if aug_embeddings.size == 0 or sample_embeddings.size == 0: return []
-    
-    similarity_matrix = cosine_similarity(aug_embeddings, sample_embeddings)
-    
-    matched_pairs = []
-    used_groups = set()
-    
-    for i, aug_q in enumerate(augmented_questions):
-        similarities = similarity_matrix[i]
-        ranked_sample_indices = np.argsort(similarities)[::-1]
-        
-        for sample_idx in ranked_sample_indices:
-            sample_num = sample_idx + 1
-            found_match = False
-            for group in group_sets:
-                if sample_num in group and tuple(group) not in used_groups:
-                    matched_pairs.append((aug_q, group))
-                    used_groups.add(tuple(group))
-                    found_match = True
-                    break
-            if found_match: break
-    
-    logger.info(f"Matched {len(matched_pairs)} augmented questions to sample groups.")
+    # Directly pair the first N augmented questions with the first N groups.
+    # This uses a simple 1-to-1 mapping.
+    num_pairs = min(len(augmented_questions), len(group_sets))
+    matched_pairs = list(zip(augmented_questions[:num_pairs], group_sets[:num_pairs]))
+
+    logger.info(f"Directly paired {len(matched_pairs)} augmented questions to sample groups.")
     return matched_pairs
 
 def analogical_adapt(
