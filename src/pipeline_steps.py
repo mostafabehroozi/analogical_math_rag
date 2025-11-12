@@ -615,6 +615,9 @@ def analogical_adapt(
 ) -> Dict[str, Any]:
     """
     Performs analogical reasoning on groups of retrieved samples.
+    
+    MODIFIED: Now supports empty groups `()` which triggers a 'self-solve'
+    action on an augmented question, using the self-sampling prompt.
     """
     logger = logging.getLogger(__name__)
     logger.info("Starting analogical adaptation step.")
@@ -631,7 +634,9 @@ def analogical_adapt(
     elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
     else: raise TypeError(f"Unsupported API manager type for analogical adaptation: {type(api_manager)}")
         
-    temperature = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0))
+    # Get temperatures for both modes
+    analogical_temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
+    self_solve_temp = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
 
     # Build full text for retrieved samples
     retrieved_samples_texts = [
@@ -649,27 +654,54 @@ def analogical_adapt(
     failed_adaptations = []
 
     for question_for_prompt, group_indices in question_group_pairs:
-        # Check if group indices are valid for the retrieved samples
-        if any(i > len(retrieved_samples_texts) for i in group_indices):
-            logger.warning(f"Group {group_indices} has an index out of bounds for the {len(retrieved_samples_texts)} retrieved samples. Skipping.")
-            continue
-        
-        sample_group_texts = [retrieved_samples_texts[i-1] for i in group_indices]
-        
-        for attempt in range(n_sampling):
-            print(f"    -> Analogical adaptation for group {group_indices}, attempt {attempt+1}/{n_sampling}...")
-            prompt = create_analogical_adaptation_prompt(question_for_prompt, sample_group_texts, config)
-            response = api_manager.generate_content(prompt, model_name, temperature)
+        # --- START OF MODIFICATION ---
+
+        # Case 1: The group is EMPTY -> Perform self-solve
+        if not group_indices:
+            print(f"    -> Performing SELF-SOLVE for empty group using question: '{question_for_prompt[:50]}...'")
+            prompt = create_self_sampling_prompt(question_for_prompt, config)
+            # Use the self-sampling temperature for this mode
+            response = api_manager.generate_content(prompt, model_name, self_solve_temp)
             
             if response['status'] == 'SUCCESS':
-                successful_adaptations.append(response['text'])
+                # The self-sampling prompt only returns the solution. We must format it
+                # into a full exemplar to match the output of the analogical path.
+                formatted_text = f"Question: {question_for_prompt}\nRationale and Answer: {response['text']}"
+                successful_adaptations.append(formatted_text)
             else:
                 failed_adaptations.append({
-                    "group_indices": group_indices,
-                    "attempt": attempt,
+                    "group_indices": "() - Self-Solve",
+                    "attempt": 0, # Self-solve is a single attempt per group
                     "question_used": question_for_prompt,
                     "error_info": response
                 })
+            continue # Move to the next group
+
+        # Case 2: The group is NOT EMPTY -> Perform standard analogical adaptation
+        else:
+            # Check if group indices are valid for the retrieved samples
+            if any(i > len(retrieved_samples_texts) for i in group_indices):
+                logger.warning(f"Group {group_indices} has an index out of bounds for the {len(retrieved_samples_texts)} retrieved samples. Skipping.")
+                continue
+            
+            sample_group_texts = [retrieved_samples_texts[i-1] for i in group_indices]
+            
+            for attempt in range(n_sampling):
+                print(f"    -> Analogical adaptation for group {group_indices}, attempt {attempt+1}/{n_sampling}...")
+                prompt = create_analogical_adaptation_prompt(question_for_prompt, sample_group_texts, config)
+                # Use the analogical adaptation temperature for this mode
+                response = api_manager.generate_content(prompt, model_name, analogical_temp)
+                
+                if response['status'] == 'SUCCESS':
+                    successful_adaptations.append(response['text'])
+                else:
+                    failed_adaptations.append({
+                        "group_indices": group_indices,
+                        "attempt": attempt,
+                        "question_used": question_for_prompt,
+                        "error_info": response
+                    })
+        # --- END OF MODIFICATION ---
 
     if not successful_adaptations and failed_adaptations: status = "FAILURE"
     elif successful_adaptations and failed_adaptations: status = "PARTIAL_SUCCESS"

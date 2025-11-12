@@ -152,8 +152,15 @@ CONFIG = {
 
     # --- 8c. NEW FEATURES: Analogical Adaptation Configuration ---
     "APPLY_ANALOGICAL_ADAPTATION": False,   # Enable analogical reasoning as adaptation
+
+    # MODIFIED: Now supports empty tuples `()` to trigger a "self-solve"
+    # action on an augmented question, using the self-sampling prompt.
+    # This creates a hybrid step mixing RAG and non-RAG generation.
+    # Example: [(), (1,), (2, 3)] would self-solve one augmented question,
+    # then use retrieved sample #1 for the second, and samples #2 & #3 for the third.
     "ANALOGICAL_GROUP_SETS": [(1, 2), (3, 4), (5, 6)],  # Grouping of retrieved samples (1-indexed)
-    "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,  # Number of attempts per group
+    
+    "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,  # Number of attempts per NON-EMPTY group
 
     # --- 8d. NEW FEATURES: Augmentation Configuration ---
     "APPLY_SELF_SAMPLING_AUGMENTATION": False,          # Augment questions for self-sampling
