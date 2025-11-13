@@ -9,60 +9,15 @@ This file provides common helper functions used across the project, including:
 - A data conversion helper to make NumPy objects JSON serializable.
 """
 
-import logging
 import os
 import json
 import pickle
 import numpy as np
-from datetime import datetime
 import shutil
 
 # --- 1. Logging Setup ---
 
-def setup_logger(logger_name: str, log_dir: str, level=logging.INFO) -> logging.Logger:
-    """
-    Configures and returns a logger that writes to both a file and the console.
-
-    The log file is named with the logger_name and a timestamp. It prevents
-    adding duplicate handlers if called multiple times.
-
-    Args:
-        logger_name (str): The name for the logger.
-        log_dir (str): The directory where the log file will be saved.
-        level (int): The logging level (e.g., logging.INFO, logging.DEBUG).
-
-    Returns:
-        logging.Logger: The configured logger instance.
-    """
-    logger = logging.getLogger(logger_name)
-
-    # Avoid adding duplicate handlers if the logger is already configured
-    if logger.handlers:
-        return logger
-
-    logger.setLevel(level)
-
-    # Define the format for the log messages
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-
-    # Create a file handler to write logs to a file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file_path = os.path.join(log_dir, f"{logger_name}_{timestamp}.log")
-    
-    file_handler = logging.FileHandler(log_file_path, mode='a')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    # Create a stream handler to print logs to the console
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-
-    logger.info(f"Logger '{logger_name}' initialized. Logging to {log_file_path}")
-    return logger
+# The setup_logger function has been removed as per the requirements.
 
 
 # --- 2. Data Type Conversion Utilities ---
@@ -110,11 +65,7 @@ def save_json(data: dict or list, file_path: str, indent: int = 4) -> bool:
             json.dump(data, f, indent=indent, default=convert_numpy_for_json)
         return True
     except (TypeError, IOError) as e:
-        # Log the error if a logger is available, otherwise print
-        try:
-            logging.getLogger(__name__).error(f"Failed to save JSON to {file_path}: {e}", exc_info=True)
-        except Exception:
-            print(f"ERROR: Failed to save JSON to {file_path}: {e}")
+        print(f"ERROR: Failed to save JSON to {file_path}: {e}")
         return False
 
 def load_json(file_path: str) -> dict or list or None:
@@ -133,10 +84,7 @@ def load_json(file_path: str) -> dict or list or None:
         with open(file_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError) as e:
-        try:
-            logging.getLogger(__name__).error(f"Failed to load JSON from {file_path}: {e}", exc_info=True)
-        except Exception:
-            print(f"ERROR: Failed to load JSON from {file_path}: {e}")
+        print(f"ERROR: Failed to load JSON from {file_path}: {e}")
         return None
 
 def save_to_pickle(data, file_path: str) -> bool:
@@ -156,10 +104,7 @@ def save_to_pickle(data, file_path: str) -> bool:
             pickle.dump(data, f)
         return True
     except (pickle.PicklingError, IOError) as e:
-        try:
-            logging.getLogger(__name__).error(f"Failed to save Pickle to {file_path}: {e}", exc_info=True)
-        except Exception:
-            print(f"ERROR: Failed to save Pickle to {file_path}: {e}")
+        print(f"ERROR: Failed to save Pickle to {file_path}: {e}")
         return False
 
 def load_from_pickle(file_path: str):
@@ -178,10 +123,7 @@ def load_from_pickle(file_path: str):
         with open(file_path, 'rb') as f:
             return pickle.load(f)
     except (pickle.UnpicklingError, IOError, EOFError) as e:
-        try:
-            logging.getLogger(__name__).error(f"Failed to load Pickle from {file_path}: {e}", exc_info=True)
-        except Exception:
-            print(f"ERROR: Failed to load Pickle from {file_path}: {e}")
+        print(f"ERROR: Failed to load Pickle from {file_path}: {e}")
         return None
 
 

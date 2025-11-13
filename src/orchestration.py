@@ -25,14 +25,14 @@ entire run switches to a two-phase model:
 This optimizes API usage by batching all expensive 'solve' calls together.
 """
 
-import logging
 from tqdm import tqdm
 import os
+import time
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 
 # Import our custom modules
-from src.pipeline_steps import retrieve, adapt, merge, solve
+from src.pipeline_steps import retrieve, adapt, analogical_adaptation, merge, solve, generate_synthetic_samples
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 
@@ -58,8 +58,6 @@ def run_pipeline_for_single_query(
         existing_log (Optional[Dict]): A pre-existing log from the intermediate phase,
                                        required for 'solve_only' mode.
     """
-    logger = logging.getLogger(__name__)
-    
     # --- Log Initialization ---
     if run_mode == 'solve_only' and existing_log:
         run_log = existing_log
@@ -71,15 +69,21 @@ def run_pipeline_for_single_query(
         print("\n" + "="*80)
         print(f"Processing Query #{hard_list_idx}: '{target_query[:100]}...'")
         print("="*80)
-        logger.info(f"--- Starting pipeline for Query #{hard_list_idx}: '{target_query[:80]}...' ---")
         run_log = {
             "target_query_original_hard_list_idx": hard_list_idx,
             "target_query_text": target_query,
             "config_flags_used": {
                 key: config.get(key) for key in [
-                    "USE_RETRIEVAL", "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
-                    "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3", "APPLY_MERGING",
+                    "USE_RETRIEVAL", "SELF_SAMPLING",
+                    "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
+                    "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3",
+                    "APPLY_ANALOGICAL_ADAPTATION",
+                    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION",
+                    "ANALOGICAL_ADAPTATION_GROUPING",
+                    "ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP",
+                    "APPLY_MERGING",
                     "DEFER_SOLVE_STEP", "TOP_N_CANDIDATES_RETRIEVAL", "N_PASS_ATTEMPTS",
+                    "N_SELF_SAMPLES",
                     "DEFAULT_PASS_N_SOLVER_TEMPERATURE"
                 ]
             },
@@ -97,7 +101,7 @@ def run_pipeline_for_single_query(
     final_exemplars_for_solve = []
     pipeline_halted = False
 
-    # --- Phase 1: Intermediate Steps (Retrieve, Adapt, Merge) ---
+    # --- Phase 1: Intermediate Steps (Retrieve, Adapt, Merge, OR Self-Sample) ---
     if run_mode in ['full', 'intermediate']:
         if config.get('USE_RETRIEVAL', True):
             # Step 1: Retrieve
@@ -110,11 +114,14 @@ def run_pipeline_for_single_query(
             run_log['steps']['retrieval'] = retrieval_result
             if retrieval_result['status'] == 'FAILURE':
                 run_log['pipeline_status'] = "FAILURE: Retrieval failed."
-                logger.error(run_log['pipeline_status'])
+                print(f"Error: {run_log['pipeline_status']}")
                 print("  -> Retrieval FAILED. Halting pipeline for this query.")
                 pipeline_halted = True
             else:
                 print(f"  -> Retrieved indices: {retrieval_result['retrieved_indices']}")
+
+            # This variable will hold the list of texts as it's passed through intermediate steps
+            texts_for_next_step = []
 
             # Step 2: Adapt
             if not pipeline_halted:
@@ -127,7 +134,7 @@ def run_pipeline_for_single_query(
                 run_log['steps']['adaptation'] = adapt_result
                 if adapt_result['status'] == 'FAILURE':
                     run_log['pipeline_status'] = "FAILURE: Adaptation failed for all exemplars."
-                    logger.error(run_log['pipeline_status'])
+                    print(f"Error: {run_log['pipeline_status']}")
                     print("  -> Adaptation FAILED for all exemplars. Halting pipeline for this query.")
                     pipeline_halted = True
                 else:
@@ -135,12 +142,43 @@ def run_pipeline_for_single_query(
                         print(f"  -> Adapted text #{i+1} (start): '{text[:120]}...'")
                     if adapt_result['status'] == 'PARTIAL_SUCCESS':
                         print(f"  -> WARNING: Adaptation partially succeeded. {len(adapt_result.get('failed_adaptations', []))} exemplars failed.")
-            
+                    texts_for_next_step = adapt_result.get('adapted_texts', [])
+
+            # Step 2.5: Analogical Adaptation (NEW STEP)
+            if not pipeline_halted:
+                print("\n[STEP 2.5] ANALOGICAL ADAPTATION")
+                analogical_adapt_result = analogical_adaptation(
+                    target_query=target_query,
+                    adapted_texts=texts_for_next_step,
+                    api_manager=manager_for_solve, # Use the powerful solver's manager
+                    config=config,
+                    # --- PASS NEW ARGUMENTS ---
+                    retrieval_result=retrieval_result,
+                    exemplar_data=exemplar_data,
+                    embedding_model=embedding_model
+                )
+                run_log['steps']['analogical_adaptation'] = analogical_adapt_result
+                
+                if analogical_adapt_result['status'] == 'SKIPPED':
+                    print("  -> Analogical Adaptation was SKIPPED as per config.")
+                    # The original texts are passed through, so texts_for_next_step is unchanged.
+                elif "FAILURE" in analogical_adapt_result['status']:
+                    run_log['pipeline_status'] = "FAILURE: Analogical Adaptation failed for all groups."
+                    print(f"Error: {run_log['pipeline_status']}")
+                    print("  -> Analogical Adaptation FAILED for all groups. Halting pipeline.")
+                    pipeline_halted = True
+                else:
+                    # On success or partial success, use the newly generated exemplars
+                    texts_for_next_step = analogical_adapt_result['newly_generated_exemplars']
+                    print(f"  -> Generated {len(texts_for_next_step)} new exemplars via analogical adaptation.")
+                    if analogical_adapt_result['status'] == 'PARTIAL_SUCCESS':
+                        print(f"  -> WARNING: {len(analogical_adapt_result.get('failed_generations', []))} generations failed.")
+
             # Step 3: Merge
             if not pipeline_halted:
                 print("\n[STEP 3] MERGE")
                 merge_result = merge(
-                    target_query=target_query, adapted_texts=adapt_result['adapted_texts'],
+                    target_query=target_query, adapted_texts=texts_for_next_step,
                     embedding_model=embedding_model, api_manager=manager_for_adapt, config=config
                 )
                 run_log['steps']['merging'] = merge_result
@@ -149,8 +187,30 @@ def run_pipeline_for_single_query(
                 for i, text in enumerate(merge_result.get('merged_texts', [])):
                     print(f"  -> Final merged text #{i+1} (start): '{text[:120]}...'")
                 final_exemplars_for_solve = merge_result['merged_texts']
+
+        elif config.get('SELF_SAMPLING', False):
+            print("\n[STEP 1] GENERATE SYNTHETIC SAMPLES (Self-Sampling Mode)")
+            # Use the powerful solver's manager for this creative task
+            sampling_result = generate_synthetic_samples(
+                target_query=target_query,
+                api_manager=manager_for_solve,
+                config=config,
+                embedding_model=embedding_model
+            )
+            run_log['steps']['self_sampling'] = sampling_result
+            if "FAILURE" in sampling_result['status']:
+                run_log['pipeline_status'] = "FAILURE: Self-sampling failed for all attempts."
+                print(f"Error: {run_log['pipeline_status']}")
+                print("  -> Self-Sampling FAILED for all attempts. Halting pipeline.")
+                pipeline_halted = True
+            else:
+                final_exemplars_for_solve = sampling_result['synthetic_samples']
+                print(f"  -> Generated {len(final_exemplars_for_solve)} synthetic samples.")
+                if sampling_result['status'] == 'PARTIAL_SUCCESS':
+                    print(f"  -> WARNING: {len(sampling_result['failed_generations'])} sample generations failed.")
+        
         else:
-            print("\n[STEP 1, 2, 3] RETRIEVE, ADAPT, MERGE SKIPPED (USE_RETRIEVAL is False).")
+            print("\n[STEP 1, 2, 3] SKIPPED (USE_RETRIEVAL and SELF_SAMPLING are False).")
             run_log['steps']['retrieval'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
             run_log['steps']['adaptation'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
             run_log['steps']['merging'] = {"status": "SKIPPED", "reason": "USE_RETRIEVAL is False"}
@@ -160,7 +220,11 @@ def run_pipeline_for_single_query(
         print("\n[STEP 1, 2, 3] SKIPPED (Running in solve_only mode). Loading intermediate results.")
         pipeline_halted = "FAILURE" in run_log.get("pipeline_status", "")
         if not pipeline_halted:
-            final_exemplars_for_solve = run_log.get('steps', {}).get('merging', {}).get('merged_texts', [])
+            # Handle loading exemplars from either RAG or Self-Sampling
+            if 'merging' in run_log.get('steps', {}):
+                final_exemplars_for_solve = run_log.get('steps', {}).get('merging', {}).get('merged_texts', [])
+            elif 'self_sampling' in run_log.get('steps', {}):
+                 final_exemplars_for_solve = run_log.get('steps', {}).get('self_sampling', {}).get('synthetic_samples', [])
             print(f"  -> Loaded {len(final_exemplars_for_solve)} exemplars for solving.")
         else:
             print("  -> Prior step failed, solve will be skipped.")
@@ -191,7 +255,6 @@ def run_pipeline_for_single_query(
         if not pipeline_halted:
              run_log['pipeline_status'] = "INTERMEDIATE_COMPLETE"
 
-    logger.info(f"--- Pipeline finished for Query #{hard_list_idx} with status: {run_log['pipeline_status']} ---")
     return run_log
 
 
@@ -206,9 +269,13 @@ def run_experiments(
     """
     Orchestrates running multiple experiments with different configurations.
     Supports both standard and cross-experiment deferred execution modes.
+    
+    MODIFIED: This function now saves individual log files for each query to prevent
+    performance degradation from rewriting a single large log file. It assembles
+    the final results dictionary at the end for downstream compatibility.
     """
-    logger = logging.getLogger(__name__)
     all_results = {}
+    results_dir = global_config['RESULTS_DIR']
 
     # --- REWRITTEN LOGIC: Check for and handle cross-experiment deferred execution ---
     is_cross_experiment_defer_enabled = any(
@@ -216,7 +283,6 @@ def run_experiments(
     )
 
     if is_cross_experiment_defer_enabled:
-        logger.info("Cross-experiment deferred mode is ENABLED. Running in two phases.")
         print("\n" + "#"*25 + " PHASE 1: EXECUTING INTERMEDIATE STEPS FOR ALL EXPERIMENTS " + "#"*25)
         
         # --- PHASE 1: Intermediate Steps for ALL experiments ---
@@ -225,30 +291,32 @@ def run_experiments(
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
             
-            # Only run intermediate steps for experiments that are actually deferred
             if not current_config.get('DEFER_SOLVE_STEP', False):
-                logger.warning(f"Experiment '{exp_name}' does not have DEFER_SOLVE_STEP enabled. It will be SKIPPED in this run.")
+                print(f"Warning: Experiment '{exp_name}' does not have DEFER_SOLVE_STEP enabled. It will be SKIPPED in this run.")
                 continue
 
-            logger.info(f"########## Starting Phase 1 (Intermediate) for Experiment: {exp_name} ##########")
-            log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
-            
-            run_logs = load_json(log_file_path) or []
-            completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE'}
-            queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
+            exp_log_dir = os.path.join(results_dir, exp_name)
+            os.makedirs(exp_log_dir, exist_ok=True)
+
+            queries_to_process = []
+            for idx, q_text in enumerate(hard_questions):
+                query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                if os.path.exists(query_log_path):
+                    log_data = load_json(query_log_path)
+                    if log_data and log_data.get('pipeline_status') == 'INTERMEDIATE_COMPLETE':
+                        continue # Skip if intermediate is already done
+                queries_to_process.append((idx, q_text))
 
             if queries_to_process:
                 for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
+                    query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
                     intermediate_log = run_pipeline_for_single_query(
                         hard_list_idx=original_idx, target_query=query_text, config=current_config,
                         embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                         run_mode='intermediate'
                     )
-                    run_logs.append(intermediate_log)
-                    save_json(run_logs, log_file_path)
-                    periodic_sync_check(loop_idx, current_config)
-            else:
-                logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
+                    save_json(intermediate_log, query_log_path)
+                    periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
 
         print("\n" + "#"*25 + " PHASE 1 COMPLETE " + "#"*25)
         print("\n" + "#"*25 + " PHASE 2: EXECUTING FINAL SOLVE STEPS FOR ALL EXPERIMENTS " + "#"*25)
@@ -259,126 +327,140 @@ def run_experiments(
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
 
-            # Only run solve steps for experiments that are deferred
             if not current_config.get('DEFER_SOLVE_STEP', False):
                 continue
             
-            logger.info(f"########## Starting Phase 2 (Solving) for Experiment: {exp_name} ##########")
-            log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
-
-            intermediate_logs = load_json(log_file_path) or []
-            logs_to_solve = [log for log in intermediate_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
+            exp_log_dir = os.path.join(results_dir, exp_name)
+            
+            logs_to_solve = []
+            for idx, q_text in enumerate(hard_questions):
+                query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                if os.path.exists(query_log_path):
+                    log_data = load_json(query_log_path)
+                    if log_data and log_data.get('pipeline_status') == 'INTERMEDIATE_COMPLETE':
+                        logs_to_solve.append(log_data)
             
             if logs_to_solve:
-                completed_logs_map = {log['target_query_original_hard_list_idx']: log for log in intermediate_logs if log.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'}
-
                 for loop_idx, log_to_solve in enumerate(tqdm(logs_to_solve, desc=f"{exp_name} - Phase 2: Solving")):
                     original_idx = log_to_solve['target_query_original_hard_list_idx']
                     query_text = log_to_solve['target_query_text']
+                    query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
                     
                     completed_log = run_pipeline_for_single_query(
                         hard_list_idx=original_idx, target_query=query_text, config=current_config,
                         embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                         run_mode='solve_only', existing_log=log_to_solve
                     )
-                    completed_logs_map[original_idx] = completed_log
-                    save_json(list(completed_logs_map.values()), log_file_path)
-                    periodic_sync_check(loop_idx, current_config)
-                
-                final_logs = list(completed_logs_map.values())
-            else:
-                 logger.info(f"All solve steps for '{exp_name}' are already complete.")
-                 final_logs = intermediate_logs
-            
-            save_json(final_logs, log_file_path)
-            all_results[exp_name] = final_logs
-            logger.info(f"########## Finished Experiment: {exp_name} ##########")
+                    save_json(completed_log, query_log_path)
+                    periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
 
         print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
 
     else:
         # --- Original Mode: Run each experiment sequentially ---
-        logger.info("Deferred mode is DISABLED. Running experiments sequentially.")
         for exp_overrides in experiment_configs:
             current_config = global_config.copy()
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
-            logger.info(f"########## Starting Experiment: {exp_name} ##########")
-            log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
             
-            # This logic handles both standard (non-deferred) and single-experiment deferred runs
+            exp_log_dir = os.path.join(results_dir, exp_name)
+            os.makedirs(exp_log_dir, exist_ok=True)
+            
+            # --- This logic branch handles experiments run in standard, non-deferred mode ---
             if not current_config.get('DEFER_SOLVE_STEP', False):
-                # --- Standard Mode: Run query-by-query ---
-                logger.info(f"Running '{exp_name}' in standard (query-by-query) mode.")
-                run_logs = load_json(log_file_path) or []
-                completed_indices = {log['target_query_original_hard_list_idx'] for log in run_logs}
-                queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_indices]
                 
-                if not queries_to_process:
-                    logger.info(f"All queries for '{exp_name}' are already processed. Skipping.")
-                    all_results[exp_name] = run_logs
-                    continue
+                # Check which queries need processing to allow for resuming a run
+                queries_to_process = []
+                for idx, q_text in enumerate(hard_questions):
+                    query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                    if not os.path.exists(query_log_path):
+                        queries_to_process.append((idx, q_text))
+                
+                if queries_to_process:
+                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
+                        query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
+                        
+                        single_run_log = run_pipeline_for_single_query(
+                            hard_list_idx=original_idx, target_query=query_text, config=current_config,
+                            embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
+                            run_mode='full'
+                        )
+                        
+                        # Save the log for this single query. This is a fast operation.
+                        save_json(single_run_log, query_log_path)
+                        
+                        periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
 
-                for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
-                    single_run_log = run_pipeline_for_single_query(
-                        hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                        run_mode='full'
-                    )
-                    run_logs.append(single_run_log)
-                    save_json(run_logs, log_file_path)
-                    periodic_sync_check(loop_idx, current_config)
             else:
-                # --- Single-Experiment Deferred Mode ---
-                logger.info(f"Running '{exp_name}' in single-experiment deferred solve mode.")
-                
+                # --- This logic branch handles single-experiment deferred mode ---
                 # PHASE 1: Intermediate Steps
                 print(f"\n--- {exp_name}: STARTING PHASE 1 of 2 (Intermediate Steps) ---")
-                run_logs = load_json(log_file_path) or []
-                completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE'}
-                queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
+                queries_to_process_interm = []
+                for idx, q_text in enumerate(hard_questions):
+                    query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                    if not os.path.exists(query_log_path):
+                        queries_to_process_interm.append((idx, q_text))
 
-                if queries_to_process:
-                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
+                if queries_to_process_interm:
+                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process_interm, desc=f"{exp_name} - Phase 1: Intermediate")):
+                        query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
                         intermediate_log = run_pipeline_for_single_query(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                             run_mode='intermediate'
                         )
-                        run_logs.append(intermediate_log)
-                        save_json(run_logs, log_file_path)
-                        periodic_sync_check(loop_idx, current_config)
-                else:
-                    logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
+                        save_json(intermediate_log, query_log_path)
+                        periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
 
                 # PHASE 2: Final Solving Step
                 print(f"\n--- {exp_name}: STARTING PHASE 2 of 2 (Final Solving) ---")
-                intermediate_logs = load_json(log_file_path)
-                logs_to_solve = [log for log in intermediate_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
+                logs_to_solve = []
+                for idx in range(len(hard_questions)):
+                    query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                    if os.path.exists(query_log_path):
+                        log_data = load_json(query_log_path)
+                        if log_data and log_data.get('pipeline_status') == 'INTERMEDIATE_COMPLETE':
+                            logs_to_solve.append(log_data)
                 
                 if logs_to_solve:
-                    completed_logs_map = {log['target_query_original_hard_list_idx']: log for log in intermediate_logs if log.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'}
-
                     for loop_idx, log_to_solve in enumerate(tqdm(logs_to_solve, desc=f"{exp_name} - Phase 2: Solving")):
                         original_idx = log_to_solve['target_query_original_hard_list_idx']
                         query_text = log_to_solve['target_query_text']
+                        query_log_path = os.path.join(exp_log_dir, f"query_{original_idx}_log.json")
                         
                         completed_log = run_pipeline_for_single_query(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                             run_mode='solve_only', existing_log=log_to_solve
                         )
-                        completed_logs_map[original_idx] = completed_log
-                        save_json(list(completed_logs_map.values()), log_file_path)
-                        periodic_sync_check(loop_idx, current_config)
-                    
-                    run_logs = list(completed_logs_map.values())
-                else:
-                     logger.info(f"All solve steps for '{exp_name}' are already complete.")
-                     run_logs = intermediate_logs
-            
-            save_json(run_logs, log_file_path)
-            logger.info(f"########## Finished Experiment: {exp_name} ##########")
-            all_results[exp_name] = run_logs
+                        save_json(completed_log, query_log_path)
+                        periodic_sync_check(loop_idx, current_config, file_to_sync=query_log_path)
         
+    # --- Final Assembly Step for Compatibility ---
+    # Load all individual logs to construct the final results object.
+    print("\n--- Assembling final results from individual logs ---")
+    for exp_overrides in experiment_configs:
+        exp_name = exp_overrides.get("experiment_name", "unnamed_experiment")
+        exp_log_dir = os.path.join(results_dir, exp_name)
+        
+        experiment_run_logs = []
+        if os.path.isdir(exp_log_dir):
+            for idx in range(len(hard_questions)):
+                query_log_path = os.path.join(exp_log_dir, f"query_{idx}_log.json")
+                if os.path.exists(query_log_path):
+                    log_data = load_json(query_log_path)
+                    if log_data:
+                        experiment_run_logs.append(log_data)
+        
+        # Sort logs by the original index to maintain consistent order
+        experiment_run_logs.sort(key=lambda x: x.get('target_query_original_hard_list_idx', 0))
+        all_results[exp_name] = experiment_run_logs
+        
+        # OPTIONAL: Save the final monolithic log file for easier external analysis.
+        # This one-time write at the end has no performance impact on the run itself.
+        final_log_path = os.path.join(results_dir, f"{exp_name}_run_log.json")
+        if experiment_run_logs:
+            print(f"Saving final consolidated log for '{exp_name}' to {final_log_path}")
+            save_json(experiment_run_logs, final_log_path)
+
     return all_results

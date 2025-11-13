@@ -10,7 +10,6 @@ This module provides functions to:
   during both generation and evaluation phases.
 """
 
-import logging
 import os
 import pandas as pd
 from tqdm import tqdm
@@ -39,9 +38,6 @@ def retry_failed_generation_pipelines(
     and re-runs the `run_pipeline_for_single_query` function for them. The original
     log entry is then replaced with the new result.
     """
-    logger = logging.getLogger(__name__)
-    logger.info("Starting the process to retry failed generation pipelines.")
-    
     for exp_name, original_logs in all_experiments_logs.items():
         exp_config_overrides = original_logs[0].get("config_flags_used", {})
         current_config = global_config.copy()
@@ -59,10 +55,9 @@ def retry_failed_generation_pipelines(
         ]
 
         if not indices_to_retry:
-            logger.info(f"No failed generation pipelines found for experiment '{exp_name}'. Skipping.")
             continue
 
-        logger.info(f"--- Retrying {len(indices_to_retry)} failed pipelines for Experiment: {exp_name} ---")
+        print(f"--- Retrying {len(indices_to_retry)} failed pipelines for Experiment: {exp_name} ---")
 
         for loop_idx, log_idx in enumerate(tqdm(indices_to_retry, desc=f"Retrying generation for {exp_name}")):
             failed_log = logs_to_process[log_idx]
@@ -92,7 +87,6 @@ def retry_failed_generation_pipelines(
         save_json(logs_to_process, log_file_path)
         sync_workspace_to_hub(current_config)
 
-    logger.info("Finished retrying all failed generation pipelines.")
     return all_experiments_logs
 
 
@@ -111,8 +105,6 @@ def retry_failed_evaluations(
     including API errors, parsing failures, etc. It updates the detailed evaluation
     logs in place.
     """
-    logger = logging.getLogger(__name__)
-    logger.info("Starting the process to retry failed evaluation attempts.")
     results_dir = config['RESULTS_DIR']
 
     for exp_name, _ in all_experiments_logs.items():
@@ -120,10 +112,8 @@ def retry_failed_evaluations(
         detailed_evaluations = load_json(eval_file_path)
 
         if not detailed_evaluations:
-            logger.warning(f"No detailed evaluation log found for '{exp_name}'. Skipping retry.")
+            print(f"Warning: No detailed evaluation log found for '{exp_name}'. Skipping retry.")
             continue
-
-        logger.info(f"--- Retrying evaluations for Experiment: {exp_name} ---")
         
         # MODIFIED: Select the correct API manager for evaluation based on the config
         provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
@@ -137,7 +127,6 @@ def retry_failed_evaluations(
                     retries_needed.append((eval_idx, attempt_idx))
 
         if not retries_needed:
-            logger.info(f"No failed evaluations found in '{exp_name}' to retry.")
             continue
 
         for loop_idx, (eval_idx, attempt_idx) in enumerate(tqdm(retries_needed, desc=f"Retrying evaluations for {exp_name}")):
@@ -171,8 +160,6 @@ def retry_failed_evaluations(
         save_json(detailed_evaluations, eval_file_path)
         sync_workspace_to_hub(config)
 
-    logger.info("Finished retrying all failed evaluations across all experiments.")
-
 
 # --- UPGRADed: Comprehensive Error Reporting ---
 
@@ -183,8 +170,6 @@ def generate_error_report(
     """
     Generates a detailed report of all errors from both generation and evaluation logs.
     """
-    logger = logging.getLogger(__name__)
-    logger.info("Generating a comprehensive error report.")
     error_records = []
     results_dir = config['RESULTS_DIR']
 
@@ -234,7 +219,6 @@ def generate_error_report(
                         })
 
     if not error_records:
-        logger.info("No errors were found in any experiment logs.")
         return pd.DataFrame()
 
     return pd.DataFrame(error_records)

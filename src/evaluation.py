@@ -17,7 +17,6 @@ This rewritten version ensures robustness, clarity, and includes the critical
 fix to prevent notebook crashes, allowing the retry logic to function correctly.
 """
 
-import logging
 import os
 import re
 import pandas as pd
@@ -63,8 +62,6 @@ def evaluate_single_answer_with_llm(
         EvaluationResult: A dictionary containing the correctness (bool), a status
                           string, and any error details from the API.
     """
-    logger = logging.getLogger(__name__)
-
     # Guard clause: An empty or invalid answer is a distinct failure type.
     if not model_answer or not isinstance(model_answer, str):
         return {"is_correct": None, "status": "EMPTY_ANSWER", "error_details": None}
@@ -89,23 +86,21 @@ def evaluate_single_answer_with_llm(
     # Handle API call failures
     if response['status'] != 'SUCCESS':
         error_msg = response.get('error_message', 'Unknown API failure')
-        logger.warning(f"LLM evaluation API call failed with status '{response['status']}': {error_msg}")
+        print(f"Warning: LLM evaluation API call failed with status '{response['status']}': {error_msg}")
         return {"is_correct": None, "status": f"API_{response['status']}", "error_details": response}
 
     # Handle successful API call, but potentially malformed response
     raw_text = response.get('text', '').strip()
     trunc_len = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
     print(f"      Evaluator LLM Raw Output (truncated): {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}") 
-    logger.debug(f"Evaluator raw response: '{raw_text}'")
 
     # Parse the 'Evaluation: [true/false]' line from the response
     eval_match = re.search(r"Evaluation:\s*(true|false)", raw_text, re.IGNORECASE)
     if eval_match:
         result_str = eval_match.group(1).lower()
-        logger.info(f"Parsed evaluation result: {result_str}")
         return {"is_correct": result_str == 'true', "status": "SUCCESS", "error_details": None}
     else:
-        logger.warning(f"Could not parse 'Evaluation:' line from LLM response. Treating as parsing failure.")
+        print(f"Warning: Could not parse 'Evaluation:' line from LLM response. Treating as parsing failure.")
         return {"is_correct": None, "status": "PARSING_FAILED", "error_details": None}
 
 
@@ -134,17 +129,14 @@ def analyze_experiment_logs(
         pd.DataFrame: A DataFrame summarizing the results, with one row per experiment,
                       containing Pass@K scores and error counts.
     """
-    logger = logging.getLogger(__name__)
-    logger.info("Starting comprehensive analysis of all experiment logs.")
     analysis_summary = []
 
     pass_k_values_to_report = config.get("PASS_K_VALUES_TO_REPORT", [1])
     results_dir = config['RESULTS_DIR']
 
     for exp_name, query_logs in all_experiments_logs.items():
-        logger.info(f"--- Analyzing Experiment: {exp_name} ---")
         if not query_logs:
-            logger.warning(f"No logs found for experiment '{exp_name}'. Skipping.")
+            print(f"Warning: No logs found for experiment '{exp_name}'. Skipping.")
             continue
 
         exp_config = query_logs[0].get("config_flags_used", {})
@@ -155,16 +147,11 @@ def analyze_experiment_logs(
         eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
         detailed_evaluations = load_json(eval_file_path) or []
         evaluated_indices = {eval_log['hard_list_idx'] for eval_log in detailed_evaluations}
-        logger.info(f"Loaded {len(detailed_evaluations)} existing evaluation results for '{exp_name}'.")
 
         # --- Phase 2: Process New (Unevaluated) Logs ---
         logs_to_process = [log for log in query_logs if log["target_query_original_hard_list_idx"] not in evaluated_indices]
 
-        if not logs_to_process:
-            logger.info(f"All query logs for '{exp_name}' have already been evaluated. Proceeding to summary.")
-        else:
-            logger.info(f"Found {len(logs_to_process)} new query logs to evaluate for '{exp_name}'.")
-
+        if logs_to_process:
             # --- MODIFIED: Select the correct API manager for evaluation ---
             provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
             manager_for_eval = api_managers[provider_for_eval]
@@ -253,5 +240,4 @@ def analyze_experiment_logs(
         
     # After processing all experiments, create and return the final DataFrame.
     # This `return` statement is the critical fix.
-    logger.info("Finished analysis of all experiments.")
     return pd.DataFrame(analysis_summary)

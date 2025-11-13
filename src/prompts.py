@@ -456,6 +456,36 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
+    # NEW: Template for the analogical adaptation step
+    "self_sampling_augmentor_v1": """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
+
+<Instructions>
+1. Read the 'Base Question' to understand its core mathematical concept, structure, and context.
+2. Create {n_samples} new questions that use the same reasoning pattern but with different numbers, entities (e.g., names, objects), and scenarios.
+3. Crucially, you must NOT provide any rationale or answer. Your output should consist ONLY of the generated question statements.
+4. Ensure the generated questions are unique from each other and from the base question.
+5. Present your output as a numbered list, as shown in the example.
+</Instructions>
+
+<Example>
+<Base Question>
+A farmer has 50 apples. He sells 20 to a market and then buys 10 more from his neighbor. How many apples does he have now?
+</Base Question>
+<Your Output (for n_samples = 2)>
+1. A student has 80 pencils. She gives 30 to her friends and then her teacher gives her 15 more. How many pencils does she have now?
+2. A painter has 120 ml of blue paint. He uses 50 ml for a canvas and then mixes in 25 ml more from another tube. How much blue paint does he have now?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+
+<Your Output (ONLY the {n_samples} numbered questions)>
+""",
+
     "final_solver_simple_v1": """**Objective:**
 Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
 
@@ -477,6 +507,76 @@ Final Answer:
 {main_question_text}
 ---
 **Your Solution:**
+""",
+
+    # NEW: Template for the Self-Sampling generation step
+    "self_sampling_generator_v1": """**Objective:**
+Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
+
+**Required Output Format (Strictly Adhere):**
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+
+---
+**Inputs:**
+**Main Question:**
+{main_question_text}
+---
+**Your Solution:**
+""",
+
+    "self_sampling_generator_v2":"""Objective:
+Your task is to solve the Main Question by providing a formal, step-by-step solution and a final answer. The solution should be presented in an academic, textbook-style format.
+
+Style Guidelines:
+
+Avoid conversational language: Do not use phrases like "Let's start by...", "Now, we will...", or any chatbot-like pleasantries.
+
+Be direct and concise: Focus on showing the mathematical steps, formulas, and calculations directly.
+
+Formal Tone: The entire output should be objective and formal, as if written in a mathematics textbook.
+
+Required Output Format (Strictly Adhere):
+Solution:
+[Your step-by-step solution, presenting the mathematical derivation directly.]
+
+Final Answer:
+[Your final answer to the Main Question.]
+
+Inputs:
+Main Question:
+{main_question_text}
+
+Your Solution:
+""" ,
+
+    "self_sampling_augmentor_v1" : """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
+
+Instructions:
+1.  Read the 'Base Question' to understand its core mathematical concept, structure, and context.
+2.  Create {n_samples} new questions that use the same reasoning pattern but with different numbers, entities (e.g., names, objects), and scenarios.
+3.  **Crucially, you must NOT provide any rationale or answer.** Your output should consist ONLY of the generated question statements.
+4.  Ensure the generated questions are unique from each other and from the base question.
+5.  Present your output as a numbered list, as shown in the example below.
+
+
+Example:
+**Base Question:**
+A farmer has 50 apples. He sells 20 to a market and then buys 10 more from his neighbor. How many apples does he have now?
+
+**Your Output (for n_samples = 2):**
+1. A student has 80 pencils. She gives 30 to her friends and then her teacher gives her 15 more. How many pencils does she have now?
+2. A painter has 120 ml of blue paint. He uses 50 ml for a canvas and then mixes in 25 ml more from another tube. How much blue paint does he have now?
+
+
+**Your Task:**
+**Base Question:**
+{main_question_text}
+
+**Your Output (ONLY the {n_samples} numbered questions):**
 """,
 
     "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
@@ -571,6 +671,26 @@ def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str
     template = PROMPT_TEMPLATES["merging_v1"]
     return template.format(target_query=target_query, sample_1=samples_to_merge[0], sample_2=samples_to_merge[1])
 
+def create_analogical_adaptation_prompt(main_question_text: str, examples: List[str], config: Dict[str, Any]) -> str:
+    """
+    Creates the prompt for the intermediate analogical adaptation step, which generates new exemplars.
+    """
+    if not examples:
+        return "Error: At least one example is required for the analogical adaptation prompt."
+
+    template_name = config.get("PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION", "analogical_adaptation_v1")
+    template = PROMPT_TEMPLATES.get(template_name)
+
+    if not template:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+
+    # Format the examples into a block, similar to the final solver
+    examples_block = ""
+    for i, sample_text in enumerate(examples):
+        examples_block += f"<Example {i+1}>\n{sample_text}\n</Example {i+1}>\n\n"
+        
+    return template.format(main_question_text=main_question_text, examples_block=examples_block.strip())
+
 def create_final_reasoning_prompt(main_question_text: str, final_examples: List[str], config: Dict[str, Any]) -> str:
     """
     Creates the final prompt for the solver, including processed examples (RAG).
@@ -608,6 +728,19 @@ def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[s
     template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE", "final_solver_simple_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question_text)
+
+# NEW: Function to create the prompt for generating synthetic samples
+def create_self_sampling_generation_prompt(main_question_text: str, config: Dict[str, Any]) -> str:
+    """Creates the prompt for generating a single synthetic sample."""
+    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR", "self_sampling_generator_v1")
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question_text)
+
+def create_self_sampling_augmentation_prompt(main_question_text: str, n_samples: int, config: Dict[str, Any]) -> str:
+    """Creates the prompt for augmenting a question into N distinct versions."""
+    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR", "self_sampling_augmentor_v1")
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question_text, n_samples=n_samples)
 
 def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any]) -> str:
     """Creates the prompt for the evaluator LLM."""

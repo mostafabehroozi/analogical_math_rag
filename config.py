@@ -21,7 +21,6 @@ BASE_OUTPUT_DIR = "/kaggle/working/"
 # Define subdirectories for organized output.
 DATA_DIR = os.path.join(BASE_OUTPUT_DIR, "data")
 OUTPUTS_DIR = os.path.join(BASE_OUTPUT_DIR, "outputs")
-LOGS_DIR = os.path.join(OUTPUTS_DIR, "logs")
 EMBEDDINGS_DIR = os.path.join(OUTPUTS_DIR, "embeddings")
 RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
 
@@ -29,12 +28,10 @@ RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
 
 CONFIG = {
     # --- 2. Logging & Control Settings ---
-    "VERBOSE_LOGGING": True,  # Master switch for detailed print statements to the console.
     "PRINT_API_CALL_DETAILS": True, # Master switch to print detailed API call info (prompt, response, errors) to the console.
     "PRINT_API_TIMING_CHECKPOINTS": True, # Prints the time elapsed between the start of consecutive API calls.
     "API_RESPONSE_TRUNCATION_LENGTH": 50, # Control truncation for successful API responses.
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
-    "LOGS_DIR": LOGS_DIR, # Directory where detailed run logs will be saved.
     "OUTPUTS_DIR": OUTPUTS_DIR,
     "RESULTS_DIR": RESULTS_DIR,
 
@@ -129,13 +126,40 @@ CONFIG = {
     # --- 8. Pipeline Step Control Flags & Parameters ---
     "USE_RETRIEVAL": True,
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
+
+    # NEW: Self-Sampling Control
+    "SELF_SAMPLING": False, # If True and USE_RETRIEVAL is False, generate synthetic samples.
+    "APPLY_SELF_SAMPLING_AUGMENTATION": False, # NEW: If True, generate N distinct questions first.
     
+    # NEW: Oversampling feature for augmentation
+    "APPLY_AUGMENTATION_OVERSAMPLING": False, # If True, generate K questions and select N from them.
+    "AUGMENTATION_OVERSAMPLING_K": 10,        # The number of questions (K) to generate in the oversampling pool.
+
+    # NEW: Batch Augmentation Control
+    # Defines an iterative augmentation process. Format: [number_of_api_calls, questions_per_call]
+    # Example: [2, 3] means make 2 API calls, each asking for 3 questions, for a total of 6.
+    # Set to None or an empty list to disable and use the standard single-call method.
+    "AUGMENTATION_BATCH_GENERATION": None,
+
     # MODIFIED: Granular adaptation steps
     "APPLY_NORMALIZATION": False,           # Renamed from APPLY_STANDARDIZATION
     "APPLY_TRANSFORMATION": False,          # DEPRECATED: Replaced by granular transformation flags.
     "APPLY_TRANSFORMATION_1": False,        # NEW: Controls the first transformation step.
     "APPLY_TRANSFORMATION_2": False,        # NEW: Controls the second transformation step.
     "APPLY_TRANSFORMATION_3": False,        # NEW: Controls the third transformation step.
+
+    # --- NEW: Analogical Adaptation Step ---
+    "APPLY_ANALOGICAL_ADAPTATION": False,   # Master switch for the new intermediate step.
+    
+    # NEW: Master switch for the augmentation feature within analogical adaptation
+    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION": False,
+    
+    # Defines how to group adapted samples for the intermediate reasoning step. Indices are 1-based.
+    # Example: [[1, 2], [3]] means group the 1st & 2nd samples together, and the 3rd sample alone.
+    "ANALOGICAL_ADAPTATION_GROUPING": [[1, 2], [3, 4], [5]],
+    # Number of new synthetic exemplars to generate for EACH group defined above.
+    "ANALOGICAL_ADAPTATION_SAMPLES_PER_GROUP": 2,
+
     "APPLY_MERGING": False,
 
     "DEFER_SOLVE_STEP": False, # NEW: If True, runs all intermediate steps for all questions first, then all solve steps.
@@ -147,6 +171,9 @@ CONFIG = {
     # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
+
+    # NEW: Self-Sampling Parameter
+    "N_SELF_SAMPLES": 3, # Number of synthetic samples to generate in self-sampling mode.
 
     # --- 10. Prompt Template Selection ---
     "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",  # Renamed
@@ -160,8 +187,17 @@ CONFIG = {
     "PROMPT_TEMPLATE_TRANSFORMATION_3": "transformation_complete",
     
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
+    
+    # NEW: Prompt for the intermediate analogical adaptation step
+    "PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION": "analogical_adaptation_v1",
+
     # MODIFIED: Default solver prompt is now v2.
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
+
+    # NEW: Prompt for generating synthetic samples
+    "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator_v2",
+    "PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR": "self_sampling_augmentor_v1", # NEW
+
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
 
@@ -183,7 +219,7 @@ def setup_directories():
     This function should be called once at the beginning of a run.
     """
     print("--- Setting up project directories ---")
-    for dir_path in [DATA_DIR, OUTPUTS_DIR, LOGS_DIR, EMBEDDINGS_DIR, RESULTS_DIR]:
+    for dir_path in [DATA_DIR, OUTPUTS_DIR, EMBEDDINGS_DIR, RESULTS_DIR]:
         try:
             os.makedirs(dir_path, exist_ok=True)
             print(f"Directory ensured: {dir_path}")
