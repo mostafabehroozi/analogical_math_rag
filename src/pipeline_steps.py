@@ -27,6 +27,11 @@ from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Union, Tuple, Optional
 import time
 
+# NEW: Explicitly import CONFIG for use throughout this module.
+# The request was to *not* use a config flag for diagnostics, but CONFIG
+# itself is essential for pipeline logic in many functions.
+from config import CONFIG
+
 # Import our custom modules
 from src.prompts import (
     EXEMPLAR_FORMAT,
@@ -49,7 +54,7 @@ def log_time_diagnostic(message: str, start_time: float, indent: int = 0) -> flo
     end_time = time.time()
     elapsed = end_time - start_time
     indent_str = "  " * indent
-    if elapsed > 0.001:
+    if elapsed > 0.001: # Only print if elapsed time is significant
         print(f"{indent_str}⏱️  DIAGNOSTIC: {message} took {elapsed:.4f} seconds.")
     return end_time
 
@@ -86,40 +91,95 @@ def retrieve(
     logger = logging.getLogger(__name__)
     logger.info(f"Starting retrieval for Top-{top_k} exemplars.")
     
-    # DIAGNOSTIC: Start timer for the retrieve function
-    last_checkpoint_time = time.time()
+    # Initialize internal timer for granular diagnostics
+    current_diag_time = time.time() 
+    indent_level = 3 # Consistent indentation for diagnostics within retrieve
     
-    query_embedding = _generate_embeddings([target_query], embedding_model)
+    # --- DETAILED RETRIEVAL DIAGNOSTICS - ALWAYS ON ---
+    print(f"{'  '*indent_level}--- STARTING DETAILED RETRIEVAL DIAGNOSTICS ---")
+    print(f"{'  '*indent_level}Target Query (start): '{target_query[:100]}...'")
+    print(f"{'  '*indent_level}Exemplar corpus size: {len(exemplar_questions)}")
+    print(f"{'  '*indent_level}Embedded exemplars shape: {embedded_exemplars.shape}")
+    print(f"{'  '*indent_level}Requested top_k: {top_k}")
+    # --- END ALWAYS ON DIAGNOSTICS ---
 
-    # DIAGNOSTIC: Measure embedding generation time
-    last_checkpoint_time = log_time_diagnostic("Generate query embedding", last_checkpoint_time, indent=3)
+
+    # Step 1: Generate query embedding
+    query_embedding_start_time = time.time()
+    query_embedding = _generate_embeddings([target_query], embedding_model)
+    current_diag_time = log_time_diagnostic("Generate query embedding", query_embedding_start_time, indent=indent_level)
+    print(f"{'  '*indent_level}Query embedding shape: {query_embedding.shape}")
     
     if query_embedding.size == 0:
         logger.error("Failed to generate embedding for the target query. Retrieval cannot proceed.")
         return {"status": "FAILURE", "retrieved_indices": [], "retrieved_exemplars": []}
     
+    # Step 2: Calculate cosine similarity
+    cosine_similarity_start_time = time.time()
+    print(f"{'  '*indent_level}Starting cosine similarity calculation (query_embedding shape: {query_embedding.shape}, embedded_exemplars shape: {embedded_exemplars.shape})...")
     similarities = cosine_similarity(query_embedding, embedded_exemplars)[0]
+    current_diag_time = log_time_diagnostic("Calculate cosine_similarity", cosine_similarity_start_time, indent=indent_level)
+    print(f"{'  '*indent_level}Similarities array shape: {similarities.shape}")
     
-    # DIAGNOSTIC: Measure cosine similarity calculation time.
-    last_checkpoint_time = log_time_diagnostic("Calculate cosine_similarity", last_checkpoint_time, indent=3)
-    
+    # Step 3: Handle potential self-match
+    self_match_start_time = time.time()
     try:
         query_index_in_corpus = exemplar_questions.index(target_query)
         similarities[query_index_in_corpus] = -np.inf
+        print(f"{'  '*indent_level}Self-match found at index {query_index_in_corpus}, set to -np.inf.")
     except ValueError:
+        print(f"{'  '*indent_level}Target query not found in corpus (no self-match to remove).")
         pass
+    current_diag_time = log_time_diagnostic("Handle self-match", self_match_start_time, indent=indent_level)
 
+    # Step 4: Determine k_to_retrieve (ensure it's not more than available)
+    k_retrieve_start_time = time.time()
     k_to_retrieve = min(top_k, len(similarities))
+    current_diag_time = log_time_diagnostic("Determine k_to_retrieve", k_retrieve_start_time, indent=indent_level)
+    print(f"{'  '*indent_level}Effective k_to_retrieve: {k_to_retrieve}")
+
+
+    # --- START OF GRANULAR TIMING FOR TOP-K SELECTION LOGIC ---
+    print(f"{'  '*indent_level}Starting granular timing for top-k selection...")
+        
+    # 4a. Perform partial sort using np.argpartition
+    argpartition_start_time = time.time()
+    print(f"{'  '*indent_level}  Calling np.argpartition on similarities array (shape: {similarities.shape}) for k={k_to_retrieve}...")
     
-    # --- START OF REVISED TOP-K SELECTION LOGIC ---
-    # The previous np.argpartition method showed pathological performance degradation.
-    # We are replacing it with np.argsort, which is robust and has guaranteed
-    # O(N log N) worst-case performance, avoiding the multi-minute stalls.
-    # Efficient partial selection + sort only the small slice
-    top_k_indices = np.argpartition(similarities, -k_to_retrieve)[-k_to_retrieve:]
-    top_k_indices = top_k_indices[np.argsort(similarities[top_k_indices])][::-1]
-    last_checkpoint_time = log_time_diagnostic("Partition and sort top-k indices", last_checkpoint_time, indent=3)
-    # --- END OF REVISED LOGIC ---
+    # This gets indices of the k-th smallest element and elements smaller than it
+    # We need the k largest, so we partition around the (N-k)-th smallest index.
+    # This will put the top_k_indices in the *last* k positions of the returned array.
+    partitioned_indices = np.argpartition(similarities, -k_to_retrieve)
+    current_diag_time = log_time_diagnostic("np.argpartition (full array)", argpartition_start_time, indent=indent_level)
+    print(f"{'  '*indent_level}  Resulting partitioned_indices shape: {partitioned_indices.shape}")
+    # print(f"{'  '*indent_level}  Partitioned indices (first 10): {partitioned_indices[:10]}...") # Optional: if you want to see raw partitioned values
+
+
+    # 4b. Slice the top K indices (these are still unsorted among themselves)
+    slice_partitioned_start_time = time.time()
+    print(f"{'  '*indent_level}  Slicing to get the top {k_to_retrieve} indices from partitioned_indices...")
+    
+    top_k_indices_unsorted = partitioned_indices[-k_to_retrieve:]
+    current_diag_time = log_time_diagnostic("Slicing partitioned indices", slice_partitioned_start_time, indent=indent_level)
+    print(f"{'  '*indent_level}  top_k_indices_unsorted shape: {top_k_indices_unsorted.shape}, Content (first 5): {top_k_indices_unsorted[:5]}...")
+
+    # 4c. Sort the sliced top K indices based on their actual similarity values
+    argsort_slice_start_time = time.time()
+    print(f"{'  '*indent_level}  Calling np.argsort on the {k_to_retrieve} selected indices based on their similarities...")
+    print(f"{'  '*indent_level}  Accessing similarities values for sorting (similarities[top_k_indices_unsorted])...")
+
+    # Get the actual similarity values for the top_k_indices_unsorted
+    relevant_similarities = similarities[top_k_indices_unsorted]
+    
+    # Sort these values to get the order, then apply that order to the indices
+    sorted_order_in_slice = np.argsort(relevant_similarities)[::-1] # [::-1] for descending order
+    
+    top_k_indices = top_k_indices_unsorted[sorted_order_in_slice]
+
+    current_diag_time = log_time_diagnostic("np.argsort & final sort (on small slice)", argsort_slice_start_time, indent=indent_level)
+    print(f"{'  '*indent_level}  Final top_k_indices shape: {top_k_indices.shape}, Content: {top_k_indices.tolist()}")
+    print(f"{'  '*indent_level}--- ENDING DETAILED RETRIEVAL DIAGNOSTICS ---")
+    # --- END OF GRANULAR TIMING ---
 
     logger.info(f"Successfully retrieved indices: {top_k_indices.tolist()}")
     
