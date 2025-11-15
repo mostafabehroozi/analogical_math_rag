@@ -25,6 +25,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Union, Tuple, Optional
+import time
 
 # Import our custom modules
 from src.prompts import (
@@ -42,6 +43,15 @@ from src.prompts import (
 # MODIFIED: Import manager classes for type checking
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
+
+def log_time_diagnostic(message: str, start_time: float, indent: int = 0) -> float:
+    """Logs a diagnostic message with elapsed time and returns the current time."""
+    end_time = time.time()
+    elapsed = end_time - start_time
+    indent_str = "  " * indent
+    if elapsed > 0.001:
+        print(f"{indent_str}⏱️  DIAGNOSTIC: {message} took {elapsed:.4f} seconds.")
+    return end_time
 
 # --- Utility Function for Embedding Generation ---
 def _generate_embeddings(
@@ -76,12 +86,22 @@ def retrieve(
     logger = logging.getLogger(__name__)
     logger.info(f"Starting retrieval for Top-{top_k} exemplars.")
     
+    # DIAGNOSTIC: Start timer for the retrieve function
+    last_checkpoint_time = time.time()
+    
     query_embedding = _generate_embeddings([target_query], embedding_model)
+
+    # DIAGNOSTIC: Measure embedding generation time
+    last_checkpoint_time = log_time_diagnostic("Generate query embedding", last_checkpoint_time, indent=3)
+    
     if query_embedding.size == 0:
         logger.error("Failed to generate embedding for the target query. Retrieval cannot proceed.")
         return {"status": "FAILURE", "retrieved_indices": [], "retrieved_exemplars": []}
     
     similarities = cosine_similarity(query_embedding, embedded_exemplars)[0]
+    
+    # DIAGNOSTIC: Measure cosine similarity calculation time.
+    last_checkpoint_time = log_time_diagnostic("Calculate cosine_similarity", last_checkpoint_time, indent=3)
     
     try:
         query_index_in_corpus = exemplar_questions.index(target_query)
@@ -90,8 +110,14 @@ def retrieve(
         pass
 
     k_to_retrieve = min(top_k, len(similarities))
-    top_k_indices = np.argpartition(similarities, -k_to_retrieve)[-k_to_retrieve:]
-    top_k_indices = top_k_indices[np.argsort(similarities[top_k_indices])][::-1]
+    
+    # --- START OF REVISED TOP-K SELECTION LOGIC ---
+    # The previous np.argpartition method showed pathological performance degradation.
+    # We are replacing it with np.argsort, which is robust and has guaranteed
+    # O(N log N) worst-case performance, avoiding the multi-minute stalls.
+    top_k_indices = np.argsort(similarities)[-k_to_retrieve:][::-1]
+    last_checkpoint_time = log_time_diagnostic("Partition and sort top-k indices", last_checkpoint_time, indent=3)
+    # --- END OF REVISED LOGIC ---
 
     logger.info(f"Successfully retrieved indices: {top_k_indices.tolist()}")
     
