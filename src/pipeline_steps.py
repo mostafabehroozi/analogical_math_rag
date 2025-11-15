@@ -115,7 +115,9 @@ def retrieve(
     # The previous np.argpartition method showed pathological performance degradation.
     # We are replacing it with np.argsort, which is robust and has guaranteed
     # O(N log N) worst-case performance, avoiding the multi-minute stalls.
-    top_k_indices = np.argsort(similarities)[-k_to_retrieve:][::-1]
+    # Efficient partial selection + sort only the small slice
+    top_k_indices = np.argpartition(similarities, -k_to_retrieve)[-k_to_retrieve:]
+    top_k_indices = top_k_indices[np.argsort(similarities[top_k_indices])][::-1]
     last_checkpoint_time = log_time_diagnostic("Partition and sort top-k indices", last_checkpoint_time, indent=3)
     # --- END OF REVISED LOGIC ---
 
