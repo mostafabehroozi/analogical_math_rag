@@ -124,13 +124,35 @@ def retrieve(
     # Step 3: Handle potential self-match
     self_match_start_time = time.time()
     try:
+        # --- NEW DIAGNOSTIC 1: Measure the .index() call ONLY ---
+        index_search_start_time = time.time()
+        
+        # This is the line we expect to be extremely slow.
         query_index_in_corpus = exemplar_questions.index(target_query)
+        
+        # Immediately log the time taken for the search.
+        log_time_diagnostic("  -> Sub-step: list.index() search", index_search_start_time, indent=indent_level)
+        
+        
+        # --- NEW DIAGNOSTIC 2: Measure the remaining (fast) operations ---
+        update_and_print_start_time = time.time()
+        
+        # These two lines should be nearly instantaneous.
         similarities[query_index_in_corpus] = -np.inf
         print(f"{'  '*indent_level}Self-match found at index {query_index_in_corpus}, set to -np.inf.")
+        
+        # Immediately log the time taken for the update and print.
+        log_time_diagnostic("  -> Sub-step: Update similarities & print", update_and_print_start_time, indent=indent_level)
+
     except ValueError:
         print(f"{'  '*indent_level}Target query not found in corpus (no self-match to remove).")
+        # Note: If this block is hit, the .index() call already finished its slow scan.
+        # The diagnostic for the search will still have been logged if it was started.
         pass
-    current_diag_time = log_time_diagnostic("Handle self-match", self_match_start_time, indent=indent_level)
+        
+    # --- MODIFIED: Rename the original diagnostic to clarify it's the total time ---
+    current_diag_time = log_time_diagnostic("Handle self-match (Total)", self_match_start_time, indent=indent_level)
+
 
     # Step 4: Determine k_to_retrieve (ensure it's not more than available)
     k_retrieve_start_time = time.time()
