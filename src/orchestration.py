@@ -26,6 +26,10 @@ This optimizes API usage by batching all expensive 'solve' calls together.
 
 This version also integrates new, optional pipeline steps for self-sampling,
 augmentation, and analogical adaptation.
+
+PERFORMANCE FIX: The call to the `retrieve` function has been updated to pass
+a pre-computed hash map, enabling O(1) self-match detection and resolving a
+major performance bottleneck.
 """
 
 import logging
@@ -118,11 +122,16 @@ def run_pipeline_for_single_query(
         retrieved_indices = []
         if config.get('USE_RETRIEVAL', True):
             print("\n[STEP 1] RETRIEVE")
+            # ========================= START OF MODIFICATION =========================
+            # Pass the pre-computed hash map to the retrieve function for O(1) lookup.
+            # This is the core of the performance fix.
             retrieval_result = retrieve(
                 target_query=target_query, embedding_model=embedding_model,
                 exemplar_questions=exemplar_data['questions'], embedded_exemplars=exemplar_data['embeddings'],
-                top_k=config['TOP_N_CANDIDATES_RETRIEVAL']
+                top_k=config['TOP_N_CANDIDATES_RETRIEVAL'],
+                question_to_index_map=exemplar_data.get('question_to_index')
             )
+            # ========================== END OF MODIFICATION ==========================
             run_log['steps']['retrieval'] = retrieval_result
             if retrieval_result['status'] == 'FAILURE':
                 run_log['pipeline_status'] = "FAILURE: Retrieval failed."
