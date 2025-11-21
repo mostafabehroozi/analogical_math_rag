@@ -167,7 +167,9 @@ def run_pipeline_for_single_query(
             else:
                 augmented_qs_for_aa = None
                 if config.get('APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION'):
-                    k = config.get('AUGMENT_K', len(config.get('ANALOGICAL_GROUP_SETS', [])))
+                    # UPDATED: We use AUGMENT_K as the pool size for the recursive tree structure.
+                    # If it's too small, the analogical_adapt function will detect it and generate fresh ones.
+                    k = config.get('AUGMENT_K', 10)
                     aug_result = augment_question(target_query, k, manager_for_adapt, config)
                     if aug_result['status'] == 'SUCCESS':
                         augmented_qs_for_aa = aug_result['augmented_questions']

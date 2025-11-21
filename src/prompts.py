@@ -531,7 +531,7 @@ Begin Output:
     # --- NEW FEATURES: Self-Sampling Prompts ---
     "self_sampling_generator": """Objective:
 Your task is to solve the Main Question by providing a formal, step-by-step solution and a final answer. The solution should be presented in an academic, textbook-style format.
-
+    
 Style Guidelines:
 Avoid conversational language: Do not use phrases like "Let's start by...", "Now, we will...", or any chatbot-like pleasantries.
 Be direct and concise: Focus on showing the mathematical steps, formulas, and calculations directly.

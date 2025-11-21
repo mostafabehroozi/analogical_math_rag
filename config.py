@@ -155,9 +155,19 @@ CONFIG = {
 
     # MODIFIED: Now supports empty tuples `()` to trigger a "self-solve"
     # action on an augmented question, using the self-sampling prompt.
-    # This creates a hybrid step mixing RAG and non-RAG generation.
-    # Example: [(), (1,), (2, 3)] would self-solve one augmented question,
-    # then use retrieved sample #1 for the second, and samples #2 & #3 for the third.
+    #
+    # UPGRADED: Now supports RECURSIVE NESTED GROUPS (Tree Structure).
+    # Structure examples:
+    # - Simple: [(1, 2), (3, 4)] -> Standard linear grouping.
+    # - Recursive: [(), (1, 2), (((3), 4), 5)] -> Complex dependency tree.
+    #
+    # Rules for Recursive Groups:
+    # 1. Integers are retrieved samples (1-indexed).
+    # 2. Tuples `(...)` are Processing Nodes. Each tuple consumes one Augmented Question from the pool.
+    #    The system solves this Augmented Question using the tuple's contents as context.
+    # 3. `()` is an empty node (Self-Solve). It solves an Augmented Question with zero context.
+    # 4. Nested tuples (e.g. `((3), 4)`) are resolved bottom-up. The result of inner `(3)` becomes context for outer `(..., 4)`.
+    #    This allows the pipeline to build complex "Super Exemplars" layer by layer.
     "ANALOGICAL_GROUP_SETS": [(1, 2), (3, 4), (5, 6)],  # Grouping of retrieved samples (1-indexed)
     
     "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,  # Number of attempts per NON-EMPTY group
@@ -174,6 +184,9 @@ CONFIG = {
     # Example: [2, 3] means 2 API calls, each generating 3 questions, for a total of 6.
     "AUGMENTATION_SCHEDULE": None,
     
+    # UPGRADED: Acts as the "Pool Size" for Recursive Analogical Adaptation.
+    # This number must be >= the total number of tuples (processing nodes) in your ANALOGICAL_GROUP_SETS structure.
+    # Each tuple in the structure consumes one augmented question.
     "AUGMENT_K": 10,                                    # Total augmentations generated (used if AUGMENTATION_SCHEDULE is None)
     "AUGMENT_N": 3,                                     # Number to select from K
     "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",     # "auto", "diversity", or "relevance"
