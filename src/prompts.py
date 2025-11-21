@@ -607,6 +607,29 @@ Question: [The Main Question]
 Rationale and Answer: [Your step-by-step solution using analogical reasoning from the samples, followed by the final answer]
 </Output Format>
 """,
+# Add this inside PROMPT_TEMPLATES in src/prompts.py
+    "analogical_adaptation_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns... [rest of final_solver_v2 text] ...
+
+<Instructions>
+Carefully analyze each example... [rest of instructions]
+</Instructions>
+
+<Solved Examples>
+{samples_block}  <-- CHANGED FROM {examples_block} TO {samples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
 
 }
 
