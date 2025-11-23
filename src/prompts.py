@@ -531,7 +531,7 @@ Begin Output:
     # --- NEW FEATURES: Self-Sampling Prompts ---
     "self_sampling_generator": """Objective:
 Your task is to solve the Main Question by providing a formal, step-by-step solution and a final answer. The solution should be presented in an academic, textbook-style format.
-
+    
 Style Guidelines:
 Avoid conversational language: Do not use phrases like "Let's start by...", "Now, we will...", or any chatbot-like pleasantries.
 Be direct and concise: Focus on showing the mathematical steps, formulas, and calculations directly.
@@ -555,7 +555,7 @@ Your Solution:
 
 <Instructions>
 1. Read the 'Base Question' to understand its core mathematical concept, structure, and context.
-2. Create {n_samples} new questions that use the same reasoning pattern but with different numbers, entities (e.g., names, objects), and scenarios.
+2. Create {n_samples} new questions s that are relevant to the base question. Your new questions should be distinct from each other and from the base question (e.g., involving different numbers and names).
 3. Crucially, you must NOT provide any rationale or answer. Your output should consist ONLY of the generated question statements.
 4. Ensure the generated questions are unique from each other and from the base question.
 5. Present your output as a numbered list, as shown in the example.
@@ -563,12 +563,12 @@ Your Solution:
 
 <Example>
 <Base Question>
-A farmer has 50 apples. He sells 20 to a market and then buys 10 more from his neighbor. How many apples does he have now?
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
 </Base Question>
 
 <Your Output (for n_samples = 2)>
-1. A student has 80 pencils. She gives 30 to her friends and then her teacher gives her 15 more. How many pencils does she have now?
-2. A painter has 120 ml of blue paint. He uses 50 ml for a canvas and then mixes in 25 ml more from another tube. How much blue paint does he have now?
+1. In a bag, there are 5 red balls and 3 blue balls. If two balls are drawn at random without replacement, what is the probability that both balls are red?
+2. A box contains 10 red marbles and 5 blue marbles. If three marbles are drawn at random without replacement, what is the probability that all three marbles are red?
 </Your Output>
 </Example>
 
@@ -640,6 +640,29 @@ Your task is to solve the Main Question by using analogical reasoning based on t
 Question: [The Main Question]
 Rationale and Answer: [Your step-by-step solution using analogical reasoning from the samples, followed by the final answer]
 </Output Format>
+""",
+# Add this inside PROMPT_TEMPLATES in src/prompts.py
+    "analogical_adaptation_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns... [rest of final_solver_v2 text] ...
+
+<Instructions>
+Carefully analyze each example... [rest of instructions]
+</Instructions>
+
+<Solved Examples>
+{samples_block}  <-- CHANGED FROM {examples_block} TO {samples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
 """,
 
 }

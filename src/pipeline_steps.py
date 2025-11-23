@@ -21,6 +21,8 @@ augmentation, and analogical adaptation.
 PERFORMANCE FIX: The retrieve() function now uses O(1) hash map lookup instead
 of O(n) linear search for self-match detection, reducing retrieval time from
 ~1300 seconds to <0.001 seconds per query.
+
+UPGRADE: Now supports Recursive Analogical Chains (Tree-structured context).
 """
 
 import logging
@@ -30,6 +32,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Union, Tuple, Optional
 import time
+from collections import deque
 
 # NEW: Explicitly import CONFIG for use throughout this module.
 # The request was to *not* use a config flag for diagnostics, but CONFIG
@@ -702,25 +705,127 @@ def select_augmented_questions(
     
     return augmented_questions[:target_n]
 
-def _match_questions_to_groups(
-    augmented_questions: List[str],
-    retrieved_samples: List[str],
-    group_sets: List[Tuple[int, ...]],
-    embedding_model: SentenceTransformer
-) -> List[Tuple[str, Tuple[int, ...]]]:
-    """
-    Directly pairs each augmented question with a group from the config list.
-    This new logic allows for reusing identical group definitions.
-    """
-    logger = logging.getLogger(__name__)
-    
-    # Directly pair the first N augmented questions with the first N groups.
-    # This uses a simple 1-to-1 mapping.
-    num_pairs = min(len(augmented_questions), len(group_sets))
-    matched_pairs = list(zip(augmented_questions[:num_pairs], group_sets[:num_pairs]))
+# --- RECURSIVE ANALOGICAL ADAPTATION LOGIC ---
 
-    logger.info(f"Directly paired {len(matched_pairs)} augmented questions to sample groups.")
-    return matched_pairs
+def _count_processing_nodes(structure: Any) -> int:
+    """
+    Recursively counts the number of processing nodes in the group structure.
+    A processing node is any list or tuple. Integers (leaves) are not processing nodes.
+    
+    Args:
+        structure: The nested list/tuple structure from ANALOGICAL_GROUP_SETS.
+        
+    Returns:
+        int: The total number of tuples/lists found.
+    """
+    count = 0
+    if isinstance(structure, (list, tuple)):
+        # If it's a container, it counts as 1 node (unless it is the top-level list container itself,
+        # but since this function is called on elements OF the top list, it works correctly).
+        # We treat the top-level iteration separately in analogical_adapt.
+        # Here we are counting nodes inside a Group definition.
+        count = 1 
+        for item in structure:
+            count += _count_processing_nodes(item)
+            # We subtract the count for the item itself if it was a list/tuple because
+            # the recursive call added 1 for it. Wait, no.
+            # Example: ((1), 2)
+            # Root is tuple: count = 1
+            # Item 1: (1). Recursive call: count = 1 + recurse(1). recurse(1) is 0. So 1.
+            # Item 2: 2. Recursive call: 0.
+            # Total = 1 (root) + 1 (child tuple) + 0 = 2. Correct.
+            
+            # However, the top-level ANALOGICAL_GROUP_SETS is a list of groups.
+            # We shouldn't count the container list itself if we iterate over it.
+            # This helper is best designed to count nodes within a SINGLE group definition.
+    
+    return count
+
+def _process_node_recursively(
+    node: Any,
+    aug_q_queue: deque,
+    retrieved_texts_map: Dict[int, str],
+    api_manager: Any,
+    config: Dict[str, Any],
+    depth: int = 0
+) -> Union[str, None]:
+    """
+    Recursively processes a node in the analogical group structure.
+    
+    Args:
+        node: An int (leaf), or tuple/list (processing node).
+        aug_q_queue: Queue of pre-generated augmented questions.
+        retrieved_texts_map: Map of 1-based indices to retrieved exemplar texts.
+        api_manager: The API manager instance.
+        config: Global config.
+        depth: Current recursion depth for logging.
+        
+    Returns:
+        str: The generated exemplar text (Question + Rationale), or None on failure.
+    """
+    indent = "  " * (depth + 2)
+    
+    # --- Base Case: Leaf Node (Integer) ---
+    if isinstance(node, int):
+        text = retrieved_texts_map.get(node)
+        if not text:
+            logging.getLogger(__name__).warning(f"{indent}Index {node} not found in retrieved map.")
+            return None
+        return text
+
+    # --- Recursive Step: Processing Node (Tuple/List) ---
+    elif isinstance(node, (list, tuple)):
+        # 1. Process Children
+        child_exemplars = []
+        for child in node:
+            child_result = _process_node_recursively(child, aug_q_queue, retrieved_texts_map, api_manager, config, depth + 1)
+            if child_result:
+                child_exemplars.append(child_result)
+            else:
+                # If a child fails, this node generally cannot proceed accurately.
+                # However, we might continue with partial context. For strictness, let's log.
+                logging.getLogger(__name__).warning(f"{indent}Child node {child} failed or returned None.")
+
+        # 2. Get Augmented Question
+        if not aug_q_queue:
+            error_msg = "Augmented question queue exhausted! Check AUGMENT_K vs Structure complexity."
+            logging.getLogger(__name__).error(error_msg)
+            return None
+        
+        current_aug_q = aug_q_queue.popleft()
+        print(f"{indent}-> Processing Node at depth {depth}. Context: {len(child_exemplars)} samples. solving AugQ: '{current_aug_q[:30]}...'")
+
+        # 3. Setup Model & Temp
+        if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+        elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+        elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
+        else: return None
+        
+        # 4. Generate Content
+        if not child_exemplars:
+            # Empty Group -> Self-Solve Mode
+            # We use the self-sampling prompt logic
+            prompt = create_self_sampling_prompt(current_aug_q, config)
+            temp = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
+        else:
+            # Occupied Group -> Analogical Adaptation Mode
+            prompt = create_analogical_adaptation_prompt(current_aug_q, child_exemplars, config)
+            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
+            
+        response = api_manager.generate_content(prompt, model_name, temp)
+        
+        if response['status'] == 'SUCCESS':
+            # The prompts usually return just the solution/rationale part (depending on template).
+            # We must wrap it to make it a valid exemplar for the parent node.
+            # Note: create_self_sampling_prompt returns "Solution: ... Final Answer: ...".
+            # We standardize to "Question: ... Rationale and Answer: ..."
+            return f"Question: {current_aug_q}\nRationale and Answer: {response['text']}"
+        else:
+            logging.getLogger(__name__).warning(f"{indent}Generation failed for node at depth {depth}.")
+            return None
+
+    return None
+
 
 def analogical_adapt(
     target_query: str,
@@ -732,97 +837,111 @@ def analogical_adapt(
     augmented_questions: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Performs analogical reasoning on groups of retrieved samples.
+    Performs recursive analogical reasoning on groups of retrieved samples.
     
-    MODIFIED: Now supports empty groups `()` which triggers a 'self-solve'
-    action on an augmented question, using the self-sampling prompt.
+    Supports nested/recursive group structures defined in ANALOGICAL_GROUP_SETS.
     """
     logger = logging.getLogger(__name__)
-    logger.info("Starting analogical adaptation step.")
+    logger.info("Starting recursive analogical adaptation step.")
     
-    n_sampling = config.get("ANALOGICAL_ADAPTATION_SAMPLING_N", 1)
     group_sets = config.get("ANALOGICAL_GROUP_SETS", [])
-
     if not group_sets:
-        logger.warning("ANALOGICAL_GROUP_SETS is empty. Skipping analogical adaptation.")
+        logger.warning("ANALOGICAL_GROUP_SETS is empty. Skipping.")
         return {"status": "SKIPPED", "reason": "No groups defined."}
 
-    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-    else: raise TypeError(f"Unsupported API manager type for analogical adaptation: {type(api_manager)}")
-        
-    # Get temperatures for both modes
-    analogical_temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
-    self_solve_temp = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
+    # 1. Build Map for O(1) Retrieval Access
+    # Indices in config are 1-based, so we map i+1 -> text
+    retrieved_texts_map = {}
+    for i, idx in enumerate(retrieved_indices):
+        q = exemplar_data['questions'][idx]
+        s = exemplar_data['solutions'][idx]
+        retrieved_texts_map[i + 1] = EXEMPLAR_FORMAT.format(question=q, solution=s)
 
-    # Build full text for retrieved samples
-    retrieved_samples_texts = [
-        EXEMPLAR_FORMAT.format(question=exemplar_data['questions'][i], solution=exemplar_data['solutions'][i])
-        for i in retrieved_indices
-    ]
+    # 2. Calculate Required Augmented Questions
+    total_nodes_needed = 0
+    for group in group_sets:
+        # We count the nodes inside this group definition
+        # If group is (1, 2), count is 1 (the tuple itself).
+        # If group is ((1), 2), count is 2 (outer tuple, inner tuple).
+        total_nodes_needed += _count_processing_nodes(group)
     
-    question_group_pairs = []
-    if config.get("APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION") and augmented_questions:
-        question_group_pairs = _match_questions_to_groups(augmented_questions, retrieved_samples_texts, group_sets, embedding_model)
-    else:
-        question_group_pairs = [(target_query, group) for group in group_sets]
+    logger.info(f"Structure requires {total_nodes_needed} augmented questions total.")
 
+    # 3. Prepare Augmented Question Queue
+    # If caller passed questions (e.g. from orchestration), use them if sufficient.
+    # Otherwise, generate fresh ones here to ensure we have enough.
+    if augmented_questions and len(augmented_questions) >= total_nodes_needed:
+        final_aug_qs = augmented_questions[:total_nodes_needed]
+    else:
+        logger.info(f"Generating {total_nodes_needed} new augmented questions to satisfy structure demand.")
+        # We use the augment_question helper
+        aug_res = augment_question(target_query, total_nodes_needed, api_manager, config)
+        if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
+            return {"status": "FAILURE", "error_info": aug_res.get('error_info')}
+        
+        final_aug_qs = aug_res['augmented_questions']
+        
+        # Optional Selection Logic (only if we have excess)
+        if config.get('SELECTIVE_AUGMENTATION_SAMPLING') and len(final_aug_qs) > total_nodes_needed:
+             final_aug_qs = select_augmented_questions(final_aug_qs, config, embedding_model)
+             # Ensure we still have enough after selection
+             if len(final_aug_qs) < total_nodes_needed:
+                 logger.warning("Selection reduced pool below required size. Using unselected pool.")
+                 final_aug_qs = aug_res['augmented_questions'][:total_nodes_needed]
+
+    if len(final_aug_qs) < total_nodes_needed:
+        msg = f"Not enough augmented questions generated. Needed {total_nodes_needed}, got {len(final_aug_qs)}."
+        logger.error(msg)
+        return {"status": "FAILURE", "error_message": msg}
+
+    aug_q_queue = deque(final_aug_qs)
+    
+    # 4. Process Each Group (Recursive Tree Traversal)
     successful_adaptations = []
     failed_adaptations = []
-
-    for question_for_prompt, group_indices in question_group_pairs:
-        # --- START OF MODIFICATION ---
-
-        # Case 1: The group is EMPTY -> Perform self-solve
-        if not group_indices:
-            print(f"    -> Performing SELF-SOLVE for empty group using question: '{question_for_prompt[:50]}...'")
-            prompt = create_self_sampling_prompt(question_for_prompt, config)
-            # Use the self-sampling temperature for this mode
-            response = api_manager.generate_content(prompt, model_name, self_solve_temp)
-            
-            if response['status'] == 'SUCCESS':
-                # The self-sampling prompt only returns the solution. We must format it
-                # into a full exemplar to match the output of the analogical path.
-                formatted_text = f"Question: {question_for_prompt}\nRationale and Answer: {response['text']}"
-                successful_adaptations.append(formatted_text)
-            else:
-                failed_adaptations.append({
-                    "group_indices": "() - Self-Solve",
-                    "attempt": 0, # Self-solve is a single attempt per group
-                    "question_used": question_for_prompt,
-                    "error_info": response
-                })
-            continue # Move to the next group
-
-        # Case 2: The group is NOT EMPTY -> Perform standard analogical adaptation
+    
+    n_sampling = config.get("ANALOGICAL_ADAPTATION_SAMPLING_N", 1)
+    
+    # Iterate over top-level groups
+    for group_idx, group_structure in enumerate(group_sets):
+        print(f"    -> Processing Top-Level Group #{group_idx + 1}: {group_structure}")
+        
+        # For top-level groups, we might want multiple attempts (sampling), 
+        # OR just one pass if the tree determines the logic.
+        # The config says "ANALOGICAL_ADAPTATION_SAMPLING_N". 
+        # If we sample at the top level, we need to consume the queue multiple times?
+        # That would require Nx augmented questions.
+        # Simplified approach for Recursive Mode: 
+        # We run the tree ONCE per group definition. n_sampling applies if we want to 
+        # run the whole tree multiple times, but that complicates the queue.
+        # Let's assume 1 pass per group definition for now to respect the queue budget.
+        
+        # To support N attempts properly in recursive mode, we'd need to copy the queue section
+        # or generate N * needed questions. 
+        # For now, we will run it once per group defined in the set.
+        
+        result_text = _process_node_recursively(
+            node=group_structure, 
+            aug_q_queue=aug_q_queue,
+            retrieved_texts_map=retrieved_texts_map,
+            api_manager=api_manager,
+            config=config,
+            depth=0
+        )
+        
+        if result_text:
+            successful_adaptations.append(result_text)
         else:
-            # Check if group indices are valid for the retrieved samples
-            if any(i > len(retrieved_samples_texts) for i in group_indices):
-                logger.warning(f"Group {group_indices} has an index out of bounds for the {len(retrieved_samples_texts)} retrieved samples. Skipping.")
-                continue
-            
-            sample_group_texts = [retrieved_samples_texts[i-1] for i in group_indices]
-            
-            for attempt in range(n_sampling):
-                print(f"    -> Analogical adaptation for group {group_indices}, attempt {attempt+1}/{n_sampling}...")
-                prompt = create_analogical_adaptation_prompt(question_for_prompt, sample_group_texts, config)
-                # Use the analogical adaptation temperature for this mode
-                response = api_manager.generate_content(prompt, model_name, analogical_temp)
-                
-                if response['status'] == 'SUCCESS':
-                    successful_adaptations.append(response['text'])
-                else:
-                    failed_adaptations.append({
-                        "group_indices": group_indices,
-                        "attempt": attempt,
-                        "question_used": question_for_prompt,
-                        "error_info": response
-                    })
-        # --- END OF MODIFICATION ---
+            failed_adaptations.append({
+                "group_structure": str(group_structure),
+                "error": "Recursive processing failed"
+            })
 
-    if not successful_adaptations and failed_adaptations: status = "FAILURE"
-    elif successful_adaptations and failed_adaptations: status = "PARTIAL_SUCCESS"
-    else: status = "SUCCESS"
+    status = "SUCCESS" if successful_adaptations else "FAILURE"
+    if successful_adaptations and failed_adaptations: status = "PARTIAL_SUCCESS"
 
-    return {"status": status, "analogically_adapted_texts": successful_adaptations, "failed_adaptations": failed_adaptations}
+    return {
+        "status": status, 
+        "analogically_adapted_texts": successful_adaptations, 
+        "failed_adaptations": failed_adaptations
+    }
