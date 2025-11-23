@@ -577,9 +577,43 @@ A farmer has 50 apples. He sells 20 to a market and then buys 10 more from his n
 {main_question_text}
 </Base Question>
 </Task>
-
-<Your Output (ONLY the {n_samples} numbered questions)>
 """,
+
+
+    "self_sampling_augmentor_decomposition":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
+2. Create {n_samples} new math questions.
+3. CRITICAL CONSTRAINTS for the new questions:
+    - Simpler: They must be somewhat easier than the Base Question.
+    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
+    - Distinct: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the numbered list of question statements.
+</Instructions>
+
+<Example>
+<Base Question>
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
+</Base Question>
+
+<Your Output (for n_samples = 2)>
+1. How many distinct ways can you arrange 3 red balls and 3 blue balls in a row of 6 slots?
+2. There are 6 seats numbered 1 to 6. If we choose 2 seats at random to be the "Captain's seats", what is the probability that we chose specifically seat #1 and seat #2?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+"""
+
+
+
+
 
     # --- NEW FEATURES: Analogical Adaptation Prompt ---
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
