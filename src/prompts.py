@@ -665,6 +665,33 @@ Final Answer:
 [Your final answer to the Main Question]
 </Your  Answer/Output Format>
 """,
+    
+    "analogical_refinement":"""You are an expert mathematical problem solver.
+
+<Instructions>
+1. Review the <Solved Examples> to see how similar problems might be approached.
+2. **Use judgment:** Only use the logic from the examples if it actually works for the Main Question.
+3. **Refine and Correct:** If the examples use a pattern that doesn't fit or is incorrect for the Main Question, discard it and use the correct mathematical method instead.
+4. Solve the Main Question. Your priority is getting the correct answer, not mimicking the examples.
+</Instructions>
+
+<Solved Examples>
+{samples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Explain your steps. Briefly state which parts of the examples helped and which parts you had to change or ignore to solve this specific question correctly.]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your Answer/Output Format>
+""",
+
 
 }
 
