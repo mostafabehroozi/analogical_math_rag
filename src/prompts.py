@@ -611,10 +611,6 @@ An airline serves a dinner to all the passengers on an airplane. They get their 
 </Task>
 """,
 
-
-
-
-
     # --- NEW FEATURES: Analogical Adaptation Prompt ---
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
 
@@ -641,15 +637,20 @@ Question: [The Main Question]
 Rationale and Answer: [Your step-by-step solution using analogical reasoning from the samples, followed by the final answer]
 </Output Format>
 """,
-# Add this inside PROMPT_TEMPLATES in src/prompts.py
-    "analogical_adaptation_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns... [rest of final_solver_v2 text] ...
+
+
+    "analogical_adaptation_v2": """You are an expert in analogical reasoning for mathematical problem-solving.
 
 <Instructions>
-Carefully analyze each example... [rest of instructions]
+1. Carefully analyze each solved sample problem to understand its reasoning pattern, problem-solving strategy, and logical structure.
+2. Identify the core reasoning principles and mathematical techniques that can be transferred to the Main Question.
+3. Apply these analogical insights to solve the Main Question, adapting the reasoning patterns to fit the specific context and requirements of the Main Question.
+4. Present your solution in a clear, step-by-step format that shows how you applied analogical reasoning.
+5. Do NOT simply copy the solutions from the samples—adapt and apply their reasoning patterns intelligently.
 </Instructions>
 
 <Solved Examples>
-{samples_block}  <-- CHANGED FROM {examples_block} TO {samples_block}
+{samples_block}
 </Solved Examples>
 
 <Main Question to Solve>
