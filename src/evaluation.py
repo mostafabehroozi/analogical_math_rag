@@ -12,6 +12,8 @@ solutions. Its responsibilities include:
 3.  Calculating Pass@K metrics and aggregating error statistics across all
     experiments.
 4.  Generating a final summary DataFrame for analysis and reporting.
+5.  NEW: Analyzing Analogical Consistency experiments, calculating voting entropy
+    and semantic similarity scores for reasoning pathways.
 
 This rewritten version ensures robustness, clarity, and includes the critical
 fix to prevent notebook crashes, allowing the retry logic to function correctly.
@@ -21,8 +23,11 @@ import logging
 import os
 import re
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 from typing import List, Dict, Any, Tuple, Optional, TypedDict
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 
 # Import custom project modules
 from src.prompts import create_evaluation_prompt
@@ -146,6 +151,11 @@ def analyze_experiment_logs(
         if not query_logs:
             logger.warning(f"No logs found for experiment '{exp_name}'. Skipping.")
             continue
+        
+        # Skip Consistency Analysis logs here; they are handled by analyze_analogical_consistency_logs
+        if query_logs[0].get("config_flags_used", {}).get("APPLY_CONSISTENCY_ANALOGICAL_CHECK", False):
+            logger.info(f"Experiment '{exp_name}' is a Consistency Check run. Skipping standard analysis.")
+            continue
 
         exp_config = query_logs[0].get("config_flags_used", {})
         n_attempts_config = exp_config.get("N_PASS_ATTEMPTS", 1)
@@ -255,3 +265,151 @@ def analyze_experiment_logs(
     # This `return` statement is the critical fix.
     logger.info("Finished analysis of all experiments.")
     return pd.DataFrame(analysis_summary)
+
+
+# --- NEW: Analogical Consistency Analysis Logic ---
+
+def _extract_answer_simple(text: str) -> str:
+    """
+    A simple heuristic to extract the final answer for consistency checking.
+    Searches for 'Final Answer:' and takes the rest of the line.
+    """
+    match = re.search(r"Final Answer:\s*(.*)", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+def _calculate_semantic_consistency(
+    texts: List[str], 
+    embedding_model: SentenceTransformer
+) -> float:
+    """
+    Calculates the average pairwise cosine similarity between a list of texts.
+    Returns 0.0 if fewer than 2 texts are provided.
+    """
+    if len(texts) < 2:
+        return 1.0 # Trivial consistency
+        
+    embeddings = embedding_model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+    sim_matrix = cosine_similarity(embeddings)
+    
+    # Get upper triangle indices (excluding diagonal)
+    triu_indices = np.triu_indices(len(texts), k=1)
+    
+    # Calculate mean of pairwise similarities
+    mean_similarity = np.mean(sim_matrix[triu_indices])
+    return float(mean_similarity)
+
+def analyze_analogical_consistency_logs(
+    all_experiments_logs: Dict[str, List[Dict]],
+    ground_truths: List[str],
+    api_managers: Dict[str, Any],
+    config: Dict[str, Any],
+    embedding_model: SentenceTransformer
+) -> pd.DataFrame:
+    """
+    Analyzes logs specifically from Analogical Consistency experiments.
+    
+    Calculates:
+    1. Answer Consistency (Majority Vote %)
+    2. Semantic Consistency (Embedding Similarity)
+    3. Accuracy of the Majority Vote Answer
+    
+    Returns a DataFrame where each row is a Reasoning Pathway (Exemplar).
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting analysis of Analogical Consistency experiments.")
+    
+    pathway_records = []
+    
+    provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
+    manager_for_eval = api_managers[provider_for_eval]
+
+    for exp_name, query_logs in all_experiments_logs.items():
+        # Only process consistency experiments
+        if not query_logs: continue
+        if not query_logs[0].get("config_flags_used", {}).get("APPLY_CONSISTENCY_ANALOGICAL_CHECK", False):
+            continue
+            
+        logger.info(f"--- Analyzing Consistency Experiment: {exp_name} ---")
+        
+        for log in tqdm(query_logs, desc=f"Analyzing {exp_name}"):
+            hard_idx = log["target_query_original_hard_list_idx"]
+            ground_truth = ground_truths[hard_idx]
+            main_question = log["target_query_text"]
+            
+            # Access the consistency data block
+            consistency_data = log.get("consistency_analysis_data", {})
+            pathways = consistency_data.get("layer_1_pathways", [])
+            
+            if not pathways:
+                logger.warning(f"No pathways found for query {hard_idx} in {exp_name}.")
+                continue
+                
+            for pathway_idx, pathway in enumerate(pathways):
+                pathway_exemplar = pathway.get("exemplar_text", "")
+                layer_2_results = pathway.get("layer_2_results", [])
+                
+                # Filter valid string results
+                valid_answers = [res for res in layer_2_results if isinstance(res, str)]
+                
+                if not valid_answers:
+                    pathway_records.append({
+                        "experiment": exp_name,
+                        "query_idx": hard_idx,
+                        "pathway_idx": pathway_idx,
+                        "n_samples": 0,
+                        "answer_consistency": 0.0,
+                        "semantic_consistency": 0.0,
+                        "majority_is_correct": False,
+                        "majority_answer": "None"
+                    })
+                    continue
+                
+                # 1. Answer Consistency (Majority Vote)
+                extracted_answers = [_extract_answer_simple(ans) for ans in valid_answers]
+                # Filter out empty extractions
+                extracted_answers = [ans for ans in extracted_answers if ans]
+                
+                if not extracted_answers:
+                    answer_consistency = 0.0
+                    majority_answer = "Extraction Failed"
+                else:
+                    from collections import Counter
+                    counts = Counter(extracted_answers)
+                    most_common_ans, count = counts.most_common(1)[0]
+                    answer_consistency = count / len(extracted_answers)
+                    majority_answer = most_common_ans
+                
+                # 2. Semantic Consistency
+                semantic_consistency = _calculate_semantic_consistency(valid_answers, embedding_model)
+                
+                # 3. Accuracy Check (on the Majority Answer)
+                # We construct a synthetic "model answer" string to pass to the evaluator
+                # that represents the majority view.
+                if majority_answer and majority_answer != "Extraction Failed":
+                    synthetic_majority_text = f"Final Answer: {majority_answer}"
+                    eval_res = evaluate_single_answer_with_llm(
+                        synthetic_majority_text, ground_truth, manager_for_eval, config
+                    )
+                    is_correct = eval_res.get("is_correct", False)
+                else:
+                    is_correct = False
+                    
+                pathway_records.append({
+                    "experiment": exp_name,
+                    "query_idx": hard_idx,
+                    "pathway_idx": pathway_idx,
+                    "n_samples": len(valid_answers),
+                    "answer_consistency": answer_consistency,
+                    "semantic_consistency": semantic_consistency,
+                    "majority_is_correct": is_correct,
+                    "majority_answer": majority_answer
+                })
+    
+    if not pathway_records:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(pathway_records)
+    logger.info("Consistency analysis complete.")
+    return df

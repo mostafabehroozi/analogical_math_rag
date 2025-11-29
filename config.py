@@ -191,6 +191,25 @@ CONFIG = {
     "AUGMENT_N": 3,                                     # Number to select from K
     "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",     # "auto", "diversity", or "relevance"
 
+    # --- 8f. NEW FEATURES: Analogical Consistency Configuration ---
+    "APPLY_CONSISTENCY_ANALOGICAL_CHECK": False,        # Master switch for the consistency pipeline.
+    
+    # Generation Mode for the First Layer (Creating the Exemplars):
+    # - "distinct_augmentations": Generate K distinct augmented questions, solve each 1 time.
+    # - "single_augmentation_sampling": Generate 1 augmented question, solve it K times.
+    "CONSISTENCY_GENERATION_MODE": "distinct_augmentations",
+    
+    # Layer 1 Settings (Generating the Pathway Pool)
+    "CONSISTENCY_PATHWAYS_K": 3,                        # Number of parent pathways (exemplars) to generate.
+    "CONSISTENCY_LAYER_1_TEMPERATURE": 0.7,             # Temp for solving the augmented questions (creating the rationale).
+    
+    # Layer 2 Settings (Stress Testing the Pathway)
+    "CONSISTENCY_SAMPLES_PER_PATHWAY_N": 3,             # Number of times to solve the Main Question using EACH parent pathway.
+    "CONSISTENCY_LAYER_2_TEMPERATURE": 0.7,             # Temp for solving the Main Question (needs variance to measure consistency).
+    
+    # Analysis Settings
+    "CONSISTENCY_VOTING_THRESHOLD": 0.6,                # Threshold for considering a pathway "consistent" (e.g., 60% agreement).
+
     # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
@@ -216,6 +235,9 @@ CONFIG = {
     "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator",
     "PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR": "self_sampling_augmentor_v1",
     "PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION": "analogical_adaptation_v1",
+    
+    # Prompt for the consistency solver (using one specific exemplar)
+    "PROMPT_TEMPLATE_CONSISTENCY_SOLVER": "analogical_adaptation_v1", 
 
     # --- 11. Hugging Face Hub Synchronization ---
     "PERSIST_RESULTS_ONLINE": True,

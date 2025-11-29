@@ -25,7 +25,7 @@ entire run switches to a two-phase model:
 This optimizes API usage by batching all expensive 'solve' calls together.
 
 This version also integrates new, optional pipeline steps for self-sampling,
-augmentation, and analogical adaptation.
+augmentation, analogical adaptation, and the NEW Analogical Consistency check.
 
 PERFORMANCE FIX: The call to the `retrieve` function has been updated to pass
 a pre-computed hash map, enabling O(1) self-match detection and resolving a
@@ -41,11 +41,12 @@ from sentence_transformers import SentenceTransformer
 # Import our custom modules
 from src.pipeline_steps import (
     retrieve, adapt, merge, solve,
-    self_sample, augment_question, select_augmented_questions, analogical_adapt
+    self_sample, augment_question, select_augmented_questions, analogical_adapt,
+    generate_reasoning_pathways # NEW Import
 )
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
-from src.prompts import EXEMPLAR_FORMAT
+from src.prompts import EXEMPLAR_FORMAT, create_analogical_adaptation_prompt
 
 def run_pipeline_for_single_query(
     hard_list_idx: int,
@@ -97,7 +98,10 @@ def run_pipeline_for_single_query(
                     "APPLY_SELF_SAMPLING", "SELF_SAMPLING_N",
                     "APPLY_ANALOGICAL_ADAPTATION", "ANALOGICAL_GROUP_SETS",
                     "APPLY_SELF_SAMPLING_AUGMENTATION", "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION",
-                    "SELECTIVE_AUGMENTATION_SAMPLING", "AUGMENT_K", "AUGMENT_N"
+                    "SELECTIVE_AUGMENTATION_SAMPLING", "AUGMENT_K", "AUGMENT_N",
+                    # Consistency Flags
+                    "APPLY_CONSISTENCY_ANALOGICAL_CHECK", "CONSISTENCY_GENERATION_MODE",
+                    "CONSISTENCY_PATHWAYS_K", "CONSISTENCY_SAMPLES_PER_PATHWAY_N"
                 ]
             },
             "pipeline_status": "PENDING",
@@ -110,7 +114,60 @@ def run_pipeline_for_single_query(
     provider_for_solve = config.get('API_PROVIDER_SOLVER', 'gemini')
     manager_for_solve = api_managers[provider_for_solve]
     
-    # --- Pipeline Execution with Failure Checks ---
+    # --- NEW: Branch for Analogical Consistency Check ---
+    if config.get('APPLY_CONSISTENCY_ANALOGICAL_CHECK', False):
+        print("\n[MODE] ANALOGICAL CONSISTENCY CHECK ACTIVATED")
+        
+        # 1. Generate Layer 1 (Reasoning Pathways / Exemplars)
+        print(f"[LAYER 1] Generating {config.get('CONSISTENCY_PATHWAYS_K')} Reasoning Pathways...")
+        pathways_result = generate_reasoning_pathways(target_query, manager_for_adapt, config)
+        
+        if pathways_result['status'] == 'FAILURE':
+            run_log['pipeline_status'] = "FAILURE: Pathway generation failed."
+            run_log['consistency_analysis_data'] = {"error": pathways_result.get("error_info")}
+            return run_log
+            
+        generated_pathways = pathways_result['pathway_exemplars']
+        print(f"  -> Generated {len(generated_pathways)} pathways.")
+        
+        # 2. Generate Layer 2 (Sampling Main Question using each Pathway)
+        layer_1_data = []
+        n_samples = config.get("CONSISTENCY_SAMPLES_PER_PATHWAY_N", 3)
+        temp_layer_2 = config.get("CONSISTENCY_LAYER_2_TEMPERATURE", 0.7)
+        model_name = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER') # Default to Gemini for now, or adapt based on provider
+        if config.get('API_PROVIDER_SOLVER') == 'avalai': model_name = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
+        if config.get('API_PROVIDER_SOLVER') == 'ollama': model_name = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
+
+        for i, pathway_text in enumerate(generated_pathways):
+            print(f"\n[LAYER 2] Stress Testing Pathway #{i+1} ({n_samples} samples)...")
+            
+            # Create a prompt using THIS specific pathway as the only exemplar
+            # We use a list of 1 because the prompt function expects a list
+            prompt = create_analogical_adaptation_prompt(target_query, [pathway_text], config)
+            
+            samples = []
+            for j in range(n_samples):
+                print(f"    -> Generating Sample {j+1}/{n_samples}")
+                resp = manager_for_solve.generate_content(prompt, model_name, temp_layer_2)
+                if resp['status'] == 'SUCCESS':
+                    samples.append(resp['text'])
+                else:
+                    samples.append({"error": resp})
+            
+            layer_1_data.append({
+                "pathway_id": i,
+                "exemplar_text": pathway_text,
+                "layer_2_results": samples
+            })
+            
+        run_log['consistency_analysis_data'] = {
+            "layer_1_pathways": layer_1_data
+        }
+        run_log['pipeline_status'] = "SUCCESS"
+        return run_log
+
+    # --- Standard Pipeline Execution (If Consistency Check is False) ---
+    
     pipeline_halted = False
     
     # This list will hold the exemplars as they are processed and augmented through the pipeline.

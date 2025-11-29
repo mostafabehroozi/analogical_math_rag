@@ -16,7 +16,7 @@ where possible, allowing the orchestrator to log partial results and enable
 targeted retries.
 
 This version also includes new, optional pipeline steps for self-sampling,
-augmentation, and analogical adaptation.
+augmentation, analogical adaptation, and the NEW Analogical Consistency check.
 
 PERFORMANCE FIX: The retrieve() function now uses O(1) hash map lookup instead
 of O(n) linear search for self-match detection, reducing retrieval time from
@@ -945,3 +945,96 @@ def analogical_adapt(
         "analogically_adapted_texts": successful_adaptations, 
         "failed_adaptations": failed_adaptations
     }
+
+# --- 6. NEW FEATURES: Analogical Consistency Generator ---
+
+def generate_reasoning_pathways(
+    target_query: str,
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Generates the 'First Layer' of reasoning pathways for Analogical Consistency.
+    
+    Supports two modes:
+    1. 'distinct_augmentations': Generates K distinct augmented questions, solves each 1 time.
+    2. 'single_augmentation_sampling': Generates 1 augmented question, solves it K times.
+    
+    Returns:
+        Dict: Contains 'status' and a list of 'pathway_exemplars' (formatted text).
+    """
+    logger = logging.getLogger(__name__)
+    mode = config.get("CONSISTENCY_GENERATION_MODE", "distinct_augmentations")
+    k_pathways = config.get("CONSISTENCY_PATHWAYS_K", 3)
+    
+    # Determine model
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
+    else:
+        raise TypeError(f"Unsupported API manager type: {type(api_manager)}")
+        
+    temp = config.get("CONSISTENCY_LAYER_1_TEMPERATURE", 0.7)
+    
+    pathways = []
+    errors = []
+
+    logger.info(f"Generating reasoning pathways in mode: {mode} (K={k_pathways})")
+
+    if mode == "distinct_augmentations":
+        # 1. Augment K times
+        aug_res = augment_question(target_query, k_pathways, api_manager, config)
+        if aug_res['status'] == 'FAILURE':
+            return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info')}
+        
+        aug_qs = aug_res['augmented_questions']
+        
+        # Ensure we have enough
+        if len(aug_qs) < k_pathways:
+            logger.warning(f"Augmentation only returned {len(aug_qs)} questions, requested {k_pathways}.")
+            
+        # 2. Solve each augmented question ONCE
+        for i, q in enumerate(aug_qs[:k_pathways]):
+            print(f"    -> Solving Pathway {i+1} (Augmented Q): '{q[:50]}...'")
+            prompt = create_self_sampling_prompt(q, config)
+            resp = api_manager.generate_content(prompt, model_name, temp)
+            
+            if resp['status'] == 'SUCCESS':
+                # Format into standard exemplar
+                exemplar = f"Question: {q}\nRationale and Answer: {resp['text']}"
+                pathways.append(exemplar)
+            else:
+                errors.append(resp)
+
+    elif mode == "single_augmentation_sampling":
+        # 1. Augment 1 time
+        aug_res = augment_question(target_query, 1, api_manager, config)
+        if aug_res['status'] != 'SUCCESS' or not aug_res['augmented_questions']:
+             return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info')}
+        
+        q = aug_res['augmented_questions'][0]
+        logger.info(f"Using single augmented question for sampling: '{q[:50]}...'")
+        
+        # 2. Solve the same question K times
+        prompt = create_self_sampling_prompt(q, config)
+        for i in range(k_pathways):
+            print(f"    -> Solving Pathway Sample {i+1} for Single AugQ.")
+            resp = api_manager.generate_content(prompt, model_name, temp)
+            
+            if resp['status'] == 'SUCCESS':
+                exemplar = f"Question: {q}\nRationale and Answer: {resp['text']}"
+                pathways.append(exemplar)
+            else:
+                errors.append(resp)
+
+    else:
+        return {"status": "FAILURE", "error_message": f"Unknown consistency mode: {mode}"}
+
+    status = "SUCCESS"
+    if not pathways: status = "FAILURE"
+    elif errors: status = "PARTIAL_SUCCESS"
+
+    return {"status": status, "pathway_exemplars": pathways, "errors": errors}
