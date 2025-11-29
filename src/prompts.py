@@ -1,3 +1,7 @@
+#======================================================================
+                            #   File: src/prompts.py
+                            #======================================================================
+                            
 # src/prompts.py
 
 """
@@ -888,4 +892,11 @@ def create_analogical_adaptation_prompt(main_question: str, sample_group: List[s
     samples_block = "\n\n".join([f"<Sample {i+1}>\n{s}\n</Sample {i+1}>" 
                                   for i, s in enumerate(sample_group)])
     
-    return template.format(main_question_text=main_question, samples_block=samples_block)
+    # === FIX APPLIED HERE ===
+    # Pass the content to both 'samples_block' AND 'examples_block' to ensure compatibility
+    # with both standard adaptation templates and solver templates like 'final_solver_v2'.
+    return template.format(
+        main_question_text=main_question, 
+        samples_block=samples_block,
+        examples_block=samples_block
+    )
