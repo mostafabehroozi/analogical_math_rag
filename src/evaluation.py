@@ -12,8 +12,8 @@ solutions. Its responsibilities include:
 3.  Calculating Pass@K metrics and aggregating error statistics across all
     experiments.
 4.  Generating a final summary DataFrame for analysis and reporting.
-5.  NEW: Analyzing Analogical Consistency experiments, calculating voting entropy
-    and semantic similarity scores for reasoning pathways.
+5.  Analyzing Analogical Consistency experiments (Reasoning Pathways).
+6.  NEW: Analyzing Group-Based Self-Consistency experiments (Correlation Analysis).
 
 This rewritten version ensures robustness, clarity, and includes the critical
 fix to prevent notebook crashes, allowing the retry logic to function correctly.
@@ -28,6 +28,7 @@ from tqdm import tqdm
 from typing import List, Dict, Any, Tuple, Optional, TypedDict
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
+from collections import Counter
 
 # Import custom project modules
 from src.prompts import create_evaluation_prompt
@@ -152,12 +153,19 @@ def analyze_experiment_logs(
             logger.warning(f"No logs found for experiment '{exp_name}'. Skipping.")
             continue
         
-        # Skip Consistency Analysis logs here; they are handled by analyze_analogical_consistency_logs
-        if query_logs[0].get("config_flags_used", {}).get("APPLY_CONSISTENCY_ANALOGICAL_CHECK", False):
-            logger.info(f"Experiment '{exp_name}' is a Consistency Check run. Skipping standard analysis.")
+        # Check config flags to determine if this is a standard experiment
+        exp_config = query_logs[0].get("config_flags_used", {})
+        
+        # Skip Pathway Consistency Analysis logs (handled by separate function)
+        if exp_config.get("APPLY_CONSISTENCY_ANALOGICAL_CHECK", False):
+            logger.info(f"Experiment '{exp_name}' is a Pathway Consistency Check run. Skipping standard analysis.")
+            continue
+            
+        # Skip Group Consistency Analysis logs (handled by separate function)
+        if exp_config.get("APPLY_GROUP_CONSISTENCY_SELECTION", False):
+            logger.info(f"Experiment '{exp_name}' is a Group Consistency run. Skipping standard analysis.")
             continue
 
-        exp_config = query_logs[0].get("config_flags_used", {})
         n_attempts_config = exp_config.get("N_PASS_ATTEMPTS", 1)
         pass_k_values = sorted([k for k in pass_k_values_to_report if 0 < k <= n_attempts_config])
 
@@ -267,7 +275,7 @@ def analyze_experiment_logs(
     return pd.DataFrame(analysis_summary)
 
 
-# --- NEW: Analogical Consistency Analysis Logic ---
+# --- SHARED HELPERS FOR CONSISTENCY ANALYSIS ---
 
 def _extract_answer_simple(text: str) -> str:
     """
@@ -300,6 +308,9 @@ def _calculate_semantic_consistency(
     mean_similarity = np.mean(sim_matrix[triu_indices])
     return float(mean_similarity)
 
+
+# --- PATHWAY CONSISTENCY ANALYSIS (OLD FEATURE) ---
+
 def analyze_analogical_consistency_logs(
     all_experiments_logs: Dict[str, List[Dict]],
     ground_truths: List[str],
@@ -308,17 +319,10 @@ def analyze_analogical_consistency_logs(
     embedding_model: SentenceTransformer
 ) -> pd.DataFrame:
     """
-    Analyzes logs specifically from Analogical Consistency experiments.
-    
-    Calculates:
-    1. Answer Consistency (Majority Vote %)
-    2. Semantic Consistency (Embedding Similarity)
-    3. Accuracy of the Majority Vote Answer
-    
-    Returns a DataFrame where each row is a Reasoning Pathway (Exemplar).
+    Analyzes logs specifically from Analogical Consistency experiments (Layer 1/2 pathways).
     """
     logger = logging.getLogger(__name__)
-    logger.info("Starting analysis of Analogical Consistency experiments.")
+    logger.info("Starting analysis of Analogical Consistency (Pathway) experiments.")
     
     pathway_records = []
     
@@ -336,46 +340,34 @@ def analyze_analogical_consistency_logs(
         for log in tqdm(query_logs, desc=f"Analyzing {exp_name}"):
             hard_idx = log["target_query_original_hard_list_idx"]
             ground_truth = ground_truths[hard_idx]
-            main_question = log["target_query_text"]
             
             # Access the consistency data block
             consistency_data = log.get("consistency_analysis_data", {})
             pathways = consistency_data.get("layer_1_pathways", [])
             
             if not pathways:
-                logger.warning(f"No pathways found for query {hard_idx} in {exp_name}.")
                 continue
                 
             for pathway_idx, pathway in enumerate(pathways):
-                pathway_exemplar = pathway.get("exemplar_text", "")
                 layer_2_results = pathway.get("layer_2_results", [])
-                
-                # Filter valid string results
                 valid_answers = [res for res in layer_2_results if isinstance(res, str)]
                 
                 if not valid_answers:
                     pathway_records.append({
-                        "experiment": exp_name,
-                        "query_idx": hard_idx,
-                        "pathway_idx": pathway_idx,
-                        "n_samples": 0,
-                        "answer_consistency": 0.0,
-                        "semantic_consistency": 0.0,
-                        "majority_is_correct": False,
-                        "majority_answer": "None"
+                        "experiment": exp_name, "query_idx": hard_idx, "pathway_idx": pathway_idx,
+                        "n_samples": 0, "answer_consistency": 0.0, "semantic_consistency": 0.0,
+                        "majority_is_correct": False, "majority_answer": "None"
                     })
                     continue
                 
-                # 1. Answer Consistency (Majority Vote)
-                extracted_answers = [_extract_answer_simple(ans) for ans in valid_answers]
-                # Filter out empty extractions
-                extracted_answers = [ans for ans in extracted_answers if ans]
+                # 1. Answer Consistency
+                extracted_answers = [_extract_answer_simple(ans) for ans in valid_answers if ans]
+                extracted_answers = [ans for ans in extracted_answers if ans] # Filter empty
                 
                 if not extracted_answers:
                     answer_consistency = 0.0
                     majority_answer = "Extraction Failed"
                 else:
-                    from collections import Counter
                     counts = Counter(extracted_answers)
                     most_common_ans, count = counts.most_common(1)[0]
                     answer_consistency = count / len(extracted_answers)
@@ -384,9 +376,7 @@ def analyze_analogical_consistency_logs(
                 # 2. Semantic Consistency
                 semantic_consistency = _calculate_semantic_consistency(valid_answers, embedding_model)
                 
-                # 3. Accuracy Check (on the Majority Answer)
-                # We construct a synthetic "model answer" string to pass to the evaluator
-                # that represents the majority view.
+                # 3. Accuracy Check
                 if majority_answer and majority_answer != "Extraction Failed":
                     synthetic_majority_text = f"Final Answer: {majority_answer}"
                     eval_res = evaluate_single_answer_with_llm(
@@ -397,19 +387,135 @@ def analyze_analogical_consistency_logs(
                     is_correct = False
                     
                 pathway_records.append({
-                    "experiment": exp_name,
-                    "query_idx": hard_idx,
-                    "pathway_idx": pathway_idx,
-                    "n_samples": len(valid_answers),
-                    "answer_consistency": answer_consistency,
+                    "experiment": exp_name, "query_idx": hard_idx, "pathway_idx": pathway_idx,
+                    "n_samples": len(valid_answers), "answer_consistency": answer_consistency,
                     "semantic_consistency": semantic_consistency,
-                    "majority_is_correct": is_correct,
-                    "majority_answer": majority_answer
+                    "majority_is_correct": is_correct, "majority_answer": majority_answer
                 })
     
-    if not pathway_records:
+    return pd.DataFrame(pathway_records)
+
+
+# --- NEW: GROUP CONSISTENCY ANALYSIS (CORRELATION STUDY) ---
+
+def analyze_group_consistency_correlation(
+    all_experiments_logs: Dict[str, List[Dict]],
+    ground_truths: List[str],
+    api_managers: Dict[str, Any],
+    config: Dict[str, Any],
+    embedding_model: SentenceTransformer
+) -> pd.DataFrame:
+    """
+    Analyzes logs from Group-Based Self-Consistency experiments.
+    
+    Produces a DataFrame designed for correlation analysis:
+    - Row: One Group within one Query.
+    - Metrics: Answer Consistency (Entropy), Semantic Consistency (Embedding), and Accuracy.
+    
+    This allows visualizing if high consistency implies high accuracy.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Group-Based Consistency Correlation Analysis.")
+    
+    records = []
+    
+    provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
+    manager_for_eval = api_managers[provider_for_eval]
+    
+    for exp_name, query_logs in all_experiments_logs.items():
+        if not query_logs: continue
+        
+        # Check flag for Group Consistency
+        if not query_logs[0].get("config_flags_used", {}).get("APPLY_GROUP_CONSISTENCY_SELECTION", False):
+            continue
+            
+        logger.info(f"--- Analyzing Group Consistency Experiment: {exp_name} ---")
+        
+        for log in tqdm(query_logs, desc=f"Analyzing {exp_name}"):
+            hard_idx = log["target_query_original_hard_list_idx"]
+            ground_truth = ground_truths[hard_idx]
+            
+            # The 'solve' step result contains the 'group_consistency_results' list
+            solve_step_output = log.get("steps", {}).get("solving", {})
+            group_results = solve_step_output.get("group_consistency_results", [])
+            
+            if not group_results:
+                logger.warning(f"No group consistency results found for query {hard_idx}.")
+                continue
+                
+            for group_data in group_results:
+                group_id = group_data.get("group_id")
+                attempts = group_data.get("attempts", [])
+                
+                # Filter valid string attempts (failed calls are dicts)
+                valid_attempts = [a for a in attempts if isinstance(a, str)]
+                
+                if not valid_attempts:
+                    continue # Skip empty groups
+                    
+                # 1. Calculate Semantic Consistency (Variance of Embeddings)
+                semantic_score = _calculate_semantic_consistency(valid_attempts, embedding_model)
+                
+                # 2. Calculate Answer Consistency (Majority Vote %)
+                extracted_answers = [_extract_answer_simple(text) for text in valid_attempts]
+                # Filter out empty extractions to avoid skewed stats
+                clean_answers = [ans for ans in extracted_answers if ans]
+                
+                majority_answer = None
+                answer_consistency_score = 0.0
+                
+                if clean_answers:
+                    counts = Counter(clean_answers)
+                    most_common_ans, count = counts.most_common(1)[0]
+                    majority_answer = most_common_ans
+                    answer_consistency_score = count / len(clean_answers)
+                else:
+                    majority_answer = "Extraction Failed"
+                    answer_consistency_score = 0.0
+                    
+                # 3. Evaluate Majority Answer against Ground Truth
+                majority_is_correct = False
+                if majority_answer and majority_answer != "Extraction Failed":
+                    # Construct a synthetic text for the evaluator
+                    synthetic_text = f"Final Answer: {majority_answer}"
+                    eval_res = evaluate_single_answer_with_llm(
+                        synthetic_text, ground_truth, manager_for_eval, config
+                    )
+                    majority_is_correct = eval_res.get("is_correct", False)
+                    
+                # 4. Check if ANY answer in the group was correct (to detect lucky guesses)
+                # We need to be careful with API usage here. If we have 5 attempts, evaluating all 5
+                # is expensive. Optimization: We check the majority answer first. 
+                # If majority is correct, then 'any_correct' is True.
+                # If majority is wrong, we *might* check others if we really want to find lucky guesses.
+                # For this implementation, we will check unique answers only.
+                any_correct = majority_is_correct
+                if not majority_is_correct and clean_answers:
+                    unique_answers = set(clean_answers)
+                    for ans in unique_answers:
+                        if ans == majority_answer: continue # Already checked
+                        synthetic_text = f"Final Answer: {ans}"
+                        eval_res = evaluate_single_answer_with_llm(
+                            synthetic_text, ground_truth, manager_for_eval, config
+                        )
+                        if eval_res.get("is_correct", False):
+                            any_correct = True
+                            break
+                            
+                records.append({
+                    "experiment_name": exp_name,
+                    "query_id": hard_idx,
+                    "group_id": group_id,
+                    "indices_used": str(group_data.get("indices_used", [])),
+                    "n_attempts": len(valid_attempts),
+                    "semantic_consistency": semantic_score,
+                    "answer_consistency": answer_consistency_score,
+                    "majority_answer": majority_answer,
+                    "is_majority_correct": majority_is_correct,
+                    "is_any_correct": any_correct
+                })
+
+    if not records:
         return pd.DataFrame()
         
-    df = pd.DataFrame(pathway_records)
-    logger.info("Consistency analysis complete.")
-    return df
+    return pd.DataFrame(records)

@@ -25,7 +25,8 @@ entire run switches to a two-phase model:
 This optimizes API usage by batching all expensive 'solve' calls together.
 
 This version also integrates new, optional pipeline steps for self-sampling,
-augmentation, analogical adaptation, and the NEW Analogical Consistency check.
+augmentation, analogical adaptation, the NEW Analogical Consistency check,
+and the Group-Based Self-Consistency Selection.
 
 PERFORMANCE FIX: The call to the `retrieve` function has been updated to pass
 a pre-computed hash map, enabling O(1) self-match detection and resolving a
@@ -42,7 +43,8 @@ from sentence_transformers import SentenceTransformer
 from src.pipeline_steps import (
     retrieve, adapt, merge, solve,
     self_sample, augment_question, select_augmented_questions, analogical_adapt,
-    generate_reasoning_pathways # NEW Import
+    generate_reasoning_pathways, # NEW Import for Pathway Consistency
+    solve_with_group_consistency # NEW Import for Group Consistency
 )
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -101,7 +103,10 @@ def run_pipeline_for_single_query(
                     "SELECTIVE_AUGMENTATION_SAMPLING", "AUGMENT_K", "AUGMENT_N",
                     # Consistency Flags
                     "APPLY_CONSISTENCY_ANALOGICAL_CHECK", "CONSISTENCY_GENERATION_MODE",
-                    "CONSISTENCY_PATHWAYS_K", "CONSISTENCY_SAMPLES_PER_PATHWAY_N"
+                    "CONSISTENCY_PATHWAYS_K", "CONSISTENCY_SAMPLES_PER_PATHWAY_N",
+                    # Group Consistency Flags
+                    "APPLY_GROUP_CONSISTENCY_SELECTION", "GROUP_CONSISTENCY_CANDIDATES",
+                    "GROUP_CONSISTENCY_SAMPLES_N"
                 ]
             },
             "pipeline_status": "PENDING",
@@ -114,7 +119,7 @@ def run_pipeline_for_single_query(
     provider_for_solve = config.get('API_PROVIDER_SOLVER', 'gemini')
     manager_for_solve = api_managers[provider_for_solve]
     
-    # --- NEW: Branch for Analogical Consistency Check ---
+    # --- NEW: Branch for Analogical Consistency Check (The "Pathway" approach) ---
     if config.get('APPLY_CONSISTENCY_ANALOGICAL_CHECK', False):
         print("\n[MODE] ANALOGICAL CONSISTENCY CHECK ACTIVATED")
         
@@ -301,20 +306,44 @@ def run_pipeline_for_single_query(
     # --- Phase 2: Final Solving Step ---
     if run_mode in ['full', 'solve_only']:
         if not pipeline_halted:
-            print("\n[STEP 6] SOLVE")
-            solve_result = solve(
-                target_query=target_query, final_exemplars=final_exemplars_for_solve,
-                api_manager=manager_for_solve, config=config
-            )
-            run_log['steps']['solving'] = solve_result
-            solution_texts = [attempt for attempt in solve_result.get('solution_attempts', []) if isinstance(attempt, str)]
-            failed_attempts = sum(1 for attempt in solve_result.get('solution_attempts', []) if isinstance(attempt, dict))
-            for i, text in enumerate(solution_texts): print(f"  -> Solution attempt #{i+1} (start): '{text[:120]}...'")
-            if failed_attempts > 0: print(f"  -> {failed_attempts} solution attempt(s) FAILED.")
             
-            run_log['llm_final_solution_attempts_texts'] = solution_texts
-            if "FAILURE" not in run_log['pipeline_status']:
-                 run_log['pipeline_status'] = "SUCCESS"
+            # --- BRANCH: Group-Based Self-Consistency Selection ---
+            if config.get('APPLY_GROUP_CONSISTENCY_SELECTION', False):
+                print("\n[STEP 6] SOLVE (Group-Based Consistency Mode)")
+                
+                # Execute the new consistency pipeline step
+                solve_result = solve_with_group_consistency(
+                    target_query=target_query,
+                    available_exemplars=final_exemplars_for_solve,
+                    api_manager=manager_for_solve,
+                    config=config
+                )
+                
+                run_log['steps']['solving'] = solve_result
+                
+                # Check outcome
+                if solve_result['status'] == 'SUCCESS':
+                    run_log['pipeline_status'] = "SUCCESS"
+                    print("  -> Group Consistency Selection completed successfully.")
+                else:
+                    run_log['pipeline_status'] = "FAILURE: Group Consistency failed."
+            
+            # --- BRANCH: Standard Solving (Pass@N) ---
+            else:
+                print("\n[STEP 6] SOLVE")
+                solve_result = solve(
+                    target_query=target_query, final_exemplars=final_exemplars_for_solve,
+                    api_manager=manager_for_solve, config=config
+                )
+                run_log['steps']['solving'] = solve_result
+                solution_texts = [attempt for attempt in solve_result.get('solution_attempts', []) if isinstance(attempt, str)]
+                failed_attempts = sum(1 for attempt in solve_result.get('solution_attempts', []) if isinstance(attempt, dict))
+                for i, text in enumerate(solution_texts): print(f"  -> Solution attempt #{i+1} (start): '{text[:120]}...'")
+                if failed_attempts > 0: print(f"  -> {failed_attempts} solution attempt(s) FAILED.")
+                
+                run_log['llm_final_solution_attempts_texts'] = solution_texts
+                if "FAILURE" not in run_log['pipeline_status']:
+                     run_log['pipeline_status'] = "SUCCESS"
         else:
             run_log['steps']['solving'] = {"status": "SKIPPED", "reason": "Pipeline halted due to critical failure in a prior step."}
 

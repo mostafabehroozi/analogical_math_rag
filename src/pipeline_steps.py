@@ -23,6 +23,7 @@ of O(n) linear search for self-match detection, reducing retrieval time from
 ~1300 seconds to <0.001 seconds per query.
 
 UPGRADE: Now supports Recursive Analogical Chains (Tree-structured context).
+UPGRADE: Now supports Group-Based Self-Consistency Selection.
 """
 
 import logging
@@ -1038,3 +1039,92 @@ def generate_reasoning_pathways(
     elif errors: status = "PARTIAL_SUCCESS"
 
     return {"status": status, "pathway_exemplars": pathways, "errors": errors}
+
+
+# --- 7. NEW FEATURES: Group-Based Self-Consistency Selection ---
+
+def solve_with_group_consistency(
+    target_query: str,
+    available_exemplars: List[str],
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Executes the Group-Based Self-Consistency strategy.
+    
+    1. Iterates through groups defined in config['GROUP_CONSISTENCY_CANDIDATES'].
+    2. Constructs a prompt using the specific exemplars for that group.
+    3. Solves the target query N times for EACH group to generate a sample set.
+    4. Returns a detailed log of all attempts for analysis by the evaluator.
+    
+    Args:
+        target_query: The main question to solve.
+        available_exemplars: A list of all available adapted exemplars (0-indexed).
+        api_manager: The API manager for the solver.
+        config: The configuration dictionary.
+        
+    Returns:
+        Dict: A structured log containing the attempts for each group.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Group-Based Self-Consistency Solving.")
+
+    group_candidates = config.get("GROUP_CONSISTENCY_CANDIDATES", [])
+    n_samples = config.get("GROUP_CONSISTENCY_SAMPLES_N", 5)
+    
+    # Determine model and temperature (Pass@N settings usually apply here for diversity)
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    else:
+        raise TypeError(f"Unsupported API manager type for solver: {type(api_manager)}")
+        
+    temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0) # High temp for diversity
+
+    group_results = []
+
+    for group_idx, indices_tuple in enumerate(group_candidates):
+        print(f"\n    -> Processing Consistency Group #{group_idx} (Indices: {indices_tuple})...")
+        
+        # 1. Form the group context from available exemplars
+        group_exemplars = []
+        valid_group = True
+        for idx in indices_tuple:
+            if 0 <= idx < len(available_exemplars):
+                group_exemplars.append(available_exemplars[idx])
+            else:
+                logger.warning(f"Group index {idx} out of bounds (Available: {len(available_exemplars)}). Skipping group.")
+                valid_group = False
+                break
+        
+        if not valid_group or not group_exemplars:
+            continue
+
+        # 2. Generate the prompt for this specific group
+        prompt = create_final_reasoning_prompt(target_query, group_exemplars, config)
+        
+        # 3. Sampling Loop (N times)
+        group_attempts = []
+        for i in range(n_samples):
+            print(f"        -> Generating sample {i+1}/{n_samples} for Group #{group_idx}...")
+            response = api_manager.generate_content(prompt, model_name, temperature)
+            
+            if response['status'] == 'SUCCESS':
+                group_attempts.append(response['text'])
+            else:
+                group_attempts.append({"status": "FAILURE", "error_info": response})
+
+        # 4. Store Data
+        group_results.append({
+            "group_id": group_idx,
+            "indices_used": indices_tuple,
+            "attempts": group_attempts
+        })
+
+    return {
+        "status": "SUCCESS" if group_results else "FAILURE",
+        "group_consistency_results": group_results
+    }

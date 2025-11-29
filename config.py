@@ -210,6 +210,19 @@ CONFIG = {
     # Analysis Settings
     "CONSISTENCY_VOTING_THRESHOLD": 0.6,                # Threshold for considering a pathway "consistent" (e.g., 60% agreement).
 
+    # --- 8g. NEW FEATURES: Group-Based Self-Consistency Selection ---
+    "APPLY_GROUP_CONSISTENCY_SELECTION": False,     # Master switch for the new Group Consistency pipeline.
+    
+    # Define which subsets of the retrieved samples to form into groups.
+    # Format: List of tuples containing 0-based indices of the retrieved/adapted exemplars.
+    # Example: [(0, 1), (2, 3)] creates Group 1 from the 1st and 2nd exemplars, Group 2 from 3rd and 4th.
+    "GROUP_CONSISTENCY_CANDIDATES": [(0, 1), (2, 3)], 
+    
+    "GROUP_CONSISTENCY_SAMPLES_N": 5,               # How many times to solve the Main Question for EACH group.
+    
+    "CONSISTENCY_SCORING_METHOD": "hybrid",         # "answer_majority", "semantic_similarity", or "hybrid".
+    "SEMANTIC_CONSISTENCY_WEIGHT": 0.5,             # If hybrid, how much weight (0-1) to give the semantic score.
+
     # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
