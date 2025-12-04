@@ -26,7 +26,7 @@ This optimizes API usage by batching all expensive 'solve' calls together.
 
 This version also integrates new, optional pipeline steps for self-sampling,
 augmentation, analogical adaptation, the NEW Analogical Consistency check,
-and the Group-Based Self-Consistency Selection.
+the Group-Based Self-Consistency Selection, and the NEW Hierarchical Augmentation.
 
 PERFORMANCE FIX: The call to the `retrieve` function has been updated to pass
 a pre-computed hash map, enabling O(1) self-match detection and resolving a
@@ -44,7 +44,8 @@ from src.pipeline_steps import (
     retrieve, adapt, merge, solve,
     self_sample, augment_question, select_augmented_questions, analogical_adapt,
     generate_reasoning_pathways, # NEW Import for Pathway Consistency
-    solve_with_group_consistency # NEW Import for Group Consistency
+    solve_with_group_consistency, # NEW Import for Group Consistency
+    solve_hierarchical_tree # NEW Import for Hierarchical Augmentation
 )
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -106,7 +107,10 @@ def run_pipeline_for_single_query(
                     "CONSISTENCY_PATHWAYS_K", "CONSISTENCY_SAMPLES_PER_PATHWAY_N",
                     # Group Consistency Flags
                     "APPLY_GROUP_CONSISTENCY_SELECTION", "GROUP_CONSISTENCY_CANDIDATES",
-                    "GROUP_CONSISTENCY_SAMPLES_N"
+                    "GROUP_CONSISTENCY_SAMPLES_N",
+                    # Hierarchical Augmentation Flags
+                    "APPLY_HIERARCHICAL_AUGMENTATION", "HIERARCHICAL_TREE_DEPTH",
+                    "HIERARCHICAL_BRANCHING_FACTOR", "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED"
                 ]
             },
             "pipeline_status": "PENDING",
@@ -119,6 +123,35 @@ def run_pipeline_for_single_query(
     provider_for_solve = config.get('API_PROVIDER_SOLVER', 'gemini')
     manager_for_solve = api_managers[provider_for_solve]
     
+    # --- NEW: Branch for Hierarchical Augmentation (Tree-Based) ---
+    if config.get('APPLY_HIERARCHICAL_AUGMENTATION', False):
+        print("\n[MODE] HIERARCHICAL AUGMENTATION ACTIVATED")
+        # Since this is a completely different solving paradigm, it bypasses the standard
+        # retrieve-adapt-merge-solve flow.
+        
+        hierarchical_result = solve_hierarchical_tree(
+            target_query=target_query,
+            exemplar_data=exemplar_data,
+            embedding_model=embedding_model,
+            api_manager_adapt=manager_for_adapt,
+            api_manager_solve=manager_for_solve,
+            config=config
+        )
+        
+        run_log['steps']['hierarchical_process'] = hierarchical_result
+        
+        if hierarchical_result['status'] == 'SUCCESS':
+            # Store the root solution as a standard solution attempt so the evaluator can pick it up
+            run_log['steps']['solving'] = {
+                "status": "SUCCESS",
+                "solution_attempts": [hierarchical_result['root_solution']]
+            }
+            run_log['pipeline_status'] = "SUCCESS"
+        else:
+            run_log['pipeline_status'] = "FAILURE: Hierarchical process failed."
+            
+        return run_log
+
     # --- NEW: Branch for Analogical Consistency Check (The "Pathway" approach) ---
     if config.get('APPLY_CONSISTENCY_ANALOGICAL_CHECK', False):
         print("\n[MODE] ANALOGICAL CONSISTENCY CHECK ACTIVATED")

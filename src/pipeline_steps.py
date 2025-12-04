@@ -24,11 +24,13 @@ of O(n) linear search for self-match detection, reducing retrieval time from
 
 UPGRADE: Now supports Recursive Analogical Chains (Tree-structured context).
 UPGRADE: Now supports Group-Based Self-Consistency Selection.
+UPGRADE: Now supports Hierarchical Augmentation with Backward Propagation.
 """
 
 import logging
 import re
 import numpy as np
+import uuid
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Union, Tuple, Optional
@@ -52,6 +54,7 @@ from src.prompts import (
     create_self_sampling_prompt,
     create_augmentation_prompt,
     create_analogical_adaptation_prompt,
+    create_hierarchical_parent_solver_prompt # NEW import
 )
 # MODIFIED: Import manager classes for type checking
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
@@ -1127,4 +1130,237 @@ def solve_with_group_consistency(
     return {
         "status": "SUCCESS" if group_results else "FAILURE",
         "group_consistency_results": group_results
+    }
+
+
+# --- 8. NEW FEATURES: Hierarchical Augmentation with Backward Propagation ---
+
+class ReasoningNode:
+    """Represents a node in the hierarchical augmentation tree."""
+    def __init__(self, question: str, depth: int):
+        self.id = str(uuid.uuid4())
+        self.question = question
+        self.depth = depth
+        self.children: List['ReasoningNode'] = []
+        self.retrieved_context: List[str] = [] # Exemplars found for this node
+        self.solution: Optional[str] = None    # The solved answer/rationale
+        self.status: str = "PENDING"           # PENDING, SOLVED, FAILED
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Recursive serialization for logging."""
+        return {
+            "id": self.id,
+            "question": self.question,
+            "depth": self.depth,
+            "children": [child.to_dict() for child in self.children],
+            "retrieved_context_count": len(self.retrieved_context),
+            "solution_preview": (self.solution[:100] + "...") if self.solution else None,
+            "status": self.status
+        }
+
+def build_hierarchical_tree(
+    current_question: str,
+    current_depth: int,
+    max_depth: int,
+    branching_factor: int,
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> ReasoningNode:
+    """
+    Recursively builds the augmentation tree.
+    """
+    logger = logging.getLogger(__name__)
+    node = ReasoningNode(current_question, current_depth)
+    
+    # Base Case: If we reached max depth, stop expanding.
+    if current_depth >= max_depth:
+        return node
+    
+    print(f"  -> [Tree Build] Expanding Node at Depth {current_depth} (Branching: {branching_factor})...")
+    
+    # Temporarily override the prompt template in config if needed for hierarchical augmentation
+    # We use a shallow copy to not affect global config permanently if we were modifying it in place,
+    # but since we pass config to augment_question, let's just ensure we use the right key.
+    # augment_question uses PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR.
+    # We can pass a modified config.
+    local_config = config.copy()
+    if config.get("PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"):
+        local_config["PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR"] = config["PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"]
+        
+    aug_res = augment_question(current_question, branching_factor, api_manager, local_config)
+    
+    if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
+        logger.warning(f"Failed to expand node at depth {current_depth}. Stopping this branch.")
+        return node
+        
+    child_questions = aug_res['augmented_questions']
+    
+    # Recursively build children
+    for child_q in child_questions:
+        child_node = build_hierarchical_tree(child_q, current_depth + 1, max_depth, branching_factor, api_manager, config)
+        node.children.append(child_node)
+        
+    return node
+
+def _process_leaves(
+    root: ReasoningNode,
+    exemplar_data: Dict[str, Any],
+    embedding_model: SentenceTransformer,
+    api_manager_adapt: Any,
+    api_manager_solve: Any,
+    config: Dict[str, Any]
+) -> None:
+    """
+    Traverses the tree to find leaves, optionally retrieves context, and solves them.
+    """
+    if not root.children:
+        # This is a leaf
+        print(f"    -> Processing Leaf Node (Depth {root.depth})...")
+        
+        # 1. Retrieval (if enabled)
+        if config.get("HIERARCHICAL_LEAF_RETRIEVAL_ENABLED", True):
+            top_k = config.get("HIERARCHICAL_LEAF_RETRIEVAL_TOP_K", 3)
+            # Use standard retrieval
+            ret_res = retrieve(
+                root.question, embedding_model, 
+                exemplar_data['questions'], exemplar_data['embeddings'], 
+                top_k, exemplar_data.get('question_to_index')
+            )
+            
+            if ret_res['status'] == 'SUCCESS':
+                # Adapt retrieved samples
+                # We use the standard adapt function but maybe with normalization only to save calls?
+                # Using standard config settings for adapt
+                adapt_res = adapt(
+                    root.question, ret_res['retrieved_indices'], 
+                    exemplar_data['questions'], exemplar_data['solutions'], 
+                    api_manager_adapt, config
+                )
+                if adapt_res.get('adapted_texts'):
+                    root.retrieved_context = adapt_res['adapted_texts']
+                    print(f"      -> Leaf retrieved {len(root.retrieved_context)} samples.")
+        
+        # 2. Solve Leaf
+        # If context exists, use RAG solver. If not, use simple solver (Self-Solve).
+        # We reuse the `solve` function logic but applied to a single node.
+        
+        # Determine prompt template
+        template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER", "final_solver_simple_v1")
+        
+        # Construct prompt manually or use helpers
+        if root.retrieved_context:
+            # Use RAG prompt helper
+            # We temporarily swap the config's solver template key to ensure the helper uses the one we want
+            local_config = config.copy()
+            local_config["PROMPT_TEMPLATE_FINAL_SOLVER"] = template_name 
+            # Note: If template is simple, it ignores context. If complex, it uses it.
+            # Assuming if context exists, user wants to use it.
+            # If the user specified a simple template for leaves, context is ignored.
+            prompt = create_final_reasoning_prompt(root.question, root.retrieved_context, local_config)
+        else:
+            # Use Simple prompt helper
+            local_config = config.copy()
+            local_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = template_name
+            prompt = create_final_reasoning_prompt_simple(root.question, local_config)
+            
+        # Model Selection
+        model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") # Default
+        if isinstance(api_manager_solve, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
+        elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
+        
+        temp = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
+        
+        resp = api_manager_solve.generate_content(prompt, model_name, temp)
+        if resp['status'] == 'SUCCESS':
+            root.solution = resp['text']
+            root.status = "SOLVED"
+        else:
+            root.status = "FAILED"
+            
+    else:
+        # Not a leaf, recurse
+        for child in root.children:
+            _process_leaves(child, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
+
+def propagate_solutions_upward(
+    node: ReasoningNode,
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> None:
+    """
+    Post-order traversal to solve parents using children's solutions.
+    """
+    # 1. Process Children First
+    for child in node.children:
+        propagate_solutions_upward(child, api_manager, config)
+    
+    # 2. If node is already solved (it was a leaf), skip
+    if node.status == "SOLVED":
+        return
+
+    # 3. Solve Parent
+    # Gather valid children solutions
+    child_data = []
+    for child in node.children:
+        if child.status == "SOLVED" and child.solution:
+            child_data.append({"question": child.question, "solution": child.solution})
+            
+    if not child_data:
+        logging.getLogger(__name__).warning(f"Node at depth {node.depth} has no solved children. Cannot propagate.")
+        node.status = "FAILED_PROPAGATION"
+        return
+        
+    print(f"  -> [Propagation] Solving Node at Depth {node.depth} using {len(child_data)} child solutions...")
+    
+    prompt = create_hierarchical_parent_solver_prompt(node.question, child_data, config)
+    
+    # Model Selection
+    model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") 
+    if isinstance(api_manager, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
+    elif isinstance(api_manager, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
+    
+    temp = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
+    
+    resp = api_manager.generate_content(prompt, model_name, temp)
+    if resp['status'] == 'SUCCESS':
+        node.solution = resp['text']
+        node.status = "SOLVED"
+    else:
+        node.status = "FAILED"
+
+def solve_hierarchical_tree(
+    target_query: str,
+    exemplar_data: Dict[str, Any],
+    embedding_model: SentenceTransformer,
+    api_manager_adapt: Any,
+    api_manager_solve: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Orchestrates the full Hierarchical Augmentation pipeline.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Hierarchical Augmentation Pipeline.")
+    
+    max_depth = config.get("HIERARCHICAL_TREE_DEPTH", 2)
+    branching = config.get("HIERARCHICAL_BRANCHING_FACTOR", 3)
+    
+    # 1. Build Tree
+    print("\n[HIERARCHICAL] Phase 1: Building Tree...")
+    root = build_hierarchical_tree(target_query, 0, max_depth, branching, api_manager_adapt, config)
+    
+    # 2. Process Leaves
+    print("\n[HIERARCHICAL] Phase 2: Processing Leaves...")
+    _process_leaves(root, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
+    
+    # 3. Propagate Upward
+    print("\n[HIERARCHICAL] Phase 3: Backward Propagation...")
+    propagate_solutions_upward(root, api_manager_solve, config)
+    
+    final_status = "SUCCESS" if root.status == "SOLVED" else "FAILURE"
+    
+    return {
+        "status": final_status,
+        "root_solution": root.solution,
+        "tree_structure": root.to_dict()
     }

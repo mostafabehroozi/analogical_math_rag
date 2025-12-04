@@ -1,7 +1,3 @@
-#======================================================================
-                            #   File: src/prompts.py
-                            #======================================================================
-                            
 # src/prompts.py
 
 """
@@ -726,7 +722,35 @@ Final Answer:
 [Your final answer to the Main Question]
 </Your Answer/Output Format>
 """,
+    
+    # --- NEW FEATURE: Hierarchical Parent Solver ---
+    "hierarchical_parent_solver_v1": """You are an expert mathematical problem solver.
+You are tasked with solving a **Main Question**.
+To assist you, we have broken this problem down into several related sub-problems or variations, and provided their solutions below.
 
+<Instructions>
+1. Analyze the 'Solved Variations'. Identify the underlying mathematical principles, formulas, or logic used to solve them.
+2. Apply these principles to the 'Main Question'. The Main Question is the parent problem of these variations, so the logic should be directly applicable or composable.
+3. Provide a clear, step-by-step rationale for the Main Question.
+4. State the Final Answer clearly.
+</Instructions>
+
+<Solved Variations>
+{child_solutions_block}
+</Solved Variations>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Output Format>
+Rationale:
+[Step-by-step derivation]
+
+Final Answer:
+[The final result]
+</Output Format>
+"""
 
 }
 
@@ -900,3 +924,29 @@ def create_analogical_adaptation_prompt(main_question: str, sample_group: List[s
         samples_block=samples_block,
         examples_block=samples_block
     )
+
+def create_hierarchical_parent_solver_prompt(main_question: str, child_nodes_data: List[Dict[str, str]], config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt for solving a parent node using its children's solutions.
+    
+    Args:
+        main_question (str): The parent question.
+        child_nodes_data (List[Dict]): List of dicts with 'question' and 'solution' keys.
+        config (Dict[str, Any]): Global config.
+        
+    Returns:
+        str: Formatted prompt.
+    """
+    template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER", "hierarchical_parent_solver_v1")
+    
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+        
+    template = PROMPT_TEMPLATES[template_name]
+    
+    # Format children into a block
+    child_block = ""
+    for i, child in enumerate(child_nodes_data):
+        child_block += f"<Variation {i+1}>\nQuestion: {child.get('question', '')}\nSolution: {child.get('solution', '')}\n</Variation {i+1}>\n\n"
+        
+    return template.format(main_question_text=main_question, child_solutions_block=child_block.strip())

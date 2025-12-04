@@ -1,3 +1,7 @@
+#======================================================================
+                            #   File: config.py
+                            #======================================================================
+                            
 # config.py
 
 """
@@ -222,6 +226,22 @@ CONFIG = {
     
     "CONSISTENCY_SCORING_METHOD": "hybrid",         # "answer_majority", "semantic_similarity", or "hybrid".
     "SEMANTIC_CONSISTENCY_WEIGHT": 0.5,             # If hybrid, how much weight (0-1) to give the semantic score.
+
+    # --- 8h. NEW FEATURES: Hierarchical Augmentation Configuration ---
+    "APPLY_HIERARCHICAL_AUGMENTATION": False,   # Master switch for the tree-based augmentation pipeline.
+    
+    # Tree Structure Settings
+    "HIERARCHICAL_TREE_DEPTH": 2,               # Number of layers below the root (e.g., 2 means Root -> Layer 1 -> Layer 2 (Leaves)).
+    "HIERARCHICAL_BRANCHING_FACTOR": 3,         # Number of augmented children to generate per node.
+    
+    # Leaf Processing Settings
+    "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED": True, # If True, performs specific retrieval for each leaf node.
+    "HIERARCHICAL_LEAF_RETRIEVAL_TOP_K": 3,      # Number of samples to retrieve per leaf (if enabled).
+    
+    # Prompt Template Settings
+    "PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR": "self_sampling_augmentor_decomposition_2", # Used to generate children.
+    "PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER": "hierarchical_parent_solver_v1",       # Used to solve parent using children.
+    "PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER": "final_solver_simple_v1",                # Used to solve leaves (with or without RAG).
 
     # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
