@@ -750,7 +750,29 @@ Rationale:
 Final Answer:
 [The final result]
 </Output Format>
-"""
+""",
+    "hierarchical_parent_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved variations.
+
+<Instructions>
+Carefully analyze each variation: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these variations as supportive guides. Adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Variations>
+{child_solutions_block}
+</Solved Variations>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
 
 }
 
