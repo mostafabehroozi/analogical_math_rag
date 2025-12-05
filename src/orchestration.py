@@ -142,9 +142,10 @@ def run_pipeline_for_single_query(
         
         if hierarchical_result['status'] == 'SUCCESS':
             # Store the root solution as a standard solution attempt so the evaluator can pick it up
+            # FIXED: Retrieve the list of attempts if available (for Pass@N support)
             run_log['steps']['solving'] = {
                 "status": "SUCCESS",
-                "solution_attempts": [hierarchical_result['root_solution']]
+                "solution_attempts": hierarchical_result.get('root_solution_attempts', [hierarchical_result['root_solution']])
             }
             run_log['pipeline_status'] = "SUCCESS"
         else:

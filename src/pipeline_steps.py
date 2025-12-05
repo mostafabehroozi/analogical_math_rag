@@ -1144,6 +1144,7 @@ class ReasoningNode:
         self.children: List['ReasoningNode'] = []
         self.retrieved_context: List[str] = [] # Exemplars found for this node
         self.solution: Optional[str] = None    # The solved answer/rationale
+        self.solution_attempts: List[str] = [] # NEW: Stores list for Root node
         self.status: str = "PENDING"           # PENDING, SOLVED, FAILED
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1155,6 +1156,7 @@ class ReasoningNode:
             "children": [child.to_dict() for child in self.children],
             "retrieved_context_count": len(self.retrieved_context),
             "solution_preview": (self.solution[:100] + "...") if self.solution else None,
+            "solution_attempts_count": len(self.solution_attempts),
             "status": self.status
         }
 
@@ -1321,12 +1323,33 @@ def propagate_solutions_upward(
     
     temp = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
     
-    resp = api_manager.generate_content(prompt, model_name, temp)
-    if resp['status'] == 'SUCCESS':
-        node.solution = resp['text']
-        node.status = "SOLVED"
+    if node.depth > 0:
+        # Intermediate Node: Solve once
+        resp = api_manager.generate_content(prompt, model_name, temp)
+        if resp['status'] == 'SUCCESS':
+            node.solution = resp['text']
+            node.status = "SOLVED"
+        else:
+            node.status = "FAILED"
     else:
-        node.status = "FAILED"
+        # Root Node: Solve N times
+        n_attempts = config.get("N_PASS_ATTEMPTS", 1)
+        print(f"    -> Root Node detected. Solving {n_attempts} times (Pass@{n_attempts})...")
+        
+        success_count = 0
+        for i in range(n_attempts):
+            resp = api_manager.generate_content(prompt, model_name, temp)
+            if resp['status'] == 'SUCCESS':
+                node.solution_attempts.append(resp['text'])
+                success_count += 1
+                # Save the first success as the primary solution for backward compatibility
+                if node.solution is None:
+                    node.solution = resp['text']
+        
+        if success_count > 0:
+            node.status = "SOLVED"
+        else:
+            node.status = "FAILED"
 
 def solve_hierarchical_tree(
     target_query: str,
@@ -1359,8 +1382,16 @@ def solve_hierarchical_tree(
     
     final_status = "SUCCESS" if root.status == "SOLVED" else "FAILURE"
     
+    # Prepare list of attempts
+    final_attempts = []
+    if root.solution_attempts:
+        final_attempts = root.solution_attempts
+    elif root.solution:
+        final_attempts = [root.solution]
+
     return {
         "status": final_status,
         "root_solution": root.solution,
+        "root_solution_attempts": final_attempts,
         "tree_structure": root.to_dict()
     }
