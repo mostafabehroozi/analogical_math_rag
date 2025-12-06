@@ -71,12 +71,12 @@ CONFIG = {
 
     # MODIFIED: Names of the models to be used for different pipeline stages.
     # Using the new, fully-qualified model name format.
-    "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-2-9b-it",    # For transformation, summarization, merging. A faster model is often sufficient.
-    "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-2-27b-it", # For generating the final solution. A more powerful model is better here.
-    "GEMINI_MODEL_NAME_EVALUATOR": "models/gemma-2-9b-it",     # For LLM-based evaluation. A faster model is sufficient.
+    "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-3-27b-it",    # For transformation, summarization, merging. A faster model is often sufficient.
+    "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-3-27b-it", # For generating the final solution. A more powerful model is better here.
+    "GEMINI_MODEL_NAME_EVALUATOR": "models/gemma-3-27b-it",     # For LLM-based evaluation. A faster model is sufficient.
     
     # NEW: Model for Augmentation tasks
-    "GEMINI_MODEL_NAME_AUGMENTATION": "models/gemma-2-9b-it",
+    "GEMINI_MODEL_NAME_AUGMENTATION": "models/gemma-3-27b-it",
 
     # --- 5. AvalAI (OpenAI-Compatible) API Settings ---
     # These settings are used ONLY if API_PROVIDER is set to "avalai".
@@ -171,23 +171,6 @@ CONFIG = {
 
     # --- 8c. NEW FEATURES: Analogical Adaptation Configuration ---
     "APPLY_ANALOGICAL_ADAPTATION": False,   # Enable analogical reasoning as adaptation
-
-    # MODIFIED: Now supports empty tuples `()` to trigger a "self-solve"
-    # action on an augmented question, using the self-sampling prompt.
-    #
-    # UPGRADED: Now supports RECURSIVE NESTED GROUPS (Tree Structure).
-    # Structure examples:
-    # - Simple: [(1, 2), (3, 4)] -> Standard linear grouping.
-    # - Recursive: [(), (1, 2), (((3), 4), 5)] -> Complex dependency tree.
-    #
-    # Rules for Recursive Groups:
-    # 1. Integers are retrieved samples (1-indexed).
-    # 2. Tuples `(...)` are Processing Nodes. Each tuple consumes one Augmented Question from the pool.
-    #    The system solves this Augmented Question using the tuple's contents as context.
-    # 3. `()` is an empty node (Self-Solve). It solves an Augmented Question with zero context.
-    # 4. Nested tuples (e.g. `((3), 4)`) are resolved bottom-up. The result of inner `(3)` becomes context for outer `(..., 4)`.
-    #    This allows the pipeline to build complex "Super Exemplars" layer by layer.
-    "ANALOGICAL_GROUP_SETS": [(1, 2), (3, 4), (5, 6)],  # Grouping of retrieved samples (1-indexed)
     
     "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,  # Number of attempts per NON-EMPTY group
 
@@ -197,29 +180,19 @@ CONFIG = {
 
     # --- 8e. NEW FEATURES: Selective Augmentation Sampling ---
     "SELECTIVE_AUGMENTATION_SAMPLING": False,           # Enable selective augmentation
-    
-    # NEW: Augmentation Schedule for multi-call generation
-    # If set, this overrides AUGMENT_K. Format: [number_of_calls, questions_per_call].
-    # Example: [2, 3] means 2 API calls, each generating 3 questions, for a total of 6.
+
     "AUGMENTATION_SCHEDULE": None,
     
-    # UPGRADED: Acts as the "Pool Size" for Recursive Analogical Adaptation.
-    # This number must be >= the total number of tuples (processing nodes) in your ANALOGICAL_GROUP_SETS structure.
-    # Each tuple in the structure consumes one augmented question.
-    "AUGMENT_K": 10,                                    # Total augmentations generated (used if AUGMENTATION_SCHEDULE is None)
-    "AUGMENT_N": 3,                                     # Number to select from K
-    "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",     # "auto", "diversity", or "relevance"
+    "AUGMENT_K": 10,                                    
+    "AUGMENT_N": 3,                                     
+    "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",     
 
-    # --- 8f. NEW FEATURES: Analogical Consistency Configuration ---
-    "APPLY_CONSISTENCY_ANALOGICAL_CHECK": False,        # Master switch for the consistency pipeline.
-    
-    # Generation Mode for the First Layer (Creating the Exemplars):
-    # - "distinct_augmentations": Generate K distinct augmented questions, solve each 1 time.
-    # - "single_augmentation_sampling": Generate 1 augmented question, solve it K times.
+    "APPLY_CONSISTENCY_ANALOGICAL_CHECK": False,        
+
     "CONSISTENCY_GENERATION_MODE": "distinct_augmentations",
     
     # Layer 1 Settings (Generating the Pathway Pool)
-    "CONSISTENCY_PATHWAYS_K": 3,                        # Number of parent pathways (exemplars) to generate.
+    "CONSISTENCY_PATHWAYS_K": 3,                        
     "CONSISTENCY_LAYER_1_TEMPERATURE": 0.7,             # Temp for solving the augmented questions (creating the rationale).
     
     # Layer 2 Settings (Stress Testing the Pathway)
@@ -229,7 +202,6 @@ CONFIG = {
     # Analysis Settings
     "CONSISTENCY_VOTING_THRESHOLD": 0.6,                # Threshold for considering a pathway "consistent" (e.g., 60% agreement).
 
-    # --- 8g. NEW FEATURES: Group-Based Self-Consistency Selection ---
     "APPLY_GROUP_CONSISTENCY_SELECTION": False,     # Master switch for the new Group Consistency pipeline.
     
     # Define which subsets of the retrieved samples to form into groups.
