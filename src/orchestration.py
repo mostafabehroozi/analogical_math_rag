@@ -1,3 +1,7 @@
+#======================================================================
+#   File: src/orchestration.py
+#======================================================================
+                            
 # src/orchestration.py
 
 """
@@ -123,6 +127,10 @@ def run_pipeline_for_single_query(
     provider_for_solve = config.get('API_PROVIDER_SOLVER', 'gemini')
     manager_for_solve = api_managers[provider_for_solve]
     
+    # NEW: Specific Manager for Augmentation
+    provider_for_aug = config.get('API_PROVIDER_AUGMENTATION', provider_for_adapt) # Fallback to adapt if not set
+    manager_for_aug = api_managers[provider_for_aug]
+    
     # --- NEW: Branch for Hierarchical Augmentation (Tree-Based) ---
     if config.get('APPLY_HIERARCHICAL_AUGMENTATION', False):
         print("\n[MODE] HIERARCHICAL AUGMENTATION ACTIVATED")
@@ -135,6 +143,7 @@ def run_pipeline_for_single_query(
             embedding_model=embedding_model,
             api_manager_adapt=manager_for_adapt,
             api_manager_solve=manager_for_solve,
+            api_manager_augment=manager_for_aug, # Use the specific augmentation manager
             config=config
         )
         
@@ -159,7 +168,8 @@ def run_pipeline_for_single_query(
         
         # 1. Generate Layer 1 (Reasoning Pathways / Exemplars)
         print(f"[LAYER 1] Generating {config.get('CONSISTENCY_PATHWAYS_K')} Reasoning Pathways...")
-        pathways_result = generate_reasoning_pathways(target_query, manager_for_adapt, config)
+        # Use manager_for_aug for generating the pathways (augmentations)
+        pathways_result = generate_reasoning_pathways(target_query, manager_for_aug, config)
         
         if pathways_result['status'] == 'FAILURE':
             run_log['pipeline_status'] = "FAILURE: Pathway generation failed."
@@ -227,7 +237,7 @@ def run_pipeline_for_single_query(
                 top_k=config['TOP_N_CANDIDATES_RETRIEVAL'],
                 question_to_index_map=exemplar_data.get('question_to_index')
             )
-            # ========================== END OF MODIFICATION ==========================
+            # ========================== END OF MODIFICATION ==========================\
             run_log['steps']['retrieval'] = retrieval_result
             if retrieval_result['status'] == 'FAILURE':
                 run_log['pipeline_status'] = "FAILURE: Retrieval failed."
@@ -266,7 +276,8 @@ def run_pipeline_for_single_query(
                     # UPDATED: We use AUGMENT_K as the pool size for the recursive tree structure.
                     # If it's too small, the analogical_adapt function will detect it and generate fresh ones.
                     k = config.get('AUGMENT_K', 10)
-                    aug_result = augment_question(target_query, k, manager_for_adapt, config)
+                    # Use manager_for_aug for augmentation
+                    aug_result = augment_question(target_query, k, manager_for_aug, config)
                     if aug_result['status'] == 'SUCCESS':
                         augmented_qs_for_aa = aug_result['augmented_questions']
                         if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
@@ -274,8 +285,11 @@ def run_pipeline_for_single_query(
                             augmented_qs_for_aa = select_augmented_questions(augmented_qs_for_aa, config, embedding_model, retrieved_texts)
 
                 aa_result = analogical_adapt(
-                    target_query, retrieved_indices, exemplar_data, manager_for_adapt, config,
-                    embedding_model, augmented_questions=augmented_qs_for_aa
+                    target_query, retrieved_indices, exemplar_data, 
+                    api_manager=manager_for_adapt, # Use adapt manager for the reasoning part
+                    api_manager_augment=manager_for_aug, # Use aug manager for internal queue refills
+                    config=config,
+                    embedding_model=embedding_model, augmented_questions=augmented_qs_for_aa
                 )
                 run_log['steps']['analogical_adaptation'] = aa_result
                 if aa_result.get('analogically_adapted_texts'):
@@ -291,7 +305,8 @@ def run_pipeline_for_single_query(
             
             if config.get('APPLY_SELF_SAMPLING_AUGMENTATION'):
                 k = config.get('AUGMENT_K', config.get('SELF_SAMPLING_N', 3))
-                aug_result = augment_question(target_query, k, manager_for_adapt, config)
+                # Use manager_for_aug for augmentation
+                aug_result = augment_question(target_query, k, manager_for_aug, config)
                 if aug_result['status'] == 'SUCCESS':
                     augmented_qs = aug_result['augmented_questions']
                     if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):

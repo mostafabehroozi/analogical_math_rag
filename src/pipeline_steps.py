@@ -1,3 +1,7 @@
+#======================================================================
+#   File: src/pipeline_steps.py
+#======================================================================
+                            
 # src/pipeline_steps.py
 
 """
@@ -588,16 +592,18 @@ def augment_question(
     logger = logging.getLogger(__name__)
 
     # --- Determine Model and Temperature ---
+    # MODIFIED: Look for AUGMENTATION specific keys first, fall back to ADAPTATION
     if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+        model_name = config.get('GEMINI_MODEL_NAME_AUGMENTATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
     elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+        model_name = config.get('AVALAI_MODEL_NAME_AUGMENTATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
     elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
+        model_name = config.get('OLLAMA_MODEL_NAME_AUGMENTATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
     else:
         raise TypeError(f"Unsupported API manager type for augmentation: {type(api_manager)}")
     
-    temperature = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
+    # Use specific augmentation temperature
+    temperature = config.get("DEFAULT_AUGMENTATION_TEMPERATURE", 0.7)
     
     # --- Check for Augmentation Schedule ---
     schedule = config.get("AUGMENTATION_SCHEDULE")
@@ -760,7 +766,7 @@ def _process_node_recursively(
         node: An int (leaf), or tuple/list (processing node).
         aug_q_queue: Queue of pre-generated augmented questions.
         retrieved_texts_map: Map of 1-based indices to retrieved exemplar texts.
-        api_manager: The API manager instance.
+        api_manager: The API manager instance (Adaptation manager).
         config: Global config.
         depth: Current recursion depth for logging.
         
@@ -799,7 +805,7 @@ def _process_node_recursively(
         current_aug_q = aug_q_queue.popleft()
         print(f"{indent}-> Processing Node at depth {depth}. Context: {len(child_exemplars)} samples. solving AugQ: '{current_aug_q[:30]}...'")
 
-        # 3. Setup Model & Temp
+        # 3. Setup Model & Temp (Uses Adaptation Model/Manager since this is solving)
         if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
         elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
         elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
@@ -836,6 +842,7 @@ def analogical_adapt(
     retrieved_indices: List[int],
     exemplar_data: Dict[str, Any],
     api_manager: Any,
+    api_manager_augment: Any, # NEW: Dedicated manager for augmentation
     config: Dict[str, Any],
     embedding_model: SentenceTransformer,
     augmented_questions: Optional[List[str]] = None
@@ -878,8 +885,8 @@ def analogical_adapt(
         final_aug_qs = augmented_questions[:total_nodes_needed]
     else:
         logger.info(f"Generating {total_nodes_needed} new augmented questions to satisfy structure demand.")
-        # We use the augment_question helper
-        aug_res = augment_question(target_query, total_nodes_needed, api_manager, config)
+        # We use the augment_question helper with the AUGMENTATION MANAGER
+        aug_res = augment_question(target_query, total_nodes_needed, api_manager_augment, config)
         if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
             return {"status": "FAILURE", "error_info": aug_res.get('error_info')}
         
@@ -910,25 +917,12 @@ def analogical_adapt(
     for group_idx, group_structure in enumerate(group_sets):
         print(f"    -> Processing Top-Level Group #{group_idx + 1}: {group_structure}")
         
-        # For top-level groups, we might want multiple attempts (sampling), 
-        # OR just one pass if the tree determines the logic.
-        # The config says "ANALOGICAL_ADAPTATION_SAMPLING_N". 
-        # If we sample at the top level, we need to consume the queue multiple times?
-        # That would require Nx augmented questions.
-        # Simplified approach for Recursive Mode: 
-        # We run the tree ONCE per group definition. n_sampling applies if we want to 
-        # run the whole tree multiple times, but that complicates the queue.
-        # Let's assume 1 pass per group definition for now to respect the queue budget.
-        
-        # To support N attempts properly in recursive mode, we'd need to copy the queue section
-        # or generate N * needed questions. 
-        # For now, we will run it once per group defined in the set.
-        
+        # Pass api_manager (adaptation manager) for the solving/reasoning parts of the recursion
         result_text = _process_node_recursively(
             node=group_structure, 
             aug_q_queue=aug_q_queue,
             retrieved_texts_map=retrieved_texts_map,
-            api_manager=api_manager,
+            api_manager=api_manager, 
             config=config,
             depth=0
         )
@@ -954,7 +948,7 @@ def analogical_adapt(
 
 def generate_reasoning_pathways(
     target_query: str,
-    api_manager: Any,
+    api_manager: Any, # Expects Augmentation Manager
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
@@ -971,13 +965,13 @@ def generate_reasoning_pathways(
     mode = config.get("CONSISTENCY_GENERATION_MODE", "distinct_augmentations")
     k_pathways = config.get("CONSISTENCY_PATHWAYS_K", 3)
     
-    # Determine model
+    # Determine model - Uses whatever manager passed, assumed to be Augmentation
     if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
+        model_name = config.get('GEMINI_MODEL_NAME_AUGMENTATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
     elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
+        model_name = config.get('AVALAI_MODEL_NAME_AUGMENTATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
     elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
+        model_name = config.get('OLLAMA_MODEL_NAME_AUGMENTATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
     else:
         raise TypeError(f"Unsupported API manager type: {type(api_manager)}")
         
@@ -989,7 +983,7 @@ def generate_reasoning_pathways(
     logger.info(f"Generating reasoning pathways in mode: {mode} (K={k_pathways})")
 
     if mode == "distinct_augmentations":
-        # 1. Augment K times
+        # 1. Augment K times using api_manager
         aug_res = augment_question(target_query, k_pathways, api_manager, config)
         if aug_res['status'] == 'FAILURE':
             return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info')}
@@ -1014,7 +1008,7 @@ def generate_reasoning_pathways(
                 errors.append(resp)
 
     elif mode == "single_augmentation_sampling":
-        # 1. Augment 1 time
+        # 1. Augment 1 time using api_manager
         aug_res = augment_question(target_query, 1, api_manager, config)
         if aug_res['status'] != 'SUCCESS' or not aug_res['augmented_questions']:
              return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info')}
@@ -1165,7 +1159,7 @@ def build_hierarchical_tree(
     current_depth: int,
     max_depth: int,
     branching_factor: int,
-    api_manager: Any,
+    api_manager_augment: Any, # NEW: Dedicated manager for augmentation
     config: Dict[str, Any]
 ) -> ReasoningNode:
     """
@@ -1181,15 +1175,12 @@ def build_hierarchical_tree(
     print(f"  -> [Tree Build] Expanding Node at Depth {current_depth} (Branching: {branching_factor})...")
     
     # Temporarily override the prompt template in config if needed for hierarchical augmentation
-    # We use a shallow copy to not affect global config permanently if we were modifying it in place,
-    # but since we pass config to augment_question, let's just ensure we use the right key.
-    # augment_question uses PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR.
-    # We can pass a modified config.
     local_config = config.copy()
     if config.get("PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"):
         local_config["PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR"] = config["PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"]
         
-    aug_res = augment_question(current_question, branching_factor, api_manager, local_config)
+    # Use the dedicated augmentation manager
+    aug_res = augment_question(current_question, branching_factor, api_manager_augment, local_config)
     
     if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
         logger.warning(f"Failed to expand node at depth {current_depth}. Stopping this branch.")
@@ -1199,7 +1190,7 @@ def build_hierarchical_tree(
     
     # Recursively build children
     for child_q in child_questions:
-        child_node = build_hierarchical_tree(child_q, current_depth + 1, max_depth, branching_factor, api_manager, config)
+        child_node = build_hierarchical_tree(child_q, current_depth + 1, max_depth, branching_factor, api_manager_augment, config)
         node.children.append(child_node)
         
     return node
@@ -1230,9 +1221,7 @@ def _process_leaves(
             )
             
             if ret_res['status'] == 'SUCCESS':
-                # Adapt retrieved samples
-                # We use the standard adapt function but maybe with normalization only to save calls?
-                # Using standard config settings for adapt
+                # Adapt retrieved samples using Adapt Manager
                 adapt_res = adapt(
                     root.question, ret_res['retrieved_indices'], 
                     exemplar_data['questions'], exemplar_data['solutions'], 
@@ -1243,30 +1232,21 @@ def _process_leaves(
                     print(f"      -> Leaf retrieved {len(root.retrieved_context)} samples.")
         
         # 2. Solve Leaf
-        # If context exists, use RAG solver. If not, use simple solver (Self-Solve).
-        # We reuse the `solve` function logic but applied to a single node.
-        
         # Determine prompt template
         template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER", "final_solver_simple_v1")
         
         # Construct prompt manually or use helpers
         if root.retrieved_context:
-            # Use RAG prompt helper
-            # We temporarily swap the config's solver template key to ensure the helper uses the one we want
             local_config = config.copy()
             local_config["PROMPT_TEMPLATE_FINAL_SOLVER"] = template_name 
-            # Note: If template is simple, it ignores context. If complex, it uses it.
-            # Assuming if context exists, user wants to use it.
-            # If the user specified a simple template for leaves, context is ignored.
             prompt = create_final_reasoning_prompt(root.question, root.retrieved_context, local_config)
         else:
-            # Use Simple prompt helper
             local_config = config.copy()
             local_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = template_name
             prompt = create_final_reasoning_prompt_simple(root.question, local_config)
             
-        # Model Selection
-        model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") # Default
+        # Model Selection (Solve Manager)
+        model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") 
         if isinstance(api_manager_solve, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
         elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
         
@@ -1357,6 +1337,7 @@ def solve_hierarchical_tree(
     embedding_model: SentenceTransformer,
     api_manager_adapt: Any,
     api_manager_solve: Any,
+    api_manager_augment: Any, # NEW: Dedicated manager for augmentation
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
@@ -1368,15 +1349,15 @@ def solve_hierarchical_tree(
     max_depth = config.get("HIERARCHICAL_TREE_DEPTH", 2)
     branching = config.get("HIERARCHICAL_BRANCHING_FACTOR", 3)
     
-    # 1. Build Tree
+    # 1. Build Tree using Augmentation Manager
     print("\n[HIERARCHICAL] Phase 1: Building Tree...")
-    root = build_hierarchical_tree(target_query, 0, max_depth, branching, api_manager_adapt, config)
+    root = build_hierarchical_tree(target_query, 0, max_depth, branching, api_manager_augment, config)
     
-    # 2. Process Leaves
+    # 2. Process Leaves using Adapt & Solve Managers
     print("\n[HIERARCHICAL] Phase 2: Processing Leaves...")
     _process_leaves(root, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
     
-    # 3. Propagate Upward
+    # 3. Propagate Upward using Solve Manager
     print("\n[HIERARCHICAL] Phase 3: Backward Propagation...")
     propagate_solutions_upward(root, api_manager_solve, config)
     

@@ -641,6 +641,64 @@ An airline serves a dinner to all the passengers on an airplane. They get their 
 </Base Question>
 </Task>
 """,
+    "self_sampling_augmentor_decomposition_3":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
+2. Create {n_samples} new math questions.
+3. CRITICAL CONSTRAINTS for the new questions:
+    - Simpler: They must be moderately simpler than the Base Question and conceptually isolated to reduce overall difficulty.
+    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
+    - Distinct: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the numbered list of question statements.
+</Instructions>
+
+<Example>
+<Base Question>
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
+</Base Question>
+
+<Your Output (for n_samples = 2)>
+1. A flight attendant has 3 steak meals and 3 fish meals on a cart. In how many distinct ways can these 6 meals be distributed to 6 specific crew members?
+2. A crew of 6 people includes exactly 2 pilots. If we randomly select a group of 3 crew members to receive the fish meals, what is the probability that the group chosen includes both pilots?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+    "self_sampling_augmentor_decomposition_4":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
+<Instructions>
+1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
+2. Create {n_samples} new math questions.
+3. CRITICAL CONSTRAINTS for the new questions:
+    - Moderately Simpler & Reduced Complexity: The new questions must be distinctly easier than the Base Question. Reduce the cognitive load by lowering numerical magnitudes or removing multi-step logic layers, ensuring the core concept remains but the execution is more straightforward.
+    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
+    - Distinct Contexts: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the numbered list of question statements.
+</Instructions>
+
+<Example>
+<Base Question>
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
+</Base Question>
+<Your Output (for n_samples = 2)>
+1. A flight attendant has 3 steak meals and 3 fish meals on a cart. In how many distinct ways can these 6 meals be distributed to 6 specific crew members?
+2. A crew of 6 people includes exactly 2 pilots. If we randomly select a group of 3 crew members to receive the fish meals, what is the probability that the group chosen includes both pilots?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
 
     # --- NEW FEATURES: Analogical Adaptation Prompt ---
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.

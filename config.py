@@ -1,7 +1,7 @@
 #======================================================================
-                            #   File: config.py
-                            #======================================================================
-                            
+#   File: config.py
+#======================================================================
+
 # config.py
 
 """
@@ -52,6 +52,9 @@ CONFIG = {
     "API_PROVIDER_ADAPTATION": "gemini",  # For normalization, transformations, merging
     "API_PROVIDER_SOLVER": "gemini",      # For generating the final solution
     "API_PROVIDER_EVALUATOR": "gemini",   # For LLM-based evaluation
+    
+    # NEW: Specific provider for Augmentation tasks (Self-Sampling, Analogical Augmentation, Hierarchical)
+    "API_PROVIDER_AUGMENTATION": "gemini", 
 
     # --- 4. Gemini API Settings ---
     # These settings are used ONLY if API_PROVIDER is set to "gemini".
@@ -70,7 +73,10 @@ CONFIG = {
     # Using the new, fully-qualified model name format.
     "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-2-9b-it",    # For transformation, summarization, merging. A faster model is often sufficient.
     "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-2-27b-it", # For generating the final solution. A more powerful model is better here.
-    "GEMINI_MODEL_NAME_EVALUATOR": "models/gemma-2-9b-it",    # For LLM-based evaluation. A faster model is sufficient.
+    "GEMINI_MODEL_NAME_EVALUATOR": "models/gemma-2-9b-it",     # For LLM-based evaluation. A faster model is sufficient.
+    
+    # NEW: Model for Augmentation tasks
+    "GEMINI_MODEL_NAME_AUGMENTATION": "models/gemma-2-9b-it",
 
     # --- 5. AvalAI (OpenAI-Compatible) API Settings ---
     # These settings are used ONLY if API_PROVIDER is set to "avalai".
@@ -86,6 +92,9 @@ CONFIG = {
     "AVALAI_MODEL_NAME_ADAPTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_FINAL_SOLVER": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
+    
+    # NEW: Model for Augmentation tasks
+    "AVALAI_MODEL_NAME_AUGMENTATION": "openai.gpt-oss-20b-1:0",
 
     # --- 5b. Ollama (Local LLM) Settings ---
     # These settings are used if any API_PROVIDER_* is set to "ollama".
@@ -95,6 +104,9 @@ CONFIG = {
     "OLLAMA_MODEL_NAME_ADAPTATION": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_FINAL_SOLVER": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_EVALUATOR": "gpt-oss:20b",
+    
+    # NEW: Model for Augmentation tasks
+    "OLLAMA_MODEL_NAME_AUGMENTATION": "llama3:8b",
 
     # --- 6. Generic LLM Generation Settings ---
     # These settings are provider-agnostic and will be used by whichever manager is active.
@@ -105,6 +117,9 @@ CONFIG = {
     "DEFAULT_FINAL_SOLVER_TEMPERATURE": 1.0, # High temp for creative/diverse single-pass solutions.
     "DEFAULT_PASS_N_SOLVER_TEMPERATURE": 1.0,# High temp for generating diverse attempts in Pass@N.
     "DEFAULT_EVALUATOR_TEMPERATURE": 0.0,    # Low temp for deterministic, consistent evaluation.
+    
+    # NEW: Temperature for Augmentation (needs creativity)
+    "DEFAULT_AUGMENTATION_TEMPERATURE": 0.7,
 
     # NEW: Max Output Tokens Settings
     # These will be used to construct the `GenerationConfig` for Gemini calls.
