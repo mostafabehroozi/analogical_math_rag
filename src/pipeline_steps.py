@@ -20,7 +20,8 @@ where possible, allowing the orchestrator to log partial results and enable
 targeted retries.
 
 This version also includes new, optional pipeline steps for self-sampling,
-augmentation, analogical adaptation, and the NEW Analogical Consistency check.
+augmentation, analogical adaptation, the NEW Analogical Consistency check,
+the Group-Based Self-Consistency Selection, and the NEW Hierarchical Augmentation.
 
 PERFORMANCE FIX: The retrieve() function now uses O(1) hash map lookup instead
 of O(n) linear search for self-match detection, reducing retrieval time from
@@ -29,6 +30,7 @@ of O(n) linear search for self-match detection, reducing retrieval time from
 UPGRADE: Now supports Recursive Analogical Chains (Tree-structured context).
 UPGRADE: Now supports Group-Based Self-Consistency Selection.
 UPGRADE: Now supports Hierarchical Augmentation with Backward Propagation.
+UPGRADE: Now supports Analogical Consistency Check (Reverse Validation).
 """
 
 import logging
@@ -58,10 +60,15 @@ from src.prompts import (
     create_self_sampling_prompt,
     create_augmentation_prompt,
     create_analogical_adaptation_prompt,
-    create_hierarchical_parent_solver_prompt # NEW import
+    create_hierarchical_parent_solver_prompt,
+    create_reverse_validation_prompt # NEW import
 )
+from src.utils import save_json, load_json
+from src.hf_sync import periodic_sync_check
 # MODIFIED: Import manager classes for type checking
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+# NEW: Import evaluation logic for the internal loop
+from src.evaluation import evaluate_single_answer_with_llm
 
 
 def log_time_diagnostic(message: str, start_time: float, indent: int = 0) -> float:
@@ -1375,4 +1382,180 @@ def solve_hierarchical_tree(
         "root_solution": root.solution,
         "root_solution_attempts": final_attempts,
         "tree_structure": root.to_dict()
+    }
+
+
+# --- 9. NEW FEATURE: Analogical Consistency (Reverse Validation) ---
+
+def solve_with_analogical_consistency(
+    target_query: str,
+    exemplar_data: Dict[str, Any],
+    embedding_model: SentenceTransformer,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Executes the Analogical Consistency Check (Reverse Validation) workflow.
+
+    Algorithm:
+    1. Generate N Candidate solutions for the Target Question.
+    2. Retrieve K Validator questions (similar solved examples) from corpus.
+    3. For each Candidate C_i:
+       - For each Validator V_j:
+         - Solve V_j using C_i as the analogy (N_val times).
+         - Evaluate generated answer against V_j's ground truth.
+    4. Score C_i based on total correct validations.
+    5. Select best Candidate.
+
+    Args:
+        target_query (str): The main hard question.
+        exemplar_data (Dict): Contains 'questions', 'solutions', 'embeddings'.
+        embedding_model (SentenceTransformer): For retrieval.
+        api_manager_solve (Any): API Manager for generation (candidates + validation).
+        api_manager_eval (Any): API Manager for checking validation correctness.
+        config (Dict): Configuration dictionary.
+
+    Returns:
+        Dict: Structured result with selection details and statistics.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting Analogical Consistency Check for query: {target_query[:50]}...")
+    print("\n" + "="*60)
+    print("  [ANALOGICAL CONSISTENCY CHECK] Reverse Validation Mode")
+    print("="*60)
+
+    # --- Config Parameters ---
+    n_candidates = config.get("REVERSE_VALIDATION_CANDIDATES_N", 5)
+    k_validators = config.get("REVERSE_VALIDATION_RETRIEVAL_K", 3)
+    n_validation_attempts = config.get("REVERSE_VALIDATION_ATTEMPTS_N", 5)
+    
+    # Determine Model for Generation
+    if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    else: raise TypeError(f"Unsupported API manager: {type(api_manager_solve)}")
+    
+    # --- Step 1: Generate Candidates ---
+    print(f"\n  [Phase 1] Generating {n_candidates} Candidate Solutions...")
+    
+    # Reuse self_sampling logic for candidate generation (Zero-shot)
+    # Note: self_sample returns "Question: ... Rationale...". We just need the rationale/answer part or full text.
+    # self_sample returns list of formatted strings.
+    # To get pure solution candidates, we might prefer direct generation, but let's reuse helper for consistency.
+    
+    # Temporarily override temp for diversity if needed, though self_sampling uses SELF_SAMPLING_TEMPERATURE
+    candidate_config = config.copy()
+    candidate_config["SELF_SAMPLING_N"] = n_candidates
+    
+    candidates_result = self_sample(target_query, api_manager_solve, candidate_config)
+    
+    if candidates_result['status'] == 'FAILURE':
+        logger.error("Failed to generate any candidates.")
+        return {"status": "FAILURE", "error": "Candidate generation failed"}
+        
+    candidates = candidates_result['self_sampled_texts'] # These are "Question: ...\nRationale..." strings
+    print(f"    -> Generated {len(candidates)} candidates.")
+
+    # --- Step 2: Retrieve Validators ---
+    print(f"\n  [Phase 2] Retrieving {k_validators} Validators (Ground Truths)...")
+    
+    retrieval_res = retrieve(
+        target_query, embedding_model, 
+        exemplar_data['questions'], exemplar_data['embeddings'], 
+        top_k=k_validators, question_to_index_map=exemplar_data.get('question_to_index')
+    )
+    
+    if retrieval_res['status'] != 'SUCCESS' or not retrieval_res['retrieved_indices']:
+        logger.error("Failed to retrieve validators.")
+        return {"status": "FAILURE", "error": "Validator retrieval failed"}
+        
+    validator_indices = retrieval_res['retrieved_indices']
+    validators = []
+    for idx in validator_indices:
+        validators.append({
+            "question": exemplar_data['questions'][idx],
+            "ground_truth": exemplar_data['solutions'][idx]
+        })
+    print(f"    -> Retrieved {len(validators)} validators.")
+
+    # --- Step 3: Validation Loop ---
+    print(f"\n  [Phase 3] Reverse Validation Loop ({len(candidates)} Candidates x {len(validators)} Validators x {n_validation_attempts} Attempts)...")
+    
+    candidate_stats = []
+    
+    for c_idx, cand_text in enumerate(candidates):
+        # cand_text is "Question: ... Rationale ...". For the prompt, we use it as the "Reference Example".
+        
+        total_attempts = 0
+        correct_attempts = 0
+        validator_details = []
+        
+        print(f"    -> Testing Candidate #{c_idx + 1}...")
+        
+        for v_idx, val in enumerate(validators):
+            val_q = val['question']
+            val_gt = val['ground_truth']
+            
+            # Create prompt: Solve val_q using cand_text as analogy
+            prompt = create_reverse_validation_prompt(val_q, cand_text, config)
+            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0) # High temp for robust checking
+            
+            v_correct = 0
+            
+            for att in range(n_validation_attempts):
+                # Generate Solution for Validator
+                resp = api_manager_solve.generate_content(prompt, model_name, temp)
+                
+                if resp['status'] == 'SUCCESS':
+                    # Check Correctness (Internal Evaluation)
+                    eval_res = evaluate_single_answer_with_llm(
+                        resp['text'], val_gt, api_manager_eval, config
+                    )
+                    
+                    if eval_res['status'] == 'SUCCESS' and eval_res['is_correct']:
+                        v_correct += 1
+                        
+                # Note: We count failed API calls as incorrect attempts for the score, 
+                # effectively penalizing unreliable candidates/models.
+            
+            total_attempts += n_validation_attempts
+            correct_attempts += v_correct
+            validator_details.append({"validator_idx": v_idx, "score": f"{v_correct}/{n_validation_attempts}"})
+            
+        consistency_score = correct_attempts / total_attempts if total_attempts > 0 else 0
+        print(f"       -> Score: {consistency_score:.2f} ({correct_attempts}/{total_attempts})")
+        
+        candidate_stats.append({
+            "candidate_id": c_idx,
+            "candidate_text": cand_text,
+            "consistency_score": consistency_score,
+            "raw_score": f"{correct_attempts}/{total_attempts}",
+            "validator_breakdown": validator_details
+        })
+
+    # --- Step 4: Selection ---
+    if not candidate_stats:
+        return {"status": "FAILURE", "error": "No stats generated"}
+        
+    # Sort by consistency score descending
+    candidate_stats.sort(key=lambda x: x['consistency_score'], reverse=True)
+    
+    best_candidate = candidate_stats[0]
+    print(f"\n  [Selection] Selected Candidate #{best_candidate['candidate_id'] + 1} with Score {best_candidate['consistency_score']:.2f}")
+    
+    # Extract just the rationale/answer part for the final "solution_attempts" format if needed,
+    # or return the full text. The evaluator expects standard format or just answer.
+    # Since self_sample returns full formatted text, we pass that.
+    
+    # Just extracting the solution part from the formatted text for cleaner logs if desired,
+    # but the evaluator usually parses the whole block.
+    
+    return {
+        "status": "SUCCESS",
+        "selected_candidate": best_candidate['candidate_text'],
+        "selected_score": best_candidate['consistency_score'],
+        # Wrap in a list to mimic standard "solution_attempts" for Pass@1 compatibility in analysis
+        "solution_attempts": [best_candidate['candidate_text']], 
+        "consistency_stats": candidate_stats
     }

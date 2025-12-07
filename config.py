@@ -230,6 +230,18 @@ CONFIG = {
     "PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER": "hierarchical_parent_solver_v1",       # Used to solve parent using children.
     "PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER": "final_solver_simple_v1",                # Used to solve leaves (with or without RAG).
 
+    # --- 8i. NEW FEATURES: Analogical Consistency (Reverse Validation) ---
+    "APPLY_REVERSE_VALIDATION": False,           # Master switch for the new validation feature
+    
+    # Phase 1: Candidate Generation
+    "REVERSE_VALIDATION_CANDIDATES_N": 5,        # Number of initial solution candidates to generate for the Target Question
+    
+    # Phase 2: Retrieval of Validators
+    "REVERSE_VALIDATION_RETRIEVAL_K": 3,         # Number of ground-truth samples to retrieve to act as validators
+    
+    # Phase 3: Validation Loop
+    "REVERSE_VALIDATION_ATTEMPTS_N": 5,          # Number of times to solve EACH validator using the Candidate as analogy
+
     # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
@@ -258,6 +270,9 @@ CONFIG = {
     
     # Prompt for the consistency solver (using one specific exemplar)
     "PROMPT_TEMPLATE_CONSISTENCY_SOLVER": "analogical_adaptation_v1", 
+    
+    # Prompt for the reverse validation solver (Candidate -> Validator)
+    "PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER": "analogical_adaptation_v1",
 
     # --- 11. Hugging Face Hub Synchronization ---
     "PERSIST_RESULTS_ONLINE": True,

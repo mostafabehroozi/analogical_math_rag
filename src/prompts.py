@@ -1,3 +1,7 @@
+#======================================================================
+#   File: src/prompts.py
+#======================================================================
+
 # src/prompts.py
 
 """
@@ -832,6 +836,33 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
+    # --- NEW FEATURE: Reverse Validation / Analogical Consistency Check ---
+    "reverse_validation_v1": """You are an expert mathematical problem solver.
+Your task is to solve the following 'Target Question' by applying the reasoning logic found in the provided 'Reference Example'.
+
+<Reference Example>
+{candidate_exemplar}
+</Reference Example>
+
+<Target Question>
+{validator_question}
+</Target Question>
+
+<Instructions>
+1. Analyze the Reference Example to understand the method used.
+2. Apply that same method/logic to solve the Target Question.
+3. Output the solution in the standard format.
+</Instructions>
+
+<Output Format>
+Rationale:
+[Step-by-step derivation]
+
+Final Answer:
+[The final result]
+</Output Format>
+""",
+
 }
 
 
@@ -1030,3 +1061,41 @@ def create_hierarchical_parent_solver_prompt(main_question: str, child_nodes_dat
         child_block += f"<Variation {i+1}>\nQuestion: {child.get('question', '')}\nSolution: {child.get('solution', '')}\n</Variation {i+1}>\n\n"
         
     return template.format(main_question_text=main_question, child_solutions_block=child_block.strip())
+
+def create_reverse_validation_prompt(validator_question: str, candidate_text: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt for the Reverse Validation (Analogical Consistency) feature.
+    
+    Args:
+        validator_question (str): The retrieved question (ground truth known) to be solved.
+        candidate_text (str): The generated candidate solution to act as the exemplar.
+        config (Dict[str, Any]): Global config.
+        
+    Returns:
+        str: Formatted prompt.
+    """
+    template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER", "reverse_validation_v1")
+    
+    # Compatibility Check: If user configured an 'analogical_adaptation' template
+    if template_name == "analogical_adaptation_v1" or template_name == "analogical_adaptation_v2":
+        if template_name not in PROMPT_TEMPLATES:
+            return f"Error: Template {template_name} not found."
+            
+        # These templates expect 'main_question_text' and 'samples_block'/'examples_block'
+        # Wrap candidate in tags for consistency
+        samples_block = f"<Sample>\n{candidate_text}\n</Sample>"
+        template = PROMPT_TEMPLATES[template_name]
+        
+        # Use safe formatting to handle potential missing keys if v1 vs v2
+        return template.format(
+            main_question_text=validator_question,
+            samples_block=samples_block,
+            examples_block=samples_block # v2 uses examples_block
+        )
+
+    # Standard Case: Use the dedicated Reverse Validation template
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(validator_question=validator_question, candidate_exemplar=candidate_text)

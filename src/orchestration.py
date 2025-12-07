@@ -49,7 +49,8 @@ from src.pipeline_steps import (
     self_sample, augment_question, select_augmented_questions, analogical_adapt,
     generate_reasoning_pathways, # NEW Import for Pathway Consistency
     solve_with_group_consistency, # NEW Import for Group Consistency
-    solve_hierarchical_tree # NEW Import for Hierarchical Augmentation
+    solve_hierarchical_tree, # NEW Import for Hierarchical Augmentation
+    solve_with_analogical_consistency # NEW Import for Reverse Validation
 )
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -114,7 +115,10 @@ def run_pipeline_for_single_query(
                     "GROUP_CONSISTENCY_SAMPLES_N",
                     # Hierarchical Augmentation Flags
                     "APPLY_HIERARCHICAL_AUGMENTATION", "HIERARCHICAL_TREE_DEPTH",
-                    "HIERARCHICAL_BRANCHING_FACTOR", "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED"
+                    "HIERARCHICAL_BRANCHING_FACTOR", "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED",
+                    # Reverse Validation Flags
+                    "APPLY_REVERSE_VALIDATION", "REVERSE_VALIDATION_CANDIDATES_N",
+                    "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N"
                 ]
             },
             "pipeline_status": "PENDING",
@@ -131,6 +135,34 @@ def run_pipeline_for_single_query(
     provider_for_aug = config.get('API_PROVIDER_AUGMENTATION', provider_for_adapt) # Fallback to adapt if not set
     manager_for_aug = api_managers[provider_for_aug]
     
+    # NEW: Specific Manager for Evaluation (needed for Reverse Validation loop)
+    provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
+    manager_for_eval = api_managers[provider_for_eval]
+
+    # --- NEW: Branch for Reverse Validation (Analogical Consistency) ---
+    if config.get('APPLY_REVERSE_VALIDATION', False):
+        print("\n[MODE] ANALOGICAL CONSISTENCY (REVERSE VALIDATION) ACTIVATED")
+        # This mode replaces the standard solve flow entirely.
+        
+        consistency_result = solve_with_analogical_consistency(
+            target_query=target_query,
+            exemplar_data=exemplar_data,
+            embedding_model=embedding_model,
+            api_manager_solve=manager_for_solve,
+            api_manager_eval=manager_for_eval, # Needs eval manager to check validators
+            config=config
+        )
+        
+        run_log['steps']['solving'] = consistency_result
+        
+        if consistency_result['status'] == 'SUCCESS':
+            # run_log['llm_final_solution_attempts_texts'] = [consistency_result['selected_candidate']]
+            run_log['pipeline_status'] = "SUCCESS"
+        else:
+            run_log['pipeline_status'] = f"FAILURE: {consistency_result.get('error')}"
+            
+        return run_log
+
     # --- NEW: Branch for Hierarchical Augmentation (Tree-Based) ---
     if config.get('APPLY_HIERARCHICAL_AUGMENTATION', False):
         print("\n[MODE] HIERARCHICAL AUGMENTATION ACTIVATED")
@@ -162,9 +194,9 @@ def run_pipeline_for_single_query(
             
         return run_log
 
-    # --- NEW: Branch for Analogical Consistency Check (The "Pathway" approach) ---
+    # --- NEW: Branch for Analogical Consistency Check (The "Pathway" approach - OLD VERSION) ---
     if config.get('APPLY_CONSISTENCY_ANALOGICAL_CHECK', False):
-        print("\n[MODE] ANALOGICAL CONSISTENCY CHECK ACTIVATED")
+        print("\n[MODE] ANALOGICAL CONSISTENCY CHECK (PATHWAY) ACTIVATED")
         
         # 1. Generate Layer 1 (Reasoning Pathways / Exemplars)
         print(f"[LAYER 1] Generating {config.get('CONSISTENCY_PATHWAYS_K')} Reasoning Pathways...")
