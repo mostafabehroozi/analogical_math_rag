@@ -217,6 +217,10 @@ CONFIG = {
     # --- 8h. NEW FEATURES: Hierarchical Augmentation Configuration ---
     "APPLY_HIERARCHICAL_AUGMENTATION": False,   # Master switch for the tree-based augmentation pipeline.
     
+    # NEW FLAG: Controls how the augmentation output is parsed
+    # Options: "decomposition" (expects numbered list), "simplification" (expects single raw string)
+    "HIERARCHICAL_AUGMENTATION_MODE": "decomposition",
+
     # Tree Structure Settings
     "HIERARCHICAL_TREE_DEPTH": 2,               # Number of layers below the root (e.g., 2 means Root -> Layer 1 -> Layer 2 (Leaves)).
     "HIERARCHICAL_BRANCHING_FACTOR": 3,         # Number of augmented children to generate per node.

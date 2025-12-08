@@ -31,6 +31,7 @@ UPGRADE: Now supports Recursive Analogical Chains (Tree-structured context).
 UPGRADE: Now supports Group-Based Self-Consistency Selection.
 UPGRADE: Now supports Hierarchical Augmentation with Backward Propagation.
 UPGRADE: Now supports Analogical Consistency Check (Reverse Validation).
+UPGRADE: Now supports 'Simplification' mode for Hierarchical Augmentation (raw text parsing).
 """
 
 import logging
@@ -595,6 +596,8 @@ def augment_question(
     If the schedule is defined (e.g., [2, 3]), it will make 2 API calls,
     each requesting 3 questions. Otherwise, it falls back to a single call
     for `n_augmentations` questions.
+    
+    Now supports 'simplification' mode (raw text) vs 'decomposition' mode (numbered list).
     """
     logger = logging.getLogger(__name__)
 
@@ -612,6 +615,10 @@ def augment_question(
     # Use specific augmentation temperature
     temperature = config.get("DEFAULT_AUGMENTATION_TEMPERATURE", 0.7)
     
+    # === NEW: Detect Mode ===
+    aug_mode = config.get("HIERARCHICAL_AUGMENTATION_MODE", "decomposition")
+    # ========================
+
     # --- Check for Augmentation Schedule ---
     schedule = config.get("AUGMENTATION_SCHEDULE")
 
@@ -629,8 +636,17 @@ def augment_question(
             response = api_manager.generate_content(prompt, model_name, temperature)
 
             if response['status'] == 'SUCCESS':
-                parsed_qs = parse_numbered_questions(response['text'])
-                if len(parsed_qs) < questions_per_call:
+                # === MODIFIED PARSING LOGIC ===
+                if aug_mode == "simplification":
+                    # In simplification mode, we assume the whole text is ONE question.
+                    # We strip whitespace and add it to the list.
+                    parsed_qs = [response['text'].strip()]
+                else:
+                    # In decomposition mode, we use the regex parser.
+                    parsed_qs = parse_numbered_questions(response['text'])
+                # ==============================
+
+                if len(parsed_qs) < questions_per_call and aug_mode == "decomposition":
                     logger.warning(f"Augmentation call {i+1} expected {questions_per_call} questions, but only parsed {len(parsed_qs)}.")
                 all_augmented_questions.extend(parsed_qs)
             else:
@@ -661,9 +677,15 @@ def augment_question(
         if response['status'] != 'SUCCESS':
             return {"status": "FAILURE", "augmented_questions": [], "error_info": response}
         
-        augmented_questions = parse_numbered_questions(response['text'])
+        # === MODIFIED PARSING LOGIC ===
+        if aug_mode == "simplification":
+            # Just take the raw text as the single question
+            augmented_questions = [response['text'].strip()]
+        else:
+            augmented_questions = parse_numbered_questions(response['text'])
+        # ==============================
         
-        if len(augmented_questions) < n_augmentations:
+        if len(augmented_questions) < n_augmentations and aug_mode == "decomposition":
             logger.warning(f"Augmentation expected {n_augmentations} questions, but only parsed {len(augmented_questions)}.")
         
         return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None}

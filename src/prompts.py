@@ -703,6 +703,42 @@ An airline serves a dinner to all the passengers on an airplane. They get their 
 </Base Question>
 </Task>
 """,
+    
+    # --- NEW: Simplification Prompt Template ---
+    "self_sampling_augmentor_simplification":"""You are an expert mathematical simplification assistant. Your task is to take a 'Base Question' and produce a ONE-STEP SIMPLIFIED version of it. This simplified version will be used as a stepping stone to solve the original problem.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify the "Core Logic" (the main rule or formula needed) and the "Complexity Layers" (large numbers, extra arithmetic steps, or difficult variables).
+2. Create EXACTLY ONE new math question.
+3. CRITICAL CONSTRAINTS for the new question:
+    - Lite Simplification: Make the question ONLY slightly easier. Do not make it trivial.
+    - Prune One Leaf: Remove exactly one layer of complexity. For example:
+        *   If the numbers are large, make them smaller integers.
+        *   If there is a pre-calculation required (e.g., "radius is 2+3"), change it to the direct value ("radius is 5").
+        *   If there are many variables, remove one variable.
+    - Preserve the Trunk: The main mathematical logic required to solve the simplified question MUST remain the same as the Base Question.
+    - Standalone: The new question must be a complete sentence and solvable.
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the simplified question statement.
+</Instructions>
+
+<Example>
+<Base Question>
+Find the area of a circle inscribed in a square that has a diagonal length of 8.
+</Base Question>
+
+<Your Output>
+Find the area of a circle inscribed in a square that has a side length of 4.
+</Your Output>
+(Note: The simplification removed the step of calculating the side from the diagonal, but kept the core logic of the circle-square relationship.)
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
 
     # --- NEW FEATURES: Analogical Adaptation Prompt ---
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
