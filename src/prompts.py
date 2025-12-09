@@ -703,6 +703,72 @@ An airline serves a dinner to all the passengers on an airplane. They get their 
 </Base Question>
 </Task>
 """,
+    "self_sampling_augmentor_decomposition_complex":"""You are an expert Logical Decomposition Specialist and Mathematical Architect. Your objective is not merely to simplify a problem, but to deconstruct a complex 'Base Question' into {n_samples} distinct, orthogonal sub-problems using the method of **Variable Isolation via Zero-State Application**.
+
+<Core_Philosophy>
+You must view the Base Question as a system composed of a **Trunk** and multiple **Aspects**.
+1.  **The Trunk (The Skeleton):** The fundamental reasoning pathway, physical law, or algorithmic structure that defines the problem type. This MUST exist in every sub-question. You effectively "freeze" the core logic.
+2.  **The Aspects (The Variables):** The specific constraints, complexities, or forces acting upon the Trunk (e.g., friction, tax rates, conditional probabilities).
+3.  **Orthogonality:** Each sub-question must focus on exactly ONE active Aspect while the others are dormant.
+4.  **The Zero-State Rule:** You do not *delete* the other aspects; you set them to their "Identity Value" or "Ideal State" so they no longer contribute to the difficulty but the Trunk remains valid.
+</Core_Philosophy>
+
+<Instructions>
+1.  **Analyze the Base Question:**
+    *   Identify the **Trunk**. (e.g., "Newton's Second Law" or "Compound Interest Formula").
+    *   List all distinct **Aspects** (complexities) present in the prompt.
+    *   Determine the **Zero-State** for each aspect (e.g., Friction → 0, Efficiency → 100%, Delay → 0 seconds).
+
+2.  **Generate {n_samples} Sub-Questions:**
+    *   For each sub-question, select **ONE** target Aspect to highlight.
+    *   Apply the **Zero-State Rule** to all *other* non-target aspects.
+    *   **Preserve the Trunk:** Ensure the core solving method remains identical to the Base Question, even if the values are simplified.
+
+3.  **Strict Constraints:**
+    *   **No Logic Deletion:** Do not remove the Trunk. If the Base Question is about calculating speed, every sub-question must still be about calculating speed/motion, not just "counting objects."
+    *   **Independence:** The specific challenge in Question 1 must not overlap with the specific challenge in Question 2. They must be orthogonal.
+    *   **Contextual Flexibility:** You may shift the setting (e.g., from cars to blocks, or apples to oranges) to make the isolation clearer, provided the mathematical structure remains isomorphic.
+
+4.  **Verification:**
+    *   Ensure that if a student solves all {n_samples} questions, they have practiced every mechanism required to solve the Base Question.
+</Instructions>
+
+<Zero_State_Protocol>
+When deactivating an Aspect, use these canonical values:
+*   **Additive constraints** (e.g., wind speed, fees): Set to **0**.
+*   **Multiplicative constraints** (e.g., coefficients, efficiency): Set to **1** (or 100%).
+*   **Logic gates** (e.g., "if it is raining"): Set to the **Simplest Valid Truth Value** (e.g., "It is sunny/dry").
+*   *Warning:* Do not set values that cause division by zero or logical paradoxes.
+</Zero_State_Protocol>
+
+<One_Shot_Example>
+<Base_Question>
+A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction is 0.1, and air resistance acts against the car with a force of 200N. Calculate the total engine force required to maintain a constant velocity.
+</Base_Question>
+
+<Reasoning_Trace>
+*   **Trunk:** Forces Logic (Sum of opposing forces = Engine Force).
+*   **Aspects:** 1. Gravity (Incline), 2. Friction, 3. Air Resistance.
+*   **Zero-States:** Incline → 0 degrees (Flat), Friction → $\mu=0$ (Smooth), Air Resistance → 0N (Vacuum).
+</Reasoning_Trace>
+
+<Your_Output (for n_samples = 3)>
+1. (Target: Gravity/Incline) A 1000kg car drives up a 30-degree incline on a perfectly smooth surface where friction is negligible and there is no air resistance. Calculate the engine force required to maintain constant velocity.
+2. (Target: Friction) A 1000kg car drives on a flat, horizontal road (0-degree incline). The surface is rough with a kinetic friction coefficient of 0.1, and we assume air resistance is negligible. Calculate the engine force required to maintain constant velocity.
+3. (Target: Air Resistance) A 1000kg car drives on a flat, smooth horizontal road (no friction). However, a drag chute creates an air resistance force of 200N. Calculate the engine force required to maintain constant velocity.
+</Your_Output>
+</One_Shot_Example>
+
+<Task>
+<Base_Question>
+{main_question_text}
+</Base_Question>
+</Task>
+
+<Output_Requirement>
+Output ONLY the numbered list of question statements. Do not include your reasoning trace in the final output.
+</Output_Requirement>
+""",
     
     # --- NEW: Simplification Prompt Template ---
     "self_sampling_augmentor_simplification":"""You are an expert mathematical simplification assistant. Your task is to take a 'Base Question' and produce a ONE-STEP SIMPLIFIED version of it. This simplified version will be used as a stepping stone to solve the original problem.
@@ -898,6 +964,7 @@ Final Answer:
 [The final result]
 </Output Format>
 """,
+    
 
 }
 
