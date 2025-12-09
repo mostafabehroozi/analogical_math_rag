@@ -431,6 +431,31 @@ Final Answer:
 ---
 **Your Solution:**
 """,
+
+    "final_solver_v3": """You are an expert solver. Solve the Main Question, using the Solved Examples as inspiration for your methodology.
+    
+<Instructions>
+Look for patterns in the Solved Examples that might help solve the Main Question. Adopt these strategies where they fit, but feel free to deviate from them if the new question requires a different logic. Treat the examples as suggestions, not strict rules.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
     
     "final_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
