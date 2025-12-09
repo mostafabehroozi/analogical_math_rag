@@ -432,7 +432,6 @@ Final Answer:
 **Your Solution:**
 """,
     
-    # --- NEW: final_solver_v2 Template ---
     "final_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
 
@@ -532,7 +531,6 @@ Begin Output:
 **Is there an exact match? (yes/no):**
 """,
 
-    # --- NEW FEATURES: Self-Sampling Prompts ---
     "self_sampling_generator": """Objective:
 Your task is to solve the Main Question by providing a formal, step-by-step solution and a final answer. The solution should be presented in an academic, textbook-style format.
     
@@ -727,7 +725,7 @@ You must view the Base Question as a system composed of a **Trunk** and multiple
 3.  **Strict Constraints:**
     *   **No Logic Deletion:** Do not remove the Trunk. If the Base Question is about calculating speed, every sub-question must still be about calculating speed/motion, not just "counting objects."
     *   **Independence:** The specific challenge in Question 1 must not overlap with the specific challenge in Question 2. They must be orthogonal.
-    *   **Contextual Flexibility:** You may shift the setting (e.g., from cars to blocks, or apples to oranges) to make the isolation clearer, provided the mathematical structure remains isomorphic.
+    *   **Contextual Divergence (CRITICAL):** To prevent analogical hallucination, the sub-questions must NOT use the same setting or objects as the Base Question. If the Base Question is about "Cars," the sub-questions must be about "Blocks," "Particles," or "Widgets." Change the *Skin*, keep the *Math*.
 
 4.  **Verification:**
     *   Ensure that if a student solves all {n_samples} questions, they have practiced every mechanism required to solve the Base Question.
@@ -750,12 +748,13 @@ A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction 
 *   **Trunk:** Forces Logic (Sum of opposing forces = Engine Force).
 *   **Aspects:** 1. Gravity (Incline), 2. Friction, 3. Air Resistance.
 *   **Zero-States:** Incline → 0 degrees (Flat), Friction → $\mu=0$ (Smooth), Air Resistance → 0N (Vacuum).
+*   **Context Strategy:** Change "Car/Road" to "Block/Ramp", "Crate/Floor", "Sled/Track".
 </Reasoning_Trace>
 
 <Your_Output (for n_samples = 3)>
-1. (Target: Gravity/Incline) A 1000kg car drives up a 30-degree incline on a perfectly smooth surface where friction is negligible and there is no air resistance. Calculate the engine force required to maintain constant velocity.
-2. (Target: Friction) A 1000kg car drives on a flat, horizontal road (0-degree incline). The surface is rough with a kinetic friction coefficient of 0.1, and we assume air resistance is negligible. Calculate the engine force required to maintain constant velocity.
-3. (Target: Air Resistance) A 1000kg car drives on a flat, smooth horizontal road (no friction). However, a drag chute creates an air resistance force of 200N. Calculate the engine force required to maintain constant velocity.
+1. A heavy stone block of mass 1000kg is being pushed up a smooth, frictionless ramp angled at 30 degrees. Assuming a vacuum (no air resistance), calculate the pushing force required to keep the block moving at a constant velocity.
+2. A large wooden crate (1000kg) slides across a flat, horizontal warehouse floor (0-degree incline). The floor is rough with a kinetic friction coefficient of 0.1, and we assume air resistance is negligible. Calculate the horizontal force needed to maintain constant velocity.
+3. A 1000kg test sled moves along a flat, smooth horizontal track (no friction). However, a parachute attached to the back creates a drag force of 200N. Calculate the propulsion force required to maintain constant velocity.
 </Your_Output>
 </One_Shot_Example>
 
@@ -766,11 +765,66 @@ A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction 
 </Task>
 
 <Output_Requirement>
-Output ONLY the numbered list of question statements. Do not include your reasoning trace in the final output.
+Output ONLY the numbered list of question statements. Do not include your reasoning trace or target labels in the final output.
+</Output_Requirement>
+""",
+
+    "self_sampling_augmentor_decomposition_complex_2":"""You are an expert Logical Decomposition Specialist and Mathematical Architect. Your objective is to deconstruct a complex 'Base Question' into {n_samples} distinct, orthogonal sub-problems using the method of **Variable Isolation via Zero-State Application**.
+
+<Core_Philosophy>
+You must view the Base Question as a system composed of a **Trunk** and multiple **Aspects**.
+1.  **The Trunk (The Skeleton):** The fundamental reasoning pathway or formula. This MUST exist in every sub-question.
+2.  **The Aspects (The Variables):** The specific constraints acting upon the Trunk.
+3.  **Orthogonality:** Each sub-question must focus on exactly ONE active Aspect while the others are dormant (Zero-State).
+4.  **The Zero-State Rule:** Do not delete aspects; set them to their "Identity Value" or "Ideal State" so the Trunk remains executable but the aspect is trivialized.
+</Core_Philosophy>
+
+<Instructions>
+1.  **Analyze the Base Question:** Identify the Trunk (logic), the Aspects (complexities), and the Zero-State for each aspect.
+2.  **Generate {n_samples} Sub-Questions:**
+    *   Select **ONE** target Aspect to highlight per question.
+    *   Apply the **Zero-State Rule** to all *other* non-target aspects.
+    *   **Preserve the Trunk:** Ensure the core solving method remains identical.
+3.  **Strict Constraints:**
+    *   **No Logic Deletion:** Do not remove the Trunk. The underlying equation/logic must remain isomorphic.
+    *   **Contextual Divergence (CRITICAL):** To prevent analogical hallucination, the sub-questions must NOT use the same setting or objects as the Base Question. If the Base Question is about "Cars," the sub-questions must be about "Blocks," "Particles," or "Widgets." Change the *Skin*, keep the *Math*.
+    *   **Independence:** The specific challenge in Question 1 must not overlap with Question 2.
+
+<Zero_State_Protocol>
+*   **Additive constraints** (e.g., wind, fees): Set to **0**.
+*   **Multiplicative constraints** (e.g., efficiency): Set to **1** (or 100%).
+*   **Logic gates**: Set to the **Simplest Valid Truth Value**.
+</Zero_State_Protocol>
+
+<One_Shot_Example>
+<Base_Question>
+A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction is 0.1, and air resistance acts against the car with a force of 200N. Calculate the total engine force required to maintain a constant velocity.
+</Base_Question>
+
+<Reasoning_Trace>
+*   **Trunk:** Forces Logic (Sum of opposing forces = Forward Force).
+*   **Aspects:** Gravity (Incline), Friction, Drag.
+*   **Context Strategy:** Base is "Car/Road". Sub-questions must use different scenarios like "Block/Ramp" or "Sled/Ice".
+</Reasoning_Trace>
+
+<Your_Output (for n_samples = 3)>
+1. A heavy stone block of mass 1000kg is being pushed up a smooth, frictionless ramp angled at 30 degrees. Assuming a vacuum (no air resistance), what is the pushing force required to keep the block moving at a constant velocity?
+2. A large wooden crate (1000kg) slides across a flat, horizontal warehouse floor. The floor is rough with a kinetic friction coefficient of 0.1. Ignoring air resistance, calculate the horizontal force needed to maintain constant velocity.
+3. A 1000kg test sled moves along a flat, frictionless magnetic track. A parachute attached to the back creates a drag force of 200N. Calculate the propulsion force required to maintain constant velocity.
+</Your_Output>
+</One_Shot_Example>
+
+<Task>
+<Base_Question>
+{main_question_text}
+</Base_Question>
+</Task>
+
+<Output_Requirement>
+Output ONLY the numbered list of question statements. Do not include your reasoning trace.
 </Output_Requirement>
 """,
     
-    # --- NEW: Simplification Prompt Template ---
     "self_sampling_augmentor_simplification":"""You are an expert mathematical simplification assistant. Your task is to take a 'Base Question' and produce a ONE-STEP SIMPLIFIED version of it. This simplified version will be used as a stepping stone to solve the original problem.
 
 <Instructions>
@@ -806,7 +860,6 @@ Find the area of a circle inscribed in a square that has a side length of 4.
 </Task>
 """,
 
-    # --- NEW FEATURES: Analogical Adaptation Prompt ---
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
 
 Your task is to solve the Main Question by using analogical reasoning based on the provided group of Solved Sample Problems.
@@ -887,7 +940,6 @@ Final Answer:
 </Your Answer/Output Format>
 """,
     
-    # --- NEW FEATURE: Hierarchical Parent Solver ---
     "hierarchical_parent_solver_v1": """You are an expert mathematical problem solver.
 You are tasked with solving a **Main Question**.
 To assist you, we have broken this problem down into several related sub-problems or variations, and provided their solutions below.
@@ -938,7 +990,6 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
-    # --- NEW FEATURE: Reverse Validation / Analogical Consistency Check ---
     "reverse_validation_v1": """You are an expert mathematical problem solver.
 Your task is to solve the following 'Target Question' by applying the reasoning logic found in the provided 'Reference Example'.
 
