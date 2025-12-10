@@ -885,6 +885,38 @@ Find the area of a circle inscribed in a square that has a side length of 4.
 </Task>
 """,
 
+    "self_sampling_augmentor_simplification_2":"""You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\pi$), messy units, or overly wordy variable descriptions.
+2. Create EXACTLY ONE new math question.
+3. CRITICAL CONSTRAINTS for the new question:
+    - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt{3}$ with 4).
+    - Syntactic Cleanup: If the question uses complex units or wordy names for variables, standardize them (e.g., change "nautical miles" to "meters", change "the number of apples John holds" to "x").
+    - Logic Lock: Do NOT remove any reasoning steps, formulas, or intermediate derivations. The path to the solution must remain exactly the same, only the arithmetic should become effortless.
+    - Standalone: The new question must be a complete sentence and solvable.
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the simplified question statement.
+</Instructions>
+
+<Example>
+<Base Question>
+Calculate the kinetic energy of an object with a mass of 4.5kg moving at a velocity of $12.2 \text{ m/s}$.
+</Base Question>
+
+<Your Output>
+Calculate the kinetic energy of an object with a mass of 2kg moving at a velocity of $4 \text{ m/s}$.
+</Your Output>
+(Note: The decimal values were replaced with simple integers to make the calculation trivial, but the physics formula required remains exactly the same.)
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
 
 Your task is to solve the Main Question by using analogical reasoning based on the provided group of Solved Sample Problems.
