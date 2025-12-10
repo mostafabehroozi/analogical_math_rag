@@ -885,7 +885,7 @@ Find the area of a circle inscribed in a square that has a side length of 4.
 </Task>
 """,
 
-    "self_sampling_augmentor_simplification_2":"""You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical.
+    "self_sampling_augmentor_simplification_shallow":"""You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical.
 
 <Instructions>
 1. Analyze the 'Base Question' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\pi$), messy units, or overly wordy variable descriptions.
