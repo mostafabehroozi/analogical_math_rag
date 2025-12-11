@@ -447,7 +447,6 @@ Look for patterns in the Solved Examples that might help solve the Main Question
 </Main Question to Solve>
 
 
-
 <Your Answer/Output Format>
 Rationale:
 [Your step-by-step rationale for the Main Question]
@@ -455,6 +454,30 @@ Rationale:
 Final Answer:
 [Your final answer to the Main Question]
 </Your  Answer/Output Format>
+""",
+
+"final_solver_v4": """Use the Solved Examples as a blueprint to solve the Main Question.
+<Instructions>
+- Study the examples to understand the logical method used to reach the solution.
+- Extract the key reasoning pattern.
+- Apply this pattern to the Main Question.
+- Provide the solution as a concise, technical derivation. Focus strictly on the mathematical steps and logic, avoiding conversational language.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
 """,
     
     "final_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
@@ -505,6 +528,27 @@ Final Answer:
 {main_question_text}
 ---
 **Your Solution:**
+""",
+    "final_solver_simple_v2": """Solve the Main Question using standard mathematical methods.
+
+<Instructions>
+1. Analyze the question to identify the necessary logical steps.
+2. Provide the solution as a concise, technical derivation.
+3. Focus strictly on the mathematical steps and logic, avoiding conversational language, teaching explanations, or filler words.
+</Instructions>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
 """,
 
     "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
