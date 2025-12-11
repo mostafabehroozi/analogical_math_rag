@@ -1052,13 +1052,13 @@ To assist you, we have broken this problem down into several related sub-problem
 4. State the Final Answer clearly.
 </Instructions>
 
-<Solved Variations>
+<Solved Examples>
 {child_solutions_block}
-</Solved Variations>
+</Solved Examples>
 
-<Main Question>
+<Main Question to Solve>
 {main_question_text}
-</Main Question>
+</Main Question to Solve>
 
 <Output Format>
 Rationale:
@@ -1090,6 +1090,32 @@ Final Answer:
 [Your final answer to the Main Question]
 </Your  Answer/Output Format>
 """,
+
+    "hierarchical_parent_solver_v3": """Use the Solved Examples as a blueprint to solve the Main Question.
+<Instructions>
+- Study the examples to understand the logical method used to reach the solution.
+- Extract the key reasoning pattern.
+- Apply this pattern to the Main Question.
+- Provide the solution as a concise, technical derivation. Focus strictly on the mathematical steps and logic, avoiding conversational language.
+</Instructions>
+
+<Solved Variations>
+{child_solutions_block}
+</Solved Variations>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
 
     "reverse_validation_v1": """You are an expert mathematical problem solver.
 Your task is to solve the following 'Target Question' by applying the reasoning logic found in the provided 'Reference Example'.
