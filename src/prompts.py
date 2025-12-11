@@ -1201,8 +1201,10 @@ def create_final_reasoning_prompt(main_question_text: str, final_examples: List[
     template = PROMPT_TEMPLATES[template_name]
     
     # --- MODIFIED: Dynamic block creation based on template ---
-    if template_name == "final_solver_v2":
-        # Format for the new v2 template with XML-style tags
+    # Handle v2, v3, v4, and standard analogical adaptation templates
+    # They all use XML-style inputs and the {examples_block} placeholder.
+    if template_name in ["final_solver_v2", "final_solver_v3", "final_solver_v4", "analogical_adaptation_v2"]:
+        # Format for the new templates with XML-style tags
         examples_block = ""
         for i, sample_text in enumerate(final_examples):
             examples_block += f"<Example {i+1}>\n{sample_text}\n</Example {i+1}>\n\n"
