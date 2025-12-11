@@ -891,7 +891,7 @@ Find the area of a circle inscribed in a square that has a side length of 4.
 1. Analyze the 'Base Question' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\pi$), messy units, or overly wordy variable descriptions.
 2. Create EXACTLY ONE new math question.
 3. CRITICAL CONSTRAINTS for the new question:
-    - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt{3}$ with 4).
+    - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt 3$ with 4).
     - Syntactic Cleanup: If the question uses complex units or wordy names for variables, standardize them (e.g., change "nautical miles" to "meters", change "the number of apples John holds" to "x").
     - Logic Lock: Do NOT remove any reasoning steps, formulas, or intermediate derivations. The path to the solution must remain exactly the same, only the arithmetic should become effortless.
     - Standalone: The new question must be a complete sentence and solvable.
@@ -901,11 +901,11 @@ Find the area of a circle inscribed in a square that has a side length of 4.
 
 <Example>
 <Base Question>
-Calculate the kinetic energy of an object with a mass of 4.5kg moving at a velocity of $12.2 \text{ m/s}$.
+Calculate the kinetic energy of an object with a mass of 4.5kg moving at a velocity of $12.2 m/s$.
 </Base Question>
 
 <Your Output>
-Calculate the kinetic energy of an object with a mass of 2kg moving at a velocity of $4 \text{ m/s}$.
+Calculate the kinetic energy of an object with a mass of 2kg moving at a velocity of $4 m/s$.
 </Your Output>
 (Note: The decimal values were replaced with simple integers to make the calculation trivial, but the physics formula required remains exactly the same.)
 </Example>
