@@ -960,6 +960,21 @@ Calculate the kinetic energy of an object with a mass of 2kg moving at a velocit
 </Base Question>
 </Task>
 """,
+    "self_sampling_augmentor_simplification_simple_shallow":"""Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
+<Instructions>
+1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
+2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
+3. Reduce the number of steps or constraints slightly, as long as the underlying relationship remains the same.
+4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
+</Instructions>
+<Main Question>
+{main_question_text}
+</Main Question>
+<Output Format>
+Simplified Question:
+[Your simplified version]
+</Output Format>
+""",
 
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
 
