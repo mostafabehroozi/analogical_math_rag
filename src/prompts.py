@@ -1153,6 +1153,30 @@ Final Answer:
 [Your final answer to the Main Question]
 </Your  Answer/Output Format>
 """,
+    "hierarchical_parent_solver_v5": """Use the method from the Simplified Reference to solve the Main Question.
+
+<Instructions>
+1. The Simplified Reference solves the same problem with easier numbers/logic.
+2. Follow the exact same sequence of steps used in the Reference, but apply them to the Main Question's values.
+3. Perform the calculations carefully. The logic is identical, but the arithmetic is more complex.
+</Instructions>
+
+<Simplified Reference>
+{simplified_solution_block}
+</Simplified Reference>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Step-by-step derivation applying the Reference's logic to the Main Question]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
+""",
 
 
     "reverse_validation_v1": """You are an expert mathematical problem solver.
