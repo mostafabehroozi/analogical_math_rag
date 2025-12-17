@@ -1171,7 +1171,7 @@ Final Answer:
 
 <Your Answer/Output Format>
 Rationale:
-[Step-by-step derivation applying the Reference's logic to the Main Question]
+[Your step-by-step rationale for the Main Question]
 
 Final Answer:
 [Your final answer]
