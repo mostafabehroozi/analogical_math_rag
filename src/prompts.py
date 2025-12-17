@@ -1162,7 +1162,7 @@ Final Answer:
 </Instructions>
 
 <Simplified Reference>
-{simplified_solution_block}
+{child_solutions_block}
 </Simplified Reference>
 
 <Main Question to Solve>
