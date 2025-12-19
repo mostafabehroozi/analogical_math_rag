@@ -248,6 +248,12 @@ CONFIG = {
 
     # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
+    
+    # NEW: Master switch for Full Pipeline Pass@N
+    # If True: The entire pipeline (Retrieval->Adaptation->Merging->Solving) runs N times.
+    # If False: Pipeline runs once, Solver runs N times.
+    "APPLY_FULL_PIPELINE_RETRY": False,
+
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
     # --- 10. Prompt Template Selection ---

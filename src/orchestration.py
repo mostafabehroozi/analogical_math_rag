@@ -35,6 +35,10 @@ the Group-Based Self-Consistency Selection, and the NEW Hierarchical Augmentatio
 PERFORMANCE FIX: The call to the `retrieve` function has been updated to pass
 a pre-computed hash map, enabling O(1) self-match detection and resolving a
 major performance bottleneck.
+
+NEW FEATURE: Added `APPLY_FULL_PIPELINE_RETRY`. If True, the entire pipeline
+(Retrieval -> Adaptation -> Merging -> Solving) is re-run N times, rather than
+just retrying the final Solver step N times.
 """
 
 import logging
@@ -118,7 +122,9 @@ def run_pipeline_for_single_query(
                     "HIERARCHICAL_BRANCHING_FACTOR", "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED",
                     # Reverse Validation Flags
                     "APPLY_REVERSE_VALIDATION", "REVERSE_VALIDATION_CANDIDATES_N",
-                    "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N"
+                    "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N",
+                    # Full Pipeline Retry Flag
+                    "APPLY_FULL_PIPELINE_RETRY"
                 ]
             },
             "pipeline_status": "PENDING",
@@ -247,192 +253,256 @@ def run_pipeline_for_single_query(
         run_log['pipeline_status'] = "SUCCESS"
         return run_log
 
-    # --- Standard Pipeline Execution (If Consistency Check is False) ---
+    # --- Standard Pipeline Execution ---
     
-    pipeline_halted = False
+    # --- SETUP FULL PIPELINE RETRY LOGIC ---
+    # Determine if we run the pipeline once (standard) or N times (new feature)
+    full_retry_mode = config.get('APPLY_FULL_PIPELINE_RETRY', False)
     
-    # This list will hold the exemplars as they are processed and augmented through the pipeline.
-    exemplars_for_next_step = []
+    if full_retry_mode and run_mode == 'full':
+        # If enabled, disable DEFER_SOLVE_STEP as complex state saving is not supported
+        if config.get("DEFER_SOLVE_STEP", False):
+            logger.warning("Disabling DEFER_SOLVE_STEP because FULL_PIPELINE_RETRY is On.")
+            config['DEFER_SOLVE_STEP'] = False
+            
+        n_pipeline_iterations = config.get("N_PASS_ATTEMPTS", 1)
+        n_solver_attempts_per_pass = 1 # We solve 1 time per pipeline iteration
+        logger.info(f"Full Pipeline Retry Enabled: Running complete pipeline {n_pipeline_iterations} times.")
+    else:
+        n_pipeline_iterations = 1
+        n_solver_attempts_per_pass = config.get("N_PASS_ATTEMPTS", 1) # Standard Pass@N
 
-    # --- Phase 1: Intermediate Steps ---
-    if run_mode in ['full', 'intermediate']:
-        # -- Step 1: Retrieve & Adapt (Standard) --
-        retrieved_indices = []
-        if config.get('USE_RETRIEVAL', True):
-            print("\n[STEP 1] RETRIEVE")
-            # ========================= START OF MODIFICATION =========================
-            # Pass the pre-computed hash map to the retrieve function for O(1) lookup.
-            # This is the core of the performance fix.
-            retrieval_result = retrieve(
-                target_query=target_query, embedding_model=embedding_model,
-                exemplar_questions=exemplar_data['questions'], embedded_exemplars=exemplar_data['embeddings'],
-                top_k=config['TOP_N_CANDIDATES_RETRIEVAL'],
-                question_to_index_map=exemplar_data.get('question_to_index')
-            )
-            # ========================== END OF MODIFICATION ==========================\
-            run_log['steps']['retrieval'] = retrieval_result
-            if retrieval_result['status'] == 'FAILURE':
-                run_log['pipeline_status'] = "FAILURE: Retrieval failed."
-                logger.error(run_log['pipeline_status'])
-                print("  -> Retrieval FAILED. Halting pipeline for this query.")
-                pipeline_halted = True
-            else:
-                retrieved_indices = retrieval_result['retrieved_indices']
-                print(f"  -> Retrieved indices: {retrieved_indices}")
-                
-                # Run standard adaptation on the retrieved exemplars
-                print("\n[STEP 2] ADAPT (Standard Transformations)")
-                adapt_result = adapt(
-                    target_query=target_query, retrieved_indices=retrieved_indices,
-                    exemplar_questions=exemplar_data['questions'], exemplar_solutions=exemplar_data['solutions'],
-                    api_manager=manager_for_adapt, config=config
+    aggregated_solution_attempts = []
+    iteration_details = []
+    final_pipeline_status = "PENDING"
+
+    # --- PIPELINE ITERATION LOOP ---
+    for iteration_idx in range(n_pipeline_iterations):
+        if full_retry_mode:
+            print(f"\n[FULL PIPELINE ITERATION] {iteration_idx + 1}/{n_pipeline_iterations}")
+            
+        pipeline_halted = False
+        exemplars_for_next_step = []
+        
+        # Local container for this iteration's logs (to avoid overwriting the main structure if iterating)
+        iter_log_steps = {}
+
+        # --- Phase 1: Intermediate Steps ---
+        if run_mode in ['full', 'intermediate']:
+            # -- Step 1: Retrieve & Adapt (Standard) --
+            retrieved_indices = []
+            if config.get('USE_RETRIEVAL', True):
+                print("\n[STEP 1] RETRIEVE")
+                # ========================= START OF MODIFICATION =========================
+                # Pass the pre-computed hash map to the retrieve function for O(1) lookup.
+                # This is the core of the performance fix.
+                retrieval_result = retrieve(
+                    target_query=target_query, embedding_model=embedding_model,
+                    exemplar_questions=exemplar_data['questions'], embedded_exemplars=exemplar_data['embeddings'],
+                    top_k=config['TOP_N_CANDIDATES_RETRIEVAL'],
+                    question_to_index_map=exemplar_data.get('question_to_index')
                 )
-                run_log['steps']['adaptation'] = adapt_result
-                if adapt_result['status'] == 'FAILURE':
-                    # This is not fatal if other steps like self-sampling are enabled
-                    print("  -> WARNING: Standard adaptation failed for all exemplars.")
-                exemplars_for_next_step.extend(adapt_result.get('adapted_texts', []))
-        else:
-            print("\n[STEP 1, 2] RETRIEVE & ADAPT SKIPPED (USE_RETRIEVAL is False).")
-
-        # -- Step 3: Analogical Adaptation (NEW) --
-        # This step refines/replaces the retrieved set.
-        if not pipeline_halted and config.get('APPLY_ANALOGICAL_ADAPTATION', False):
-            print("\n[STEP 3] ADAPT (Analogical Adaptation)")
-            if not retrieved_indices:
-                logger.warning("Analogical Adaptation requires retrieval but no exemplars were retrieved. Skipping.")
-                run_log['steps']['analogical_adaptation'] = {"status": "SKIPPED", "reason": "No retrieved exemplars."}
+                # ========================== END OF MODIFICATION ==========================
+                iter_log_steps['retrieval'] = retrieval_result
+                if retrieval_result['status'] == 'FAILURE':
+                    final_pipeline_status = "FAILURE: Retrieval failed."
+                    logger.error(final_pipeline_status)
+                    print("  -> Retrieval FAILED. Halting pipeline for this query.")
+                    pipeline_halted = True
+                else:
+                    retrieved_indices = retrieval_result['retrieved_indices']
+                    print(f"  -> Retrieved indices: {retrieved_indices}")
+                    
+                    # Run standard adaptation on the retrieved exemplars
+                    print("\n[STEP 2] ADAPT (Standard Transformations)")
+                    adapt_result = adapt(
+                        target_query=target_query, retrieved_indices=retrieved_indices,
+                        exemplar_questions=exemplar_data['questions'], exemplar_solutions=exemplar_data['solutions'],
+                        api_manager=manager_for_adapt, config=config
+                    )
+                    iter_log_steps['adaptation'] = adapt_result
+                    if adapt_result['status'] == 'FAILURE':
+                        # This is not fatal if other steps like self-sampling are enabled
+                        print("  -> WARNING: Standard adaptation failed for all exemplars.")
+                    exemplars_for_next_step.extend(adapt_result.get('adapted_texts', []))
             else:
-                augmented_qs_for_aa = None
-                if config.get('APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION'):
-                    # UPDATED: We use AUGMENT_K as the pool size for the recursive tree structure.
-                    # If it's too small, the analogical_adapt function will detect it and generate fresh ones.
-                    k = config.get('AUGMENT_K', 10)
+                print("\n[STEP 1, 2] RETRIEVE & ADAPT SKIPPED (USE_RETRIEVAL is False).")
+
+            # -- Step 3: Analogical Adaptation (NEW) --
+            # This step refines/replaces the retrieved set.
+            if not pipeline_halted and config.get('APPLY_ANALOGICAL_ADAPTATION', False):
+                print("\n[STEP 3] ADAPT (Analogical Adaptation)")
+                if not retrieved_indices:
+                    logger.warning("Analogical Adaptation requires retrieval but no exemplars were retrieved. Skipping.")
+                    iter_log_steps['analogical_adaptation'] = {"status": "SKIPPED", "reason": "No retrieved exemplars."}
+                else:
+                    augmented_qs_for_aa = None
+                    if config.get('APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION'):
+                        # UPDATED: We use AUGMENT_K as the pool size for the recursive tree structure.
+                        # If it's too small, the analogical_adapt function will detect it and generate fresh ones.
+                        k = config.get('AUGMENT_K', 10)
+                        # Use manager_for_aug for augmentation
+                        aug_result = augment_question(target_query, k, manager_for_aug, config)
+                        if aug_result['status'] == 'SUCCESS':
+                            augmented_qs_for_aa = aug_result['augmented_questions']
+                            if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
+                                retrieved_texts = [EXEMPLAR_FORMAT.format(question=exemplar_data['questions'][i], solution=exemplar_data['solutions'][i]) for i in retrieved_indices]
+                                augmented_qs_for_aa = select_augmented_questions(augmented_qs_for_aa, config, embedding_model, retrieved_texts)
+
+                    aa_result = analogical_adapt(
+                        target_query, retrieved_indices, exemplar_data, 
+                        api_manager=manager_for_adapt, # Use adapt manager for the reasoning part
+                        api_manager_augment=manager_for_aug, # Use aug manager for internal queue refills
+                        config=config,
+                        embedding_model=embedding_model, augmented_questions=augmented_qs_for_aa
+                    )
+                    iter_log_steps['analogical_adaptation'] = aa_result
+                    if aa_result.get('analogically_adapted_texts'):
+                        print(f"  -> Generated {len(aa_result['analogically_adapted_texts'])} new exemplars via analogical adaptation.")
+                        # Replace the original retrieved/adapted set with the new ones
+                        exemplars_for_next_step = aa_result['analogically_adapted_texts']
+
+            # -- Step 4: Self-Sampling (NEW) --
+            # This step adds to the existing pool of exemplars.
+            if not pipeline_halted and config.get('APPLY_SELF_SAMPLING', False):
+                print("\n[STEP 4] SELF-SAMPLE")
+                self_sampled_texts = []
+                
+                if config.get('APPLY_SELF_SAMPLING_AUGMENTATION'):
+                    k = config.get('AUGMENT_K', config.get('SELF_SAMPLING_N', 3))
                     # Use manager_for_aug for augmentation
                     aug_result = augment_question(target_query, k, manager_for_aug, config)
                     if aug_result['status'] == 'SUCCESS':
-                        augmented_qs_for_aa = aug_result['augmented_questions']
+                        augmented_qs = aug_result['augmented_questions']
                         if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
-                            retrieved_texts = [EXEMPLAR_FORMAT.format(question=exemplar_data['questions'][i], solution=exemplar_data['solutions'][i]) for i in retrieved_indices]
-                            augmented_qs_for_aa = select_augmented_questions(augmented_qs_for_aa, config, embedding_model, retrieved_texts)
-
-                aa_result = analogical_adapt(
-                    target_query, retrieved_indices, exemplar_data, 
-                    api_manager=manager_for_adapt, # Use adapt manager for the reasoning part
-                    api_manager_augment=manager_for_aug, # Use aug manager for internal queue refills
-                    config=config,
-                    embedding_model=embedding_model, augmented_questions=augmented_qs_for_aa
-                )
-                run_log['steps']['analogical_adaptation'] = aa_result
-                if aa_result.get('analogically_adapted_texts'):
-                    print(f"  -> Generated {len(aa_result['analogically_adapted_texts'])} new exemplars via analogical adaptation.")
-                    # Replace the original retrieved/adapted set with the new ones
-                    exemplars_for_next_step = aa_result['analogically_adapted_texts']
-
-        # -- Step 4: Self-Sampling (NEW) --
-        # This step adds to the existing pool of exemplars.
-        if not pipeline_halted and config.get('APPLY_SELF_SAMPLING', False):
-            print("\n[STEP 4] SELF-SAMPLE")
-            self_sampled_texts = []
-            
-            if config.get('APPLY_SELF_SAMPLING_AUGMENTATION'):
-                k = config.get('AUGMENT_K', config.get('SELF_SAMPLING_N', 3))
-                # Use manager_for_aug for augmentation
-                aug_result = augment_question(target_query, k, manager_for_aug, config)
-                if aug_result['status'] == 'SUCCESS':
-                    augmented_qs = aug_result['augmented_questions']
-                    if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
-                        augmented_qs = select_augmented_questions(augmented_qs, config, embedding_model)
-                    
-                    # Solve each augmented question
-                    for q in augmented_qs:
-                        ss_result = self_sample(q, manager_for_adapt, config)
-                        self_sampled_texts.extend(ss_result.get('self_sampled_texts', []))
-                    run_log['steps']['self_sampling'] = {"status": "SUCCESS", "details": "Augmented Self-Sampling"}
-            else:
-                # Standard self-sampling on the main query
-                ss_result = self_sample(target_query, manager_for_adapt, config)
-                self_sampled_texts.extend(ss_result.get('self_sampled_texts', []))
-                run_log['steps']['self_sampling'] = ss_result
-
-            print(f"  -> Generated {len(self_sampled_texts)} new exemplars via self-sampling.")
-            exemplars_for_next_step.extend(self_sampled_texts)
-            
-        # -- Step 5: Merge --
-        # This step consolidates the final pool of exemplars.
-        final_exemplars_for_solve = exemplars_for_next_step
-        if not pipeline_halted:
-            print("\n[STEP 5] MERGE")
-            merge_result = merge(
-                target_query=target_query, adapted_texts=final_exemplars_for_solve,
-                embedding_model=embedding_model, api_manager=manager_for_adapt, config=config
-            )
-            run_log['steps']['merging'] = merge_result
-            if merge_result['status'] == 'SKIPPED':
-                print("  -> Merging was SKIPPED as per config.")
-            else:
-                print(f"  -> Merged down to {len(merge_result.get('merged_texts', []))} final exemplar(s).")
-            final_exemplars_for_solve = merge_result['merged_texts']
-
-    elif run_mode == 'solve_only':
-        print("\n[STEPS 1-5] SKIPPED (Running in solve_only mode). Loading intermediate results.")
-        pipeline_halted = "FAILURE" in run_log.get("pipeline_status", "")
-        if not pipeline_halted:
-            # Merging is the last intermediate step, so its output is what we need for solve
-            final_exemplars_for_solve = run_log.get('steps', {}).get('merging', {}).get('merged_texts', [])
-            print(f"  -> Loaded {len(final_exemplars_for_solve)} exemplars for solving.")
-        else:
-            print("  -> Prior step failed, solve will be skipped.")
-
-    # --- Phase 2: Final Solving Step ---
-    if run_mode in ['full', 'solve_only']:
-        if not pipeline_halted:
-            
-            # --- BRANCH: Group-Based Self-Consistency Selection ---
-            if config.get('APPLY_GROUP_CONSISTENCY_SELECTION', False):
-                print("\n[STEP 6] SOLVE (Group-Based Consistency Mode)")
-                
-                # Execute the new consistency pipeline step
-                solve_result = solve_with_group_consistency(
-                    target_query=target_query,
-                    available_exemplars=final_exemplars_for_solve,
-                    api_manager=manager_for_solve,
-                    config=config
-                )
-                
-                run_log['steps']['solving'] = solve_result
-                
-                # Check outcome
-                if solve_result['status'] == 'SUCCESS':
-                    run_log['pipeline_status'] = "SUCCESS"
-                    print("  -> Group Consistency Selection completed successfully.")
+                            augmented_qs = select_augmented_questions(augmented_qs, config, embedding_model)
+                        
+                        # Solve each augmented question
+                        for q in augmented_qs:
+                            ss_result = self_sample(q, manager_for_adapt, config)
+                            self_sampled_texts.extend(ss_result.get('self_sampled_texts', []))
+                        iter_log_steps['self_sampling'] = {"status": "SUCCESS", "details": "Augmented Self-Sampling"}
                 else:
-                    run_log['pipeline_status'] = "FAILURE: Group Consistency failed."
-            
-            # --- BRANCH: Standard Solving (Pass@N) ---
-            else:
-                print("\n[STEP 6] SOLVE")
-                solve_result = solve(
-                    target_query=target_query, final_exemplars=final_exemplars_for_solve,
-                    api_manager=manager_for_solve, config=config
-                )
-                run_log['steps']['solving'] = solve_result
-                solution_texts = [attempt for attempt in solve_result.get('solution_attempts', []) if isinstance(attempt, str)]
-                failed_attempts = sum(1 for attempt in solve_result.get('solution_attempts', []) if isinstance(attempt, dict))
-                for i, text in enumerate(solution_texts): print(f"  -> Solution attempt #{i+1} (start): '{text[:120]}...'")
-                if failed_attempts > 0: print(f"  -> {failed_attempts} solution attempt(s) FAILED.")
-                
-                run_log['llm_final_solution_attempts_texts'] = solution_texts
-                if "FAILURE" not in run_log['pipeline_status']:
-                     run_log['pipeline_status'] = "SUCCESS"
-        else:
-            run_log['steps']['solving'] = {"status": "SKIPPED", "reason": "Pipeline halted due to critical failure in a prior step."}
+                    # Standard self-sampling on the main query
+                    ss_result = self_sample(target_query, manager_for_adapt, config)
+                    self_sampled_texts.extend(ss_result.get('self_sampled_texts', []))
+                    iter_log_steps['self_sampling'] = ss_result
 
-    elif run_mode == 'intermediate':
-        print("\n[STEP 6] SOLVE DEFERRED.")
-        run_log['steps']['solving'] = {"status": "DEFERRED"}
-        if not pipeline_halted:
-             run_log['pipeline_status'] = "INTERMEDIATE_COMPLETE"
+                print(f"  -> Generated {len(self_sampled_texts)} new exemplars via self-sampling.")
+                exemplars_for_next_step.extend(self_sampled_texts)
+                
+            # -- Step 5: Merge --
+            # This step consolidates the final pool of exemplars.
+            final_exemplars_for_solve = exemplars_for_next_step
+            if not pipeline_halted:
+                print("\n[STEP 5] MERGE")
+                merge_result = merge(
+                    target_query=target_query, adapted_texts=final_exemplars_for_solve,
+                    embedding_model=embedding_model, api_manager=manager_for_adapt, config=config
+                )
+                iter_log_steps['merging'] = merge_result
+                if merge_result['status'] == 'SKIPPED':
+                    print("  -> Merging was SKIPPED as per config.")
+                else:
+                    print(f"  -> Merged down to {len(merge_result.get('merged_texts', []))} final exemplar(s).")
+                final_exemplars_for_solve = merge_result['merged_texts']
+
+        elif run_mode == 'solve_only':
+            print("\n[STEPS 1-5] SKIPPED (Running in solve_only mode). Loading intermediate results.")
+            pipeline_halted = "FAILURE" in run_log.get("pipeline_status", "")
+            if not pipeline_halted:
+                # Merging is the last intermediate step, so its output is what we need for solve
+                final_exemplars_for_solve = run_log.get('steps', {}).get('merging', {}).get('merged_texts', [])
+                print(f"  -> Loaded {len(final_exemplars_for_solve)} exemplars for solving.")
+            else:
+                print("  -> Prior step failed, solve will be skipped.")
+
+        # --- Phase 2: Final Solving Step ---
+        solve_result = {}
+        if run_mode in ['full', 'solve_only']:
+            if not pipeline_halted:
+                
+                # --- BRANCH: Group-Based Self-Consistency Selection ---
+                if config.get('APPLY_GROUP_CONSISTENCY_SELECTION', False):
+                    print("\n[STEP 6] SOLVE (Group-Based Consistency Mode)")
+                    
+                    # Execute the new consistency pipeline step
+                    solve_result = solve_with_group_consistency(
+                        target_query=target_query,
+                        available_exemplars=final_exemplars_for_solve,
+                        api_manager=manager_for_solve,
+                        config=config
+                    )
+                    
+                    # Check outcome
+                    if solve_result['status'] == 'SUCCESS':
+                        final_pipeline_status = "SUCCESS"
+                        print("  -> Group Consistency Selection completed successfully.")
+                    else:
+                        final_pipeline_status = "FAILURE: Group Consistency failed."
+                
+                # --- BRANCH: Standard Solving (Pass@N) ---
+                else:
+                    print("\n[STEP 6] SOLVE")
+                    
+                    # Temporarily override N_PASS_ATTEMPTS for this specific call if wrapping in a loop
+                    current_solver_config = config.copy()
+                    current_solver_config['N_PASS_ATTEMPTS'] = n_solver_attempts_per_pass
+                    
+                    solve_result = solve(
+                        target_query=target_query, final_exemplars=final_exemplars_for_solve,
+                        api_manager=manager_for_solve, config=current_solver_config
+                    )
+                    
+                    current_attempts = solve_result.get('solution_attempts', [])
+                    aggregated_solution_attempts.extend(current_attempts)
+                    
+                    solution_texts = [attempt for attempt in current_attempts if isinstance(attempt, str)]
+                    failed_attempts = sum(1 for attempt in current_attempts if isinstance(attempt, dict))
+                    for i, text in enumerate(solution_texts): print(f"  -> Solution attempt #{i+1} (start): '{text[:120]}...'")
+                    if failed_attempts > 0: print(f"  -> {failed_attempts} solution attempt(s) FAILED.")
+                    
+                    if "FAILURE" not in final_pipeline_status:
+                         final_pipeline_status = "SUCCESS"
+            else:
+                solve_result = {"status": "SKIPPED", "reason": "Pipeline halted due to critical failure in a prior step."}
+        elif run_mode == 'intermediate':
+            print("\n[STEP 6] SOLVE DEFERRED.")
+            solve_result = {"status": "DEFERRED"}
+            if not pipeline_halted:
+                 final_pipeline_status = "INTERMEDIATE_COMPLETE"
+
+        # Update logs for this iteration
+        if full_retry_mode:
+            # In full retry mode, we store detailed steps for each iteration separately
+            iteration_details.append({
+                "iteration": iteration_idx,
+                "context_exemplars": final_exemplars_for_solve,
+                "steps": iter_log_steps,
+                "solve_result": solve_result
+            })
+            # Also update the main run_log steps with the LAST iteration's details just so it isn't empty
+            run_log['steps'] = iter_log_steps
+            run_log['steps']['solving'] = solve_result
+        else:
+            # In standard mode, we update the main steps directly
+            run_log['steps'].update(iter_log_steps)
+            run_log['steps']['solving'] = solve_result
+
+    # --- END PIPELINE ITERATION LOOP ---
+
+    # Final Aggregation
+    run_log['pipeline_status'] = final_pipeline_status
+    if full_retry_mode:
+        run_log['full_pipeline_iterations_data'] = iteration_details
+    
+    # Consolidate all solution attempts (strings) for the evaluator
+    all_solution_texts = [attempt for attempt in aggregated_solution_attempts if isinstance(attempt, str)]
+    run_log['llm_final_solution_attempts_texts'] = all_solution_texts
+    
+    # Ensure the solve step in run_log accurately reflects the aggregated results
+    if 'solving' in run_log['steps']:
+        run_log['steps']['solving']['solution_attempts'] = aggregated_solution_attempts
 
     logger.info(f"--- Pipeline finished for Query #{hard_list_idx} with status: {run_log['pipeline_status']} ---")
     return run_log
