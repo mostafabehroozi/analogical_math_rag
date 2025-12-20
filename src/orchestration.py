@@ -172,31 +172,97 @@ def run_pipeline_for_single_query(
     # --- NEW: Branch for Hierarchical Augmentation (Tree-Based) ---
     if config.get('APPLY_HIERARCHICAL_AUGMENTATION', False):
         print("\n[MODE] HIERARCHICAL AUGMENTATION ACTIVATED")
-        # Since this is a completely different solving paradigm, it bypasses the standard
-        # retrieve-adapt-merge-solve flow.
         
-        hierarchical_result = solve_hierarchical_tree(
-            target_query=target_query,
-            exemplar_data=exemplar_data,
-            embedding_model=embedding_model,
-            api_manager_adapt=manager_for_adapt,
-            api_manager_solve=manager_for_solve,
-            api_manager_augment=manager_for_aug, # Use the specific augmentation manager
-            config=config
-        )
+        # Determine retry behavior
+        is_full_retry = config.get('APPLY_FULL_PIPELINE_RETRY', False)
+        n_passes = config.get("N_PASS_ATTEMPTS", 1)
         
-        run_log['steps']['hierarchical_process'] = hierarchical_result
+        all_root_attempts = []
+        last_hierarchical_result = None
         
-        if hierarchical_result['status'] == 'SUCCESS':
-            # Store the root solution as a standard solution attempt so the evaluator can pick it up
-            # FIXED: Retrieve the list of attempts if available (for Pass@N support)
-            run_log['steps']['solving'] = {
-                "status": "SUCCESS",
-                "solution_attempts": hierarchical_result.get('root_solution_attempts', [hierarchical_result['root_solution']])
-            }
+        # --- SCENARIO A: Full Pipeline Retry (N Distinct Trees) ---
+        if is_full_retry and n_passes > 1:
+            logger.info(f"Full Pipeline Retry Enabled for Hierarchical Mode: Generating {n_passes} distinct trees.")
+            
+            # CRITICAL: Create a config copy that forces the INTERNAL solver 
+            # to run only once per tree. We handle the looping here externally.
+            single_pass_config = config.copy()
+            single_pass_config['N_PASS_ATTEMPTS'] = 1
+            
+            full_pipeline_iterations_data = []
+
+            for i in range(n_passes):
+                print(f"\n[HIERARCHICAL ITERATION] {i+1}/{n_passes} (Building fresh tree)")
+                
+                # Run the full tree pipeline (Build -> Leaf Solve -> Root Solve)
+                # This ensures a NEW simplification (Augmentation) happens every time.
+                hierarchical_result = solve_hierarchical_tree(
+                    target_query=target_query,
+                    exemplar_data=exemplar_data,
+                    embedding_model=embedding_model,
+                    api_manager_adapt=manager_for_adapt,
+                    api_manager_solve=manager_for_solve,
+                    api_manager_augment=manager_for_aug,
+                    config=single_pass_config # <--- Pass the N=1 config
+                )
+                
+                # Aggregate the single solution from this tree
+                if hierarchical_result['status'] == 'SUCCESS':
+                    sol = hierarchical_result.get('root_solution')
+                    if sol:
+                        all_root_attempts.append(sol)
+                
+                # Store debug data for this tree
+                full_pipeline_iterations_data.append({
+                    "iteration": i,
+                    "tree_structure": hierarchical_result.get('tree_structure'),
+                    "root_solution": hierarchical_result.get('root_solution')
+                })
+                
+                last_hierarchical_result = hierarchical_result
+            
+            # Store iteration data
+            run_log['full_pipeline_iterations_data'] = full_pipeline_iterations_data
+
+        # --- SCENARIO B: Standard Pass@N (1 Tree, N Root Solves) ---
+        else:
+            # If retry is False, we pass the original config. 
+            # The internal logic in propagate_solutions_upward handles the N loops.
+            logger.info(f"Standard Hierarchical Mode: 1 Tree, Pass@{n_passes} on Root.")
+            
+            last_hierarchical_result = solve_hierarchical_tree(
+                target_query=target_query,
+                exemplar_data=exemplar_data,
+                embedding_model=embedding_model,
+                api_manager_adapt=manager_for_adapt,
+                api_manager_solve=manager_for_solve,
+                api_manager_augment=manager_for_aug,
+                config=config
+            )
+            
+            if last_hierarchical_result['status'] == 'SUCCESS':
+                # Grab the list generated internally
+                all_root_attempts = last_hierarchical_result.get('root_solution_attempts', [])
+                # Fallback if the list is empty but solution exists
+                if not all_root_attempts and last_hierarchical_result.get('root_solution'):
+                    all_root_attempts = [last_hierarchical_result['root_solution']]
+
+        # --- Final Log Construction ---
+        run_log['steps']['hierarchical_process'] = last_hierarchical_result
+        
+        # Populate the location the Evaluator looks for
+        run_log['steps']['solving'] = {
+            "status": "SUCCESS" if all_root_attempts else "FAILURE",
+            "solution_attempts": all_root_attempts
+        }
+        
+        # Also populate the top-level text list for the analysis script
+        run_log['llm_final_solution_attempts_texts'] = all_root_attempts
+        
+        if all_root_attempts:
             run_log['pipeline_status'] = "SUCCESS"
         else:
-            run_log['pipeline_status'] = "FAILURE: Hierarchical process failed."
+            run_log['pipeline_status'] = "FAILURE: Hierarchical process failed to produce solutions."
             
         return run_log
 
