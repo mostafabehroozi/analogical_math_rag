@@ -229,6 +229,11 @@ CONFIG = {
     "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED": True, # If True, performs specific retrieval for each leaf node.
     "HIERARCHICAL_LEAF_RETRIEVAL_TOP_K": 3,      # Number of samples to retrieve per leaf (if enabled).
     
+    # --- NEW: Retrieval Query Mode for Leaves ---
+    # "leaf": Retrieves samples similar to the simplified LEAF question.
+    # "root": Retrieves samples similar to the original ROOT (Main) question.
+    "HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE": "leaf", 
+    
     # Prompt Template Settings
     "PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR": "self_sampling_augmentor_decomposition_2", # Used to generate children.
     "PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER": "hierarchical_parent_solver_v1",       # Used to solve parent using children.

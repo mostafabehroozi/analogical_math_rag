@@ -32,6 +32,7 @@ UPGRADE: Now supports Group-Based Self-Consistency Selection.
 UPGRADE: Now supports Hierarchical Augmentation with Backward Propagation.
 UPGRADE: Now supports Analogical Consistency Check (Reverse Validation).
 UPGRADE: Now supports 'Simplification' mode for Hierarchical Augmentation (raw text parsing).
+UPGRADE: Now supports configurable Leaf Retrieval Query Mode (Root vs Leaf).
 """
 
 import logging
@@ -1226,6 +1227,7 @@ def build_hierarchical_tree(
 
 def _process_leaves(
     root: ReasoningNode,
+    target_query: str, # Added to support Root-Based Retrieval Mode
     exemplar_data: Dict[str, Any],
     embedding_model: SentenceTransformer,
     api_manager_adapt: Any,
@@ -1242,15 +1244,28 @@ def _process_leaves(
         # 1. Retrieval (if enabled)
         if config.get("HIERARCHICAL_LEAF_RETRIEVAL_ENABLED", True):
             top_k = config.get("HIERARCHICAL_LEAF_RETRIEVAL_TOP_K", 3)
-            # Use standard retrieval
+            
+            # --- Retrieval Mode Selection ---
+            query_mode = config.get("HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE", "leaf")
+            
+            if query_mode == "root":
+                search_query = target_query
+                print(f"      [Retrieval] Mode: ROOT (Using Main Question: '{search_query[:50]}...')")
+            else:
+                search_query = root.question
+                print(f"      [Retrieval] Mode: LEAF (Using Simplified Question: '{search_query[:50]}...')")
+            
+            # Use search_query for the retrieval step
             ret_res = retrieve(
-                root.question, embedding_model, 
+                search_query, 
+                embedding_model, 
                 exemplar_data['questions'], exemplar_data['embeddings'], 
                 top_k, exemplar_data.get('question_to_index')
             )
             
             if ret_res['status'] == 'SUCCESS':
                 # Adapt retrieved samples using Adapt Manager
+                # Note: We continue to adapt towards the leaf question because context must match the leaf.
                 adapt_res = adapt(
                     root.question, ret_res['retrieved_indices'], 
                     exemplar_data['questions'], exemplar_data['solutions'], 
@@ -1291,7 +1306,7 @@ def _process_leaves(
     else:
         # Not a leaf, recurse
         for child in root.children:
-            _process_leaves(child, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
+            _process_leaves(child, target_query, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
 
 def propagate_solutions_upward(
     node: ReasoningNode,
@@ -1384,7 +1399,9 @@ def solve_hierarchical_tree(
     
     # 2. Process Leaves using Adapt & Solve Managers
     print("\n[HIERARCHICAL] Phase 2: Processing Leaves...")
-    _process_leaves(root, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
+    
+    # UPDATED: Pass target_query down the pipeline for potential Root-based retrieval
+    _process_leaves(root, target_query, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
     
     # 3. Propagate Upward using Solve Manager
     print("\n[HIERARCHICAL] Phase 3: Backward Propagation...")
