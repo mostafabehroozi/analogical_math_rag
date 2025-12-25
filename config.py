@@ -1,164 +1,329 @@
+#======================================================================
+#   File: config.py
+#======================================================================
+
+# config.py
+
+"""
+Central configuration file for the Analogical Reasoning RAG project.
+
+This file defines all parameters, file paths, model settings, and control flags
+for the entire pipeline. It now supports multiple API providers (Gemini and
+OpenAI-compatible services like AvalAI).
+
+By modifying this file, you can easily switch between API providers and run
+different experiments without changing the core logic of the source code.
+"""
+
 import os
 
+# --- 1. Core Directory Structure ---
+# Define the base directory for all outputs. This is the root for logs, results, etc.
+# In Kaggle, this is typically '/kaggle/working/'.
 BASE_OUTPUT_DIR = "/kaggle/working/"
 
+# Define subdirectories for organized output.
 DATA_DIR = os.path.join(BASE_OUTPUT_DIR, "data")
 OUTPUTS_DIR = os.path.join(BASE_OUTPUT_DIR, "outputs")
 LOGS_DIR = os.path.join(OUTPUTS_DIR, "logs")
 EMBEDDINGS_DIR = os.path.join(OUTPUTS_DIR, "embeddings")
 RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
 
+# --- Main CONFIG Dictionary ---
+
 CONFIG = {
-    "VERBOSE_LOGGING": True,
-    "PRINT_API_CALL_DETAILS": True,
-    "PRINT_API_TIMING_CHECKPOINTS": True,
-    "API_RESPONSE_TRUNCATION_LENGTH": 50,
+    # --- 2. Logging & Control Settings ---
+    "VERBOSE_LOGGING": True,  # Master switch for detailed print statements to the console.
+    "PRINT_API_CALL_DETAILS": True, # Master switch to print detailed API call info (prompt, response, errors) to the console.
+    "PRINT_API_TIMING_CHECKPOINTS": True, # Prints the time elapsed between the start of consecutive API calls.
+    "API_RESPONSE_TRUNCATION_LENGTH": 50, # Control truncation for successful API responses.
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
-    "LOGS_DIR": LOGS_DIR,
+    "LOGS_DIR": LOGS_DIR, # Directory where detailed run logs will be saved.
     "OUTPUTS_DIR": OUTPUTS_DIR,
     "RESULTS_DIR": RESULTS_DIR,
 
-    "API_PROVIDER_ADAPTATION": "gemini",
-    "API_PROVIDER_SOLVER": "gemini",
-    "API_PROVIDER_EVALUATOR": "gemini",
-    "API_PROVIDER_AUGMENTATION": "gemini",
+    # --- 3. API Provider Selection ---
+    # Master switch to select the API provider.
+    # Options: "gemini" or "avalai"
+    # "API_PROVIDER": "gemini", # DEPRECATED: Provider is now set per-step.
 
-    "GEMINI_API_KEYS": [],
+    # MODIFIED: Define which API provider to use for each major stage of the pipeline.
+    # Options: "gemini", "avalai", or "ollama"
+    "API_PROVIDER_ADAPTATION": "gemini",  # For normalization, transformations, merging
+    "API_PROVIDER_SOLVER": "gemini",      # For generating the final solution
+    "API_PROVIDER_EVALUATOR": "gemini",   # For LLM-based evaluation
+    
+    # NEW: Specific provider for Augmentation tasks (Self-Sampling, Analogical Augmentation, Hierarchical)
+    "API_PROVIDER_AUGMENTATION": "gemini", 
+
+    # NEW: Specific provider for Simplification tasks
+    "API_PROVIDER_SIMPLIFICATION": "gemini",
+
+    # --- 4. Gemini API Settings ---
+    # These settings are used ONLY if API_PROVIDER is set to "gemini".
+    "GEMINI_API_KEYS": [
+        # Add your Gemini API keys here.
+        # e.g., "AIzaSy...",
+    ],
+    # Per-model and global rate limiting settings.
     "GEMINI_MODEL_QUOTAS": {
+        # MODIFIED: These model names can be updated to match the new format
         "models/gemma-3-27b-it": {"delay_seconds": 20, "rpd": 100},
     },
-    "GLOBAL_API_CALL_DELAY_SECONDS": 5,
+    "GLOBAL_API_CALL_DELAY_SECONDS": 5, # A minimum delay between any two API calls, regardless of the key.
 
-    "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-3-27b-it",
-    "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-3-27b-it",
-    "GEMINI_MODEL_NAME_EVALUATOR": "models/gemma-3-27b-it",
+    # MODIFIED: Names of the models to be used for different pipeline stages.
+    # Using the new, fully-qualified model name format.
+    "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-3-27b-it",    # For transformation, summarization, merging. A faster model is often sufficient.
+    "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-3-27b-it", # For generating the final solution. A more powerful model is better here.
+    "GEMINI_MODEL_NAME_EVALUATOR": "models/gemma-3-27b-it",     # For LLM-based evaluation. A faster model is sufficient.
+    
+    # NEW: Model for Augmentation tasks
     "GEMINI_MODEL_NAME_AUGMENTATION": "models/gemma-3-27b-it",
+    
+    # NEW: Model for Simplification tasks
+    "GEMINI_MODEL_NAME_SIMPLIFICATION": "models/gemma-3-27b-it",
 
+    # --- 5. AvalAI (OpenAI-Compatible) API Settings ---
+    # These settings are used ONLY if API_PROVIDER is set to "avalai".
     "AVALAI_API_KEY": "YOUR_AVALAI_API_KEY_HERE",
     "AVALAI_BASE_URL": "https://api.avalai.ir/v1",
+
+    # Simple rate limiting for AvalAI. Can be expanded if needed.
     "AVALAI_MODEL_QUOTAS": {
-        "default": {"delay_seconds": 2}
+        "default": {"delay_seconds": 2} # A simple 2-second delay between calls.
     },
+
+    # Model names for AvalAI. Replace with any supported model.
     "AVALAI_MODEL_NAME_ADAPTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_FINAL_SOLVER": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
+    
+    # NEW: Model for Augmentation tasks
     "AVALAI_MODEL_NAME_AUGMENTATION": "openai.gpt-oss-20b-1:0",
 
-    "OLLAMA_BASE_URL": "http://localhost:11434",
+    # NEW: Model for Simplification tasks
+    "AVALAI_MODEL_NAME_SIMPLIFICATION": "openai.gpt-oss-20b-1:0",
+
+    # --- 5b. Ollama (Local LLM) Settings ---
+    # These settings are used if any API_PROVIDER_* is set to "ollama".
+    "OLLAMA_BASE_URL": "http://localhost:11434", # Default URL for a local Ollama instance.
+
+    # Model names for Ollama. Replace with any models you have pulled (e.g., 'llama2', 'mistral').
     "OLLAMA_MODEL_NAME_ADAPTATION": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_FINAL_SOLVER": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_EVALUATOR": "gpt-oss:20b",
+    
+    # NEW: Model for Augmentation tasks
     "OLLAMA_MODEL_NAME_AUGMENTATION": "llama3:8b",
 
-    "DEFAULT_ADAPTATION_TEMPERATURE": 0.0,
+    # NEW: Model for Simplification tasks
+    "OLLAMA_MODEL_NAME_SIMPLIFICATION": "llama3:8b",
+
+    # --- 6. Generic LLM Generation Settings ---
+    # These settings are provider-agnostic and will be used by whichever manager is active.
+    
+    # Temperature Settings
+    "DEFAULT_ADAPTATION_TEMPERATURE": 0.0,   # Low temp for deterministic tasks like reformatting.
     "DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE": 1.0,
-    "DEFAULT_FINAL_SOLVER_TEMPERATURE": 1.0,
-    "DEFAULT_PASS_N_SOLVER_TEMPERATURE": 1.0,
-    "DEFAULT_EVALUATOR_TEMPERATURE": 0.0,
+    "DEFAULT_FINAL_SOLVER_TEMPERATURE": 1.0, # High temp for creative/diverse single-pass solutions.
+    "DEFAULT_PASS_N_SOLVER_TEMPERATURE": 1.0,# High temp for generating diverse attempts in Pass@N.
+    "DEFAULT_EVALUATOR_TEMPERATURE": 0.0,    # Low temp for deterministic, consistent evaluation.
+    
+    # NEW: Temperature for Augmentation (needs creativity)
     "DEFAULT_AUGMENTATION_TEMPERATURE": 0.7,
 
-    "DEFAULT_ADAPTATION_MAX_TOKENS": 10000,
-    "DEFAULT_FINAL_SOLVER_MAX_TOKENS": 10000,
-    "DEFAULT_EVALUATOR_MAX_TOKENS": 10000,
+    # NEW: Temperature for Simplification
+    "DEFAULT_SIMPLIFICATION_TEMPERATURE": 0.3, # Slightly creative but focused
 
+    # NEW: Max Output Tokens Settings
+    # These will be used to construct the `GenerationConfig` for Gemini calls.
+    "DEFAULT_ADAPTATION_MAX_TOKENS": 10000,   # Adaptation tasks (normalization, transformation) are usually short.
+    "DEFAULT_FINAL_SOLVER_MAX_TOKENS": 10000, # Allow plenty of room for complex reasoning and step-by-step solutions.
+    "DEFAULT_EVALUATOR_MAX_TOKENS": 10000,     # Evaluation produces a very short, structured response.
+
+    # --- 7. File Paths, Data & Embedding Settings ---
     "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',
+    
     "HARD_QUESTIONS_INDICES_PATH": os.path.join(DATA_DIR, "hard_question_indices.json"),
     "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
-
+    
+    # RAG exemplar corpus details.
     "EXEMPLAR_CORPUS_NAME": "AI-MO/NuminaMath-CoT",
-    "EXEMPLAR_CORPUS_HF_TOKEN": None,
+    "EXEMPLAR_CORPUS_HF_TOKEN": None, # Your Hugging Face token if the dataset is private.
 
+    # Paths for storing/loading the generated embeddings for the exemplar corpus.
     "EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH": os.path.join(EMBEDDINGS_DIR, 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy'),
     "EXEMPLAR_EMBEDDINGS_HF_REPO_ID": "mostafabehroozi/embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath",
     "EXEMPLAR_EMBEDDINGS_HF_FILENAME": "embeddings.npy",
-
+    
+    # Paths for saving experiment outputs.
     "ADVANCED_RAG_FULL_LOG_PATH": os.path.join(RESULTS_DIR, "advanced_rag_pipeline_full_log.json"),
     "ADVANCED_RAG_EVALUATION_RESULTS_PATH": os.path.join(RESULTS_DIR, "advanced_rag_evaluation_results.pkl"),
 
+    # --- 8. Pipeline Step Control Flags & Parameters ---
     "USE_RETRIEVAL": True,
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
-
-    "APPLY_NORMALIZATION": False,
-    "APPLY_TRANSFORMATION": False,
-    "APPLY_TRANSFORMATION_1": False,
-    "APPLY_TRANSFORMATION_2": False,
-    "APPLY_TRANSFORMATION_3": False,
+    
+    # MODIFIED: Granular adaptation steps
+    "APPLY_NORMALIZATION": False,           # Renamed from APPLY_STANDARDIZATION
+    "APPLY_TRANSFORMATION": False,          # DEPRECATED: Replaced by granular transformation flags.
+    "APPLY_TRANSFORMATION_1": False,        # NEW: Controls the first transformation step.
+    "APPLY_TRANSFORMATION_2": False,        # NEW: Controls the second transformation step.
+    "APPLY_TRANSFORMATION_3": False,        # NEW: Controls the third transformation step.
     "APPLY_MERGING": False,
 
-    "DEFER_SOLVE_STEP": False,
-
+    "DEFER_SOLVE_STEP": False, # NEW: If True, runs all intermediate steps for all questions first, then all solve steps.
+    
     "TOP_N_CANDIDATES_RETRIEVAL": 1,
     "FINAL_K_SELECTION_ADAPTATION": 1,
     "TARGET_ADAPTED_SAMPLES_MERGING": 1,
 
-    "APPLY_SELF_SAMPLING": False,
-    "SELF_SAMPLING_N": 3,
-    "SELF_SAMPLING_TEMPERATURE": 0.7,
+    # --- 8b. NEW FEATURES: Self-Sampling Configuration ---
+    "APPLY_SELF_SAMPLING": False,           # Enable self-sampling feature
+    "SELF_SAMPLING_N": 3,                   # Number of self-sampling attempts
+    "SELF_SAMPLING_TEMPERATURE": 0.7,       # Temperature for diversity in self-sampling
 
-    "APPLY_ANALOGICAL_ADAPTATION": False,
-    "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,
+    # --- 8c. NEW FEATURES: Analogical Adaptation Configuration ---
+    "APPLY_ANALOGICAL_ADAPTATION": False,   # Enable analogical reasoning as adaptation
+    
+    "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,  # Number of attempts per NON-EMPTY group
 
-    "APPLY_SELF_SAMPLING_AUGMENTATION": False,
-    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION": False,
+    # --- 8d. NEW FEATURES: Augmentation Configuration ---
+    "APPLY_SELF_SAMPLING_AUGMENTATION": False,          # Augment questions for self-sampling
+    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION": False,  # Augment for analogical adaptation
 
-    "SELECTIVE_AUGMENTATION_SAMPLING": False,
+    # --- 8e. NEW FEATURES: Selective Augmentation Sampling ---
+    "SELECTIVE_AUGMENTATION_SAMPLING": False,           # Enable selective augmentation
+
     "AUGMENTATION_SCHEDULE": None,
-    "AUGMENT_K": 10,
-    "AUGMENT_N": 3,
-    "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",
+    
+    "AUGMENT_K": 10,                                    
+    "AUGMENT_N": 3,                                     
+    "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",     
 
-    "APPLY_CONSISTENCY_ANALOGICAL_CHECK": False,
+    "APPLY_CONSISTENCY_ANALOGICAL_CHECK": False,        
+
     "CONSISTENCY_GENERATION_MODE": "distinct_augmentations",
-    "CONSISTENCY_PATHWAYS_K": 3,
-    "CONSISTENCY_LAYER_1_TEMPERATURE": 0.7,
-    "CONSISTENCY_SAMPLES_PER_PATHWAY_N": 3,
-    "CONSISTENCY_LAYER_2_TEMPERATURE": 0.7,
-    "CONSISTENCY_VOTING_THRESHOLD": 0.6,
+    
+    # Layer 1 Settings (Generating the Pathway Pool)
+    "CONSISTENCY_PATHWAYS_K": 3,                        
+    "CONSISTENCY_LAYER_1_TEMPERATURE": 0.7,             # Temp for solving the augmented questions (creating the rationale).
+    
+    # Layer 2 Settings (Stress Testing the Pathway)
+    "CONSISTENCY_SAMPLES_PER_PATHWAY_N": 3,             # Number of times to solve the Main Question using EACH parent pathway.
+    "CONSISTENCY_LAYER_2_TEMPERATURE": 0.7,             # Temp for solving the Main Question (needs variance to measure consistency).
+    
+    # Analysis Settings
+    "CONSISTENCY_VOTING_THRESHOLD": 0.6,                # Threshold for considering a pathway "consistent" (e.g., 60% agreement).
 
-    "APPLY_GROUP_CONSISTENCY_SELECTION": False,
-    "GROUP_CONSISTENCY_CANDIDATES": [(0, 1), (2, 3)],
-    "GROUP_CONSISTENCY_SAMPLES_N": 5,
-    "CONSISTENCY_SCORING_METHOD": "hybrid",
-    "SEMANTIC_CONSISTENCY_WEIGHT": 0.5,
+    "APPLY_GROUP_CONSISTENCY_SELECTION": False,     # Master switch for the new Group Consistency pipeline.
+    
+    # Define which subsets of the retrieved samples to form into groups.
+    # Format: List of tuples containing 0-based indices of the retrieved/adapted exemplars.
+    # Example: [(0, 1), (2, 3)] creates Group 1 from the 1st and 2nd exemplars, Group 2 from 3rd and 4th.
+    "GROUP_CONSISTENCY_CANDIDATES": [(0, 1), (2, 3)], 
+    
+    "GROUP_CONSISTENCY_SAMPLES_N": 5,               # How many times to solve the Main Question for EACH group.
+    
+    "CONSISTENCY_SCORING_METHOD": "hybrid",         # "answer_majority", "semantic_similarity", or "hybrid".
+    "SEMANTIC_CONSISTENCY_WEIGHT": 0.5,             # If hybrid, how much weight (0-1) to give the semantic score.
 
-    "APPLY_HIERARCHICAL_AUGMENTATION": False,
+    # --- 8h. NEW FEATURES: Hierarchical Augmentation Configuration ---
+    "APPLY_HIERARCHICAL_AUGMENTATION": False,   # Master switch for the tree-based augmentation pipeline.
+    
+    # NEW FLAG: Controls how the augmentation output is parsed
+    # Options: "decomposition" (expects numbered list), "simplification" (expects single raw string)
     "HIERARCHICAL_AUGMENTATION_MODE": "decomposition",
-    "HIERARCHICAL_TREE_DEPTH": 2,
-    "HIERARCHICAL_BRANCHING_FACTOR": 3,
-    "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED": True,
-    "HIERARCHICAL_LEAF_RETRIEVAL_TOP_K": 3,
-    "HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE": "leaf",
 
-    "PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR": "self_sampling_augmentor_decomposition_2",
-    "PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER": "hierarchical_parent_solver_v1",
-    "PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER": "final_solver_simple_v1",
+    # Tree Structure Settings
+    "HIERARCHICAL_TREE_DEPTH": 2,               # Number of layers below the root (e.g., 2 means Root -> Layer 1 -> Layer 2 (Leaves)).
+    "HIERARCHICAL_BRANCHING_FACTOR": 3,         # Number of augmented children to generate per node.
+    
+    # Leaf Processing Settings
+    "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED": True, # If True, performs specific retrieval for each leaf node.
+    "HIERARCHICAL_LEAF_RETRIEVAL_TOP_K": 3,      # Number of samples to retrieve per leaf (if enabled).
+    
+    # --- NEW: Retrieval Query Mode for Leaves ---
+    # "leaf": Retrieves samples similar to the simplified LEAF question.
+    # "root": Retrieves samples similar to the original ROOT (Main) question.
+    "HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE": "leaf", 
+    
+    # Prompt Template Settings
+    "PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR": "self_sampling_augmentor_decomposition_2", # Used to generate children.
+    "PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER": "hierarchical_parent_solver_v1",       # Used to solve parent using children.
+    "PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER": "final_solver_simple_v1",                # Used to solve leaves (with or without RAG).
 
-    "APPLY_REVERSE_VALIDATION": False,
-    "REVERSE_VALIDATION_CANDIDATES_N": 5,
-    "REVERSE_VALIDATION_RETRIEVAL_K": 3,
-    "REVERSE_VALIDATION_ATTEMPTS_N": 5,
+    # --- 8j. NEW FEATURES: Simplification Configuration ---
+    "APPLY_SIMPLIFICATION": False,           # Master switch for the simplification feature
+    
+    # Workflow A: Simplify samples before they enter the main adaptation pipeline.
+    # Logic: Retrieved Sample -> Simplify Q -> Solve Simple Q using Original Sample -> New Exemplar
+    "SIMPLIFY_RETRIEVED_SAMPLES": False,
+    
+    # Workflow B: Simplify the Main Question during the solving phase.
+    # Logic: Main Q -> Simplify Q -> Solve Simple Q (using RAG) -> Solve Main Q using Solved Simple Q
+    "SIMPLIFY_MAIN_QUESTION": False,
 
+    # --- 8i. NEW FEATURES: Analogical Consistency (Reverse Validation) ---
+    "APPLY_REVERSE_VALIDATION": False,           # Master switch for the new validation feature
+    
+    # Phase 1: Candidate Generation
+    "REVERSE_VALIDATION_CANDIDATES_N": 5,        # Number of initial solution candidates to generate for the Target Question
+    
+    # Phase 2: Retrieval of Validators
+    "REVERSE_VALIDATION_RETRIEVAL_K": 3,         # Number of ground-truth samples to retrieve to act as validators
+    
+    # Phase 3: Validation Loop
+    "REVERSE_VALIDATION_ATTEMPTS_N": 5,          # Number of times to solve EACH validator using the Candidate as analogy
+
+    # --- 9. Pass@N & Evaluation Settings ---
     "N_PASS_ATTEMPTS": 3,
+    
+    # NEW: Master switch for Full Pipeline Pass@N
+    # If True: The entire pipeline (Retrieval->Adaptation->Merging->Solving) runs N times.
+    # If False: Pipeline runs once, Solver runs N times.
     "APPLY_FULL_PIPELINE_RETRY": False,
+
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
-    "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",
-    "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
-    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",
+    # --- 10. Prompt Template Selection ---
+    "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",  # Renamed
+    "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1", # Kept for backward compatibility, but normalization is preferred.
+    
+    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",  # DEPRECATED: Replaced by granular transformation flags.
+    
+    # NEW: Select a prompt for each transformation step independently
     "PROMPT_TEMPLATE_TRANSFORMATION_1": "transformation_shallow",
     "PROMPT_TEMPLATE_TRANSFORMATION_2": "transformation_shallow-&-moderately-deep",
     "PROMPT_TEMPLATE_TRANSFORMATION_3": "transformation_complete",
+    
     "PROMPT_TEMPLATE_MERGING": "merging_v1",
+    # MODIFIED: Default solver prompt is now v2.
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
 
+    # --- 10b. NEW FEATURES: Prompt Template Selection for New Features ---
     "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator",
     "PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR": "self_sampling_augmentor_v1",
     "PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION": "analogical_adaptation_v1",
-    "PROMPT_TEMPLATE_CONSISTENCY_SOLVER": "analogical_adaptation_v1",
+    
+    # Prompt for the consistency solver (using one specific exemplar)
+    "PROMPT_TEMPLATE_CONSISTENCY_SOLVER": "analogical_adaptation_v1", 
+    
+    # Prompt for the reverse validation solver (Candidate -> Validator)
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER": "analogical_adaptation_v1",
 
+    # --- 10c. NEW FEATURES: Prompt Template Selection for Simplification ---
+    # Used to generate the simplified question text
+    "PROMPT_TEMPLATE_SIMPLIFICATION_GENERATOR": "simplification_generator_v1",
+    # Used to solve a simplified sample using the original sample as reasoning
+    "PROMPT_TEMPLATE_SIMPLIFIED_SAMPLE_SOLVER": "simplified_sample_solver_v1",
+    # Used to solve the complex Main Question using the solution of its simplified proxy
+    "PROMPT_TEMPLATE_SIMPLIFIED_MAIN_PROXY_SOLVER": "main_from_simplified_proxy_v1",
+
+    # --- 11. Hugging Face Hub Synchronization ---
     "PERSIST_RESULTS_ONLINE": True,
     "HF_SYNC_TOKEN": "YOUR_HUGGING_FACE_TOKEN_HERE",
     "HF_HUB_USERNAME": "your-hf-username-here",
@@ -166,10 +331,15 @@ CONFIG = {
     "HF_SYNC_REVISION_ENABLED": False,
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
-}
+
+} # This closes the main CONFIG dictionary
 
 
 def setup_directories():
+    """
+    Creates the necessary directory structure defined in the configuration.
+    This function should be called once at the beginning of a run.
+    """
     print("--- Setting up project directories ---")
     for dir_path in [DATA_DIR, OUTPUTS_DIR, LOGS_DIR, EMBEDDINGS_DIR, RESULTS_DIR]:
         try:

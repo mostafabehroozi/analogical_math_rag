@@ -33,6 +33,7 @@ UPGRADE: Now supports Hierarchical Augmentation with Backward Propagation.
 UPGRADE: Now supports Analogical Consistency Check (Reverse Validation).
 UPGRADE: Now supports 'Simplification' mode for Hierarchical Augmentation (raw text parsing).
 UPGRADE: Now supports configurable Leaf Retrieval Query Mode (Root vs Leaf).
+UPGRADE: Now supports Pipeline Simplification (Workflow A: Samples, Workflow B: Main Question).
 """
 
 import logging
@@ -63,7 +64,11 @@ from src.prompts import (
     create_augmentation_prompt,
     create_analogical_adaptation_prompt,
     create_hierarchical_parent_solver_prompt,
-    create_reverse_validation_prompt # NEW import
+    create_reverse_validation_prompt,
+    # NEW IMPORTS FOR SIMPLIFICATION
+    create_simplification_prompt,
+    create_simplified_sample_solver_prompt,
+    create_main_from_simplified_proxy_prompt
 )
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -236,6 +241,89 @@ def retrieve(
     return {
         "status": "SUCCESS",
         "retrieved_indices": top_k_indices.tolist(),
+    }
+
+
+# --- 1.5 SIMPLIFY RETRIEVED SAMPLES (NEW FEATURE) ---
+def simplify_retrieved_samples(
+    retrieved_indices: List[int],
+    exemplar_questions: List[str],
+    exemplar_solutions: List[str],
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Workflow A: Simplifies each retrieved sample to create a new, cleaner exemplar.
+    
+    Process for each sample:
+    1. Simplify the original Question using LLM.
+    2. Solve the simplified Question using the original Exemplar as reasoning support.
+    3. Construct new Exemplar: "Question: {SimpleQ}\nRationale and Answer: {DerivedSolution}"
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Simplification of Retrieved Samples.")
+    
+    successful_simplifications = []
+    failed_indices = []
+
+    # Determine Model for Simplification (Use dedicated model or fallback to adaptation)
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config.get('GEMINI_MODEL_NAME_SIMPLIFICATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config.get('AVALAI_MODEL_NAME_SIMPLIFICATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config.get('OLLAMA_MODEL_NAME_SIMPLIFICATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
+    else:
+        raise TypeError(f"Unsupported API manager type: {type(api_manager)}")
+        
+    temp = config.get("DEFAULT_SIMPLIFICATION_TEMPERATURE", 0.3)
+
+    for idx in retrieved_indices:
+        original_q = exemplar_questions[idx]
+        original_s = exemplar_solutions[idx]
+        original_exemplar_text = EXEMPLAR_FORMAT.format(question=original_q, solution=original_s)
+        
+        print(f"    -> Processing Sample #{idx} for Simplification...")
+
+        # Stage 1: Generate Simplified Question
+        prompt_simp = create_simplification_prompt(original_q, config)
+        resp_simp = api_manager.generate_content(prompt_simp, model_name, temp)
+        
+        if resp_simp['status'] != 'SUCCESS':
+            logger.warning(f"Failed to simplify question for sample {idx}: {resp_simp.get('error_message')}")
+            failed_indices.append({"index": idx, "step": "simplify_q", "error": resp_simp})
+            continue
+            
+        simple_q = resp_simp['text'].strip()
+        
+        # Stage 2: Solve Simplified Question using Original as Logic
+        prompt_solve = create_simplified_sample_solver_prompt(simple_q, original_exemplar_text, config)
+        resp_solve = api_manager.generate_content(prompt_solve, model_name, temp)
+        
+        if resp_solve['status'] != 'SUCCESS':
+            logger.warning(f"Failed to solve simplified question for sample {idx}: {resp_solve.get('error_message')}")
+            failed_indices.append({"index": idx, "step": "solve_simple_q", "error": resp_solve})
+            continue
+            
+        simple_solution = resp_solve['text'].strip()
+        
+        # Construct New Exemplar
+        # Note: The prompt output usually contains "Rationale: ... Final Answer: ...".
+        # We manually stitch it into standard format if the prompt output isn't fully compliant,
+        # but the prompt template instructs strictly. 
+        # We assume simple_solution contains "Rationale: ... Final Answer: ..."
+        
+        new_exemplar_text = f"Question: {simple_q}\nRationale and Answer: {simple_solution}"
+        successful_simplifications.append(new_exemplar_text)
+        print(f"      -> Success. New simplified exemplar created.")
+
+    status = "SUCCESS" if successful_simplifications else "FAILURE"
+    if successful_simplifications and failed_indices: status = "PARTIAL_SUCCESS"
+
+    return {
+        "status": status,
+        "simplified_exemplars": successful_simplifications,
+        "failed_indices": failed_indices
     }
 
 
@@ -524,6 +612,93 @@ def solve(
                 "status": "FAILURE",
                 "error_info": response
             })
+            
+    return {"status": "SUCCESS", "solution_attempts": solution_attempts}
+
+
+# --- 4.5 SOLVE VIA MAIN SIMPLIFICATION (NEW FEATURE) ---
+def solve_via_main_simplification(
+    target_query: str,
+    final_exemplars: List[str],
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Workflow B: Solves the Main Question via simplification proxy.
+    
+    Process:
+    1. Simplify the Main Question (target_query).
+    2. Solve the Simplified Main Question.
+       - If 'final_exemplars' exist, use RAG.
+       - If not, use simple solver.
+    3. Solve the Original Main Question using the logic from the Solved Simplified Question.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Solver via Main Question Simplification.")
+    
+    # Determine Models
+    # Use Simplification manager for step 1, Solver manager for step 2 & 3
+    if isinstance(api_manager, GeminiAPIManager):
+        model_simp = config.get('GEMINI_MODEL_NAME_SIMPLIFICATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
+        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_simp = config.get('AVALAI_MODEL_NAME_SIMPLIFICATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
+        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_simp = config.get('OLLAMA_MODEL_NAME_SIMPLIFICATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
+        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    else:
+        raise TypeError(f"Unsupported API manager type.")
+
+    temp_simp = config.get("DEFAULT_SIMPLIFICATION_TEMPERATURE", 0.3)
+    temp_solve = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
+    
+    # Step 1: Simplify Main Question
+    print("    -> [Simplification] Generating Simplified Main Question...")
+    prompt_simp = create_simplification_prompt(target_query, config)
+    resp_simp = api_manager.generate_content(prompt_simp, model_simp, temp_simp)
+    
+    if resp_simp['status'] != 'SUCCESS':
+        logger.error(f"Failed to simplify main question: {resp_simp.get('error_message')}")
+        return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": resp_simp, "phase": "simplify_main"}]}
+    
+    simple_main_q = resp_simp['text'].strip()
+    print(f"       Simplified Q: '{simple_main_q[:50]}...'")
+
+    # Step 2: Solve Simplified Main Question
+    print("    -> [Simplification] Solving Simplified Main Question...")
+    
+    # Check if we have RAG context (final_exemplars) to use for the simplified question
+    if final_exemplars:
+        # Note: We are using the context retrieved for the original question to solve the simplified one.
+        # This assumes the simplified question is semantically close enough for the exemplars to be valid.
+        prompt_solve_simple = create_final_reasoning_prompt(simple_main_q, final_exemplars, config)
+    else:
+        prompt_solve_simple = create_final_reasoning_prompt_simple(simple_main_q, config)
+        
+    resp_solve_simple = api_manager.generate_content(prompt_solve_simple, model_solve, temp_solve)
+    
+    if resp_solve_simple['status'] != 'SUCCESS':
+        logger.error(f"Failed to solve simplified main question: {resp_solve_simple.get('error_message')}")
+        return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": resp_solve_simple, "phase": "solve_simple"}]}
+    
+    simple_solution = resp_solve_simple['text']
+    
+    # Step 3: Solve Original Main Question using Proxy
+    print("    -> [Simplification] Solving Original Main Question via Proxy...")
+    prompt_proxy = create_main_from_simplified_proxy_prompt(target_query, simple_solution, config)
+    
+    n_attempts = config.get("N_PASS_ATTEMPTS", 1)
+    solution_attempts = []
+    
+    for i in range(n_attempts):
+        print(f"       Generating Attempt {i+1}/{n_attempts}...")
+        resp_final = api_manager.generate_content(prompt_proxy, model_solve, temp_solve)
+        
+        if resp_final['status'] == 'SUCCESS':
+            solution_attempts.append(resp_final['text'])
+        else:
+            solution_attempts.append({"status": "FAILURE", "error_info": resp_final})
             
     return {"status": "SUCCESS", "solution_attempts": solution_attempts}
 

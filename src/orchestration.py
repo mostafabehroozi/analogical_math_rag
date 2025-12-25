@@ -39,6 +39,10 @@ major performance bottleneck.
 NEW FEATURE: Added `APPLY_FULL_PIPELINE_RETRY`. If True, the entire pipeline
 (Retrieval -> Adaptation -> Merging -> Solving) is re-run N times, rather than
 just retrying the final Solver step N times.
+
+NEW FEATURE: Added Pipeline Simplification.
+- Workflow A: Simplification of Retrieved Samples (replaces standard adaptation).
+- Workflow B: Simplification of Main Question (alters solving strategy).
 """
 
 import logging
@@ -54,7 +58,10 @@ from src.pipeline_steps import (
     generate_reasoning_pathways, # NEW Import for Pathway Consistency
     solve_with_group_consistency, # NEW Import for Group Consistency
     solve_hierarchical_tree, # NEW Import for Hierarchical Augmentation
-    solve_with_analogical_consistency # NEW Import for Reverse Validation
+    solve_with_analogical_consistency, # NEW Import for Reverse Validation
+    # NEW IMPORTS FOR SIMPLIFICATION
+    simplify_retrieved_samples,
+    solve_via_main_simplification
 )
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -123,6 +130,8 @@ def run_pipeline_for_single_query(
                     # Reverse Validation Flags
                     "APPLY_REVERSE_VALIDATION", "REVERSE_VALIDATION_CANDIDATES_N",
                     "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N",
+                    # Simplification Flags
+                    "APPLY_SIMPLIFICATION", "SIMPLIFY_RETRIEVED_SAMPLES", "SIMPLIFY_MAIN_QUESTION",
                     # Full Pipeline Retry Flag
                     "APPLY_FULL_PIPELINE_RETRY"
                 ]
@@ -144,6 +153,10 @@ def run_pipeline_for_single_query(
     # NEW: Specific Manager for Evaluation (needed for Reverse Validation loop)
     provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
     manager_for_eval = api_managers[provider_for_eval]
+
+    # NEW: Specific Manager for Simplification
+    provider_for_simp = config.get('API_PROVIDER_SIMPLIFICATION', provider_for_adapt)
+    manager_for_simp = api_managers[provider_for_simp]
 
     # --- NEW: Branch for Reverse Validation (Analogical Consistency) ---
     if config.get('APPLY_REVERSE_VALIDATION', False):
@@ -355,7 +368,7 @@ def run_pipeline_for_single_query(
 
         # --- Phase 1: Intermediate Steps ---
         if run_mode in ['full', 'intermediate']:
-            # -- Step 1: Retrieve & Adapt (Standard) --
+            # -- Step 1: Retrieve --
             retrieved_indices = []
             if config.get('USE_RETRIEVAL', True):
                 print("\n[STEP 1] RETRIEVE")
@@ -379,18 +392,39 @@ def run_pipeline_for_single_query(
                     retrieved_indices = retrieval_result['retrieved_indices']
                     print(f"  -> Retrieved indices: {retrieved_indices}")
                     
-                    # Run standard adaptation on the retrieved exemplars
-                    print("\n[STEP 2] ADAPT (Standard Transformations)")
-                    adapt_result = adapt(
-                        target_query=target_query, retrieved_indices=retrieved_indices,
-                        exemplar_questions=exemplar_data['questions'], exemplar_solutions=exemplar_data['solutions'],
-                        api_manager=manager_for_adapt, config=config
-                    )
-                    iter_log_steps['adaptation'] = adapt_result
-                    if adapt_result['status'] == 'FAILURE':
-                        # This is not fatal if other steps like self-sampling are enabled
-                        print("  -> WARNING: Standard adaptation failed for all exemplars.")
-                    exemplars_for_next_step.extend(adapt_result.get('adapted_texts', []))
+                    # --- BRANCH: Simplification vs Standard Adaptation ---
+                    # Check if Sample Simplification (Workflow A) is enabled
+                    if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_RETRIEVED_SAMPLES', False):
+                        print("\n[STEP 1.5] SIMPLIFY RETRIEVED SAMPLES")
+                        # Run the new simplification pipeline step
+                        simp_result = simplify_retrieved_samples(
+                            retrieved_indices=retrieved_indices,
+                            exemplar_questions=exemplar_data['questions'],
+                            exemplar_solutions=exemplar_data['solutions'],
+                            api_manager=manager_for_simp,
+                            config=config
+                        )
+                        iter_log_steps['simplification_of_samples'] = simp_result
+                        
+                        if simp_result.get('simplified_exemplars'):
+                            print(f"  -> Generated {len(simp_result['simplified_exemplars'])} simplified exemplars.")
+                            # Use these as the exemplars for the next step, skipping standard adaptation (Step 2)
+                            exemplars_for_next_step.extend(simp_result['simplified_exemplars'])
+                        else:
+                            print("  -> WARNING: Sample Simplification failed. Falling back to Standard Adaptation.")
+                            # Fallback logic could be added here, but for now we proceed with empty or partial results
+                    else:
+                        # -- Step 2: Standard Adapt (Normalization/Transformation) --
+                        print("\n[STEP 2] ADAPT (Standard Transformations)")
+                        adapt_result = adapt(
+                            target_query=target_query, retrieved_indices=retrieved_indices,
+                            exemplar_questions=exemplar_data['questions'], exemplar_solutions=exemplar_data['solutions'],
+                            api_manager=manager_for_adapt, config=config
+                        )
+                        iter_log_steps['adaptation'] = adapt_result
+                        if adapt_result['status'] == 'FAILURE':
+                            print("  -> WARNING: Standard adaptation failed for all exemplars.")
+                        exemplars_for_next_step.extend(adapt_result.get('adapted_texts', []))
             else:
                 print("\n[STEP 1, 2] RETRIEVE & ADAPT SKIPPED (USE_RETRIEVAL is False).")
 
@@ -488,8 +522,27 @@ def run_pipeline_for_single_query(
         if run_mode in ['full', 'solve_only']:
             if not pipeline_halted:
                 
+                # --- BRANCH: Main Question Simplification Workflow (Workflow B) ---
+                if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_MAIN_QUESTION', False):
+                    print("\n[STEP 6] SOLVE (Simplification of Main Question)")
+                    
+                    solve_result = solve_via_main_simplification(
+                        target_query=target_query,
+                        final_exemplars=final_exemplars_for_solve,
+                        api_manager=manager_for_simp, # Can use Simp manager or Solve manager, func handles it
+                        config=config
+                    )
+                    
+                    current_attempts = solve_result.get('solution_attempts', [])
+                    aggregated_solution_attempts.extend(current_attempts)
+                    
+                    if solve_result['status'] == 'SUCCESS':
+                        final_pipeline_status = "SUCCESS"
+                    else:
+                        final_pipeline_status = "FAILURE"
+
                 # --- BRANCH: Group-Based Self-Consistency Selection ---
-                if config.get('APPLY_GROUP_CONSISTENCY_SELECTION', False):
+                elif config.get('APPLY_GROUP_CONSISTENCY_SELECTION', False):
                     print("\n[STEP 6] SOLVE (Group-Based Consistency Mode)")
                     
                     # Execute the new consistency pipeline step

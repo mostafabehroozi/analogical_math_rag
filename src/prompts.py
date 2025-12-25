@@ -1204,6 +1204,89 @@ Final Answer:
 [The final result]
 </Output Format>
 """,
+
+    # --- NEW TEMPLATES FOR SIMPLIFICATION FEATURE ---
+
+    "simplification_generator_v1": """You are an expert mathematical simplification assistant. Your task is to take a 'Base Question' and produce a simplified version of it.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify the "Core Logic" (the main rule or formula needed) and the "Complexity Layers" (large numbers, extra arithmetic steps, or difficult variables).
+2. Create EXACTLY ONE new math question that is simpler than the Base Question but retains the same underlying logic.
+3. CRITICAL CONSTRAINTS:
+    - Make the numbers smaller or friendlier (e.g., replace decimals with integers).
+    - Remove unnecessary descriptive fluff.
+    - Reduce the number of steps if possible, without changing the fundamental method required to solve it.
+    - The new question must be a complete, standalone sentence.
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the simplified question statement.
+</Instructions>
+
+<Example>
+<Base Question>
+Find the area of a circle inscribed in a square that has a diagonal length of 8.25.
+</Base Question>
+<Your Output>
+Find the area of a circle inscribed in a square that has a diagonal length of 8.
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{text_to_simplify}
+</Base Question>
+</Task>
+""",
+
+    "simplified_sample_solver_v1": """You are an expert mathematician. Your task is to solve a 'Simplified Question' by applying the logic found in an 'Original Solved Example'.
+
+<Original Solved Example>
+{original_exemplar}
+</Original Solved Example>
+
+<Simplified Question>
+{simplified_question}
+</Simplified Question>
+
+<Instructions>
+1. Analyze the Original Solved Example to understand the underlying logic and problem-solving method.
+2. Apply that SAME logic to solve the Simplified Question.
+3. Output the solution in the standard format.
+</Instructions>
+
+<Output Format (Strictly follow this format)>
+Rationale:
+[Your step-by-step rationale for the Simplified Question]
+
+Final Answer:
+[Your final answer]
+</Output Format>
+""",
+
+    "main_from_simplified_proxy_v1": """You are an expert mathematician. You have a 'Complex Main Question' and a solution to a 'Simplified Version' of that question.
+Use the logic from the Simplified Solution to solve the Complex Main Question.
+
+<Simplified Version Solution>
+{simplified_solution}
+</Simplified Version Solution>
+
+<Complex Main Question>
+{original_main_question}
+</Complex Main Question>
+
+<Instructions>
+1. Read the Simplified Version Solution to understand the method used.
+2. Apply that same method to the Complex Main Question (handling the extra complexity or larger numbers).
+3. Output the solution in the standard format.
+</Instructions>
+
+<Output Format (Strictly follow this format)>
+Rationale:
+[Your step-by-step rationale for the Complex Main Question]
+
+Final Answer:
+[Your final answer]
+</Output Format>
+""",
     
 
 }
@@ -1444,3 +1527,39 @@ def create_reverse_validation_prompt(validator_question: str, candidate_text: st
     
     template = PROMPT_TEMPLATES[template_name]
     return template.format(validator_question=validator_question, candidate_exemplar=candidate_text)
+
+
+# --- NEW FUNCTIONS FOR SIMPLIFICATION FEATURE ---
+
+def create_simplification_prompt(text_to_simplify: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt for generating a simplified version of a question.
+    """
+    template_name = config.get("PROMPT_TEMPLATE_SIMPLIFICATION_GENERATOR", "simplification_generator_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(text_to_simplify=text_to_simplify)
+
+def create_simplified_sample_solver_prompt(simplified_question: str, original_exemplar: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve a simplified sample using the original sample as reasoning support.
+    """
+    template_name = config.get("PROMPT_TEMPLATE_SIMPLIFIED_SAMPLE_SOLVER", "simplified_sample_solver_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(simplified_question=simplified_question, original_exemplar=original_exemplar)
+
+def create_main_from_simplified_proxy_prompt(original_main_question: str, simplified_solution: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve the main question using the logic from its solved simplified proxy.
+    """
+    template_name = config.get("PROMPT_TEMPLATE_SIMPLIFIED_MAIN_PROXY_SOLVER", "main_from_simplified_proxy_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(original_main_question=original_main_question, simplified_solution=simplified_solution)
