@@ -1207,35 +1207,22 @@ Final Answer:
 
     # --- NEW TEMPLATES FOR SIMPLIFICATION FEATURE ---
 
-    "simplification_generator_v1": """You are an expert mathematical simplification assistant. Your task is to take a 'Base Question' and produce a simplified version of it.
-
+    "simplification_generator_v1": """Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
 <Instructions>
-1. Analyze the 'Base Question' to identify the "Core Logic" (the main rule or formula needed) and the "Complexity Layers" (large numbers, extra arithmetic steps, or difficult variables).
-2. Create EXACTLY ONE new math question that is simpler than the Base Question but retains the same underlying logic.
-3. CRITICAL CONSTRAINTS:
-    - Make the numbers smaller or friendlier (e.g., replace decimals with integers).
-    - Remove unnecessary descriptive fluff.
-    - Reduce the number of steps if possible, without changing the fundamental method required to solve it.
-    - The new question must be a complete, standalone sentence.
-4. Do NOT provide any rationale, steps, or solutions.
-5. Output ONLY the simplified question statement.
+1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
+2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
+3. Reduce the number of steps or constraints slightly, as long as the underlying relationship remains the same.
+4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
 </Instructions>
-
-<Example>
-<Base Question>
-Find the area of a circle inscribed in a square that has a diagonal length of 8.25.
-</Base Question>
-<Your Output>
-Find the area of a circle inscribed in a square that has a diagonal length of 8.
-</Your Output>
-</Example>
-
-<Task>
-<Base Question>
+<Main Question>
 {text_to_simplify}
-</Base Question>
-</Task>
+</Main Question>
+<Output Format>
+Simplified Question:
+[Your simplified version]
+</Output Format>
 """,
+
 
     "simplified_sample_solver_v1": """You are an expert mathematician. Your task is to solve a 'Simplified Question' by applying the logic found in an 'Original Solved Example'.
 
