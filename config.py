@@ -1,9 +1,3 @@
-#======================================================================
-#   File: config.py
-#======================================================================
-
-# config.py
-
 """
 Central configuration file for the Analogical Reasoning RAG project.
 
@@ -131,7 +125,7 @@ CONFIG = {
     "DEFAULT_EVALUATOR_TEMPERATURE": 0.0,    # Low temp for deterministic, consistent evaluation.
     
     # NEW: Temperature for Augmentation (needs creativity)
-    "DEFAULT_AUGMENTATION_TEMPERATURE": 0.7,
+    "DEFAULT_AUGMENTATION_TEMPERATURE": 1.0,
 
     # NEW: Temperature for Simplification
     "DEFAULT_SIMPLIFICATION_TEMPERATURE": 0.3, # Slightly creative but focused
@@ -182,7 +176,7 @@ CONFIG = {
     # --- 8b. NEW FEATURES: Self-Sampling Configuration ---
     "APPLY_SELF_SAMPLING": False,           # Enable self-sampling feature
     "SELF_SAMPLING_N": 3,                   # Number of self-sampling attempts
-    "SELF_SAMPLING_TEMPERATURE": 0.7,       # Temperature for diversity in self-sampling
+    "SELF_SAMPLING_TEMPERATURE": 1.0,       # Temperature for diversity in self-sampling
 
     # --- 8c. NEW FEATURES: Analogical Adaptation Configuration ---
     "APPLY_ANALOGICAL_ADAPTATION": False,   # Enable analogical reasoning as adaptation
@@ -208,11 +202,11 @@ CONFIG = {
     
     # Layer 1 Settings (Generating the Pathway Pool)
     "CONSISTENCY_PATHWAYS_K": 3,                        
-    "CONSISTENCY_LAYER_1_TEMPERATURE": 0.7,             # Temp for solving the augmented questions (creating the rationale).
+    "CONSISTENCY_LAYER_1_TEMPERATURE": 1.0,             # Temp for solving the augmented questions (creating the rationale).
     
     # Layer 2 Settings (Stress Testing the Pathway)
     "CONSISTENCY_SAMPLES_PER_PATHWAY_N": 3,             # Number of times to solve the Main Question using EACH parent pathway.
-    "CONSISTENCY_LAYER_2_TEMPERATURE": 0.7,             # Temp for solving the Main Question (needs variance to measure consistency).
+    "CONSISTENCY_LAYER_2_TEMPERATURE": 1.0,             # Temp for solving the Main Question (needs variance to measure consistency).
     
     # Analysis Settings
     "CONSISTENCY_VOTING_THRESHOLD": 0.6,                # Threshold for considering a pathway "consistent" (e.g., 60% agreement).

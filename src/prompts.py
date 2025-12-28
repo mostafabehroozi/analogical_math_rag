@@ -1179,31 +1179,29 @@ Final Answer:
 """,
 
 
-    "reverse_validation_v1": """You are an expert mathematical problem solver.
-Your task is to solve the following 'Target Question' by applying the reasoning logic found in the provided 'Reference Example'.
-
-<Reference Example>
-{candidate_exemplar}
-</Reference Example>
-
-<Target Question>
-{validator_question}
-</Target Question>
+    "reverse_validation_v1": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved variations.
 
 <Instructions>
-1. Analyze the Reference Example to understand the method used.
-2. Apply that same method/logic to solve the Target Question.
-3. Output the solution in the standard format.
+Carefully analyze each variation: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these variations as supportive guides. Adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
 </Instructions>
 
-<Output Format>
+<Solved Variations>
+{candidate_exemplar}
+</Solved Variations>
+
+<Main Question to Solve>
+{validator_question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
 Rationale:
-[Step-by-step derivation]
+[Your step-by-step rationale for the Main Question]
 
 Final Answer:
-[The final result]
-</Output Format>
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
 """,
+
 
     # --- NEW TEMPLATES FOR SIMPLIFICATION FEATURE ---
 
