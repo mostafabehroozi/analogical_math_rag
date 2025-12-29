@@ -976,6 +976,36 @@ Simplified Question:
 </Output Format>
 """,
 
+    "self_sampling_augmentor_simplification_safe":"""You are a Logic Preservation Engine. Your goal is to analyze the <Main Question> to determine if it can be "Safely Simplified" for an Analogical Reasoning task.
+
+<Definition of Safe Simplification>
+A "Safe Simplification" creates an easier version of the problem to solve as a reference, BUT it must adhere to these strict rules:
+1. PRESERVE LOGIC: The mathematical formulas, logical relationships, and required solution steps must remain identical to the original.
+2. REDUCE NOISE: You may replace large numbers with small integers (e.g., 5,392 -> 3), or remove narrative fluff (names, backstory).
+3. DO NO HARM: If changing a number or removing a sentence alters the fundamental question type or logic, it is UNSAFE.
+</Definition of Safe Simplification>
+
+<Evaluation Protocol>
+Before generating an output, analyze the question for these conditions:
+- Condition A (Simplifiable): The question uses large numbers or distracting text that are NOT essential to the logic.
+- Condition B (Unsafe/Core Only): The question is already short, abstract, or every number/constraint is structurally vital (e.g., specific constants, core puzzle constraints).
+
+<Instructions>
+- IF Condition A is met: Rewrite the question using small numbers and plain language. Keep the core logic exactly the same.
+- IF Condition B is met (or if you are unsure): Do NOT simplify. Output the <Main Question> exactly as it appears word-for-word.
+- WARNING: Better to output the original complex question than a simplified version with broken logic.
+</Instructions>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Output Format>
+Simplified Question:
+[Your Output Here]
+</Output Format>
+""",
+
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
 
 Your task is to solve the Main Question by using analogical reasoning based on the provided group of Solved Sample Problems.
