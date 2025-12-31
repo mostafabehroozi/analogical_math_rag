@@ -2,29 +2,10 @@
 #   File: src/prompts.py
 #======================================================================
 
-# src/prompts.py
-
-"""
-Prompt engineering module for the Analogical Reasoning RAG project.
-
-This file centralizes all prompt templates and the functions that construct
-the final prompts used in the pipeline. It employs a registry pattern
-(the `PROMPT_TEMPLATES` dictionary) to allow for easy management, versioning,
-and selection of different prompt variations via the main configuration file.
-
-This rewritten version includes hardened instructions in key templates to ensure
-LLMs adhere strictly to the expected output format, reducing parsing errors
-in downstream pipeline steps.
-"""
-
 from typing import List, Dict, Any
 
-# Define the standard text format for a question-solution pair.
-# This ensures consistency when constructing and parsing exemplars.
 EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
 
-# --- 1. Prompt Template Registry ---
-# A dictionary holding all versioned prompt templates for the project.
 PROMPT_TEMPLATES: Dict[str, str] = {
 
     "standardization_v1": """You are a helpful math assistant.
@@ -157,6 +138,7 @@ Rationale and Answer: [Merged Rationale and Answer]
 </Output>
 </Task>
 """,
+
     "transformation_complete":"""<Objective>
 Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
 The transformation should be holistic, aiming to align the sample with the Target Question on multiple levels—from surface features like entities and context to deeper conceptual and structural similarities. The goal is to reframe the sample to make its reasoning pattern as clear and applicable as possible for solving the Target Question, while strictly preserving the sample's original reasoning process and final answer.
@@ -352,14 +334,12 @@ Your task is to merge two solved math problems into a single new, synthesized pr
 These two input samples are called Parent Sample A and Parent Sample B, because they will be merged to form one new "child" example.   
 The child example should combine the most relevant and valuable reasoning patterns from its parents in a coherent, context-aware manner.
 
-
 <Your Objective> 
 Create a new merged example that:
 1. Retains the core reasoning structures and mathematical logic from both Parent A and Parent B.
 2. Selectively integrates only the parts most relevant to the Target Question. 
 3. Produces a new, logically consistent and useful exemplar that the LLM can learn from for analogical reasoning.
 </Your Objective> 
-
 
 <Core Guidelines> 
 1. Principled Construction from Parent Materials   
@@ -385,7 +365,6 @@ Create a new merged example that:
 - Discard irrelevant parts. The goal is maximum usefulness, not balance. 
 </Core Guidelines> 
 
-
 </Input Materials>  
 Parent Sample A: 
 {sample_1}
@@ -396,7 +375,6 @@ Parent Sample B:
 Target Question: 
 {target_query}
 </Input Materials> 
-
 
 <Output Instructions> 
 You must output ONLY in the following format.   
@@ -446,7 +424,6 @@ Look for patterns in the Solved Examples that might help solve the Main Question
 {main_question_text}
 </Main Question to Solve>
 
-
 <Your Answer/Output Format>
 Rationale:
 [Your step-by-step rationale for the Main Question]
@@ -482,8 +459,6 @@ Final Answer:
     
     "final_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
-
-
 <Instructions>
 Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
 </Instructions>
@@ -495,8 +470,6 @@ Carefully analyze each example: pinpoint common reasoning steps, patterns (inclu
 <Main Question to Solve>
 {main_question_text}
 </Main Question to Solve>
-
-
 
 <Your Answer/Output Format>
 Rationale:
@@ -1005,77 +978,6 @@ Simplified Question:
 [Your Output Here]
 </Output Format>
 """,
-    "self_sampling_augmentor_simplification_safe_complex":"""You are a Logic Preservation and Simplification Engine. Your goal is to generate a "Simplified Reference Question" that makes the logical pattern obvious, but ONLY if it can be done without damaging the core logic.
-
-<Safe Simplification Strategies>
-Analyze the Main Question for these three specific types of "Shallow Complexity."
-1. ARITHMETIC REDUCTION (Target: Calculation Load)
-   - IF the question uses large numbers (e.g., 5,492), decimals (e.g., 15.75), or fractions just to make the math hard:
-   - ACTION: Replace them with small integers (e.g., 2, 5, 10).
-   - SAFETY CONSTRAINT: You must preserve the proportional relationships. (e.g., If X was half of Y, the new X must still be half of the new Y).
-
-2. SEMANTIC DISTILLATION (Target: Linguistic Load)
-   - IF the question contains distracting names, backstories, irrelevant objects, or wordy descriptions:
-   - ACTION: Rewrite as a generic statement (e.g., "Mr. Smith drives 500 miles" -> "An object moves distance D").
-   - SAFETY CONSTRAINT: Do not remove any structural constraints (e.g., "without replacement," "simultaneously," "in that specific order").
-
-3. SCALE REDUCTION (Target: Iterative Load)
-   - IF the question asks for a result after many iterations or steps (e.g., "Find the sum of the first 100 terms"):
-   - ACTION: Reduce the iterations to a small number (e.g., "Find the sum of the first 3 terms") to reveal the pattern.
-   - SAFETY CONSTRAINT: Do not change the rule of the sequence or the boundary conditions (e.g., do not change "limits to infinity").
-</Safe Simplification Strategies>
-
-<Evaluation Protocol>
-Before generating the output, you must pass the question through this check:
-1. Is the question ALREADY simple? (Small numbers, direct logic).
-2. Is the complexity PART of the logic? (e.g., A cipher puzzle, or a question specifically about how to handle large exponents).
-3. If I simplify, will the answer method change?
-
-<Strict Instructions>
-- CASE A: If the question has "Shallow Complexity" (Safe Strategies 1, 2, or 3 apply) AND it is safe to change -> Output the simplified version.
-- CASE B: If the question is already simple, OR if simplifying it risks changing the core logic -> STOP. Output the <Main Question> exactly word-for-word.
-- WARNING: It is better to output the original complex question than a simplified version with broken logic.
-</Strict Instructions>
-
-<Main Question>
-{main_question_text}
-</Main Question>
-
-<Output Format>
-Simplified Question:
-[Your Output Here]
-</Output Format>
-""",
-    "self_sampling_augmentor_simplification_safe_simple":"""Your task is to simplify the Main Question by changing ONLY ONE surface detail to make it easier to read.
-
-<Instructions>
-
-1. FIND ONE TARGET: Look for ONE of these three things that makes the question look complicated:
-   - A difficult number (e.g., "4,592", "12.5", or "$19.99").
-   - A long name (e.g., "Mr. Jonathan Beauregard" or "The National Library").
-   - A wordy object description (e.g., "antique porcelain vases").
-
-2. MAKE ONE CHANGE: Replace that ONE target with something simple:
-   - Change the difficult number to a small single digit (e.g., "5").
-   - Change the long name to a short name (e.g., "Tom" or "The Library").
-   - Change the wordy object to a generic word (e.g., "boxes").
-
-3. SAFETY RULES (CRITICAL):
-   - CHANGE ONLY ONE THING. Do not change two numbers or a number and a name.
-   - CHECK THE LOGIC: If changing the target breaks the math relationship or makes the question impossible to solve, DO NOT CHANGE IT.
-   - IF UNSURE: Output the Main Question exactly as it is.
-
-</Instructions>
-
-<Main Question>
-{main_question_text}
-</Main Question>
-
-<Output Format>
-Simplified Question:
-[Your output here]
-</Output Format>
-""",
 
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
 
@@ -1303,9 +1205,6 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
-
-    # --- NEW TEMPLATES FOR SIMPLIFICATION FEATURE ---
-
     "simplification_generator_v1": """Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
 <Instructions>
 1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
@@ -1321,7 +1220,6 @@ Simplified Question:
 [Your simplified version]
 </Output Format>
 """,
-
 
     "simplified_sample_solver_v1": """You are an expert mathematician. Your task is to solve a 'Simplified Question' by applying the logic found in an 'Original Solved Example'.
 
@@ -1373,177 +1271,116 @@ Final Answer:
 [Your final answer]
 </Output Format>
 """,
-    
+
+    "self_sampling_augmentor_simplification_with_solution": """You are an expert mathematical simplification assistant. 
+Your task is to create a SIMPLIFIED version of the 'Base Question'.
+To help you understand exactly what parts of the question are complex versus simple, you are provided with a 'Reference Solution' to the Base Question.
+
+<Instructions>
+1. Analyze the 'Base Question' and its 'Reference Solution'.
+2. Identify the logical steps and the components that make the solution complex (e.g., large numbers, difficult arithmetic, complex units).
+3. Create EXACTLY ONE new math question that follows the same logic but is simpler.
+4. Use the Reference Solution to ensure you preserve the core logic while making the execution easier.
+5. Do NOT provide any rationale, steps, or solutions for your new question.
+6. Output ONLY the simplified question statement.
+</Instructions>
+
+<Base Question>
+{main_question_text}
+</Base Question>
+
+<Reference Solution>
+{generated_solution}
+</Reference Solution>
+
+<Output Format>
+[Your simplified question]
+</Output Format>
+"""
 
 }
 
-
-# --- 2. Prompt Creation Functions ---
-# These functions abstract the process of selecting and formatting a template.
-
 def create_normalization_prompt(original_example: str) -> str:
-    """Creates a prompt for the 'normalization' pipeline step."""
     template = PROMPT_TEMPLATES["standardization_v1"]
     return template.format(original_example=original_example)
 
-# Alias for backward compatibility
 create_standardization_prompt = create_normalization_prompt
 
 def create_transformation_prompt(target_query: str, text_to_transform: str, config: Dict[str, Any], template_key_name: str) -> str:
-    """
-    Creates a prompt for a 'transformation' pipeline step using a dynamically specified template key.
-    
-    Args:
-        target_query (str): The main question the transformation is being guided by.
-        text_to_transform (str): The exemplar text to be transformed.
-        config (Dict[str, Any]): The main configuration dictionary.
-        template_key_name (str): The key in the config that holds the name of the prompt template to use
-                                 (e.g., "PROMPT_TEMPLATE_TRANSFORMATION_1").
-    """
-    # Dynamically get the template name from the config using the provided key.
-    template_name = config.get(template_key_name, "transformation_v1") # Fallback to a default.
-    
+    template_name = config.get(template_key_name, "transformation_v1")
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' specified by key '{template_key_name}' not found in registry."
-        
     template = PROMPT_TEMPLATES[template_name]
     return template.format(target_query=target_query, text_to_transform=text_to_transform)
 
 
 def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str:
-    """Creates a prompt for the 'merging' pipeline step."""
     if len(samples_to_merge) != 2:
-        # This guard clause prevents errors if the merging logic provides the wrong number of samples.
         return "Error: create_merging_prompt requires exactly two samples."
-    
     template = PROMPT_TEMPLATES["merging_v1"]
     return template.format(target_query=target_query, sample_1=samples_to_merge[0], sample_2=samples_to_merge[1])
 
 def create_final_reasoning_prompt(main_question_text: str, final_examples: List[str], config: Dict[str, Any]) -> str:
-    """
-    Creates the final prompt for the solver, including processed examples (RAG).
-    This function now dynamically selects the template and formats the examples
-    based on the template's requirements.
-    """
     if not final_examples:
         return "Error: At least one example is required for the RAG-based final reasoning prompt."
 
     template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER", "final_solver_v2")
     template = PROMPT_TEMPLATES[template_name]
     
-    # --- MODIFIED: Dynamic block creation based on template ---
-    # Handle v2, v3, v4, and standard analogical adaptation templates
-    # They all use XML-style inputs and the {examples_block} placeholder.
     if template_name in ["final_solver_v2", "final_solver_v3", "final_solver_v4", "analogical_adaptation_v2"]:
-        # Format for the new templates with XML-style tags
         examples_block = ""
         for i, sample_text in enumerate(final_examples):
             examples_block += f"<Example {i+1}>\n{sample_text}\n</Example {i+1}>\n\n"
         return template.format(main_question_text=main_question_text, examples_block=examples_block.strip())
     
     elif template_name == "final_solver_v1":
-        # Original formatting for the v1 template
         samples_block = ""
         for i, sample_text in enumerate(final_examples):
             samples_block += f"\n**Adapted Sample {i+1}:**\n{sample_text}\n"
         return template.format(main_question_text=main_question_text, adapted_samples_block=samples_block.strip())
     
     else:
-        # Fallback or error for unknown templates
         return f"Error: Unknown final solver template '{template_name}' specified in config."
 
 
 def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[str, Any]) -> str:
-    """Creates the final prompt for the solver without any adapted samples (No RAG)."""
     template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE", "final_solver_simple_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question_text)
 
 def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any]) -> str:
-    """Creates the prompt for the evaluator LLM."""
     template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(model_answer=model_answer, ground_truth=ground_truth)
 
 def create_duplicate_check_prompt(main_question_text: str, retrieved_questions: List[str]) -> str:
-    """Creates the prompt for the special duplicate question check task."""
     template = PROMPT_TEMPLATES["duplicate_question_check_v1"]
-    
-    # Format the list of retrieved questions into a numbered block for the LLM.
     retrieved_block = "\n".join(f"{i+1}. {q}" for i, q in enumerate(retrieved_questions))
-        
     return template.format(main_question_text=main_question_text, retrieved_questions_block=retrieved_block.strip())
 
 
-# --- NEW FEATURES: Prompt Creation Functions ---
-
 def create_self_sampling_prompt(main_question: str, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt for the self-sampling step.
-    
-    Args:
-        main_question (str): The question to be solved via self-sampling.
-        config (Dict[str, Any]): The main configuration dictionary.
-    
-    Returns:
-        str: The formatted prompt for self-sampling.
-    """
     template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR", "self_sampling_generator")
-    
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question)
 
 
 def create_augmentation_prompt(main_question: str, n_samples: int, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt for generating augmented versions of a question.
-    
-    Args:
-        main_question (str): The base question to augment.
-        n_samples (int): The number of augmented questions to generate.
-        config (Dict[str, Any]): The main configuration dictionary.
-    
-    Returns:
-        str: The formatted prompt for augmentation.
-    """
     template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR", "self_sampling_augmentor_v1")
-    
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question, n_samples=n_samples)
 
 
 def create_analogical_adaptation_prompt(main_question: str, sample_group: List[str], config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt for the analogical adaptation step.
-    
-    Args:
-        main_question (str): The main question to solve using analogical reasoning.
-        sample_group (List[str]): A group of retrieved sample texts to use for analogical reasoning.
-        config (Dict[str, Any]): The main configuration dictionary.
-    
-    Returns:
-        str: The formatted prompt for analogical adaptation.
-    """
     template_name = config.get("PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION", "analogical_adaptation_v1")
-    
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    
     template = PROMPT_TEMPLATES[template_name]
-    
-    # Format the sample group with XML-style tags
-    samples_block = "\n\n".join([f"<Sample {i+1}>\n{s}\n</Sample {i+1}>" 
-                                  for i, s in enumerate(sample_group)])
-    
-    # === FIX APPLIED HERE ===
-    # Pass the content to both 'samples_block' AND 'examples_block' to ensure compatibility
-    # with both standard adaptation templates and solver templates like 'final_solver_v2'.
+    samples_block = "\n\n".join([f"<Sample {i+1}>\n{s}\n</Sample {i+1}>" for i, s in enumerate(sample_group)])
     return template.format(
         main_question_text=main_question, 
         samples_block=samples_block,
@@ -1551,101 +1388,57 @@ def create_analogical_adaptation_prompt(main_question: str, sample_group: List[s
     )
 
 def create_hierarchical_parent_solver_prompt(main_question: str, child_nodes_data: List[Dict[str, str]], config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt for solving a parent node using its children's solutions.
-    
-    Args:
-        main_question (str): The parent question.
-        child_nodes_data (List[Dict]): List of dicts with 'question' and 'solution' keys.
-        config (Dict[str, Any]): Global config.
-        
-    Returns:
-        str: Formatted prompt.
-    """
     template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER", "hierarchical_parent_solver_v1")
-    
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-        
     template = PROMPT_TEMPLATES[template_name]
-    
-    # Format children into a block
     child_block = ""
     for i, child in enumerate(child_nodes_data):
         child_block += f"<Variation {i+1}>\nQuestion: {child.get('question', '')}\nSolution: {child.get('solution', '')}\n</Variation {i+1}>\n\n"
-        
     return template.format(main_question_text=main_question, child_solutions_block=child_block.strip())
 
 def create_reverse_validation_prompt(validator_question: str, candidate_text: str, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt for the Reverse Validation (Analogical Consistency) feature.
-    
-    Args:
-        validator_question (str): The retrieved question (ground truth known) to be solved.
-        candidate_text (str): The generated candidate solution to act as the exemplar.
-        config (Dict[str, Any]): Global config.
-        
-    Returns:
-        str: Formatted prompt.
-    """
     template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER", "reverse_validation_v1")
-    
-    # Compatibility Check: If user configured an 'analogical_adaptation' template
     if template_name == "analogical_adaptation_v1" or template_name == "analogical_adaptation_v2":
         if template_name not in PROMPT_TEMPLATES:
             return f"Error: Template {template_name} not found."
-            
-        # These templates expect 'main_question_text' and 'samples_block'/'examples_block'
-        # Wrap candidate in tags for consistency
         samples_block = f"<Sample>\n{candidate_text}\n</Sample>"
         template = PROMPT_TEMPLATES[template_name]
-        
-        # Use safe formatting to handle potential missing keys if v1 vs v2
         return template.format(
             main_question_text=validator_question,
             samples_block=samples_block,
-            examples_block=samples_block # v2 uses examples_block
+            examples_block=samples_block
         )
-
-    # Standard Case: Use the dedicated Reverse Validation template
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    
     template = PROMPT_TEMPLATES[template_name]
     return template.format(validator_question=validator_question, candidate_exemplar=candidate_text)
 
 
-# --- NEW FUNCTIONS FOR SIMPLIFICATION FEATURE ---
-
 def create_simplification_prompt(text_to_simplify: str, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt for generating a simplified version of a question.
-    """
     template_name = config.get("PROMPT_TEMPLATE_SIMPLIFICATION_GENERATOR", "simplification_generator_v1")
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    
     template = PROMPT_TEMPLATES[template_name]
     return template.format(text_to_simplify=text_to_simplify)
 
 def create_simplified_sample_solver_prompt(simplified_question: str, original_exemplar: str, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt to solve a simplified sample using the original sample as reasoning support.
-    """
     template_name = config.get("PROMPT_TEMPLATE_SIMPLIFIED_SAMPLE_SOLVER", "simplified_sample_solver_v1")
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    
     template = PROMPT_TEMPLATES[template_name]
     return template.format(simplified_question=simplified_question, original_exemplar=original_exemplar)
 
 def create_main_from_simplified_proxy_prompt(original_main_question: str, simplified_solution: str, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt to solve the main question using the logic from its solved simplified proxy.
-    """
     template_name = config.get("PROMPT_TEMPLATE_SIMPLIFIED_MAIN_PROXY_SOLVER", "main_from_simplified_proxy_v1")
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    
     template = PROMPT_TEMPLATES[template_name]
     return template.format(original_main_question=original_main_question, simplified_solution=simplified_solution)
+
+def create_augmentation_with_solution_prompt(main_question: str, generated_solution: str, n_samples: int, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_AUGMENTATION_STEP2_GENERATOR", "self_sampling_augmentor_simplification_with_solution")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question, generated_solution=generated_solution, n_samples=n_samples)

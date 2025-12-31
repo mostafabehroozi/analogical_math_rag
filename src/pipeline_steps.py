@@ -1,40 +1,6 @@
 #======================================================================
 #   File: src/pipeline_steps.py
 #======================================================================
-                            
-# src/pipeline_steps.py
-
-"""
-Core pipeline steps for the Analogical Reasoning RAG project.
-
-This module contains the primary functions that constitute the RAG pipeline,
-broken down into modular, sequential steps:
-1.  retrieve: Finds relevant exemplars from the corpus.
-2.  adapt: Transforms and/or summarizes the retrieved exemplars.
-3.  merge: Iteratively combines adapted exemplars into a more potent one.
-4.  solve: Generates the final answer using the processed exemplars.
-
-This version is updated to handle structured, detailed API error responses.
-When an API call fails, the step captures the error information and continues
-where possible, allowing the orchestrator to log partial results and enable
-targeted retries.
-
-This version also includes new, optional pipeline steps for self-sampling,
-augmentation, analogical adaptation, the NEW Analogical Consistency check,
-the Group-Based Self-Consistency Selection, and the NEW Hierarchical Augmentation.
-
-PERFORMANCE FIX: The retrieve() function now uses O(1) hash map lookup instead
-of O(n) linear search for self-match detection, reducing retrieval time from
-~1300 seconds to <0.001 seconds per query.
-
-UPGRADE: Now supports Recursive Analogical Chains (Tree-structured context).
-UPGRADE: Now supports Group-Based Self-Consistency Selection.
-UPGRADE: Now supports Hierarchical Augmentation with Backward Propagation.
-UPGRADE: Now supports Analogical Consistency Check (Reverse Validation).
-UPGRADE: Now supports 'Simplification' mode for Hierarchical Augmentation (raw text parsing).
-UPGRADE: Now supports configurable Leaf Retrieval Query Mode (Root vs Leaf).
-UPGRADE: Now supports Pipeline Simplification (Workflow A: Samples, Workflow B: Main Question).
-"""
 
 import logging
 import re
@@ -46,12 +12,7 @@ from typing import List, Dict, Any, Union, Tuple, Optional
 import time
 from collections import deque
 
-# NEW: Explicitly import CONFIG for use throughout this module.
-# The request was to *not* use a config flag for diagnostics, but CONFIG
-# itself is essential for pipeline logic in many functions.
 from config import CONFIG
-
-# Import our custom modules
 from src.prompts import (
     EXEMPLAR_FORMAT,
     create_normalization_prompt,
@@ -65,35 +26,29 @@ from src.prompts import (
     create_analogical_adaptation_prompt,
     create_hierarchical_parent_solver_prompt,
     create_reverse_validation_prompt,
-    # NEW IMPORTS FOR SIMPLIFICATION
     create_simplification_prompt,
     create_simplified_sample_solver_prompt,
-    create_main_from_simplified_proxy_prompt
+    create_main_from_simplified_proxy_prompt,
+    create_augmentation_with_solution_prompt 
 )
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
-# MODIFIED: Import manager classes for type checking
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
-# NEW: Import evaluation logic for the internal loop
 from src.evaluation import evaluate_single_answer_with_llm
 
-
 def log_time_diagnostic(message: str, start_time: float, indent: int = 0) -> float:
-    """Logs a diagnostic message with elapsed time and returns the current time."""
     end_time = time.time()
     elapsed = end_time - start_time
     indent_str = "  " * indent
-    if elapsed > 0.001: # Only print if elapsed time is significant
+    if elapsed > 0.001: 
         print(f"{indent_str}⏱️  DIAGNOSTIC: {message} took {elapsed:.4f} seconds.")
     return end_time
 
-# --- Utility Function for Embedding Generation ---
 def _generate_embeddings(
     texts: List[str],
     embedding_model: SentenceTransformer,
     batch_size: int = 32
 ) -> np.ndarray:
-    """Helper function to generate sentence embeddings."""
     if not isinstance(embedding_model, SentenceTransformer) or not texts:
         return np.array([])
     try:
@@ -107,8 +62,6 @@ def _generate_embeddings(
         logging.getLogger(__name__).error(f"Failed to generate embeddings: {e}", exc_info=True)
         return np.array([])
 
-
-# --- 1. RETRIEVAL STEP ---
 def retrieve(
     target_query: str,
     embedding_model: SentenceTransformer,
@@ -117,38 +70,18 @@ def retrieve(
     top_k: int,
     question_to_index_map: Optional[Dict[str, int]] = None
 ) -> Dict[str, Any]:
-    """
-    Retrieves the top_k most relevant exemplars for a target query.
-    
-    Args:
-        target_query (str): The query to find similar exemplars for.
-        embedding_model (SentenceTransformer): The model used to generate embeddings.
-        exemplar_questions (List[str]): List of all exemplar questions.
-        embedded_exemplars (np.ndarray): Pre-computed embeddings for all exemplars.
-        top_k (int): Number of most similar exemplars to retrieve.
-        question_to_index_map (Optional[Dict[str, int]]): Pre-computed hash map 
-            for O(1) self-match detection. If None, self-match check is skipped.
-    
-    Returns:
-        Dict[str, Any]: Dictionary containing retrieval status and retrieved indices.
-    """
     logger = logging.getLogger(__name__)
     logger.info(f"Starting retrieval for Top-{top_k} exemplars.")
     
-    # Initialize internal timer for granular diagnostics
     current_diag_time = time.time() 
-    indent_level = 3 # Consistent indentation for diagnostics within retrieve
+    indent_level = 3
     
-    # --- DETAILED RETRIEVAL DIAGNOSTICS - ALWAYS ON ---
     print(f"{'  '*indent_level}--- STARTING DETAILED RETRIEVAL DIAGNOSTICS ---")
     print(f"{'  '*indent_level}Target Query (start): '{target_query[:100]}...'")
     print(f"{'  '*indent_level}Exemplar corpus size: {len(exemplar_questions)}")
     print(f"{'  '*indent_level}Embedded exemplars shape: {embedded_exemplars.shape}")
     print(f"{'  '*indent_level}Requested top_k: {top_k}")
-    # --- END ALWAYS ON DIAGNOSTICS ---
 
-
-    # Step 1: Generate query embedding
     query_embedding_start_time = time.time()
     query_embedding = _generate_embeddings([target_query], embedding_model)
     current_diag_time = log_time_diagnostic("Generate query embedding", query_embedding_start_time, indent=indent_level)
@@ -158,59 +91,41 @@ def retrieve(
         logger.error("Failed to generate embedding for the target query. Retrieval cannot proceed.")
         return {"status": "FAILURE", "retrieved_indices": [], "retrieved_exemplars": []}
     
-    # Step 2: Calculate cosine similarity
     cosine_similarity_start_time = time.time()
     print(f"{'  '*indent_level}Starting cosine similarity calculation (query_embedding shape: {query_embedding.shape}, embedded_exemplars shape: {embedded_exemplars.shape})...")
     similarities = cosine_similarity(query_embedding, embedded_exemplars)[0]
     current_diag_time = log_time_diagnostic("Calculate cosine_similarity", cosine_similarity_start_time, indent=indent_level)
     print(f"{'  '*indent_level}Similarities array shape: {similarities.shape}")
     
-    # Step 3: Handle potential self-match using O(1) hash map lookup
     self_match_start_time = time.time()
 
     if question_to_index_map is not None:
-        # Use the pre-computed hash map for instant lookup
         query_index_in_corpus = question_to_index_map.get(target_query)
-        
         if query_index_in_corpus is not None:
-            # Self-match found - exclude it from results
             similarities[query_index_in_corpus] = -np.inf
             print(f"{'  '*indent_level}Self-match found at index {query_index_in_corpus}, set to -np.inf.")
         else:
-            # Query not in corpus (expected for test queries)
             print(f"{'  '*indent_level}Target query not found in corpus (no self-match to remove).")
     else:
-        # Fallback if hash map not provided (backward compatibility)
         print(f"{'  '*indent_level}Warning: question_to_index_map not provided. Skipping self-match check.")
         logger.warning("retrieve() called without question_to_index_map. Self-match detection skipped.")
 
     current_diag_time = log_time_diagnostic("Handle self-match (O(1) lookup)", self_match_start_time, indent=indent_level)
 
-
-    # Step 4: Determine k_to_retrieve (ensure it's not more than available)
     k_retrieve_start_time = time.time()
     k_to_retrieve = min(top_k, len(similarities))
     current_diag_time = log_time_diagnostic("Determine k_to_retrieve", k_retrieve_start_time, indent=indent_level)
     print(f"{'  '*indent_level}Effective k_to_retrieve: {k_to_retrieve}")
 
-
-    # --- START OF GRANULAR TIMING FOR TOP-K SELECTION LOGIC ---
     print(f"{'  '*indent_level}Starting granular timing for top-k selection...")
         
-    # 4a. Perform partial sort using np.argpartition
     argpartition_start_time = time.time()
     print(f"{'  '*indent_level}  Calling np.argpartition on similarities array (shape: {similarities.shape}) for k={k_to_retrieve}...")
     
-    # This gets indices of the k-th smallest element and elements smaller than it
-    # We need the k largest, so we partition around the (N-k)-th smallest index.
-    # This will put the top_k_indices in the *last* k positions of the returned array.
     partitioned_indices = np.argpartition(similarities, -k_to_retrieve)
     current_diag_time = log_time_diagnostic("np.argpartition (full array)", argpartition_start_time, indent=indent_level)
     print(f"{'  '*indent_level}  Resulting partitioned_indices shape: {partitioned_indices.shape}")
-    # print(f"{'  '*indent_level}  Partitioned indices (first 10): {partitioned_indices[:10]}...") # Optional: if you want to see raw partitioned values
 
-
-    # 4b. Slice the top K indices (these are still unsorted among themselves)
     slice_partitioned_start_time = time.time()
     print(f"{'  '*indent_level}  Slicing to get the top {k_to_retrieve} indices from partitioned_indices...")
     
@@ -218,23 +133,19 @@ def retrieve(
     current_diag_time = log_time_diagnostic("Slicing partitioned indices", slice_partitioned_start_time, indent=indent_level)
     print(f"{'  '*indent_level}  top_k_indices_unsorted shape: {top_k_indices_unsorted.shape}, Content (first 5): {top_k_indices_unsorted[:5]}...")
 
-    # 4c. Sort the sliced top K indices based on their actual similarity values
     argsort_slice_start_time = time.time()
     print(f"{'  '*indent_level}  Calling np.argsort on the {k_to_retrieve} selected indices based on their similarities...")
     print(f"{'  '*indent_level}  Accessing similarities values for sorting (similarities[top_k_indices_unsorted])...")
 
-    # Get the actual similarity values for the top_k_indices_unsorted
     relevant_similarities = similarities[top_k_indices_unsorted]
     
-    # Sort these values to get the order, then apply that order to the indices
-    sorted_order_in_slice = np.argsort(relevant_similarities)[::-1] # [::-1] for descending order
+    sorted_order_in_slice = np.argsort(relevant_similarities)[::-1] 
     
     top_k_indices = top_k_indices_unsorted[sorted_order_in_slice]
 
     current_diag_time = log_time_diagnostic("np.argsort & final sort (on small slice)", argsort_slice_start_time, indent=indent_level)
     print(f"{'  '*indent_level}  Final top_k_indices shape: {top_k_indices.shape}, Content: {top_k_indices.tolist()}")
     print(f"{'  '*indent_level}--- ENDING DETAILED RETRIEVAL DIAGNOSTICS ---")
-    # --- END OF GRANULAR TIMING ---
 
     logger.info(f"Successfully retrieved indices: {top_k_indices.tolist()}")
     
@@ -243,8 +154,6 @@ def retrieve(
         "retrieved_indices": top_k_indices.tolist(),
     }
 
-
-# --- 1.5 SIMPLIFY RETRIEVED SAMPLES (NEW FEATURE) ---
 def simplify_retrieved_samples(
     retrieved_indices: List[int],
     exemplar_questions: List[str],
@@ -252,21 +161,12 @@ def simplify_retrieved_samples(
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Workflow A: Simplifies each retrieved sample to create a new, cleaner exemplar.
-    
-    Process for each sample:
-    1. Simplify the original Question using LLM.
-    2. Solve the simplified Question using the original Exemplar as reasoning support.
-    3. Construct new Exemplar: "Question: {SimpleQ}\nRationale and Answer: {DerivedSolution}"
-    """
     logger = logging.getLogger(__name__)
     logger.info("Starting Simplification of Retrieved Samples.")
     
     successful_simplifications = []
     failed_indices = []
 
-    # Determine Model for Simplification (Use dedicated model or fallback to adaptation)
     if isinstance(api_manager, GeminiAPIManager):
         model_name = config.get('GEMINI_MODEL_NAME_SIMPLIFICATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
     elif isinstance(api_manager, AvalAIAPIManager):
@@ -285,7 +185,6 @@ def simplify_retrieved_samples(
         
         print(f"    -> Processing Sample #{idx} for Simplification...")
 
-        # Stage 1: Generate Simplified Question
         prompt_simp = create_simplification_prompt(original_q, config)
         resp_simp = api_manager.generate_content(prompt_simp, model_name, temp)
         
@@ -296,7 +195,6 @@ def simplify_retrieved_samples(
             
         simple_q = resp_simp['text'].strip()
         
-        # Stage 2: Solve Simplified Question using Original as Logic
         prompt_solve = create_simplified_sample_solver_prompt(simple_q, original_exemplar_text, config)
         resp_solve = api_manager.generate_content(prompt_solve, model_name, temp)
         
@@ -306,12 +204,6 @@ def simplify_retrieved_samples(
             continue
             
         simple_solution = resp_solve['text'].strip()
-        
-        # Construct New Exemplar
-        # Note: The prompt output usually contains "Rationale: ... Final Answer: ...".
-        # We manually stitch it into standard format if the prompt output isn't fully compliant,
-        # but the prompt template instructs strictly. 
-        # We assume simple_solution contains "Rationale: ... Final Answer: ..."
         
         new_exemplar_text = f"Question: {simple_q}\nRationale and Answer: {simple_solution}"
         successful_simplifications.append(new_exemplar_text)
@@ -326,8 +218,6 @@ def simplify_retrieved_samples(
         "failed_indices": failed_indices
     }
 
-
-# --- 2. ADAPTATION STEP (REWRITTEN) ---
 def adapt(
     target_query: str,
     retrieved_indices: List[int],
@@ -336,18 +226,12 @@ def adapt(
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Performs a multi-stage adaptation on retrieved exemplars:
-    Normalization -> Transformation 1 -> Transformation 2 -> Transformation 3.
-    Captures failures for individual exemplars without halting the entire step.
-    """
     logger = logging.getLogger(__name__)
     logger.info("Starting multi-stage adaptation step.")
     
     successful_texts = []
     failed_adaptations = []
     
-    # MODIFIED: Determine model name based on the type of the provided API manager
     if isinstance(api_manager, GeminiAPIManager):
         model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
     elif isinstance(api_manager, AvalAIAPIManager):
@@ -366,7 +250,6 @@ def adapt(
         
         step_failed = False
 
-        # --- Step 1: Normalization (formerly Standardization) ---
         if config.get('APPLY_NORMALIZATION', False) and not step_failed:
             logger.info(f"Applying normalization to exemplar index {idx}.")
             print(f"    -> Normalizing exemplar {idx}...")
@@ -382,7 +265,6 @@ def adapt(
                 failed_adaptations.append({"source_index": idx, "failed_at_step": "normalization", "error_info": response})
                 step_failed = True
 
-        # --- Step 2: Transformation 1 ---
         if config.get('APPLY_TRANSFORMATION_1', False) and not step_failed:
             logger.info(f"Applying transformation 1 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 1 to exemplar {idx}...")
@@ -397,7 +279,6 @@ def adapt(
                 failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_1", "error_info": response})
                 step_failed = True
         
-        # --- Step 3: Transformation 2 ---
         if config.get('APPLY_TRANSFORMATION_2', False) and not step_failed:
             logger.info(f"Applying transformation 2 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 2 to exemplar {idx}...")
@@ -412,7 +293,6 @@ def adapt(
                 failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_2", "error_info": response})
                 step_failed = True
 
-        # --- Step 4: Transformation 3 ---
         if config.get('APPLY_TRANSFORMATION_3', False) and not step_failed:
             logger.info(f"Applying transformation 3 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 3 to exemplar {idx}...")
@@ -430,7 +310,6 @@ def adapt(
         if not step_failed:
             successful_texts.append(current_text)
 
-    # Determine final status based on outcomes
     if not retrieved_indices:
         final_status = "SUCCESS"
     elif not successful_texts and failed_adaptations:
@@ -446,8 +325,6 @@ def adapt(
         "failed_adaptations": failed_adaptations
     }
 
-
-# --- 3. MERGING STEP ---
 def merge(
     target_query: str,
     adapted_texts: List[str],
@@ -455,10 +332,6 @@ def merge(
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Iteratively merges adapted exemplars. If a merge fails, the pair is discarded
-    and the process continues.
-    """
     logger = logging.getLogger(__name__)
     target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
 
@@ -470,7 +343,6 @@ def merge(
     current_texts = list(adapted_texts)
     failed_merges = []
     
-    # MODIFIED: Determine model name based on the type of the provided API manager
     if isinstance(api_manager, GeminiAPIManager):
         model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
     elif isinstance(api_manager, AvalAIAPIManager):
@@ -507,24 +379,15 @@ def merge(
 
     return {"status": "SUCCESS", "merged_texts": current_texts, "failed_merges": failed_merges}
 
-
-# --- 4. SOLVER STEP ---
 def solve(
     target_query: str,
     final_exemplars: List[str],
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Generates final solution(s). If an attempt fails due to an API error,
-    the error details are saved instead of a text solution for that attempt.
-    
-    MODIFIED: Can also be used to run a classification task like duplicate checking.
-    """
     logger = logging.getLogger(__name__)
     logger.info("Starting final solver step.")
     
-    # --- NEW: LOGIC FOR DUPLICATE QUESTION CHECKING ---
     final_solver_prompt_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER")
     if final_solver_prompt_name == "duplicate_question_check_v1":
         logger.info("Running in 'Duplicate Question Check' mode.")
@@ -541,7 +404,6 @@ def solve(
 
         prompt = create_duplicate_check_prompt(target_query, retrieved_questions)
         
-        # MODIFIED: Determine model name based on manager type (uses adaptation model)
         if isinstance(api_manager, GeminiAPIManager):
             model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
         elif isinstance(api_manager, AvalAIAPIManager):
@@ -551,7 +413,7 @@ def solve(
         else:
             raise TypeError(f"Unsupported API manager type for duplicate check: {type(api_manager)}")
             
-        temperature = 0.0 # Low temp for deterministic classification
+        temperature = 0.0 
         
         print("    -> Checking for duplicate questions...")
         print("      [API Context] Calling LLM for: Duplicate Check")
@@ -567,11 +429,8 @@ def solve(
                 result = "parsing_failed"
             return {"status": "SUCCESS", "solution_attempts": [result]}
         else:
-            # If the API call fails, log the failure details
             return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": response}]}
-    # --- END OF NEW LOGIC ---
 
-    # --- Original Solver Logic ---
     prompt = create_final_reasoning_prompt(target_query, final_exemplars, config) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
     logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
@@ -582,7 +441,6 @@ def solve(
 
     n_attempts = config.get("N_PASS_ATTEMPTS", 1)
     
-    # MODIFIED: Determine model name based on the type of the provided API manager
     if isinstance(api_manager, GeminiAPIManager):
         model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
     elif isinstance(api_manager, AvalAIAPIManager):
@@ -615,29 +473,15 @@ def solve(
             
     return {"status": "SUCCESS", "solution_attempts": solution_attempts}
 
-
-# --- 4.5 SOLVE VIA MAIN SIMPLIFICATION (NEW FEATURE) ---
 def solve_via_main_simplification(
     target_query: str,
     final_exemplars: List[str],
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Workflow B: Solves the Main Question via simplification proxy.
-    
-    Process:
-    1. Simplify the Main Question (target_query).
-    2. Solve the Simplified Main Question.
-       - If 'final_exemplars' exist, use RAG.
-       - If not, use simple solver.
-    3. Solve the Original Main Question using the logic from the Solved Simplified Question.
-    """
     logger = logging.getLogger(__name__)
     logger.info("Starting Solver via Main Question Simplification.")
     
-    # Determine Models
-    # Use Simplification manager for step 1, Solver manager for step 2 & 3
     if isinstance(api_manager, GeminiAPIManager):
         model_simp = config.get('GEMINI_MODEL_NAME_SIMPLIFICATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
         model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
@@ -653,7 +497,6 @@ def solve_via_main_simplification(
     temp_simp = config.get("DEFAULT_SIMPLIFICATION_TEMPERATURE", 0.3)
     temp_solve = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
     
-    # Step 1: Simplify Main Question
     print("    -> [Simplification] Generating Simplified Main Question...")
     prompt_simp = create_simplification_prompt(target_query, config)
     resp_simp = api_manager.generate_content(prompt_simp, model_simp, temp_simp)
@@ -665,13 +508,9 @@ def solve_via_main_simplification(
     simple_main_q = resp_simp['text'].strip()
     print(f"       Simplified Q: '{simple_main_q[:50]}...'")
 
-    # Step 2: Solve Simplified Main Question
     print("    -> [Simplification] Solving Simplified Main Question...")
     
-    # Check if we have RAG context (final_exemplars) to use for the simplified question
     if final_exemplars:
-        # Note: We are using the context retrieved for the original question to solve the simplified one.
-        # This assumes the simplified question is semantically close enough for the exemplars to be valid.
         prompt_solve_simple = create_final_reasoning_prompt(simple_main_q, final_exemplars, config)
     else:
         prompt_solve_simple = create_final_reasoning_prompt_simple(simple_main_q, config)
@@ -684,7 +523,6 @@ def solve_via_main_simplification(
     
     simple_solution = resp_solve_simple['text']
     
-    # Step 3: Solve Original Main Question using Proxy
     print("    -> [Simplification] Solving Original Main Question via Proxy...")
     prompt_proxy = create_main_from_simplified_proxy_prompt(target_query, simple_solution, config)
     
@@ -702,17 +540,11 @@ def solve_via_main_simplification(
             
     return {"status": "SUCCESS", "solution_attempts": solution_attempts}
 
-
-# --- 5. NEW FEATURES: Self-Sampling, Augmentation, and Analogical Adaptation ---
-
 def self_sample(
     target_query: str,
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Generates N synthetic exemplars by solving the target query N times.
-    """
     logger = logging.getLogger(__name__)
     logger.info("Starting self-sampling step.")
     
@@ -738,7 +570,6 @@ def self_sample(
         response = api_manager.generate_content(prompt, model_name, temperature)
         
         if response['status'] == 'SUCCESS':
-            # Format as standard exemplar
             formatted_text = f"Question: {target_query}\nRationale and Answer: {response['text']}"
             successful_texts.append(formatted_text)
         else:
@@ -751,9 +582,7 @@ def self_sample(
     return {"status": status, "self_sampled_texts": successful_texts, "failed_samples": failed_samples}
 
 def parse_numbered_questions(text: str) -> List[str]:
-    """Helper to parse a numbered list of questions from an LLM response."""
     questions = []
-    # Regex to find lines starting with a number, period, and optional space
     matches = re.findall(r'^\s*\d+\.\s*(.*)', text, re.MULTILINE)
     for match in matches:
         questions.append(match.strip())
@@ -765,20 +594,8 @@ def augment_question(
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Generates N augmented versions of the target query.
-    
-    Supports a multi-call schedule via the `AUGMENTATION_SCHEDULE` config.
-    If the schedule is defined (e.g., [2, 3]), it will make 2 API calls,
-    each requesting 3 questions. Otherwise, it falls back to a single call
-    for `n_augmentations` questions.
-    
-    Now supports 'simplification' mode (raw text) vs 'decomposition' mode (numbered list).
-    """
     logger = logging.getLogger(__name__)
 
-    # --- Determine Model and Temperature ---
-    # MODIFIED: Look for AUGMENTATION specific keys first, fall back to ADAPTATION
     if isinstance(api_manager, GeminiAPIManager):
         model_name = config.get('GEMINI_MODEL_NAME_AUGMENTATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
     elif isinstance(api_manager, AvalAIAPIManager):
@@ -788,17 +605,44 @@ def augment_question(
     else:
         raise TypeError(f"Unsupported API manager type for augmentation: {type(api_manager)}")
     
-    # Use specific augmentation temperature
     temperature = config.get("DEFAULT_AUGMENTATION_TEMPERATURE", 0.7)
-    
-    # === NEW: Detect Mode ===
     aug_mode = config.get("HIERARCHICAL_AUGMENTATION_MODE", "decomposition")
-    # ========================
-
-    # --- Check for Augmentation Schedule ---
     schedule = config.get("AUGMENTATION_SCHEDULE")
 
-    # --- Path 1: Scheduled, Multi-Call Augmentation ---
+    # --- NEW: Two-Step Augmentation Mode (Solve -> Simplify) ---
+    if config.get("HIERARCHICAL_AUGMENTATION_TWO_STEP", False):
+        logger.info("Running Two-Step Augmentation (Solve -> Simplify).")
+        
+        # Step 1: Solve Base Question
+        step1_template = config.get("PROMPT_TEMPLATE_AUGMENTATION_STEP1_SOLVER", "final_solver_simple_v2")
+        step1_config = config.copy()
+        step1_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = step1_template
+        
+        prompt_s1 = create_final_reasoning_prompt_simple(target_query, step1_config)
+        print(f"    -> [Augment Step 1] Solving base question...")
+        resp_s1 = api_manager.generate_content(prompt_s1, model_name, temperature)
+        
+        if resp_s1['status'] != 'SUCCESS':
+            return {"status": "FAILURE", "error_info": resp_s1} 
+        
+        solution_text = resp_s1['text']
+
+        # Step 2: Augment using Context
+        prompt_s2 = create_augmentation_with_solution_prompt(target_query, solution_text, n_augmentations, config)
+        print(f"    -> [Augment Step 2] Generating simplified question using solution context...")
+        response = api_manager.generate_content(prompt_s2, model_name, temperature)
+
+        if response['status'] != 'SUCCESS':
+            return {"status": "FAILURE", "augmented_questions": [], "error_info": response}
+        
+        if aug_mode == "simplification":
+            augmented_questions = [response['text'].strip()]
+        else:
+            augmented_questions = parse_numbered_questions(response['text'])
+        
+        return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None}
+
+    # --- Existing Schedule-based Logic ---
     if isinstance(schedule, list) and len(schedule) == 2:
         num_calls, questions_per_call = schedule
         logger.info(f"Using augmentation schedule: {num_calls} calls, {questions_per_call} questions per call.")
@@ -812,15 +656,10 @@ def augment_question(
             response = api_manager.generate_content(prompt, model_name, temperature)
 
             if response['status'] == 'SUCCESS':
-                # === MODIFIED PARSING LOGIC ===
                 if aug_mode == "simplification":
-                    # In simplification mode, we assume the whole text is ONE question.
-                    # We strip whitespace and add it to the list.
                     parsed_qs = [response['text'].strip()]
                 else:
-                    # In decomposition mode, we use the regex parser.
                     parsed_qs = parse_numbered_questions(response['text'])
-                # ==============================
 
                 if len(parsed_qs) < questions_per_call and aug_mode == "decomposition":
                     logger.warning(f"Augmentation call {i+1} expected {questions_per_call} questions, but only parsed {len(parsed_qs)}.")
@@ -829,7 +668,6 @@ def augment_question(
                 logger.error(f"Augmentation call {i+1}/{num_calls} failed: {response['error_message']}")
                 failed_calls.append({"call_index": i + 1, "error_info": response})
 
-        # Determine the final status based on the outcomes
         status = "SUCCESS"
         if failed_calls and not all_augmented_questions:
             status = "FAILURE"
@@ -842,7 +680,7 @@ def augment_question(
             "failed_calls": failed_calls
         }
 
-    # --- Path 2: Fallback, Single-Call Augmentation ---
+    # --- Existing Single-Call Logic ---
     else:
         logger.info(f"Generating {n_augmentations} augmented questions in a single call.")
         prompt = create_augmentation_prompt(target_query, n_augmentations, config)
@@ -853,13 +691,10 @@ def augment_question(
         if response['status'] != 'SUCCESS':
             return {"status": "FAILURE", "augmented_questions": [], "error_info": response}
         
-        # === MODIFIED PARSING LOGIC ===
         if aug_mode == "simplification":
-            # Just take the raw text as the single question
             augmented_questions = [response['text'].strip()]
         else:
             augmented_questions = parse_numbered_questions(response['text'])
-        # ==============================
         
         if len(augmented_questions) < n_augmentations and aug_mode == "decomposition":
             logger.warning(f"Augmentation expected {n_augmentations} questions, but only parsed {len(augmented_questions)}.")
@@ -867,7 +702,6 @@ def augment_question(
         return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None}
 
 def _select_diverse_questions(questions: List[str], embeddings: np.ndarray, n: int) -> List[str]:
-    """Selects n questions with the lowest average pairwise similarity."""
     if embeddings.shape[0] < n: return questions
     
     similarity_matrix = cosine_similarity(embeddings)
@@ -877,12 +711,11 @@ def _select_diverse_questions(questions: List[str], embeddings: np.ndarray, n: i
     return [questions[i] for i in selected_indices]
 
 def _select_relevant_questions(aug_questions: List[str], aug_embeddings: np.ndarray, sample_embeddings: np.ndarray, n: int) -> List[str]:
-    """Selects n augmented questions most relevant to retrieved samples."""
     if aug_embeddings.shape[0] < n: return aug_questions
     
     cross_similarity = cosine_similarity(aug_embeddings, sample_embeddings)
     max_similarities = cross_similarity.max(axis=1)
-    selected_indices = np.argsort(max_similarities)[-n:][::-1] # Top N scores
+    selected_indices = np.argsort(max_similarities)[-n:][::-1] 
     return [aug_questions[i] for i in selected_indices]
 
 def select_augmented_questions(
@@ -891,9 +724,6 @@ def select_augmented_questions(
     embedding_model: SentenceTransformer,
     retrieved_sample_texts: Optional[List[str]] = None
 ) -> List[str]:
-    """
-    Selects N best augmented questions from a larger pool based on config mode.
-    """
     logger = logging.getLogger(__name__)
     target_n = config['AUGMENT_N']
     mode = config['SELECTIVE_AUGMENTATION_SAMPLING_MODE']
@@ -920,40 +750,12 @@ def select_augmented_questions(
     
     return augmented_questions[:target_n]
 
-# --- RECURSIVE ANALOGICAL ADAPTATION LOGIC ---
-
 def _count_processing_nodes(structure: Any) -> int:
-    """
-    Recursively counts the number of processing nodes in the group structure.
-    A processing node is any list or tuple. Integers (leaves) are not processing nodes.
-    
-    Args:
-        structure: The nested list/tuple structure from ANALOGICAL_GROUP_SETS.
-        
-    Returns:
-        int: The total number of tuples/lists found.
-    """
     count = 0
     if isinstance(structure, (list, tuple)):
-        # If it's a container, it counts as 1 node (unless it is the top-level list container itself,
-        # but since this function is called on elements OF the top list, it works correctly).
-        # We treat the top-level iteration separately in analogical_adapt.
-        # Here we are counting nodes inside a Group definition.
         count = 1 
         for item in structure:
             count += _count_processing_nodes(item)
-            # We subtract the count for the item itself if it was a list/tuple because
-            # the recursive call added 1 for it. Wait, no.
-            # Example: ((1), 2)
-            # Root is tuple: count = 1
-            # Item 1: (1). Recursive call: count = 1 + recurse(1). recurse(1) is 0. So 1.
-            # Item 2: 2. Recursive call: 0.
-            # Total = 1 (root) + 1 (child tuple) + 0 = 2. Correct.
-            
-            # However, the top-level ANALOGICAL_GROUP_SETS is a list of groups.
-            # We shouldn't count the container list itself if we iterate over it.
-            # This helper is best designed to count nodes within a SINGLE group definition.
-    
     return count
 
 def _process_node_recursively(
@@ -964,23 +766,8 @@ def _process_node_recursively(
     config: Dict[str, Any],
     depth: int = 0
 ) -> Union[str, None]:
-    """
-    Recursively processes a node in the analogical group structure.
-    
-    Args:
-        node: An int (leaf), or tuple/list (processing node).
-        aug_q_queue: Queue of pre-generated augmented questions.
-        retrieved_texts_map: Map of 1-based indices to retrieved exemplar texts.
-        api_manager: The API manager instance (Adaptation manager).
-        config: Global config.
-        depth: Current recursion depth for logging.
-        
-    Returns:
-        str: The generated exemplar text (Question + Rationale), or None on failure.
-    """
     indent = "  " * (depth + 2)
     
-    # --- Base Case: Leaf Node (Integer) ---
     if isinstance(node, int):
         text = retrieved_texts_map.get(node)
         if not text:
@@ -988,20 +775,15 @@ def _process_node_recursively(
             return None
         return text
 
-    # --- Recursive Step: Processing Node (Tuple/List) ---
     elif isinstance(node, (list, tuple)):
-        # 1. Process Children
         child_exemplars = []
         for child in node:
             child_result = _process_node_recursively(child, aug_q_queue, retrieved_texts_map, api_manager, config, depth + 1)
             if child_result:
                 child_exemplars.append(child_result)
             else:
-                # If a child fails, this node generally cannot proceed accurately.
-                # However, we might continue with partial context. For strictness, let's log.
                 logging.getLogger(__name__).warning(f"{indent}Child node {child} failed or returned None.")
 
-        # 2. Get Augmented Question
         if not aug_q_queue:
             error_msg = "Augmented question queue exhausted! Check AUGMENT_K vs Structure complexity."
             logging.getLogger(__name__).error(error_msg)
@@ -1010,30 +792,21 @@ def _process_node_recursively(
         current_aug_q = aug_q_queue.popleft()
         print(f"{indent}-> Processing Node at depth {depth}. Context: {len(child_exemplars)} samples. solving AugQ: '{current_aug_q[:30]}...'")
 
-        # 3. Setup Model & Temp (Uses Adaptation Model/Manager since this is solving)
         if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
         elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
         elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
         else: return None
         
-        # 4. Generate Content
         if not child_exemplars:
-            # Empty Group -> Self-Solve Mode
-            # We use the self-sampling prompt logic
             prompt = create_self_sampling_prompt(current_aug_q, config)
             temp = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
         else:
-            # Occupied Group -> Analogical Adaptation Mode
             prompt = create_analogical_adaptation_prompt(current_aug_q, child_exemplars, config)
             temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
             
         response = api_manager.generate_content(prompt, model_name, temp)
         
         if response['status'] == 'SUCCESS':
-            # The prompts usually return just the solution/rationale part (depending on template).
-            # We must wrap it to make it a valid exemplar for the parent node.
-            # Note: create_self_sampling_prompt returns "Solution: ... Final Answer: ...".
-            # We standardize to "Question: ... Rationale and Answer: ..."
             return f"Question: {current_aug_q}\nRationale and Answer: {response['text']}"
         else:
             logging.getLogger(__name__).warning(f"{indent}Generation failed for node at depth {depth}.")
@@ -1041,22 +814,16 @@ def _process_node_recursively(
 
     return None
 
-
 def analogical_adapt(
     target_query: str,
     retrieved_indices: List[int],
     exemplar_data: Dict[str, Any],
     api_manager: Any,
-    api_manager_augment: Any, # NEW: Dedicated manager for augmentation
+    api_manager_augment: Any, 
     config: Dict[str, Any],
     embedding_model: SentenceTransformer,
     augmented_questions: Optional[List[str]] = None
 ) -> Dict[str, Any]:
-    """
-    Performs recursive analogical reasoning on groups of retrieved samples.
-    
-    Supports nested/recursive group structures defined in ANALOGICAL_GROUP_SETS.
-    """
     logger = logging.getLogger(__name__)
     logger.info("Starting recursive analogical adaptation step.")
     
@@ -1065,42 +832,30 @@ def analogical_adapt(
         logger.warning("ANALOGICAL_GROUP_SETS is empty. Skipping.")
         return {"status": "SKIPPED", "reason": "No groups defined."}
 
-    # 1. Build Map for O(1) Retrieval Access
-    # Indices in config are 1-based, so we map i+1 -> text
     retrieved_texts_map = {}
     for i, idx in enumerate(retrieved_indices):
         q = exemplar_data['questions'][idx]
         s = exemplar_data['solutions'][idx]
         retrieved_texts_map[i + 1] = EXEMPLAR_FORMAT.format(question=q, solution=s)
 
-    # 2. Calculate Required Augmented Questions
     total_nodes_needed = 0
     for group in group_sets:
-        # We count the nodes inside this group definition
-        # If group is (1, 2), count is 1 (the tuple itself).
-        # If group is ((1), 2), count is 2 (outer tuple, inner tuple).
         total_nodes_needed += _count_processing_nodes(group)
     
     logger.info(f"Structure requires {total_nodes_needed} augmented questions total.")
 
-    # 3. Prepare Augmented Question Queue
-    # If caller passed questions (e.g. from orchestration), use them if sufficient.
-    # Otherwise, generate fresh ones here to ensure we have enough.
     if augmented_questions and len(augmented_questions) >= total_nodes_needed:
         final_aug_qs = augmented_questions[:total_nodes_needed]
     else:
         logger.info(f"Generating {total_nodes_needed} new augmented questions to satisfy structure demand.")
-        # We use the augment_question helper with the AUGMENTATION MANAGER
         aug_res = augment_question(target_query, total_nodes_needed, api_manager_augment, config)
         if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
             return {"status": "FAILURE", "error_info": aug_res.get('error_info')}
         
         final_aug_qs = aug_res['augmented_questions']
         
-        # Optional Selection Logic (only if we have excess)
         if config.get('SELECTIVE_AUGMENTATION_SAMPLING') and len(final_aug_qs) > total_nodes_needed:
              final_aug_qs = select_augmented_questions(final_aug_qs, config, embedding_model)
-             # Ensure we still have enough after selection
              if len(final_aug_qs) < total_nodes_needed:
                  logger.warning("Selection reduced pool below required size. Using unselected pool.")
                  final_aug_qs = aug_res['augmented_questions'][:total_nodes_needed]
@@ -1112,17 +867,12 @@ def analogical_adapt(
 
     aug_q_queue = deque(final_aug_qs)
     
-    # 4. Process Each Group (Recursive Tree Traversal)
     successful_adaptations = []
     failed_adaptations = []
     
-    n_sampling = config.get("ANALOGICAL_ADAPTATION_SAMPLING_N", 1)
-    
-    # Iterate over top-level groups
     for group_idx, group_structure in enumerate(group_sets):
         print(f"    -> Processing Top-Level Group #{group_idx + 1}: {group_structure}")
         
-        # Pass api_manager (adaptation manager) for the solving/reasoning parts of the recursion
         result_text = _process_node_recursively(
             node=group_structure, 
             aug_q_queue=aug_q_queue,
@@ -1149,28 +899,15 @@ def analogical_adapt(
         "failed_adaptations": failed_adaptations
     }
 
-# --- 6. NEW FEATURES: Analogical Consistency Generator ---
-
 def generate_reasoning_pathways(
     target_query: str,
-    api_manager: Any, # Expects Augmentation Manager
+    api_manager: Any, 
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Generates the 'First Layer' of reasoning pathways for Analogical Consistency.
-    
-    Supports two modes:
-    1. 'distinct_augmentations': Generates K distinct augmented questions, solves each 1 time.
-    2. 'single_augmentation_sampling': Generates 1 augmented question, solves it K times.
-    
-    Returns:
-        Dict: Contains 'status' and a list of 'pathway_exemplars' (formatted text).
-    """
     logger = logging.getLogger(__name__)
     mode = config.get("CONSISTENCY_GENERATION_MODE", "distinct_augmentations")
     k_pathways = config.get("CONSISTENCY_PATHWAYS_K", 3)
     
-    # Determine model - Uses whatever manager passed, assumed to be Augmentation
     if isinstance(api_manager, GeminiAPIManager):
         model_name = config.get('GEMINI_MODEL_NAME_AUGMENTATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
     elif isinstance(api_manager, AvalAIAPIManager):
@@ -1188,32 +925,27 @@ def generate_reasoning_pathways(
     logger.info(f"Generating reasoning pathways in mode: {mode} (K={k_pathways})")
 
     if mode == "distinct_augmentations":
-        # 1. Augment K times using api_manager
         aug_res = augment_question(target_query, k_pathways, api_manager, config)
         if aug_res['status'] == 'FAILURE':
             return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info')}
         
         aug_qs = aug_res['augmented_questions']
         
-        # Ensure we have enough
         if len(aug_qs) < k_pathways:
             logger.warning(f"Augmentation only returned {len(aug_qs)} questions, requested {k_pathways}.")
             
-        # 2. Solve each augmented question ONCE
         for i, q in enumerate(aug_qs[:k_pathways]):
             print(f"    -> Solving Pathway {i+1} (Augmented Q): '{q[:50]}...'")
             prompt = create_self_sampling_prompt(q, config)
             resp = api_manager.generate_content(prompt, model_name, temp)
             
             if resp['status'] == 'SUCCESS':
-                # Format into standard exemplar
                 exemplar = f"Question: {q}\nRationale and Answer: {resp['text']}"
                 pathways.append(exemplar)
             else:
                 errors.append(resp)
 
     elif mode == "single_augmentation_sampling":
-        # 1. Augment 1 time using api_manager
         aug_res = augment_question(target_query, 1, api_manager, config)
         if aug_res['status'] != 'SUCCESS' or not aug_res['augmented_questions']:
              return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info')}
@@ -1221,7 +953,6 @@ def generate_reasoning_pathways(
         q = aug_res['augmented_questions'][0]
         logger.info(f"Using single augmented question for sampling: '{q[:50]}...'")
         
-        # 2. Solve the same question K times
         prompt = create_self_sampling_prompt(q, config)
         for i in range(k_pathways):
             print(f"    -> Solving Pathway Sample {i+1} for Single AugQ.")
@@ -1242,39 +973,18 @@ def generate_reasoning_pathways(
 
     return {"status": status, "pathway_exemplars": pathways, "errors": errors}
 
-
-# --- 7. NEW FEATURES: Group-Based Self-Consistency Selection ---
-
 def solve_with_group_consistency(
     target_query: str,
     available_exemplars: List[str],
     api_manager: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Executes the Group-Based Self-Consistency strategy.
-    
-    1. Iterates through groups defined in config['GROUP_CONSISTENCY_CANDIDATES'].
-    2. Constructs a prompt using the specific exemplars for that group.
-    3. Solves the target query N times for EACH group to generate a sample set.
-    4. Returns a detailed log of all attempts for analysis by the evaluator.
-    
-    Args:
-        target_query: The main question to solve.
-        available_exemplars: A list of all available adapted exemplars (0-indexed).
-        api_manager: The API manager for the solver.
-        config: The configuration dictionary.
-        
-    Returns:
-        Dict: A structured log containing the attempts for each group.
-    """
     logger = logging.getLogger(__name__)
     logger.info("Starting Group-Based Self-Consistency Solving.")
 
     group_candidates = config.get("GROUP_CONSISTENCY_CANDIDATES", [])
     n_samples = config.get("GROUP_CONSISTENCY_SAMPLES_N", 5)
     
-    # Determine model and temperature (Pass@N settings usually apply here for diversity)
     if isinstance(api_manager, GeminiAPIManager):
         model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
     elif isinstance(api_manager, AvalAIAPIManager):
@@ -1284,14 +994,13 @@ def solve_with_group_consistency(
     else:
         raise TypeError(f"Unsupported API manager type for solver: {type(api_manager)}")
         
-    temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0) # High temp for diversity
+    temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0) 
 
     group_results = []
 
     for group_idx, indices_tuple in enumerate(group_candidates):
         print(f"\n    -> Processing Consistency Group #{group_idx} (Indices: {indices_tuple})...")
         
-        # 1. Form the group context from available exemplars
         group_exemplars = []
         valid_group = True
         for idx in indices_tuple:
@@ -1305,10 +1014,8 @@ def solve_with_group_consistency(
         if not valid_group or not group_exemplars:
             continue
 
-        # 2. Generate the prompt for this specific group
         prompt = create_final_reasoning_prompt(target_query, group_exemplars, config)
         
-        # 3. Sampling Loop (N times)
         group_attempts = []
         for i in range(n_samples):
             print(f"        -> Generating sample {i+1}/{n_samples} for Group #{group_idx}...")
@@ -1319,7 +1026,6 @@ def solve_with_group_consistency(
             else:
                 group_attempts.append({"status": "FAILURE", "error_info": response})
 
-        # 4. Store Data
         group_results.append({
             "group_id": group_idx,
             "indices_used": indices_tuple,
@@ -1331,23 +1037,18 @@ def solve_with_group_consistency(
         "group_consistency_results": group_results
     }
 
-
-# --- 8. NEW FEATURES: Hierarchical Augmentation with Backward Propagation ---
-
 class ReasoningNode:
-    """Represents a node in the hierarchical augmentation tree."""
     def __init__(self, question: str, depth: int):
         self.id = str(uuid.uuid4())
         self.question = question
         self.depth = depth
         self.children: List['ReasoningNode'] = []
-        self.retrieved_context: List[str] = [] # Exemplars found for this node
-        self.solution: Optional[str] = None    # The solved answer/rationale
-        self.solution_attempts: List[str] = [] # NEW: Stores list for Root node
-        self.status: str = "PENDING"           # PENDING, SOLVED, FAILED
+        self.retrieved_context: List[str] = [] 
+        self.solution: Optional[str] = None    
+        self.solution_attempts: List[str] = [] 
+        self.status: str = "PENDING"           
 
     def to_dict(self) -> Dict[str, Any]:
-        """Recursive serialization for logging."""
         return {
             "id": self.id,
             "question": self.question,
@@ -1364,27 +1065,21 @@ def build_hierarchical_tree(
     current_depth: int,
     max_depth: int,
     branching_factor: int,
-    api_manager_augment: Any, # NEW: Dedicated manager for augmentation
+    api_manager_augment: Any, 
     config: Dict[str, Any]
 ) -> ReasoningNode:
-    """
-    Recursively builds the augmentation tree.
-    """
     logger = logging.getLogger(__name__)
     node = ReasoningNode(current_question, current_depth)
     
-    # Base Case: If we reached max depth, stop expanding.
     if current_depth >= max_depth:
         return node
     
     print(f"  -> [Tree Build] Expanding Node at Depth {current_depth} (Branching: {branching_factor})...")
     
-    # Temporarily override the prompt template in config if needed for hierarchical augmentation
     local_config = config.copy()
     if config.get("PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"):
         local_config["PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR"] = config["PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"]
         
-    # Use the dedicated augmentation manager
     aug_res = augment_question(current_question, branching_factor, api_manager_augment, local_config)
     
     if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
@@ -1393,7 +1088,6 @@ def build_hierarchical_tree(
         
     child_questions = aug_res['augmented_questions']
     
-    # Recursively build children
     for child_q in child_questions:
         child_node = build_hierarchical_tree(child_q, current_depth + 1, max_depth, branching_factor, api_manager_augment, config)
         node.children.append(child_node)
@@ -1402,25 +1096,18 @@ def build_hierarchical_tree(
 
 def _process_leaves(
     root: ReasoningNode,
-    target_query: str, # Added to support Root-Based Retrieval Mode
+    target_query: str, 
     exemplar_data: Dict[str, Any],
     embedding_model: SentenceTransformer,
     api_manager_adapt: Any,
     api_manager_solve: Any,
     config: Dict[str, Any]
 ) -> None:
-    """
-    Traverses the tree to find leaves, optionally retrieves context, and solves them.
-    """
     if not root.children:
-        # This is a leaf
         print(f"    -> Processing Leaf Node (Depth {root.depth})...")
         
-        # 1. Retrieval (if enabled)
         if config.get("HIERARCHICAL_LEAF_RETRIEVAL_ENABLED", True):
             top_k = config.get("HIERARCHICAL_LEAF_RETRIEVAL_TOP_K", 3)
-            
-            # --- Retrieval Mode Selection ---
             query_mode = config.get("HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE", "leaf")
             
             if query_mode == "root":
@@ -1430,7 +1117,6 @@ def _process_leaves(
                 search_query = root.question
                 print(f"      [Retrieval] Mode: LEAF (Using Simplified Question: '{search_query[:50]}...')")
             
-            # Use search_query for the retrieval step
             ret_res = retrieve(
                 search_query, 
                 embedding_model, 
@@ -1439,8 +1125,6 @@ def _process_leaves(
             )
             
             if ret_res['status'] == 'SUCCESS':
-                # Adapt retrieved samples using Adapt Manager
-                # Note: We continue to adapt towards the leaf question because context must match the leaf.
                 adapt_res = adapt(
                     root.question, ret_res['retrieved_indices'], 
                     exemplar_data['questions'], exemplar_data['solutions'], 
@@ -1450,11 +1134,8 @@ def _process_leaves(
                     root.retrieved_context = adapt_res['adapted_texts']
                     print(f"      -> Leaf retrieved {len(root.retrieved_context)} samples.")
         
-        # 2. Solve Leaf
-        # Determine prompt template
         template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER", "final_solver_simple_v1")
         
-        # Construct prompt manually or use helpers
         if root.retrieved_context:
             local_config = config.copy()
             local_config["PROMPT_TEMPLATE_FINAL_SOLVER"] = template_name 
@@ -1464,7 +1145,6 @@ def _process_leaves(
             local_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = template_name
             prompt = create_final_reasoning_prompt_simple(root.question, local_config)
             
-        # Model Selection (Solve Manager)
         model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") 
         if isinstance(api_manager_solve, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
         elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
@@ -1479,7 +1159,6 @@ def _process_leaves(
             root.status = "FAILED"
             
     else:
-        # Not a leaf, recurse
         for child in root.children:
             _process_leaves(child, target_query, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
 
@@ -1488,19 +1167,12 @@ def propagate_solutions_upward(
     api_manager: Any,
     config: Dict[str, Any]
 ) -> None:
-    """
-    Post-order traversal to solve parents using children's solutions.
-    """
-    # 1. Process Children First
     for child in node.children:
         propagate_solutions_upward(child, api_manager, config)
     
-    # 2. If node is already solved (it was a leaf), skip
     if node.status == "SOLVED":
         return
 
-    # 3. Solve Parent
-    # Gather valid children solutions
     child_data = []
     for child in node.children:
         if child.status == "SOLVED" and child.solution:
@@ -1515,7 +1187,6 @@ def propagate_solutions_upward(
     
     prompt = create_hierarchical_parent_solver_prompt(node.question, child_data, config)
     
-    # Model Selection
     model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") 
     if isinstance(api_manager, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
     elif isinstance(api_manager, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
@@ -1523,7 +1194,6 @@ def propagate_solutions_upward(
     temp = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
     
     if node.depth > 0:
-        # Intermediate Node: Solve once
         resp = api_manager.generate_content(prompt, model_name, temp)
         if resp['status'] == 'SUCCESS':
             node.solution = resp['text']
@@ -1531,7 +1201,6 @@ def propagate_solutions_upward(
         else:
             node.status = "FAILED"
     else:
-        # Root Node: Solve N times
         n_attempts = config.get("N_PASS_ATTEMPTS", 1)
         print(f"    -> Root Node detected. Solving {n_attempts} times (Pass@{n_attempts})...")
         
@@ -1541,7 +1210,6 @@ def propagate_solutions_upward(
             if resp['status'] == 'SUCCESS':
                 node.solution_attempts.append(resp['text'])
                 success_count += 1
-                # Save the first success as the primary solution for backward compatibility
                 if node.solution is None:
                     node.solution = resp['text']
         
@@ -1556,35 +1224,27 @@ def solve_hierarchical_tree(
     embedding_model: SentenceTransformer,
     api_manager_adapt: Any,
     api_manager_solve: Any,
-    api_manager_augment: Any, # NEW: Dedicated manager for augmentation
+    api_manager_augment: Any, 
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Orchestrates the full Hierarchical Augmentation pipeline.
-    """
     logger = logging.getLogger(__name__)
     logger.info("Starting Hierarchical Augmentation Pipeline.")
     
     max_depth = config.get("HIERARCHICAL_TREE_DEPTH", 2)
     branching = config.get("HIERARCHICAL_BRANCHING_FACTOR", 3)
     
-    # 1. Build Tree using Augmentation Manager
     print("\n[HIERARCHICAL] Phase 1: Building Tree...")
     root = build_hierarchical_tree(target_query, 0, max_depth, branching, api_manager_augment, config)
     
-    # 2. Process Leaves using Adapt & Solve Managers
     print("\n[HIERARCHICAL] Phase 2: Processing Leaves...")
     
-    # UPDATED: Pass target_query down the pipeline for potential Root-based retrieval
     _process_leaves(root, target_query, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config)
     
-    # 3. Propagate Upward using Solve Manager
     print("\n[HIERARCHICAL] Phase 3: Backward Propagation...")
     propagate_solutions_upward(root, api_manager_solve, config)
     
     final_status = "SUCCESS" if root.status == "SOLVED" else "FAILURE"
     
-    # Prepare list of attempts
     final_attempts = []
     if root.solution_attempts:
         final_attempts = root.solution_attempts
@@ -1598,9 +1258,6 @@ def solve_hierarchical_tree(
         "tree_structure": root.to_dict()
     }
 
-
-# --- 9. NEW FEATURE: Analogical Consistency (Reverse Validation) ---
-
 def solve_with_analogical_consistency(
     target_query: str,
     exemplar_data: Dict[str, Any],
@@ -1609,56 +1266,23 @@ def solve_with_analogical_consistency(
     api_manager_eval: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Executes the Analogical Consistency Check (Reverse Validation) workflow.
-
-    Algorithm:
-    1. Generate N Candidate solutions for the Target Question.
-    2. Retrieve K Validator questions (similar solved examples) from corpus.
-    3. For each Candidate C_i:
-       - For each Validator V_j:
-         - Solve V_j using C_i as the analogy (N_val times).
-         - Evaluate generated answer against V_j's ground truth.
-    4. Score C_i based on total correct validations.
-    5. Select best Candidate.
-
-    Args:
-        target_query (str): The main hard question.
-        exemplar_data (Dict): Contains 'questions', 'solutions', 'embeddings'.
-        embedding_model (SentenceTransformer): For retrieval.
-        api_manager_solve (Any): API Manager for generation (candidates + validation).
-        api_manager_eval (Any): API Manager for checking validation correctness.
-        config (Dict): Configuration dictionary.
-
-    Returns:
-        Dict: Structured result with selection details and statistics.
-    """
     logger = logging.getLogger(__name__)
     logger.info(f"Starting Analogical Consistency Check for query: {target_query[:50]}...")
     print("\n" + "="*60)
     print("  [ANALOGICAL CONSISTENCY CHECK] Reverse Validation Mode")
     print("="*60)
 
-    # --- Config Parameters ---
     n_candidates = config.get("REVERSE_VALIDATION_CANDIDATES_N", 5)
     k_validators = config.get("REVERSE_VALIDATION_RETRIEVAL_K", 3)
     n_validation_attempts = config.get("REVERSE_VALIDATION_ATTEMPTS_N", 5)
     
-    # Determine Model for Generation
     if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
     elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
     elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
     else: raise TypeError(f"Unsupported API manager: {type(api_manager_solve)}")
     
-    # --- Step 1: Generate Candidates ---
     print(f"\n  [Phase 1] Generating {n_candidates} Candidate Solutions...")
     
-    # Reuse self_sampling logic for candidate generation (Zero-shot)
-    # Note: self_sample returns "Question: ... Rationale...". We just need the rationale/answer part or full text.
-    # self_sample returns list of formatted strings.
-    # To get pure solution candidates, we might prefer direct generation, but let's reuse helper for consistency.
-    
-    # Temporarily override temp for diversity if needed, though self_sampling uses SELF_SAMPLING_TEMPERATURE
     candidate_config = config.copy()
     candidate_config["SELF_SAMPLING_N"] = n_candidates
     
@@ -1668,10 +1292,9 @@ def solve_with_analogical_consistency(
         logger.error("Failed to generate any candidates.")
         return {"status": "FAILURE", "error": "Candidate generation failed"}
         
-    candidates = candidates_result['self_sampled_texts'] # These are "Question: ...\nRationale..." strings
+    candidates = candidates_result['self_sampled_texts'] 
     print(f"    -> Generated {len(candidates)} candidates.")
 
-    # --- Step 2: Retrieve Validators ---
     print(f"\n  [Phase 2] Retrieving {k_validators} Validators (Ground Truths)...")
     
     retrieval_res = retrieve(
@@ -1693,13 +1316,11 @@ def solve_with_analogical_consistency(
         })
     print(f"    -> Retrieved {len(validators)} validators.")
 
-    # --- Step 3: Validation Loop ---
     print(f"\n  [Phase 3] Reverse Validation Loop ({len(candidates)} Candidates x {len(validators)} Validators x {n_validation_attempts} Attempts)...")
     
     candidate_stats = []
     
     for c_idx, cand_text in enumerate(candidates):
-        # cand_text is "Question: ... Rationale ...". For the prompt, we use it as the "Reference Example".
         
         total_attempts = 0
         correct_attempts = 0
@@ -1711,18 +1332,15 @@ def solve_with_analogical_consistency(
             val_q = val['question']
             val_gt = val['ground_truth']
             
-            # Create prompt: Solve val_q using cand_text as analogy
             prompt = create_reverse_validation_prompt(val_q, cand_text, config)
-            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0) # High temp for robust checking
+            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0) 
             
             v_correct = 0
             
             for att in range(n_validation_attempts):
-                # Generate Solution for Validator
                 resp = api_manager_solve.generate_content(prompt, model_name, temp)
                 
                 if resp['status'] == 'SUCCESS':
-                    # Check Correctness (Internal Evaluation)
                     eval_res = evaluate_single_answer_with_llm(
                         resp['text'], val_gt, api_manager_eval, config
                     )
@@ -1730,8 +1348,6 @@ def solve_with_analogical_consistency(
                     if eval_res['status'] == 'SUCCESS' and eval_res['is_correct']:
                         v_correct += 1
                         
-                # Note: We count failed API calls as incorrect attempts for the score, 
-                # effectively penalizing unreliable candidates/models.
             
             total_attempts += n_validation_attempts
             correct_attempts += v_correct
@@ -1748,28 +1364,18 @@ def solve_with_analogical_consistency(
             "validator_breakdown": validator_details
         })
 
-    # --- Step 4: Selection ---
     if not candidate_stats:
         return {"status": "FAILURE", "error": "No stats generated"}
         
-    # Sort by consistency score descending
     candidate_stats.sort(key=lambda x: x['consistency_score'], reverse=True)
     
     best_candidate = candidate_stats[0]
     print(f"\n  [Selection] Selected Candidate #{best_candidate['candidate_id'] + 1} with Score {best_candidate['consistency_score']:.2f}")
     
-    # Extract just the rationale/answer part for the final "solution_attempts" format if needed,
-    # or return the full text. The evaluator expects standard format or just answer.
-    # Since self_sample returns full formatted text, we pass that.
-    
-    # Just extracting the solution part from the formatted text for cleaner logs if desired,
-    # but the evaluator usually parses the whole block.
-    
     return {
         "status": "SUCCESS",
         "selected_candidate": best_candidate['candidate_text'],
         "selected_score": best_candidate['consistency_score'],
-        # Wrap in a list to mimic standard "solution_attempts" for Pass@1 compatibility in analysis
         "solution_attempts": [best_candidate['candidate_text']], 
         "consistency_stats": candidate_stats
     }
