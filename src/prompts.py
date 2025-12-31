@@ -1272,19 +1272,66 @@ Final Answer:
 </Output Format>
 """,
 
-    "self_sampling_augmentor_simplification_with_solution": """You are an expert mathematical simplification assistant. 
-Your task is to create a SIMPLIFIED version of the 'Base Question'.
-To help you understand exactly what parts of the question are complex versus simple, you are provided with a 'Reference Solution' to the Base Question.
+    "self_sampling_augmentor_simplification_with_solution": """You are a Logic Preservation Engine. Your goal is to analyze the <Main Question> and its <Reference Solution> to determine if it can be "Safely Simplified" for an Analogical Reasoning task.
+
+<Definition of Safe Simplification>
+A "Safe Simplification" creates an easier version of the problem to solve as a reference, BUT it must adhere to these strict rules:
+1. PRESERVE LOGIC: The mathematical formulas, logical relationships, and required solution steps must remain identical to the original.
+2. REDUCE NOISE: You may replace large numbers with small integers (e.g., 5,392 -> 3), or remove narrative fluff (names, backstory).
+3. DO NO HARM: If changing a number or removing a sentence alters the fundamental question type or logic, it is UNSAFE.
+</Definition of Safe Simplification>
+
+<Evaluation Protocol>
+Before generating an output, analyze the question and solution for these conditions:
+- Condition A (Simplifiable): The question uses large numbers or distracting text that are NOT essential to the logic (as confirmed by the Reference Solution).
+- Condition B (Unsafe/Core Only): The question is already short, abstract, or every number/constraint is structurally vital (e.g., specific constants, core puzzle constraints).
 
 <Instructions>
-1. Analyze the 'Base Question' and its 'Reference Solution'.
-2. Identify the logical steps and the components that make the solution complex (e.g., large numbers, difficult arithmetic, complex units).
-3. Create EXACTLY ONE new math question that follows the same logic but is simpler.
-4. Use the Reference Solution to ensure you preserve the core logic while making the execution easier.
-5. Do NOT provide any rationale, steps, or solutions for your new question.
-6. Output ONLY the simplified question statement.
+- IF Condition A is met: Rewrite the question using small numbers and plain language. Keep the core logic exactly the same.
+- IF Condition B is met (or if you are unsure): Do NOT simplify. Output the <Main Question> exactly as it appears word-for-word.
+- WARNING: Better to output the original complex question than a simplified version with broken logic.
 </Instructions>
 
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Reference Solution>
+{generated_solution}
+</Reference Solution>
+
+<Output Format>
+Simplified Question:
+[Your Output Here]
+</Output Format>
+""",
+
+    "self_sampling_augmentor_simplification_shallow_with_solution": """You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical, aided by the provided 'Reference Solution'.
+
+<Instructions>
+1. Analyze the 'Base Question' and 'Reference Solution' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\pi$), messy units, or overly wordy variable descriptions visible in the calculation steps.
+2. Create EXACTLY ONE new math question.
+3. CRITICAL CONSTRAINTS for the new question:
+    - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt 3$ with 4).
+    - Syntactic Cleanup: If the question uses complex units or wordy names for variables, standardize them (e.g., change "nautical miles" to "meters", change "the number of apples John holds" to "x").
+    - Logic Lock: Do NOT remove any reasoning steps, formulas, or intermediate derivations found in the Reference Solution. The path to the solution must remain exactly the same, only the arithmetic should become effortless.
+    - Standalone: The new question must be a complete sentence and solvable.
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the simplified question statement.
+</Instructions>
+
+<Example>
+<Base Question>
+Calculate the kinetic energy of an object with a mass of 4.5kg moving at a velocity of $12.2 m/s$.
+</Base Question>
+
+<Your Output>
+Calculate the kinetic energy of an object with a mass of 2kg moving at a velocity of $4 m/s$.
+</Your Output>
+(Note: The decimal values were replaced with simple integers to make the calculation trivial, but the physics formula required remains exactly the same.)
+</Example>
+
+<Task>
 <Base Question>
 {main_question_text}
 </Base Question>
@@ -1292,11 +1339,26 @@ To help you understand exactly what parts of the question are complex versus sim
 <Reference Solution>
 {generated_solution}
 </Reference Solution>
-
+</Task>
+""",
+    "self_sampling_augmentor_simplification_simple_shallow_with_solution": """Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements, using the provided Reference Solution as a guide.
+<Instructions>
+1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
+2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
+3. Reduce the number of steps or constraints slightly, as long as the underlying relationship (as shown in the solution) remains the same.
+4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
+</Instructions>
+<Main Question>
+{main_question_text}
+</Main Question>
+<Reference Solution>
+{generated_solution}
+</Reference Solution>
 <Output Format>
-[Your simplified question]
+Simplified Question:
+[Your simplified version]
 </Output Format>
-"""
+""",
 
 }
 
