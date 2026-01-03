@@ -844,21 +844,25 @@ def analogical_adapt(
     
     logger.info(f"Structure requires {total_nodes_needed} augmented questions total.")
 
-    if augmented_questions and len(augmented_questions) >= total_nodes_needed:
-        final_aug_qs = augmented_questions[:total_nodes_needed]
+    if config.get("ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION", False):
+        logger.info("Identity Augmentation Mode ENABLED. Injecting Main Question into all nodes.")
+        final_aug_qs = [target_query] * total_nodes_needed
     else:
-        logger.info(f"Generating {total_nodes_needed} new augmented questions to satisfy structure demand.")
-        aug_res = augment_question(target_query, total_nodes_needed, api_manager_augment, config)
-        if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
-            return {"status": "FAILURE", "error_info": aug_res.get('error_info')}
-        
-        final_aug_qs = aug_res['augmented_questions']
-        
-        if config.get('SELECTIVE_AUGMENTATION_SAMPLING') and len(final_aug_qs) > total_nodes_needed:
-             final_aug_qs = select_augmented_questions(final_aug_qs, config, embedding_model)
-             if len(final_aug_qs) < total_nodes_needed:
-                 logger.warning("Selection reduced pool below required size. Using unselected pool.")
-                 final_aug_qs = aug_res['augmented_questions'][:total_nodes_needed]
+        if augmented_questions and len(augmented_questions) >= total_nodes_needed:
+            final_aug_qs = augmented_questions[:total_nodes_needed]
+        else:
+            logger.info(f"Generating {total_nodes_needed} new augmented questions to satisfy structure demand.")
+            aug_res = augment_question(target_query, total_nodes_needed, api_manager_augment, config)
+            if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
+                return {"status": "FAILURE", "error_info": aug_res.get('error_info')}
+            
+            final_aug_qs = aug_res['augmented_questions']
+            
+            if config.get('SELECTIVE_AUGMENTATION_SAMPLING') and len(final_aug_qs) > total_nodes_needed:
+                 final_aug_qs = select_augmented_questions(final_aug_qs, config, embedding_model)
+                 if len(final_aug_qs) < total_nodes_needed:
+                     logger.warning("Selection reduced pool below required size. Using unselected pool.")
+                     final_aug_qs = aug_res['augmented_questions'][:total_nodes_needed]
 
     if len(final_aug_qs) < total_nodes_needed:
         msg = f"Not enough augmented questions generated. Needed {total_nodes_needed}, got {len(final_aug_qs)}."

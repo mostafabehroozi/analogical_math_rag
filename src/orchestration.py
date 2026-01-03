@@ -117,6 +117,7 @@ def run_pipeline_for_single_query(
                     "APPLY_SELF_SAMPLING", "SELF_SAMPLING_N",
                     "APPLY_ANALOGICAL_ADAPTATION", "ANALOGICAL_GROUP_SETS",
                     "APPLY_SELF_SAMPLING_AUGMENTATION", "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION",
+                    "ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION", # <--- NEW FLAG LOGGED
                     "SELECTIVE_AUGMENTATION_SAMPLING", "AUGMENT_K", "AUGMENT_N",
                     # Consistency Flags
                     "APPLY_CONSISTENCY_ANALOGICAL_CHECK", "CONSISTENCY_GENERATION_MODE",
@@ -437,7 +438,9 @@ def run_pipeline_for_single_query(
                     iter_log_steps['analogical_adaptation'] = {"status": "SKIPPED", "reason": "No retrieved exemplars."}
                 else:
                     augmented_qs_for_aa = None
-                    if config.get('APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION'):
+                    
+                    # --- MODIFICATION: Bypass external augmentation if Identity Mode is ON ---
+                    if config.get('APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION') and not config.get('ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION', False):
                         # UPDATED: We use AUGMENT_K as the pool size for the recursive tree structure.
                         # If it's too small, the analogical_adapt function will detect it and generate fresh ones.
                         k = config.get('AUGMENT_K', 10)
@@ -449,6 +452,8 @@ def run_pipeline_for_single_query(
                                 retrieved_texts = [EXEMPLAR_FORMAT.format(question=exemplar_data['questions'][i], solution=exemplar_data['solutions'][i]) for i in retrieved_indices]
                                 augmented_qs_for_aa = select_augmented_questions(augmented_qs_for_aa, config, embedding_model, retrieved_texts)
 
+                    # Note: If ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION is True, augmented_qs_for_aa is None, 
+                    # but the analogical_adapt function internally handles this by using the main query.
                     aa_result = analogical_adapt(
                         target_query, retrieved_indices, exemplar_data, 
                         api_manager=manager_for_adapt, # Use adapt manager for the reasoning part
