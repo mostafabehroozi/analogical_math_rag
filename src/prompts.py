@@ -978,6 +978,77 @@ Simplified Question:
 [Your Output Here]
 </Output Format>
 """,
+    "self_sampling_augmentor_simplification_safe_complex":"""You are a Logic Preservation and Simplification Engine. Your goal is to generate a "Simplified Reference Question" that makes the logical pattern obvious, but ONLY if it can be done without damaging the core logic.
+
+<Safe Simplification Strategies>
+Analyze the Main Question for these three specific types of "Shallow Complexity."
+1. ARITHMETIC REDUCTION (Target: Calculation Load)
+   - IF the question uses large numbers (e.g., 5,492), decimals (e.g., 15.75), or fractions just to make the math hard:
+   - ACTION: Replace them with small integers (e.g., 2, 5, 10).
+   - SAFETY CONSTRAINT: You must preserve the proportional relationships. (e.g., If X was half of Y, the new X must still be half of the new Y).
+
+2. SEMANTIC DISTILLATION (Target: Linguistic Load)
+   - IF the question contains distracting names, backstories, irrelevant objects, or wordy descriptions:
+   - ACTION: Rewrite as a generic statement (e.g., "Mr. Smith drives 500 miles" -> "An object moves distance D").
+   - SAFETY CONSTRAINT: Do not remove any structural constraints (e.g., "without replacement," "simultaneously," "in that specific order").
+
+3. SCALE REDUCTION (Target: Iterative Load)
+   - IF the question asks for a result after many iterations or steps (e.g., "Find the sum of the first 100 terms"):
+   - ACTION: Reduce the iterations to a small number (e.g., "Find the sum of the first 3 terms") to reveal the pattern.
+   - SAFETY CONSTRAINT: Do not change the rule of the sequence or the boundary conditions (e.g., do not change "limits to infinity").
+</Safe Simplification Strategies>
+
+<Evaluation Protocol>
+Before generating the output, you must pass the question through this check:
+1. Is the question ALREADY simple? (Small numbers, direct logic).
+2. Is the complexity PART of the logic? (e.g., A cipher puzzle, or a question specifically about how to handle large exponents).
+3. If I simplify, will the answer method change?
+
+<Strict Instructions>
+- CASE A: If the question has "Shallow Complexity" (Safe Strategies 1, 2, or 3 apply) AND it is safe to change -> Output the simplified version.
+- CASE B: If the question is already simple, OR if simplifying it risks changing the core logic -> STOP. Output the <Main Question> exactly word-for-word.
+- WARNING: It is better to output the original complex question than a simplified version with broken logic.
+</Strict Instructions>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Output Format>
+Simplified Question:
+[Your Output Here]
+</Output Format>
+""",
+    "self_sampling_augmentor_simplification_safe_simple":"""Your task is to simplify the Main Question by changing ONLY ONE surface detail to make it easier to read.
+
+<Instructions>
+
+1. FIND ONE TARGET: Look for ONE of these three things that makes the question look complicated:
+   - A difficult number (e.g., "4,592", "12.5", or "$19.99").
+   - A long name (e.g., "Mr. Jonathan Beauregard" or "The National Library").
+   - A wordy object description (e.g., "antique porcelain vases").
+
+2. MAKE ONE CHANGE: Replace that ONE target with something simple:
+   - Change the difficult number to a small single digit (e.g., "5").
+   - Change the long name to a short name (e.g., "Tom" or "The Library").
+   - Change the wordy object to a generic word (e.g., "boxes").
+
+3. SAFETY RULES (CRITICAL):
+   - CHANGE ONLY ONE THING. Do not change two numbers or a number and a name.
+   - CHECK THE LOGIC: If changing the target breaks the math relationship or makes the question impossible to solve, DO NOT CHANGE IT.
+   - IF UNSURE: Output the Main Question exactly as it is.
+
+</Instructions>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Output Format>
+Simplified Question:
+[Your output here]
+</Output Format>
+""",
 
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
 
