@@ -7,6 +7,7 @@ This file provides common helper functions used across the project, including:
 - A centralized logging setup to write logs to both console and file.
 - Standardized functions for reading and writing JSON and Pickle files with error handling.
 - A data conversion helper to make NumPy objects JSON serializable.
+- NEW: Helper functions for creating standardized execution trace entries.
 """
 
 import logging
@@ -74,9 +75,12 @@ def convert_numpy_for_json(obj):
     """
     if isinstance(obj, np.ndarray):
         return obj.tolist()
-    if isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64,
+    if isinstance(obj, (np.int_, np.intc, np.int8, np.int16, np.int32, np.int64,
                         np.uint8, np.uint16, np.uint32, np.uint64)):
         return int(obj)
+    # Note: np.intp is machine dependent, often aliased to int64 or int32.
+    # We include a catch-all for other integer types if needed, but the above covers specific numpy types.
+    # Handling float types
     if isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
         return float(obj)
     if isinstance(obj, np.bool_):
@@ -185,12 +189,6 @@ def load_from_pickle(file_path: str):
         return None
 
 
-
-
-# While the request was primarily 'os', shutil.move is generally safer
-# for moving files across different file systems.
-# I will primarily use os.rename as requested, but add a note about shutil.
-
 def move_files_to_directories(files_to_move_map: dict) -> dict:
     """
     Moves files from their source paths to specified destination directories.
@@ -276,4 +274,43 @@ def move_files_to_directories(files_to_move_map: dict) -> dict:
     return {
         'successful_moves': successful_moves,
         'failed_moves': failed_moves
+    }
+
+
+# --- 4. Logging & Trace Utilities ---
+
+def create_trace_entry(
+    step_name: str,
+    sub_step: str,
+    input_context: dict,
+    output_result: dict,
+    api_call_meta: dict = None,
+    error_info: dict = None
+) -> dict:
+    """
+    Creates a standardized dictionary for the high-resolution execution log.
+
+    This function helps maintain a consistent schema for capturing granular
+    pipeline events (like individual API calls) without losing the broader
+    pipeline structure.
+
+    Args:
+        step_name (str): The high-level phase (e.g., 'adapt', 'solve').
+        sub_step (str): The specific action (e.g., 'normalization', 'attempt_1').
+        input_context (dict): Data sent to the operation (e.g., prompts, source text).
+        output_result (dict): Data received (e.g., raw LLM response).
+        api_call_meta (dict, optional): Metadata like model name, temperature.
+        error_info (dict, optional): If an error occurred, the error details.
+
+    Returns:
+        dict: A dictionary ready to be appended to the execution trace list.
+    """
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "step_name": step_name,
+        "sub_step": sub_step,
+        "input_context": input_context,
+        "api_call_meta": api_call_meta or {},
+        "output_result": output_result,
+        "error_info": error_info
     }

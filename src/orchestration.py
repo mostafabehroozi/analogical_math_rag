@@ -43,6 +43,10 @@ just retrying the final Solver step N times.
 NEW FEATURE: Added Pipeline Simplification.
 - Workflow A: Simplification of Retrieved Samples (replaces standard adaptation).
 - Workflow B: Simplification of Main Question (alters solving strategy).
+
+NEW FEATURE: High-Resolution Execution Tracing.
+- Collects granular prompt/response logs from all steps and aggregates them
+  into a master `execution_trace` list.
 """
 
 import logging
@@ -97,6 +101,9 @@ def run_pipeline_for_single_query(
         run_log = existing_log
         # Reset status to ensure we correctly log the outcome of the solve step
         run_log['pipeline_status'] = "PENDING_SOLVE"
+        # Ensure execution_trace exists if resuming old logs
+        if "execution_trace" not in run_log:
+            run_log["execution_trace"] = []
         print(f"\nResuming pipeline for Query #{hard_list_idx} (Solve Phase)...")
     else:
         # Standard initialization for 'full' or 'intermediate' modes
@@ -138,6 +145,7 @@ def run_pipeline_for_single_query(
                 ]
             },
             "pipeline_status": "PENDING",
+            "execution_trace": [], # NEW: High-resolution trace log
             "steps": {}
         }
 
@@ -172,6 +180,10 @@ def run_pipeline_for_single_query(
             api_manager_eval=manager_for_eval, # Needs eval manager to check validators
             config=config
         )
+        
+        # Aggregation: Extract trace
+        if 'trace' in consistency_result:
+            run_log['execution_trace'].extend(consistency_result.pop('trace'))
         
         run_log['steps']['solving'] = consistency_result
         
@@ -220,6 +232,10 @@ def run_pipeline_for_single_query(
                     config=single_pass_config # <--- Pass the N=1 config
                 )
                 
+                # Aggregation: Extract trace
+                if 'trace' in hierarchical_result:
+                    run_log['execution_trace'].extend(hierarchical_result.pop('trace'))
+                
                 # Aggregate the single solution from this tree
                 if hierarchical_result['status'] == 'SUCCESS':
                     sol = hierarchical_result.get('root_solution')
@@ -253,6 +269,10 @@ def run_pipeline_for_single_query(
                 api_manager_augment=manager_for_aug,
                 config=config
             )
+            
+            # Aggregation: Extract trace
+            if 'trace' in last_hierarchical_result:
+                run_log['execution_trace'].extend(last_hierarchical_result.pop('trace'))
             
             if last_hierarchical_result['status'] == 'SUCCESS':
                 # Grab the list generated internally
@@ -289,6 +309,10 @@ def run_pipeline_for_single_query(
         # Use manager_for_aug for generating the pathways (augmentations)
         pathways_result = generate_reasoning_pathways(target_query, manager_for_aug, config)
         
+        # Aggregation: Extract trace
+        if 'trace' in pathways_result:
+            run_log['execution_trace'].extend(pathways_result.pop('trace'))
+        
         if pathways_result['status'] == 'FAILURE':
             run_log['pipeline_status'] = "FAILURE: Pathway generation failed."
             run_log['consistency_analysis_data'] = {"error": pathways_result.get("error_info")}
@@ -316,6 +340,14 @@ def run_pipeline_for_single_query(
             for j in range(n_samples):
                 print(f"    -> Generating Sample {j+1}/{n_samples}")
                 resp = manager_for_solve.generate_content(prompt, model_name, temp_layer_2)
+                
+                # Manually log trace for this explicit loop since it's inside orchestration
+                from src.utils import create_trace_entry
+                run_log['execution_trace'].append(create_trace_entry(
+                    "pathway_consistency", f"layer_2_pathway_{i}_sample_{j}",
+                    {"pathway_text": pathway_text, "prompt": prompt}, resp, {"model": model_name, "temp": temp_layer_2}
+                ))
+
                 if resp['status'] == 'SUCCESS':
                     samples.append(resp['text'])
                 else:
@@ -383,6 +415,11 @@ def run_pipeline_for_single_query(
                     question_to_index_map=exemplar_data.get('question_to_index')
                 )
                 # ========================== END OF MODIFICATION ==========================
+                
+                # Aggregation: Extract trace
+                if 'trace' in retrieval_result:
+                    run_log['execution_trace'].extend(retrieval_result.pop('trace'))
+
                 iter_log_steps['retrieval'] = retrieval_result
                 if retrieval_result['status'] == 'FAILURE':
                     final_pipeline_status = "FAILURE: Retrieval failed."
@@ -405,6 +442,10 @@ def run_pipeline_for_single_query(
                             api_manager=manager_for_simp,
                             config=config
                         )
+                        # Aggregation: Extract trace
+                        if 'trace' in simp_result:
+                            run_log['execution_trace'].extend(simp_result.pop('trace'))
+
                         iter_log_steps['simplification_of_samples'] = simp_result
                         
                         if simp_result.get('simplified_exemplars'):
@@ -422,6 +463,10 @@ def run_pipeline_for_single_query(
                             exemplar_questions=exemplar_data['questions'], exemplar_solutions=exemplar_data['solutions'],
                             api_manager=manager_for_adapt, config=config
                         )
+                        # Aggregation: Extract trace
+                        if 'trace' in adapt_result:
+                            run_log['execution_trace'].extend(adapt_result.pop('trace'))
+
                         iter_log_steps['adaptation'] = adapt_result
                         if adapt_result['status'] == 'FAILURE':
                             print("  -> WARNING: Standard adaptation failed for all exemplars.")
@@ -446,6 +491,11 @@ def run_pipeline_for_single_query(
                         k = config.get('AUGMENT_K', 10)
                         # Use manager_for_aug for augmentation
                         aug_result = augment_question(target_query, k, manager_for_aug, config)
+                        
+                        # Aggregation: Extract trace (Augmentation)
+                        if 'trace' in aug_result:
+                            run_log['execution_trace'].extend(aug_result.pop('trace'))
+
                         if aug_result['status'] == 'SUCCESS':
                             augmented_qs_for_aa = aug_result['augmented_questions']
                             if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
@@ -461,6 +511,10 @@ def run_pipeline_for_single_query(
                         config=config,
                         embedding_model=embedding_model, augmented_questions=augmented_qs_for_aa
                     )
+                    # Aggregation: Extract trace (Analogical Adapt + Recursion)
+                    if 'trace' in aa_result:
+                        run_log['execution_trace'].extend(aa_result.pop('trace'))
+
                     iter_log_steps['analogical_adaptation'] = aa_result
                     if aa_result.get('analogically_adapted_texts'):
                         print(f"  -> Generated {len(aa_result['analogically_adapted_texts'])} new exemplars via analogical adaptation.")
@@ -477,6 +531,11 @@ def run_pipeline_for_single_query(
                     k = config.get('AUGMENT_K', config.get('SELF_SAMPLING_N', 3))
                     # Use manager_for_aug for augmentation
                     aug_result = augment_question(target_query, k, manager_for_aug, config)
+                    
+                    # Aggregation: Extract trace (Augmentation)
+                    if 'trace' in aug_result:
+                        run_log['execution_trace'].extend(aug_result.pop('trace'))
+                    
                     if aug_result['status'] == 'SUCCESS':
                         augmented_qs = aug_result['augmented_questions']
                         if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
@@ -485,11 +544,15 @@ def run_pipeline_for_single_query(
                         # Solve each augmented question
                         for q in augmented_qs:
                             ss_result = self_sample(q, manager_for_adapt, config)
+                            if 'trace' in ss_result:
+                                run_log['execution_trace'].extend(ss_result.pop('trace'))
                             self_sampled_texts.extend(ss_result.get('self_sampled_texts', []))
                         iter_log_steps['self_sampling'] = {"status": "SUCCESS", "details": "Augmented Self-Sampling"}
                 else:
                     # Standard self-sampling on the main query
                     ss_result = self_sample(target_query, manager_for_adapt, config)
+                    if 'trace' in ss_result:
+                        run_log['execution_trace'].extend(ss_result.pop('trace'))
                     self_sampled_texts.extend(ss_result.get('self_sampled_texts', []))
                     iter_log_steps['self_sampling'] = ss_result
 
@@ -505,6 +568,11 @@ def run_pipeline_for_single_query(
                     target_query=target_query, adapted_texts=final_exemplars_for_solve,
                     embedding_model=embedding_model, api_manager=manager_for_adapt, config=config
                 )
+                
+                # Aggregation: Extract trace
+                if 'trace' in merge_result:
+                    run_log['execution_trace'].extend(merge_result.pop('trace'))
+
                 iter_log_steps['merging'] = merge_result
                 if merge_result['status'] == 'SKIPPED':
                     print("  -> Merging was SKIPPED as per config.")
@@ -538,6 +606,10 @@ def run_pipeline_for_single_query(
                         config=config
                     )
                     
+                    # Aggregation: Extract trace
+                    if 'trace' in solve_result:
+                        run_log['execution_trace'].extend(solve_result.pop('trace'))
+                    
                     current_attempts = solve_result.get('solution_attempts', [])
                     aggregated_solution_attempts.extend(current_attempts)
                     
@@ -557,6 +629,10 @@ def run_pipeline_for_single_query(
                         api_manager=manager_for_solve,
                         config=config
                     )
+                    
+                    # Aggregation: Extract trace
+                    if 'trace' in solve_result:
+                        run_log['execution_trace'].extend(solve_result.pop('trace'))
                     
                     # Check outcome
                     if solve_result['status'] == 'SUCCESS':
@@ -578,6 +654,10 @@ def run_pipeline_for_single_query(
                         api_manager=manager_for_solve, config=current_solver_config
                     )
                     
+                    # Aggregation: Extract trace
+                    if 'trace' in solve_result:
+                        run_log['execution_trace'].extend(solve_result.pop('trace'))
+
                     current_attempts = solve_result.get('solution_attempts', [])
                     aggregated_solution_attempts.extend(current_attempts)
                     
