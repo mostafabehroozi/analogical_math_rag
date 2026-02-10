@@ -211,6 +211,38 @@ CONFIG = {
     "HF_SYNC_REVISION_ENABLED": False,
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
+
+
+    # --- MIRROR_AS_EVALUATOR (Analogical Mirroring) ---
+    # Master Switch: Enables the post-retrieval optimization loop.
+    "APPLY_MIRROR_AS_EVALUATOR": False,
+
+    # 2.1 Sampling Parameters
+    # Number of inference attempts used to calculate consistency scores (N_mirror).
+    # Higher values = more accurate but expensive. (Recommended: 3-5)
+    "MIRROR_N_OPTIMIZATION": 3,
+    
+    # 2.2 Feature Toggles
+    # If True, injects a virtual "Zero-Shot" candidate at Rank 0.
+    "MIRROR_ENABLE_R0": True,
+    
+    # Master switch for the filtering module (removes Score=0 candidates).
+    "MIRROR_ENABLE_FILTERING": True,
+    
+    # Sub-switch: If True, removes lower-ranked candidates covered by higher ones.
+    "MIRROR_ENABLE_REDUNDANCY_FILTER": True,
+    
+    # Limits the process to the top-K retrieved samples to save API costs.
+    "MIRROR_ACTIVE_CANDIDATE_LIMIT": 5,
+
+    # --- Mirroring Prompts ---
+    # Keys pointing to templates in src/prompts.py
+    "PROMPT_TEMPLATE_MIRROR_BASELINE": "mirror_baseline_zero_shot_v1",
+    "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS": "mirror_hypothesis_gen_v1",
+    "PROMPT_TEMPLATE_MIRROR_VERIFICATION": "mirror_verification_v1",
+    "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT": "mirror_hypothesis_gen_zero_shot_v1",
+
+    
 }
 
 def setup_directories():

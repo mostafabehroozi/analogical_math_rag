@@ -11,6 +11,16 @@ from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Union, Tuple, Optional
 import time
 from collections import deque
+from src.evaluation import evaluate_single_answer_with_llm
+from src.prompts import PROMPT_TEMPLATES
+from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+# --- CRITICAL: Ensure these API classes are imported ---
+# (Adjust the path 'src.api_manager' if your file is named differently)
+from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager 
+
+from src.utils import create_trace_entry
+from src.evaluation import evaluate_single_answer_with_llm
+from src.prompts import PROMPT_TEMPLATES
 
 from config import CONFIG
 from src.prompts import (
@@ -165,6 +175,292 @@ def retrieve(
         "retrieved_indices": top_k_indices.tolist(),
         "trace": local_trace
     }
+
+
+def _calculate_baseline_difficulty(
+    retrieved_indices: List[int],
+    exemplar_data: Dict[str, Any],
+    api_manager: Any,
+    config: Dict[str, Any],
+    trace_accumulator: List[Dict]
+) -> Dict[int, float]:
+    """
+    Phase 0: Calculates S_base for each retrieved sample (Zero-Shot).
+    Returns a dict mapping {index: baseline_score}.
+    """
+    logger = logging.getLogger(__name__)
+    n_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
+    
+    # Determine Model Name
+    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    
+    # Load Template
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_BASELINE", "mirror_baseline_zero_shot_v1")
+    base_template = PROMPT_TEMPLATES.get(template_name, "Problem: {question}\nSolve this step-by-step.\nFinal Answer:")
+    
+    baseline_scores = {}
+    print(f"    -> [Mirror Phase 0] Calculating Baseline Difficulty for {len(retrieved_indices)} samples...")
+
+    for idx in retrieved_indices:
+        question = exemplar_data['questions'][idx]
+        ground_truth = exemplar_data['solutions'][idx]
+        
+        # Format the template
+        prompt = base_template.format(question=question)
+        
+        correct_count = 0
+        for i in range(n_mirror):
+            # Lower temp for baseline to capture "inherent" solvability
+            resp = api_manager.generate_content(prompt, model_name, temperature=0.5)
+            
+            trace_accumulator.append(create_trace_entry(
+                "mirror_phase_0", f"baseline_idx_{idx}_attempt_{i}",
+                {"question": question, "ground_truth": ground_truth}, 
+                resp, {"model": model_name}
+            ))
+            
+            if resp['status'] == 'SUCCESS':
+                eval_res = evaluate_single_answer_with_llm(
+                    resp['text'], ground_truth, api_manager, config
+                )
+                if eval_res['is_correct']:
+                    correct_count += 1
+        
+        score = correct_count / n_mirror
+        baseline_scores[idx] = score
+
+    return baseline_scores
+
+def _generate_hypotheses(
+    target_query: str,
+    candidate_indices: List[int], # Includes -1 for R0 if enabled
+    exemplar_data: Dict[str, Any],
+    api_manager: Any,
+    config: Dict[str, Any],
+    trace_accumulator: List[Dict]
+) -> Dict[int, str]:
+    """
+    Phase 1: Generates a Hypothesis (H) for the target query using each candidate.
+    Returns a dict mapping {candidate_index: hypothesis_text}.
+    """
+    logger = logging.getLogger(__name__)
+    
+    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    
+    hypotheses = {}
+    
+    # Load templates
+    tmpl_zero = PROMPT_TEMPLATES.get("mirror_hypothesis_gen_zero_shot_v1", "{target_query}")
+    tmpl_few = PROMPT_TEMPLATES.get("mirror_hypothesis_gen_v1", "{target_query}")
+
+    print(f"    -> [Mirror Phase 1] Generating Hypotheses for {len(candidate_indices)} candidates...")
+
+    for cand_idx in candidate_indices:
+        if cand_idx == -1:
+            # R0: Zero-Shot
+            prompt = tmpl_zero.format(target_query=target_query)
+        else:
+            # R_cand: Few-Shot
+            q_ex = exemplar_data['questions'][cand_idx]
+            s_ex = exemplar_data['solutions'][cand_idx]
+            prompt = tmpl_few.format(
+                exemplar_question=q_ex,
+                exemplar_solution=s_ex,
+                target_query=target_query
+            )
+
+        # Generate Hypothesis (Single attempt, Temp=0.7)
+        resp = api_manager.generate_content(prompt, model_name, temperature=0.7)
+        
+        trace_accumulator.append(create_trace_entry(
+            "mirror_phase_1", f"hypothesis_cand_{cand_idx}",
+            {"prompt": prompt}, resp, {"model": model_name}
+        ))
+        
+        if resp['status'] == 'SUCCESS':
+            hypotheses[cand_idx] = resp['text']
+        else:
+            hypotheses[cand_idx] = ""
+
+    return hypotheses
+
+def _evaluate_mirror_consistency(
+    target_query: str,
+    hypotheses: Dict[int, str],
+    validation_indices: List[int],
+    exemplar_data: Dict[str, Any],
+    api_manager: Any,
+    config: Dict[str, Any],
+    trace_accumulator: List[Dict]
+) -> Dict[int, Dict[int, float]]:
+    """
+    Phase 2: Mirror Evaluation (Backward Pass).
+    Tests if the Hypothesis (H) can solve the Validation Samples (R_val).
+    """
+    logger = logging.getLogger(__name__)
+    n_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
+    
+    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    
+    # Load Template
+    tmpl_verify = PROMPT_TEMPLATES.get(
+        config.get("PROMPT_TEMPLATE_MIRROR_VERIFICATION", "mirror_verification_v1"), 
+        "Example Q:\n{hypothesis_question}\nExample A:\n{hypothesis_solution}\n\nProblem:\n{validation_question}\n\nFinal Answer:"
+    )
+
+    mirror_results = {}
+    print(f"    -> [Mirror Phase 2] Running Consistency Check ({len(hypotheses)} Candidates x {len(validation_indices)} Validation Samples)...")
+
+    for cand_id, hypothesis_text in hypotheses.items():
+        if not hypothesis_text:
+            mirror_results[cand_id] = {v_idx: 0.0 for v_idx in validation_indices}
+            continue
+            
+        mirror_results[cand_id] = {}
+        formatted_hypothesis_sol = f"{hypothesis_text}"
+
+        for val_idx in validation_indices:
+            # Skip self-test (trivial)
+            if cand_id == val_idx:
+                mirror_results[cand_id][val_idx] = 0.0 
+                continue
+
+            val_q = exemplar_data['questions'][val_idx]
+            val_gt = exemplar_data['solutions'][val_idx]
+            
+            # Construct Prompt
+            prompt = tmpl_verify.format(
+                hypothesis_question=target_query, 
+                hypothesis_solution=formatted_hypothesis_sol,
+                validation_question=val_q
+            )
+            
+            correct_count = 0
+            
+            for i in range(n_mirror):
+                resp = api_manager.generate_content(prompt, model_name, temperature=0.7)
+                
+                trace_accumulator.append(create_trace_entry(
+                    "mirror_phase_2", f"cand_{cand_id}_vs_val_{val_idx}_run_{i}",
+                    {"prompt": prompt}, resp, {"model": model_name}
+                ))
+                
+                if resp['status'] == 'SUCCESS':
+                    eval_res = evaluate_single_answer_with_llm(
+                        resp['text'], val_gt, api_manager, config
+                    )
+                    if eval_res['is_correct']:
+                        correct_count += 1
+            
+            mirror_results[cand_id][val_idx] = correct_count / n_mirror
+
+    return mirror_results
+
+def _rank_and_filter_candidates(
+    baseline_scores: Dict[int, float],
+    mirror_results: Dict[int, Dict[int, float]],
+    config: Dict[str, Any],
+    trace_accumulator: List[Dict]
+) -> List[int]:
+    """
+    Phase 3 & 4: Scoring, ReRanking, and Filtering.
+    """
+    logger = logging.getLogger(__name__)
+    
+    # 1. Calculate Total Utility Score
+    candidate_scores = {}
+    candidate_contributions = {} 
+
+    for cand_id, val_scores in mirror_results.items():
+        total_score = 0.0
+        contribution_pattern = {}
+        
+        for val_idx, mirror_score in val_scores.items():
+            base_score = baseline_scores.get(val_idx, 0.0)
+            
+            # Contribution Logic: Strictly improve upon baseline
+            if mirror_score > base_score:
+                delta = mirror_score 
+                total_score += delta
+                contribution_pattern[val_idx] = delta
+            else:
+                contribution_pattern[val_idx] = 0.0
+        
+        candidate_scores[cand_id] = total_score
+        candidate_contributions[cand_id] = contribution_pattern
+
+    # 2. ReRanking (Score Descending, Index Ascending)
+    ranked_candidates = sorted(
+        candidate_scores.keys(),
+        key=lambda x: (candidate_scores[x], -x),
+        reverse=True
+    )
+    
+    # 3. Filtering
+    # A. Usefulness
+    if config.get("MIRROR_ENABLE_FILTERING", True):
+        useful_candidates = [c for c in ranked_candidates if candidate_scores[c] > 0]
+    else:
+        useful_candidates = ranked_candidates
+
+    # B. Redundancy (Covering Rule)
+    final_selection = []
+    
+    if config.get("MIRROR_ENABLE_REDUNDANCY_FILTER", True) and useful_candidates:
+        accepted = []
+        for curr_cand in useful_candidates:
+            is_redundant = False
+            curr_pattern = candidate_contributions[curr_cand]
+            
+            for higher_cand in accepted:
+                higher_pattern = candidate_contributions[higher_cand]
+                # Check coverage
+                covered = True
+                for val_idx, curr_delta in curr_pattern.items():
+                    if higher_pattern.get(val_idx, 0.0) < curr_delta:
+                        covered = False
+                        break
+                if covered:
+                    is_redundant = True
+                    break
+            
+            if not is_redundant:
+                accepted.append(curr_cand)
+        final_selection = accepted
+    else:
+        final_selection = useful_candidates
+
+    # 4. Final Cleanup (Remove R0 ghost token)
+    final_indices_clean = [i for i in final_selection if i != -1]
+
+    # Leaderboard Trace
+    leaderboard = []
+    for c in ranked_candidates:
+        status = "KEPT"
+        if c not in useful_candidates: status = "USELESS"
+        elif c not in final_selection: status = "REDUNDANT"
+        
+        leaderboard.append({
+            "cand_id": c,
+            "score": f"{candidate_scores[c]:.2f}",
+            "status": status
+        })
+
+    trace_accumulator.append(create_trace_entry(
+        "mirror_phase_4", "ranking_leaderboard",
+        {"input_candidates": list(mirror_results.keys())},
+        {"leaderboard": leaderboard, "final_selection": final_indices_clean},
+        {"info": "Final Optimization Decision"}
+    ))
+    
+    return final_indices_clean
+
 
 def simplify_retrieved_samples(
     retrieved_indices: List[int],
@@ -1416,6 +1712,9 @@ def propagate_solutions_upward(
         else:
             node.status = "FAILED"
 
+
+
+
 def solve_hierarchical_tree(
     target_query: str,
     exemplar_data: Dict[str, Any],
@@ -1456,6 +1755,78 @@ def solve_hierarchical_tree(
         "root_solution_attempts": final_attempts,
         "tree_structure": root.to_dict(),
         "trace": local_trace
+    }
+
+def optimize_demonstrations_via_mirroring(
+    target_query: str,
+    retrieved_indices: List[int],
+    exemplar_data: Dict[str, Any],
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Implements the MIRROR_AS_EVALUATOR framework.
+    Performs bidirectional consistency checks to Re-Rank and Filter retrieved samples.
+    """
+    logger = logging.getLogger(__name__)
+    local_trace = []
+
+    # 1. Master Switch Safety Check
+    if not config.get("APPLY_MIRROR_AS_EVALUATOR", False):
+        return {
+            "status": "SKIPPED", 
+            "optimized_indices": retrieved_indices, 
+            "trace": []
+        }
+
+    logger.info(f"Starting Analogical Mirroring Optimization for query: '{target_query[:50]}...'")
+    
+    # Limit active candidates to save cost
+    limit = config.get("MIRROR_ACTIVE_CANDIDATE_LIMIT", 5)
+    active_indices = retrieved_indices[:limit]
+
+    # --- PHASE 0: BASELINE ASSESSMENT ---
+    baseline_scores = _calculate_baseline_difficulty(
+        active_indices, exemplar_data, api_manager, config, local_trace
+    )
+    
+    # --- PHASE 1: HYPOTHESIS GENERATION ---
+    candidate_indices = list(active_indices)
+    if config.get("MIRROR_ENABLE_R0", True):
+        candidate_indices.insert(0, -1) # -1 represents R0
+        
+    hypotheses = _generate_hypotheses(
+        target_query, candidate_indices, exemplar_data, api_manager, config, local_trace
+    )
+
+    # --- PHASE 2: MIRROR EVALUATION ---
+    mirror_raw_scores = _evaluate_mirror_consistency(
+        target_query, hypotheses, active_indices, exemplar_data, api_manager, config, local_trace
+    )
+
+    # --- PHASE 3 & 4: SCORING & FILTERING ---
+    optimized_indices = _rank_and_filter_candidates(
+        baseline_scores, 
+        mirror_raw_scores, 
+        config, 
+        local_trace
+    )
+    
+    # Enforce Final Capacity
+    capacity = config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+    final_indices = optimized_indices[:capacity]
+    
+    print(f"    -> [Mirroring] Optimization Complete. Indices: {len(retrieved_indices)} -> {len(final_indices)}")
+
+    return {
+        "status": "SUCCESS", 
+        "optimized_indices": final_indices,
+        "trace": local_trace,
+        "debug_data": {
+            "baseline_scores": baseline_scores,
+            "hypotheses": hypotheses,
+            "mirror_raw_scores": mirror_raw_scores
+        }
     }
 
 def solve_with_analogical_consistency(

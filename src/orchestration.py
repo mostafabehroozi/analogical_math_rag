@@ -59,11 +59,11 @@ from sentence_transformers import SentenceTransformer
 from src.pipeline_steps import (
     retrieve, adapt, merge, solve,
     self_sample, augment_question, select_augmented_questions, analogical_adapt,
-    generate_reasoning_pathways, # NEW Import for Pathway Consistency
-    solve_with_group_consistency, # NEW Import for Group Consistency
-    solve_hierarchical_tree, # NEW Import for Hierarchical Augmentation
-    solve_with_analogical_consistency, # NEW Import for Reverse Validation
-    # NEW IMPORTS FOR SIMPLIFICATION
+    generate_reasoning_pathways, 
+    solve_with_group_consistency, 
+    solve_hierarchical_tree, 
+    solve_with_analogical_consistency, 
+    optimize_demonstrations_via_mirroring,
     simplify_retrieved_samples,
     solve_via_main_simplification
 )
@@ -429,12 +429,50 @@ def run_pipeline_for_single_query(
                 else:
                     retrieved_indices = retrieval_result['retrieved_indices']
                     print(f"  -> Retrieved indices: {retrieved_indices}")
+
+                    # ============================================================================
+                    # [STEP 1.5] MIRROR OPTIMIZATION (Analogical Consistency)
+                    # ============================================================================
+                    # This step re-ranks and filters the retrieved indices based on reasoning utility.
+                    # It must happen BEFORE Simplification or Adaptation.
                     
+                    if config.get("APPLY_MIRROR_AS_EVALUATOR", False):
+                        print("\n[STEP 1.5] MIRROR OPTIMIZATION")
+                        
+                        # Use the Solver Manager (requires reasoning)
+                        mirror_result = optimize_demonstrations_via_mirroring(
+                            target_query=target_query,
+                            retrieved_indices=retrieved_indices,
+                            exemplar_data=exemplar_data,
+                            api_manager=manager_for_solve, 
+                            config=config
+                        )
+
+                        # 1. Capture Trace
+                        if 'trace' in mirror_result:
+                            run_log['execution_trace'].extend(mirror_result.pop('trace'))
+                        
+                        # 2. Update Indices (The Critical Handover)
+                        if mirror_result['status'] in ['SUCCESS', 'SKELETON_PASS']:
+                            old_count = len(retrieved_indices)
+                            retrieved_indices = mirror_result['optimized_indices']
+                            new_count = len(retrieved_indices)
+                            print(f"  -> Mirroring Complete. Optimized candidates from {old_count} to {new_count}.")
+                            
+                            # Log the step
+                            iter_log_steps['mirror_optimization'] = mirror_result
+                        else:
+                            logger.warning("Mirroring optimization failed. Proceeding with original retrieved indices.")
+                            iter_log_steps['mirror_optimization'] = {"status": "FAILURE", "error": mirror_result.get("error")}
+                    # ============================================================================
+
+
                     # --- BRANCH: Simplification vs Standard Adaptation ---
                     # Check if Sample Simplification (Workflow A) is enabled
                     if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_RETRIEVED_SAMPLES', False):
                         print("\n[STEP 1.5] SIMPLIFY RETRIEVED SAMPLES")
                         # Run the new simplification pipeline step
+                        # Note: This now uses the potentially filtered 'retrieved_indices'
                         simp_result = simplify_retrieved_samples(
                             retrieved_indices=retrieved_indices,
                             exemplar_questions=exemplar_data['questions'],
@@ -458,10 +496,14 @@ def run_pipeline_for_single_query(
                     else:
                         # -- Step 2: Standard Adapt (Normalization/Transformation) --
                         print("\n[STEP 2] ADAPT (Standard Transformations)")
+                        # Note: This now uses the potentially filtered 'retrieved_indices'
                         adapt_result = adapt(
-                            target_query=target_query, retrieved_indices=retrieved_indices,
-                            exemplar_questions=exemplar_data['questions'], exemplar_solutions=exemplar_data['solutions'],
-                            api_manager=manager_for_adapt, config=config
+                            target_query=target_query, 
+                            retrieved_indices=retrieved_indices,
+                            exemplar_questions=exemplar_data['questions'], 
+                            exemplar_solutions=exemplar_data['solutions'],
+                            api_manager=manager_for_adapt, 
+                            config=config
                         )
                         # Aggregation: Extract trace
                         if 'trace' in adapt_result:
