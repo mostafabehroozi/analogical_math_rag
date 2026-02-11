@@ -363,103 +363,76 @@ def _evaluate_mirror_consistency(
     return mirror_results
 
 def _rank_and_filter_candidates(
-    baseline_scores: Dict[int, float],
-    mirror_results: Dict[int, Dict[int, float]],
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> List[int]:
+    candidate_indices: list,
+    candidate_scores: dict,
+    candidate_contributions: dict,
+    config: dict,
+    trace_accumulator: list
+) -> tuple: # CHANGED: Returns tuple (final_indices, base_indices)
     """
-    Phase 3 & 4: Scoring, ReRanking, and Filtering.
+    Applies Usefulness Filtering (Score > 0) and Redundancy Filtering (Pairwise Dominance).
+    Returns both the Redundancy-Filtered list and the Base (Noise-Filtered) list.
     """
-    logger = logging.getLogger(__name__)
-    
-    # 1. Calculate Total Utility Score
-    candidate_scores = {}
-    candidate_contributions = {} 
+    enable_filtering = config.get("MIRROR_ENABLE_FILTERING", True)
+    enable_redundancy = config.get("MIRROR_ENABLE_REDUNDANCY_FILTER", True)
 
-    for cand_id, val_scores in mirror_results.items():
-        total_score = 0.0
-        contribution_pattern = {}
-        
-        for val_idx, mirror_score in val_scores.items():
-            base_score = baseline_scores.get(val_idx, 0.0)
-            
-            # Contribution Logic: Strictly improve upon baseline
-            if mirror_score > base_score:
-                delta = mirror_score 
-                total_score += delta
-                contribution_pattern[val_idx] = delta
-            else:
-                contribution_pattern[val_idx] = 0.0
-        
-        candidate_scores[cand_id] = total_score
-        candidate_contributions[cand_id] = contribution_pattern
+    # 1. Sort all candidates by Score (Desc), then Index (Asc for stability)
+    #    Note: -x is used because we want ascending index for stability, 
+    #    but Python sorts tuples element-wise. (Score, -Index) works if Score is Desc.
+    sorted_candidates = sorted(candidate_indices, key=lambda x: (candidate_scores[x], -x), reverse=True)
 
-    # 2. ReRanking (Score Descending, Index Ascending)
-    ranked_candidates = sorted(
-        candidate_scores.keys(),
-        key=lambda x: (candidate_scores[x], -x),
-        reverse=True
-    )
-    
-    # 3. Filtering
-    # A. Usefulness
-    if config.get("MIRROR_ENABLE_FILTERING", True):
-        useful_candidates = [c for c in ranked_candidates if candidate_scores[c] > 0]
+    # 2. Base Filtering: Remove Useless Candidates (Score <= 0)
+    if enable_filtering:
+        base_indices = [c for c in sorted_candidates if candidate_scores[c] > 0]
+        # Trace log
+        trace_accumulator.append(f"   > Base Filtering: Kept {len(base_indices)}/{len(sorted_candidates)} (Score > 0)")
     else:
-        useful_candidates = ranked_candidates
+        base_indices = sorted_candidates
+        trace_accumulator.append("   > Base Filtering: DISABLED (All candidates kept)")
 
-    # B. Redundancy (Covering Rule)
+    # 3. Redundancy Filtering: Remove Covered Candidates
+    if not enable_redundancy or not enable_filtering:
+        # If redundancy is off, the final selection IS the base selection
+        return base_indices, base_indices
+
     final_selection = []
     
-    if config.get("MIRROR_ENABLE_REDUNDANCY_FILTER", True) and useful_candidates:
-        accepted = []
-        for curr_cand in useful_candidates:
-            is_redundant = False
-            curr_pattern = candidate_contributions[curr_cand]
-            
-            for higher_cand in accepted:
-                higher_pattern = candidate_contributions[higher_cand]
-                # Check coverage
-                covered = True
-                for val_idx, curr_delta in curr_pattern.items():
-                    if higher_pattern.get(val_idx, 0.0) < curr_delta:
-                        covered = False
-                        break
-                if covered:
-                    is_redundant = True
-                    break
-            
-            if not is_redundant:
-                accepted.append(curr_cand)
-        final_selection = accepted
-    else:
-        final_selection = useful_candidates
-
-    # 4. Final Cleanup (Remove R0 ghost token)
-    final_indices_clean = [i for i in final_selection if i != -1]
-
-    # Leaderboard Trace
-    leaderboard = []
-    for c in ranked_candidates:
-        status = "KEPT"
-        if c not in useful_candidates: status = "USELESS"
-        elif c not in final_selection: status = "REDUNDANT"
+    # We iterate through the sorted 'useful' candidates (highest score first)
+    for current_cand in base_indices:
+        is_covered = False
         
-        leaderboard.append({
-            "cand_id": c,
-            "score": f"{candidate_scores[c]:.2f}",
-            "status": status
-        })
+        # Check against already accepted candidates (which have higher/equal scores)
+        for accepted_cand in final_selection:
+            # Check if 'accepted_cand' covers 'current_cand'
+            # Definition: accepted covers current if for ALL validation samples j:
+            # contribution(accepted, j) >= contribution(current, j)
+            
+            accepted_contribs = candidate_contributions.get(accepted_cand, {})
+            current_contribs = candidate_contributions.get(current_cand, {})
+            
+            covered_completely = True
+            
+            # We must check against ALL validation samples that 'current_cand' helped with
+            for val_idx, score_gain in current_contribs.items():
+                if score_gain > 0:
+                    # If the accepted candidate didn't help here, or helped less/equal...
+                    # Wait, covering means accepted >= current.
+                    if accepted_contribs.get(val_idx, 0.0) < score_gain:
+                        covered_completely = False
+                        break
+            
+            if covered_completely:
+                is_covered = True
+                trace_accumulator.append(f"     - Dropped Candidate {current_cand} (Covered by {accepted_cand})")
+                break
+        
+        if not is_covered:
+            final_selection.append(current_cand)
 
-    trace_accumulator.append(create_trace_entry(
-        "mirror_phase_4", "ranking_leaderboard",
-        {"input_candidates": list(mirror_results.keys())},
-        {"leaderboard": leaderboard, "final_selection": final_indices_clean},
-        {"info": "Final Optimization Decision"}
-    ))
-    
-    return final_indices_clean
+    trace_accumulator.append(f"   > Redundancy Filtering: Kept {len(final_selection)}/{len(base_indices)}")
+
+    # RETURN BOTH LISTS
+    return final_selection, base_indices
 
 
 def simplify_retrieved_samples(
@@ -1757,77 +1730,107 @@ def solve_hierarchical_tree(
         "trace": local_trace
     }
 
-def optimize_demonstrations_via_mirroring(
-    target_query: str,
-    retrieved_indices: List[int],
-    exemplar_data: Dict[str, Any],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
+def optimize_demonstrations_via_mirroring(query: str, retrieved_indices: list, corpus_data: list, config: dict, api_key: str = None) -> dict:
     """
-    Implements the MIRROR_AS_EVALUATOR framework.
-    Performs bidirectional consistency checks to Re-Rank and Filter retrieved samples.
+    Main entry point for MIRROR_AS_EVALUATOR.
+    Orchestrates Phases 0-4: Baseline -> Hypothesis -> Verification -> ReRanking -> Filtering.
     """
-    logger = logging.getLogger(__name__)
-    local_trace = []
-
-    # 1. Master Switch Safety Check
-    if not config.get("APPLY_MIRROR_AS_EVALUATOR", False):
-        return {
-            "status": "SKIPPED", 
-            "optimized_indices": retrieved_indices, 
-            "trace": []
-        }
-
-    logger.info(f"Starting Analogical Mirroring Optimization for query: '{target_query[:50]}...'")
+    trace_accumulator = ["\n[MIRROR_AS_EVALUATOR] Started"]
     
-    # Limit active candidates to save cost
-    limit = config.get("MIRROR_ACTIVE_CANDIDATE_LIMIT", 5)
-    active_indices = retrieved_indices[:limit]
-
-    # --- PHASE 0: BASELINE ASSESSMENT ---
-    baseline_scores = _calculate_baseline_difficulty(
-        active_indices, exemplar_data, api_manager, config, local_trace
-    )
-    
-    # --- PHASE 1: HYPOTHESIS GENERATION ---
-    candidate_indices = list(active_indices)
-    if config.get("MIRROR_ENABLE_R0", True):
-        candidate_indices.insert(0, -1) # -1 represents R0
+    try:
+        # --- Phase 0: Initialization ---
+        # 1. Apply Candidate Limit (Cost Saving)
+        limit = config.get("MIRROR_ACTIVE_CANDIDATE_LIMIT", 5)
+        active_candidates = retrieved_indices[:limit]
         
-    hypotheses = _generate_hypotheses(
-        target_query, candidate_indices, exemplar_data, api_manager, config, local_trace
-    )
+        # 2. Inject Zero-Shot Candidate (R0) if enabled
+        if config.get("MIRROR_ENABLE_R0", True):
+            # We use -1 to represent R0 (Zero-Shot)
+            if -1 not in active_candidates:
+                active_candidates.insert(0, -1)
+            trace_accumulator.append(f"   > Active Candidates (incl. R0): {active_candidates}")
+        
+        # 3. Calculate Baseline Difficulty (S_base)
+        # We use the retrieved samples themselves as the Evaluation Set (E = R)
+        validation_set_indices = [idx for idx in retrieved_indices if idx != -1] # Ensure no R0 in validation
+        
+        trace_accumulator.append(f"   > Calculating Baseline for {len(validation_set_indices)} validation samples...")
+        baseline_scores = _calculate_baseline_difficulty(
+            query, validation_set_indices, corpus_data, config, api_key
+        )
+        
+        # --- Phase 1: Hypothesis Generation (Forward Pass) ---
+        trace_accumulator.append(f"   > Generating Hypotheses for {len(active_candidates)} candidates...")
+        hypotheses = _generate_hypotheses(
+            query, active_candidates, corpus_data, config, api_key
+        )
+        
+        # --- Phase 2: Mirror Evaluation (Backward Pass) ---
+        trace_accumulator.append("   > Evaluating Mirror Consistency...")
+        # Returns matrix: {candidate_idx: {validation_idx: score}}
+        consistency_matrix = _evaluate_mirror_consistency(
+            hypotheses, validation_set_indices, corpus_data, config, api_key
+        )
+        
+        # --- Phase 3: Utility Scoring ---
+        candidate_scores = {} # Total Utility Score per candidate
+        candidate_contributions = {} # Specific validation samples they helped with
+        
+        for cand_idx in active_candidates:
+            total_utility = 0.0
+            contribs = {}
+            
+            # Score = Sum of (Mirror_Score - Baseline_Score) ONLY IF Mirror > Baseline
+            for val_idx in validation_set_indices:
+                # Skip self-validation logic is handled in evaluation, but good to be safe
+                if cand_idx == val_idx: continue
+                
+                mirror_acc = consistency_matrix.get(cand_idx, {}).get(val_idx, 0.0)
+                base_acc = baseline_scores.get(val_idx, 0.0)
+                
+                if mirror_acc > base_acc:
+                    delta = mirror_acc # We use raw accuracy as the utility value, could also use (acc - base)
+                    total_utility += delta
+                    contribs[val_idx] = delta
+            
+            candidate_scores[cand_idx] = total_utility
+            candidate_contributions[cand_idx] = contribs
 
-    # --- PHASE 2: MIRROR EVALUATION ---
-    mirror_raw_scores = _evaluate_mirror_consistency(
-        target_query, hypotheses, active_indices, exemplar_data, api_manager, config, local_trace
-    )
+        # --- Phase 4: ReRanking and Filtering ---
+        # UPDATED CALL: Unpack both lists
+        final_indices, base_indices = _rank_and_filter_candidates(
+            active_candidates, candidate_scores, candidate_contributions, config, trace_accumulator
+        )
+        
+        trace_accumulator.append(f"   > Final Optimized Indices (Redundancy Filtered): {final_indices}")
+        trace_accumulator.append("[MIRROR_AS_EVALUATOR] Finished\n")
 
-    # --- PHASE 3 & 4: SCORING & FILTERING ---
-    optimized_indices = _rank_and_filter_candidates(
-        baseline_scores, 
-        mirror_raw_scores, 
-        config, 
-        local_trace
-    )
-    
-    # Enforce Final Capacity
-    capacity = config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-    final_indices = optimized_indices[:capacity]
-    
-    print(f"    -> [Mirroring] Optimization Complete. Indices: {len(retrieved_indices)} -> {len(final_indices)}")
+        # --- BRANCHING LOGIC ---
+        if config.get("MIRROR_EVALUATE_BASE_FILTERING", False):
+            return {
+                "status": "BRANCHED",
+                "strategies": {
+                    "redundancy_filtering": final_indices, # List B (Primary)
+                    "base_filtering": base_indices         # List A (Secondary)
+                },
+                "trace": trace_accumulator
+            }
+        else:
+            return {
+                "status": "SUCCESS",
+                "optimized_indices": final_indices,
+                "trace": trace_accumulator
+            }
 
-    return {
-        "status": "SUCCESS", 
-        "optimized_indices": final_indices,
-        "trace": local_trace,
-        "debug_data": {
-            "baseline_scores": baseline_scores,
-            "hypotheses": hypotheses,
-            "mirror_raw_scores": mirror_raw_scores
-        }
-    }
+    except Exception as e:
+        trace_accumulator.append(f"   [ERROR] Mirroring failed: {str(e)}")
+        # Fallback to original retrieval on error
+        return {
+            "status": "FAILED", 
+            "error": str(e),
+            "fallback_indices": retrieved_indices,
+            "trace": trace_accumulator
+        }   
 
 def solve_with_analogical_consistency(
     target_query: str,

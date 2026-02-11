@@ -232,6 +232,10 @@ CONFIG = {
     # Sub-switch: If True, removes lower-ranked candidates covered by higher ones.
     "MIRROR_ENABLE_REDUNDANCY_FILTER": True,
     
+    # NEW: Multi-Strategy Evaluation Switch
+    # If True, forks the pipeline to solve BOTH the Base Filtered list and the Redundancy Filtered list separately.
+    "MIRROR_EVALUATE_BASE_FILTERING": False,
+    
     # Limits the process to the top-K retrieved samples to save API costs.
     "MIRROR_ACTIVE_CANDIDATE_LIMIT": 5,
 
@@ -241,8 +245,6 @@ CONFIG = {
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS": "mirror_hypothesis_gen_v1",
     "PROMPT_TEMPLATE_MIRROR_VERIFICATION": "mirror_verification_v1",
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT": "mirror_hypothesis_gen_zero_shot_v1",
-
-    
 }
 
 def setup_directories():

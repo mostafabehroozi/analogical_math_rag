@@ -1,48 +1,47 @@
 #======================================================================
 #   File: src/orchestration.py
 #======================================================================
-                            
+
 # src/orchestration.py
 
 """
 Orchestration module for the Analogical Reasoning RAG project.
-
 This module chains together the individual steps from `pipeline_steps.py` to
-run the full RAG pipeline. It manages running experiments for multiple queries
+run the full RAG pipeline.
+It manages running experiments for multiple queries
 and configurations, and handles the saving and loading of results for
 pausing and resuming.
-
 This version is updated to be API provider-agnostic and to handle detailed
-error states from the pipeline steps. It logs partial progress when failures
+error states from the pipeline steps.
+It logs partial progress when failures
 occur, preventing data loss and enabling targeted retries.
-
 MODIFIED: This version now supports a deferred execution mode via the
-`DEFER_SOLVE_STEP` config flag. When enabled, it runs all intermediate steps
+`DEFER_SOLVE_STEP` config flag.
+When enabled, it runs all intermediate steps
 (retrieve, adapt, merge) for all queries first, then runs the final solve
 step for all queries in a second phase.
-
 REWRITTEN: The `run_experiments` function now implements a global, cross-experiment
-deferred execution. If ANY experiment has `DEFER_SOLVE_STEP` set to True, the
+deferred execution.
+If ANY experiment has `DEFER_SOLVE_STEP` set to True, the
 entire run switches to a two-phase model:
 1. Phase 1: All intermediate steps for ALL experiments are completed.
 2. Phase 2: All final solving steps for ALL experiments are completed.
 This optimizes API usage by batching all expensive 'solve' calls together.
-
 This version also integrates new, optional pipeline steps for self-sampling,
 augmentation, analogical adaptation, the NEW Analogical Consistency check,
 the Group-Based Self-Consistency Selection, and the NEW Hierarchical Augmentation.
-
 PERFORMANCE FIX: The call to the `retrieve` function has been updated to pass
 a pre-computed hash map, enabling O(1) self-match detection and resolving a
 major performance bottleneck.
-
 NEW FEATURE: Added `APPLY_FULL_PIPELINE_RETRY`. If True, the entire pipeline
 (Retrieval -> Adaptation -> Merging -> Solving) is re-run N times, rather than
 just retrying the final Solver step N times.
-
 NEW FEATURE: Added Pipeline Simplification.
 - Workflow A: Simplification of Retrieved Samples (replaces standard adaptation).
 - Workflow B: Simplification of Main Question (alters solving strategy).
+NEW FEATURE: Multi-Strategy Branching (Mirroring).
+- Supports branching the pipeline after Mirroring to evaluate "Base" vs "Redundancy"
+  filtering strategies in parallel.
 
 NEW FEATURE: High-Resolution Execution Tracing.
 - Collects granular prompt/response logs from all steps and aggregates them
@@ -84,7 +83,6 @@ def run_pipeline_for_single_query(
     """
     Executes the RAG pipeline for a single query, supporting different execution modes
     and new features like self-sampling and analogical adaptation.
-
     Args:
         ... (standard arguments) ...
         run_mode (str): Controls execution flow.
@@ -140,13 +138,16 @@ def run_pipeline_for_single_query(
                     "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N",
                     # Simplification Flags
                     "APPLY_SIMPLIFICATION", "SIMPLIFY_RETRIEVED_SAMPLES", "SIMPLIFY_MAIN_QUESTION",
+                    # Mirroring Flags
+                    "APPLY_MIRROR_AS_EVALUATOR", "MIRROR_EVALUATE_BASE_FILTERING",
                     # Full Pipeline Retry Flag
                     "APPLY_FULL_PIPELINE_RETRY"
                 ]
             },
             "pipeline_status": "PENDING",
             "execution_trace": [], # NEW: High-resolution trace log
-            "steps": {}
+            "steps": {},
+            "steps_alternatives": {} # NEW: Store alternative strategies (Base vs Redundancy)
         }
 
     # --- API Manager Selection ---
@@ -171,7 +172,6 @@ def run_pipeline_for_single_query(
     if config.get('APPLY_REVERSE_VALIDATION', False):
         print("\n[MODE] ANALOGICAL CONSISTENCY (REVERSE VALIDATION) ACTIVATED")
         # This mode replaces the standard solve flow entirely.
-        
         consistency_result = solve_with_analogical_consistency(
             target_query=target_query,
             exemplar_data=exemplar_data,
@@ -256,7 +256,7 @@ def run_pipeline_for_single_query(
 
         # --- SCENARIO B: Standard Pass@N (1 Tree, N Root Solves) ---
         else:
-            # If retry is False, we pass the original config. 
+            # If retry is False, we pass the original config.
             # The internal logic in propagate_solutions_upward handles the N loops.
             logger.info(f"Standard Hierarchical Mode: 1 Tree, Pass@{n_passes} on Root.")
             
@@ -297,7 +297,6 @@ def run_pipeline_for_single_query(
             run_log['pipeline_status'] = "SUCCESS"
         else:
             run_log['pipeline_status'] = "FAILURE: Hierarchical process failed to produce solutions."
-            
         return run_log
 
     # --- NEW: Branch for Analogical Consistency Check (The "Pathway" approach - OLD VERSION) ---
@@ -394,15 +393,16 @@ def run_pipeline_for_single_query(
             print(f"\n[FULL PIPELINE ITERATION] {iteration_idx + 1}/{n_pipeline_iterations}")
             
         pipeline_halted = False
-        exemplars_for_next_step = []
         
         # Local container for this iteration's logs (to avoid overwriting the main structure if iterating)
-        iter_log_steps = {}
+        # Structure: { "primary": {step: val}, "base_filtering": {step: val}, ... }
+        iter_log_strategies = {} 
 
         # --- Phase 1: Intermediate Steps ---
         if run_mode in ['full', 'intermediate']:
             # -- Step 1: Retrieve --
-            retrieved_indices = []
+            retrieved_indices_initial = []
+            
             if config.get('USE_RETRIEVAL', True):
                 print("\n[STEP 1] RETRIEVE")
                 # ========================= START OF MODIFICATION =========================
@@ -420,274 +420,252 @@ def run_pipeline_for_single_query(
                 if 'trace' in retrieval_result:
                     run_log['execution_trace'].extend(retrieval_result.pop('trace'))
 
-                iter_log_steps['retrieval'] = retrieval_result
+                # Retrieval is common to all strategies
                 if retrieval_result['status'] == 'FAILURE':
                     final_pipeline_status = "FAILURE: Retrieval failed."
                     logger.error(final_pipeline_status)
                     print("  -> Retrieval FAILED. Halting pipeline for this query.")
                     pipeline_halted = True
                 else:
-                    retrieved_indices = retrieval_result['retrieved_indices']
-                    print(f"  -> Retrieved indices: {retrieved_indices}")
+                    retrieved_indices_initial = retrieval_result['retrieved_indices']
+                    print(f"  -> Retrieved indices: {retrieved_indices_initial}")
 
-                    # ============================================================================
-                    # [STEP 1.5] MIRROR OPTIMIZATION (Analogical Consistency)
-                    # ============================================================================
-                    # This step re-ranks and filters the retrieved indices based on reasoning utility.
-                    # It must happen BEFORE Simplification or Adaptation.
+            else:
+                print("\n[STEP 1] RETRIEVE SKIPPED (USE_RETRIEVAL is False).")
+
+            # ============================================================================
+            # [STEP 1.5] MIRROR OPTIMIZATION (Analogical Consistency)
+            # ============================================================================
+            # Returns a dictionary of strategies: { "strategy_name": [indices], ... }
+            
+            candidate_strategies = {} # Map: strategy_name -> indices
+            
+            if not pipeline_halted:
+                if config.get("APPLY_MIRROR_AS_EVALUATOR", False) and retrieved_indices_initial:
+                    print("\n[STEP 1.5] MIRROR OPTIMIZATION")
                     
-                    if config.get("APPLY_MIRROR_AS_EVALUATOR", False):
-                        print("\n[STEP 1.5] MIRROR OPTIMIZATION")
+                    # Use the Solver Manager (requires reasoning)
+                    mirror_result = optimize_demonstrations_via_mirroring(
+                        target_query=target_query,
+                        retrieved_indices=retrieved_indices_initial,
+                        exemplar_data=exemplar_data,
+                        api_manager=manager_for_solve, 
+                        config=config
+                    )
+
+                    # 1. Capture Trace
+                    if 'trace' in mirror_result:
+                        run_log['execution_trace'].extend(mirror_result.pop('trace'))
+                    
+                    run_log['steps']['mirror_optimization'] = mirror_result
+
+                    # 2. Determine Strategies (Branching)
+                    if mirror_result['status'] == "BRANCHED":
+                        # We have multiple lists to solve (Base vs Redundancy)
+                        candidate_strategies = mirror_result['strategies']
+                        print(f"  -> Branching Active. Strategies: {list(candidate_strategies.keys())}")
                         
-                        # Use the Solver Manager (requires reasoning)
-                        mirror_result = optimize_demonstrations_via_mirroring(
-                            target_query=target_query,
-                            retrieved_indices=retrieved_indices,
-                            exemplar_data=exemplar_data,
-                            api_manager=manager_for_solve, 
-                            config=config
-                        )
-
-                        # 1. Capture Trace
-                        if 'trace' in mirror_result:
-                            run_log['execution_trace'].extend(mirror_result.pop('trace'))
+                    elif mirror_result['status'] == 'SUCCESS':
+                        # Standard single list
+                        optimized = mirror_result['optimized_indices']
+                        candidate_strategies = {"primary": optimized}
+                        print(f"  -> Mirroring Complete. Optimized to {len(optimized)} candidates.")
                         
-                        # 2. Update Indices (The Critical Handover)
-                        if mirror_result['status'] in ['SUCCESS', 'SKELETON_PASS']:
-                            old_count = len(retrieved_indices)
-                            retrieved_indices = mirror_result['optimized_indices']
-                            new_count = len(retrieved_indices)
-                            print(f"  -> Mirroring Complete. Optimized candidates from {old_count} to {new_count}.")
-                            
-                            # Log the step
-                            iter_log_steps['mirror_optimization'] = mirror_result
-                        else:
-                            logger.warning("Mirroring optimization failed. Proceeding with original retrieved indices.")
-                            iter_log_steps['mirror_optimization'] = {"status": "FAILURE", "error": mirror_result.get("error")}
-                    # ============================================================================
-
-
-                    # --- BRANCH: Simplification vs Standard Adaptation ---
-                    # Check if Sample Simplification (Workflow A) is enabled
-                    if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_RETRIEVED_SAMPLES', False):
-                        print("\n[STEP 1.5] SIMPLIFY RETRIEVED SAMPLES")
-                        # Run the new simplification pipeline step
-                        # Note: This now uses the potentially filtered 'retrieved_indices'
-                        simp_result = simplify_retrieved_samples(
-                            retrieved_indices=retrieved_indices,
-                            exemplar_questions=exemplar_data['questions'],
-                            exemplar_solutions=exemplar_data['solutions'],
-                            api_manager=manager_for_simp,
-                            config=config
-                        )
-                        # Aggregation: Extract trace
-                        if 'trace' in simp_result:
-                            run_log['execution_trace'].extend(simp_result.pop('trace'))
-
-                        iter_log_steps['simplification_of_samples'] = simp_result
-                        
-                        if simp_result.get('simplified_exemplars'):
-                            print(f"  -> Generated {len(simp_result['simplified_exemplars'])} simplified exemplars.")
-                            # Use these as the exemplars for the next step, skipping standard adaptation (Step 2)
-                            exemplars_for_next_step.extend(simp_result['simplified_exemplars'])
-                        else:
-                            print("  -> WARNING: Sample Simplification failed. Falling back to Standard Adaptation.")
-                            # Fallback logic could be added here, but for now we proceed with empty or partial results
                     else:
-                        # -- Step 2: Standard Adapt (Normalization/Transformation) --
-                        print("\n[STEP 2] ADAPT (Standard Transformations)")
-                        # Note: This now uses the potentially filtered 'retrieved_indices'
+                        logger.warning("Mirroring optimization failed. Proceeding with original retrieved indices.")
+                        candidate_strategies = {"fallback": retrieved_indices_initial}
+                else:
+                    # No Mirroring -> Single strategy using retrieved indices
+                    candidate_strategies = {"primary": retrieved_indices_initial}
+
+            # ============================================================================
+            # [STEP 2-6] STRATEGY LOOP (Adapt -> Merge -> Solve)
+            # ============================================================================
+            # Iterate through each strategy (e.g., "primary", "base_filtering", "redundancy_filtering")
+            
+            # Define which keys are considered "Primary" for backward compatibility in logs
+            primary_keys = ["primary", "redundancy_filtering", "fallback"]
+
+            for strategy_name, indices in candidate_strategies.items():
+                if pipeline_halted: break # Global halt
+                
+                print(f"\n--- Strategy: {strategy_name.upper()} (Candidates: {len(indices)}) ---")
+                
+                local_step_log = {} # Log for this strategy
+                current_exemplars_for_step = [] # Will hold text
+                
+                # We need to manually populate retrieval info in local log if we want completeness
+                if config.get('USE_RETRIEVAL'):
+                    local_step_log['retrieval'] = {"retrieved_indices": indices}
+
+                # --- BRANCH: Simplification vs Standard Adaptation ---
+                if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_RETRIEVED_SAMPLES', False):
+                    print(f"[{strategy_name}] SIMPLIFY RETRIEVED SAMPLES")
+                    simp_result = simplify_retrieved_samples(
+                        retrieved_indices=indices,
+                        exemplar_questions=exemplar_data['questions'],
+                        exemplar_solutions=exemplar_data['solutions'],
+                        api_manager=manager_for_simp,
+                        config=config
+                    )
+                    if 'trace' in simp_result:
+                        run_log['execution_trace'].extend(simp_result.pop('trace'))
+
+                    local_step_log['simplification_of_samples'] = simp_result
+                    
+                    if simp_result.get('simplified_exemplars'):
+                        current_exemplars_for_step.extend(simp_result['simplified_exemplars'])
+                    else:
+                        print(f"  -> WARNING: Sample Simplification failed for {strategy_name}.")
+                else:
+                    # -- Step 2: Standard Adapt --
+                    if config.get('USE_RETRIEVAL'):
+                        print(f"[{strategy_name}] ADAPT (Standard Transformations)")
                         adapt_result = adapt(
                             target_query=target_query, 
-                            retrieved_indices=retrieved_indices,
+                            retrieved_indices=indices,
                             exemplar_questions=exemplar_data['questions'], 
                             exemplar_solutions=exemplar_data['solutions'],
                             api_manager=manager_for_adapt, 
                             config=config
                         )
-                        # Aggregation: Extract trace
                         if 'trace' in adapt_result:
                             run_log['execution_trace'].extend(adapt_result.pop('trace'))
 
-                        iter_log_steps['adaptation'] = adapt_result
-                        if adapt_result['status'] == 'FAILURE':
-                            print("  -> WARNING: Standard adaptation failed for all exemplars.")
-                        exemplars_for_next_step.extend(adapt_result.get('adapted_texts', []))
-            else:
-                print("\n[STEP 1, 2] RETRIEVE & ADAPT SKIPPED (USE_RETRIEVAL is False).")
+                        local_step_log['adaptation'] = adapt_result
+                        current_exemplars_for_step.extend(adapt_result.get('adapted_texts', []))
+                    else:
+                        print(f"[{strategy_name}] RETRIEVE & ADAPT SKIPPED.")
 
-            # -- Step 3: Analogical Adaptation (NEW) --
-            # This step refines/replaces the retrieved set.
-            if not pipeline_halted and config.get('APPLY_ANALOGICAL_ADAPTATION', False):
-                print("\n[STEP 3] ADAPT (Analogical Adaptation)")
-                if not retrieved_indices:
-                    logger.warning("Analogical Adaptation requires retrieval but no exemplars were retrieved. Skipping.")
-                    iter_log_steps['analogical_adaptation'] = {"status": "SKIPPED", "reason": "No retrieved exemplars."}
-                else:
-                    augmented_qs_for_aa = None
+                # -- Step 3: Analogical Adaptation --
+                if config.get('APPLY_ANALOGICAL_ADAPTATION', False):
+                    print(f"[{strategy_name}] ADAPT (Analogical Adaptation)")
+                    # (Simplified logic: Assumes existing functions handle augmentation correctly)
+                    # Note: We pass the indices for this strategy
                     
-                    # --- MODIFICATION: Bypass external augmentation if Identity Mode is ON ---
+                    augmented_qs_for_aa = None
                     if config.get('APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION') and not config.get('ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION', False):
-                        # UPDATED: We use AUGMENT_K as the pool size for the recursive tree structure.
-                        # If it's too small, the analogical_adapt function will detect it and generate fresh ones.
                         k = config.get('AUGMENT_K', 10)
-                        # Use manager_for_aug for augmentation
                         aug_result = augment_question(target_query, k, manager_for_aug, config)
-                        
-                        # Aggregation: Extract trace (Augmentation)
                         if 'trace' in aug_result:
                             run_log['execution_trace'].extend(aug_result.pop('trace'))
-
                         if aug_result['status'] == 'SUCCESS':
                             augmented_qs_for_aa = aug_result['augmented_questions']
                             if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
-                                retrieved_texts = [EXEMPLAR_FORMAT.format(question=exemplar_data['questions'][i], solution=exemplar_data['solutions'][i]) for i in retrieved_indices]
+                                retrieved_texts = [EXEMPLAR_FORMAT.format(question=exemplar_data['questions'][i], solution=exemplar_data['solutions'][i]) for i in indices]
                                 augmented_qs_for_aa = select_augmented_questions(augmented_qs_for_aa, config, embedding_model, retrieved_texts)
 
-                    # Note: If ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION is True, augmented_qs_for_aa is None, 
-                    # but the analogical_adapt function internally handles this by using the main query.
                     aa_result = analogical_adapt(
-                        target_query, retrieved_indices, exemplar_data, 
-                        api_manager=manager_for_adapt, # Use adapt manager for the reasoning part
-                        api_manager_augment=manager_for_aug, # Use aug manager for internal queue refills
-                        config=config,
-                        embedding_model=embedding_model, augmented_questions=augmented_qs_for_aa
+                        target_query, indices, exemplar_data, 
+                        api_manager=manager_for_adapt, api_manager_augment=manager_for_aug,
+                        config=config, embedding_model=embedding_model, augmented_questions=augmented_qs_for_aa
                     )
-                    # Aggregation: Extract trace (Analogical Adapt + Recursion)
                     if 'trace' in aa_result:
                         run_log['execution_trace'].extend(aa_result.pop('trace'))
 
-                    iter_log_steps['analogical_adaptation'] = aa_result
+                    local_step_log['analogical_adaptation'] = aa_result
                     if aa_result.get('analogically_adapted_texts'):
-                        print(f"  -> Generated {len(aa_result['analogically_adapted_texts'])} new exemplars via analogical adaptation.")
-                        # Replace the original retrieved/adapted set with the new ones
-                        exemplars_for_next_step = aa_result['analogically_adapted_texts']
+                         current_exemplars_for_step = aa_result['analogically_adapted_texts']
 
-            # -- Step 4: Self-Sampling (NEW) --
-            # This step adds to the existing pool of exemplars.
-            if not pipeline_halted and config.get('APPLY_SELF_SAMPLING', False):
-                print("\n[STEP 4] SELF-SAMPLE")
-                self_sampled_texts = []
-                
-                if config.get('APPLY_SELF_SAMPLING_AUGMENTATION'):
-                    k = config.get('AUGMENT_K', config.get('SELF_SAMPLING_N', 3))
-                    # Use manager_for_aug for augmentation
-                    aug_result = augment_question(target_query, k, manager_for_aug, config)
-                    
-                    # Aggregation: Extract trace (Augmentation)
-                    if 'trace' in aug_result:
-                        run_log['execution_trace'].extend(aug_result.pop('trace'))
-                    
-                    if aug_result['status'] == 'SUCCESS':
-                        augmented_qs = aug_result['augmented_questions']
-                        if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
-                            augmented_qs = select_augmented_questions(augmented_qs, config, embedding_model)
-                        
-                        # Solve each augmented question
-                        for q in augmented_qs:
-                            ss_result = self_sample(q, manager_for_adapt, config)
-                            if 'trace' in ss_result:
-                                run_log['execution_trace'].extend(ss_result.pop('trace'))
-                            self_sampled_texts.extend(ss_result.get('self_sampled_texts', []))
-                        iter_log_steps['self_sampling'] = {"status": "SUCCESS", "details": "Augmented Self-Sampling"}
-                else:
-                    # Standard self-sampling on the main query
+                # -- Step 4: Self-Sampling --
+                if config.get('APPLY_SELF_SAMPLING', False):
+                    print(f"[{strategy_name}] SELF-SAMPLE")
+                    self_sampled_texts = []
+                    # (Standard self-sampling logic)
                     ss_result = self_sample(target_query, manager_for_adapt, config)
                     if 'trace' in ss_result:
                         run_log['execution_trace'].extend(ss_result.pop('trace'))
                     self_sampled_texts.extend(ss_result.get('self_sampled_texts', []))
-                    iter_log_steps['self_sampling'] = ss_result
+                    
+                    local_step_log['self_sampling'] = ss_result
+                    current_exemplars_for_step.extend(self_sampled_texts)
 
-                print(f"  -> Generated {len(self_sampled_texts)} new exemplars via self-sampling.")
-                exemplars_for_next_step.extend(self_sampled_texts)
-                
-            # -- Step 5: Merge --
-            # This step consolidates the final pool of exemplars.
-            final_exemplars_for_solve = exemplars_for_next_step
-            if not pipeline_halted:
-                print("\n[STEP 5] MERGE")
+                # -- Step 5: Merge --
+                print(f"[{strategy_name}] MERGE")
                 merge_result = merge(
-                    target_query=target_query, adapted_texts=final_exemplars_for_solve,
+                    target_query=target_query, adapted_texts=current_exemplars_for_step,
                     embedding_model=embedding_model, api_manager=manager_for_adapt, config=config
                 )
-                
-                # Aggregation: Extract trace
                 if 'trace' in merge_result:
                     run_log['execution_trace'].extend(merge_result.pop('trace'))
 
-                iter_log_steps['merging'] = merge_result
-                if merge_result['status'] == 'SKIPPED':
-                    print("  -> Merging was SKIPPED as per config.")
-                else:
-                    print(f"  -> Merged down to {len(merge_result.get('merged_texts', []))} final exemplar(s).")
+                local_step_log['merging'] = merge_result
                 final_exemplars_for_solve = merge_result['merged_texts']
+                
+                # STORE INTERMEDIATE LOG FOR THIS STRATEGY
+                iter_log_strategies[strategy_name] = local_step_log
+                iter_log_strategies[strategy_name]['final_exemplars'] = final_exemplars_for_solve
 
         elif run_mode == 'solve_only':
             print("\n[STEPS 1-5] SKIPPED (Running in solve_only mode). Loading intermediate results.")
             pipeline_halted = "FAILURE" in run_log.get("pipeline_status", "")
+            
+            # In solve_only, we check existing logs.
+            # If 'steps_alternatives' exists, we respect branching.
+            # If not, we assume standard 'primary' strategy from 'steps'.
+            
+            # Load Primary
+            candidate_strategies = {}
             if not pipeline_halted:
-                # Merging is the last intermediate step, so its output is what we need for solve
-                final_exemplars_for_solve = run_log.get('steps', {}).get('merging', {}).get('merged_texts', [])
-                print(f"  -> Loaded {len(final_exemplars_for_solve)} exemplars for solving.")
+                # Primary
+                primary_exemplars = run_log.get('steps', {}).get('merging', {}).get('merged_texts', [])
+                if primary_exemplars:
+                    candidate_strategies["primary"] = primary_exemplars # Value is exemplars list here, not indices
+                
+                # Alternatives
+                alts = run_log.get('steps_alternatives', {})
+                for name, data in alts.items():
+                    alt_exemplars = data.get('merging', {}).get('merged_texts', [])
+                    if alt_exemplars:
+                        candidate_strategies[name] = alt_exemplars
+                
+                # Note: In solve_only mode, 'candidate_strategies' values are TEXTS, not INDICES.
+                # We need to handle this diff in the solving phase below.
             else:
                 print("  -> Prior step failed, solve will be skipped.")
 
-        # --- Phase 2: Final Solving Step ---
-        solve_result = {}
-        if run_mode in ['full', 'solve_only']:
-            if not pipeline_halted:
+        # --- Phase 2: Final Solving Step (For EACH Strategy) ---
+        
+        # We loop again or continue. Since run_mode='full' populates 'iter_log_strategies' with keys and exemplars,
+        # and 'solve_only' populates 'candidate_strategies' with keys and exemplars, we can unify.
+        
+        strategies_to_solve = {}
+        if run_mode in ['full', 'intermediate']:
+             for name, data in iter_log_strategies.items():
+                 strategies_to_solve[name] = data['final_exemplars']
+        elif run_mode == 'solve_only':
+             strategies_to_solve = candidate_strategies # Already mapping name -> exemplars
+
+        if run_mode in ['full', 'solve_only'] and not pipeline_halted:
+            primary_keys = ["primary", "redundancy_filtering", "fallback"]
+
+            for strategy_name, final_exemplars_for_solve in strategies_to_solve.items():
+                print(f"\n[{strategy_name}] SOLVE PHASE")
+                solve_result = {}
                 
                 # --- BRANCH: Main Question Simplification Workflow (Workflow B) ---
                 if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_MAIN_QUESTION', False):
-                    print("\n[STEP 6] SOLVE (Simplification of Main Question)")
-                    
+                    print(f"[{strategy_name}] SOLVE (Simplification of Main Question)")
                     solve_result = solve_via_main_simplification(
                         target_query=target_query,
                         final_exemplars=final_exemplars_for_solve,
-                        api_manager=manager_for_simp, # Can use Simp manager or Solve manager, func handles it
+                        api_manager=manager_for_simp,
                         config=config
                     )
-                    
-                    # Aggregation: Extract trace
-                    if 'trace' in solve_result:
-                        run_log['execution_trace'].extend(solve_result.pop('trace'))
-                    
-                    current_attempts = solve_result.get('solution_attempts', [])
-                    aggregated_solution_attempts.extend(current_attempts)
-                    
-                    if solve_result['status'] == 'SUCCESS':
-                        final_pipeline_status = "SUCCESS"
-                    else:
-                        final_pipeline_status = "FAILURE"
-
+                
                 # --- BRANCH: Group-Based Self-Consistency Selection ---
                 elif config.get('APPLY_GROUP_CONSISTENCY_SELECTION', False):
-                    print("\n[STEP 6] SOLVE (Group-Based Consistency Mode)")
-                    
-                    # Execute the new consistency pipeline step
+                    print(f"[{strategy_name}] SOLVE (Group-Based Consistency Mode)")
                     solve_result = solve_with_group_consistency(
                         target_query=target_query,
                         available_exemplars=final_exemplars_for_solve,
                         api_manager=manager_for_solve,
                         config=config
                     )
-                    
-                    # Aggregation: Extract trace
-                    if 'trace' in solve_result:
-                        run_log['execution_trace'].extend(solve_result.pop('trace'))
-                    
-                    # Check outcome
-                    if solve_result['status'] == 'SUCCESS':
-                        final_pipeline_status = "SUCCESS"
-                        print("  -> Group Consistency Selection completed successfully.")
-                    else:
-                        final_pipeline_status = "FAILURE: Group Consistency failed."
                 
                 # --- BRANCH: Standard Solving (Pass@N) ---
                 else:
-                    print("\n[STEP 6] SOLVE")
-                    
-                    # Temporarily override N_PASS_ATTEMPTS for this specific call if wrapping in a loop
+                    print(f"[{strategy_name}] SOLVE (Standard)")
                     current_solver_config = config.copy()
                     current_solver_config['N_PASS_ATTEMPTS'] = n_solver_attempts_per_pass
                     
@@ -695,45 +673,75 @@ def run_pipeline_for_single_query(
                         target_query=target_query, final_exemplars=final_exemplars_for_solve,
                         api_manager=manager_for_solve, config=current_solver_config
                     )
-                    
-                    # Aggregation: Extract trace
-                    if 'trace' in solve_result:
-                        run_log['execution_trace'].extend(solve_result.pop('trace'))
 
-                    current_attempts = solve_result.get('solution_attempts', [])
-                    aggregated_solution_attempts.extend(current_attempts)
+                # Aggregation: Extract trace
+                if 'trace' in solve_result:
+                    run_log['execution_trace'].extend(solve_result.pop('trace'))
+
+                # --- STORE RESULTS ---
+                # Check if this is a Primary strategy
+                is_primary = (strategy_name in primary_keys)
+                
+                if is_primary:
+                    # Update Main Status
+                    if solve_result['status'] == 'SUCCESS':
+                        final_pipeline_status = "SUCCESS"
+                    else:
+                        final_pipeline_status = "FAILURE"
                     
-                    solution_texts = [attempt for attempt in current_attempts if isinstance(attempt, str)]
-                    failed_attempts = sum(1 for attempt in current_attempts if isinstance(attempt, dict))
-                    for i, text in enumerate(solution_texts): print(f"  -> Solution attempt #{i+1} (start): '{text[:120]}...'")
-                    if failed_attempts > 0: print(f"  -> {failed_attempts} solution attempt(s) FAILED.")
+                    # Store in main 'steps' for backward compatibility
+                    # Note: We assume only ONE primary strategy exists usually.
+                    # If Mirroring returns 'redundancy_filtering' as primary, we log it here.
+                    run_log['steps']['solving'] = solve_result
                     
-                    if "FAILURE" not in final_pipeline_status:
-                         final_pipeline_status = "SUCCESS"
-            else:
-                solve_result = {"status": "SKIPPED", "reason": "Pipeline halted due to critical failure in a prior step."}
+                    # Collect attempts for global aggregation
+                    if 'solution_attempts' in solve_result:
+                         aggregated_solution_attempts.extend(solve_result['solution_attempts'])
+                    elif 'group_consistency_results' in solve_result:
+                        # For group consistency, we might assume the first group's first attempt 
+                        # or similar for "aggregation", but usually it's handled by specific evaluators.
+                        pass
+                else:
+                    # Store in 'steps_alternatives'
+                    if 'steps_alternatives' not in run_log:
+                        run_log['steps_alternatives'] = {}
+                    
+                    if strategy_name not in run_log['steps_alternatives']:
+                        run_log['steps_alternatives'][strategy_name] = {}
+                        
+                    run_log['steps_alternatives'][strategy_name]['solving'] = solve_result
+                    
+                    # We also ensure the intermediate steps for this alternative are saved there
+                    if run_mode in ['full', 'intermediate'] and strategy_name in iter_log_strategies:
+                         run_log['steps_alternatives'][strategy_name].update(iter_log_strategies[strategy_name])
+
         elif run_mode == 'intermediate':
             print("\n[STEP 6] SOLVE DEFERRED.")
             solve_result = {"status": "DEFERRED"}
             if not pipeline_halted:
                  final_pipeline_status = "INTERMEDIATE_COMPLETE"
 
-        # Update logs for this iteration
+        # Update logs for this iteration (Full Retry Mode)
         if full_retry_mode:
             # In full retry mode, we store detailed steps for each iteration separately
+            # We assume Primary strategy for retry logic simplicity currently
             iteration_details.append({
                 "iteration": iteration_idx,
-                "context_exemplars": final_exemplars_for_solve,
-                "steps": iter_log_steps,
-                "solve_result": solve_result
+                "context_exemplars": strategies_to_solve.get("primary", []), # Fallback
+                "steps": iter_log_strategies.get("primary", {}),
+                "solve_result": run_log['steps'].get('solving', {})
             })
             # Also update the main run_log steps with the LAST iteration's details just so it isn't empty
-            run_log['steps'] = iter_log_steps
-            run_log['steps']['solving'] = solve_result
+            if "primary" in iter_log_strategies:
+                run_log['steps'].update(iter_log_strategies["primary"])
         else:
             # In standard mode, we update the main steps directly
-            run_log['steps'].update(iter_log_steps)
-            run_log['steps']['solving'] = solve_result
+            if "primary" in iter_log_strategies:
+                run_log['steps'].update(iter_log_strategies["primary"])
+            elif "redundancy_filtering" in iter_log_strategies:
+                 run_log['steps'].update(iter_log_strategies["redundancy_filtering"])
+            elif "fallback" in iter_log_strategies:
+                 run_log['steps'].update(iter_log_strategies["fallback"])
 
     # --- END PIPELINE ITERATION LOOP ---
 
@@ -747,7 +755,7 @@ def run_pipeline_for_single_query(
     run_log['llm_final_solution_attempts_texts'] = all_solution_texts
     
     # Ensure the solve step in run_log accurately reflects the aggregated results
-    if 'solving' in run_log['steps']:
+    if 'solving' in run_log['steps'] and aggregated_solution_attempts:
         run_log['steps']['solving']['solution_attempts'] = aggregated_solution_attempts
 
     logger.info(f"--- Pipeline finished for Query #{hard_list_idx} with status: {run_log['pipeline_status']} ---")
