@@ -36,7 +36,8 @@ CONFIG = {
         # Add your Gemini API keys here
     ],
     "GEMINI_MODEL_QUOTAS": {
-        "models/gemma-3-27b-it": {"delay_seconds": 20, "rpd": 100},
+        # UPDATED: Increased limits to accommodate Mirroring inner loops
+        "models/gemma-3-27b-it": {"delay_seconds": 2, "rpd": 1000},
     },
     "GLOBAL_API_CALL_DELAY_SECONDS": 5,
 
@@ -136,12 +137,27 @@ CONFIG = {
     "CONSISTENCY_LAYER_2_TEMPERATURE": 1.0,
     "CONSISTENCY_VOTING_THRESHOLD": 0.6,
 
-    # --- Group Consistency Selection ---
-    "APPLY_GROUP_CONSISTENCY_SELECTION": False,
-    "GROUP_CONSISTENCY_CANDIDATES": [(0, 1), (2, 3)],
-    "GROUP_CONSISTENCY_SAMPLES_N": 5,
-    "CONSISTENCY_SCORING_METHOD": "hybrid",
-    "SEMANTIC_CONSISTENCY_WEIGHT": 0.5,
+    # --- Parallel Research Benchmarking (formerly Group Consistency) ---
+    # If True, the system forks into independent generation tracks for each defined group.
+    # The system will NOT merge these; it will report Pass@K for each strategy separately.
+    "APPLY_GROUP_CONSISTENCY_SELECTION": True,
+
+    # DEFINITION OF STRATEGIES (Benchmarks)
+    # Each tuple represents a specific Prompt Strategy (indices of retrieved exemplars).
+    # Group 1 (0,): 1-Shot Strategy (Top-1 exemplar only)
+    # Group 2 (0, 1): 2-Shot Strategy (Top-1 + Top-2)
+    # Group 3 (0, 1, 2): 3-Shot Strategy (Top-1 + Top-2 + Top-3)
+    "GROUP_CONSISTENCY_CANDIDATES": [(0,), (0, 1), (0, 1, 2)],
+
+    # N_gen (Evaluation Sampling):
+    # Number of independent generations per strategy to calculate Pass@K.
+    # Recommended: 10 <= N <= 40 for statistically significant benchmarking.
+    "GROUP_CONSISTENCY_SAMPLES_N": 10,
+
+    # These legacy scoring flags can be ignored or set to None as we are 
+    # now doing independent Pass@K benchmarking, not internal voting.
+    "CONSISTENCY_SCORING_METHOD": "benchmark_report", 
+    "SEMANTIC_CONSISTENCY_WEIGHT": 0.0,
 
     # --- Hierarchical Augmentation ---
     "APPLY_HIERARCHICAL_AUGMENTATION": False,
@@ -212,35 +228,36 @@ CONFIG = {
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
 
-
     # --- MIRROR_AS_EVALUATOR (Analogical Mirroring) ---
     # Master Switch: Enables the post-retrieval optimization loop.
-    "APPLY_MIRROR_AS_EVALUATOR": False,
+    "APPLY_MIRROR_AS_EVALUATOR": True,
 
     # 2.1 Sampling Parameters
-    # Number of inference attempts used to calculate consistency scores (N_mirror).
-    # Higher values = more accurate but expensive. (Recommended: 3-5)
+    # N_mirror: Number of zero-shot attempts used to calculate consistency scores.
+    # Higher values = more robust scoring but higher cost. (Recommended: 3-5)
     "MIRROR_N_OPTIMIZATION": 3,
     
     # 2.2 Feature Toggles
-    # If True, injects a virtual "Zero-Shot" candidate at Rank 0.
+    # enable_R0: If True, injects a virtual "Zero-Shot" candidate at Rank 0.
     "MIRROR_ENABLE_R0": True,
     
-    # Master switch for the filtering module (removes Score=0 candidates).
+    # enable_filtering: Master switch for removing candidates (Score=0).
     "MIRROR_ENABLE_FILTERING": True,
     
-    # Sub-switch: If True, removes lower-ranked candidates covered by higher ones.
+    # enable_redundancy_filter: Sub-switch. If True, removes lower-ranked candidates 
+    # that are "covered" by higher-ranked ones (Parsimony).
     "MIRROR_ENABLE_REDUNDANCY_FILTER": True,
     
-    # NEW: Multi-Strategy Evaluation Switch
-    # If True, forks the pipeline to solve BOTH the Base Filtered list and the Redundancy Filtered list separately.
-    "MIRROR_EVALUATE_BASE_FILTERING": False,
-    
-    # Limits the process to the top-K retrieved samples to save API costs.
+    # active_candidate_limit: Limits the process to the top-K retrieved samples to save API costs.
+    # Only these candidates will be scored.
     "MIRROR_ACTIVE_CANDIDATE_LIMIT": 5,
 
-    # --- Mirroring Prompts ---
-    # Keys pointing to templates in src/prompts.py
+    # NEW: Multi-Strategy Branching Switch
+    # If True, the pipeline will fork to solve BOTH the "Base Filtered" list 
+    # AND the "Redundancy Filtered" list separately.
+    "MIRROR_EVALUATE_BASE_FILTERING": True,
+
+    # --- Mirroring Prompts (Keys pointing to templates in src/prompts.py) ---
     "PROMPT_TEMPLATE_MIRROR_BASELINE": "mirror_baseline_zero_shot_v1",
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS": "mirror_hypothesis_gen_v1",
     "PROMPT_TEMPLATE_MIRROR_VERIFICATION": "mirror_verification_v1",

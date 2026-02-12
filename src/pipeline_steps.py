@@ -45,6 +45,15 @@ from src.utils import save_json, load_json, create_trace_entry
 from src.hf_sync import periodic_sync_check
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.evaluation import evaluate_single_answer_with_llm
+from collections import defaultdict
+from src.prompts import (
+    create_mirror_baseline_prompt,
+    create_mirror_hypothesis_prompt,
+    create_mirror_hypothesis_zeroshot_prompt,
+    create_mirror_verification_prompt,
+    create_evaluation_prompt,
+    EXEMPLAR_FORMAT
+)
 
 def log_time_diagnostic(message: str, start_time: float, indent: int = 0) -> float:
     end_time = time.time()
@@ -1401,76 +1410,289 @@ def generate_reasoning_pathways(
 
     return {"status": status, "pathway_exemplars": pathways, "errors": errors, "trace": local_trace}
 
-def solve_with_group_consistency(
+
+
+
+
+# ==============================================================================
+#   Analogical Mirroring Logic (MIRROR_AS_EVALUATOR)
+# ==============================================================================
+
+def optimize_demonstrations_via_mirroring(
     target_query: str,
-    available_exemplars: List[str],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting Group-Based Self-Consistency Solving.")
-    local_trace = []
-
-    group_candidates = config.get("GROUP_CONSISTENCY_CANDIDATES", [])
-    n_samples = config.get("GROUP_CONSISTENCY_SAMPLES_N", 5)
+    retrieved_indices: list,
+    exemplar_data: list,
+    api_manager,
+    config: dict
+):
+    """
+    Implements the 'Mirror as Evaluator' pipeline:
+    1. Baseline: Checks how hard retrieved samples are to solve zero-shot.
+    2. Hypothesis: Uses candidates to solve the Target Query.
+    3. Mirroring: Uses the Hypothesis to solve the original retrieved samples.
+    4. Filtering: Scores and filters candidates based on utility (Mirror > Baseline).
+    """
     
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager type for solver: {type(api_manager)}")
-        
-    temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0) 
+    # --- 1. Setup & Constants ---
+    N_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
+    active_limit = config.get("MIRROR_ACTIVE_CANDIDATE_LIMIT", 5)
+    
+    # Defines the validation set (The retrieved exemplars themselves)
+    # We only validate against the top-k to keep costs manageable
+    validation_indices = retrieved_indices[:active_limit]
+    
+    # Defines the candidate set (Top-k + optionally R0/Zero-Shot)
+    candidate_indices = retrieved_indices[:active_limit].copy()
+    if config.get("MIRROR_ENABLE_R0", True):
+        candidate_indices.insert(0, -1) # -1 represents Zero-Shot (R0)
 
-    group_results = []
+    # --- Phase 0: Baseline Assessment ---
+    # How hard is it to solve the validation samples without any help?
+    baseline_scores = _calculate_baseline_difficulty(
+        validation_indices, exemplar_data, api_manager, config, N_mirror
+    )
 
-    for group_idx, indices_tuple in enumerate(group_candidates):
-        print(f"\n    -> Processing Consistency Group #{group_idx} (Indices: {indices_tuple})...")
-        
-        group_exemplars = []
-        valid_group = True
-        for idx in indices_tuple:
-            if 0 <= idx < len(available_exemplars):
-                group_exemplars.append(available_exemplars[idx])
-            else:
-                logger.warning(f"Group index {idx} out of bounds (Available: {len(available_exemplars)}). Skipping group.")
-                valid_group = False
-                break
-        
-        if not valid_group or not group_exemplars:
-            continue
+    # --- Phase 1: Hypothesis Generation (Forward Pass) ---
+    # Generate a solution for the Target Query using each candidate.
+    hypotheses = _generate_hypotheses(
+        target_query, candidate_indices, exemplar_data, api_manager, config
+    )
 
-        prompt = create_final_reasoning_prompt(target_query, group_exemplars, config)
-        
-        group_attempts = []
-        for i in range(n_samples):
-            print(f"        -> Generating sample {i+1}/{n_samples} for Group #{group_idx}...")
-            response = api_manager.generate_content(prompt, model_name, temperature)
-            
-            local_trace.append(create_trace_entry(
-                "group_consistency", f"group_{group_idx}_sample_{i+1}",
-                {"indices": indices_tuple, "prompt": prompt}, response, {"model": model_name, "temp": temperature}
-            ))
+    # --- Phase 2: Mirror Evaluation (Backward Pass) ---
+    # Test if the generated hypotheses can solve the validation set.
+    mirror_scores = _evaluate_mirror_consistency(
+        hypotheses, validation_indices, exemplar_data, api_manager, config, N_mirror
+    )
 
-            if response['status'] == 'SUCCESS':
-                group_attempts.append(response['text'])
-            else:
-                group_attempts.append({"status": "FAILURE", "error_info": response})
-
-        group_results.append({
-            "group_id": group_idx,
-            "indices_used": indices_tuple,
-            "attempts": group_attempts
-        })
+    # --- Phase 3 & 4: Scoring, Ranking, and Filtering ---
+    results = _rank_and_filter_candidates(
+        candidate_indices, validation_indices, baseline_scores, mirror_scores, config
+    )
 
     return {
-        "status": "SUCCESS" if group_results else "FAILURE",
-        "group_consistency_results": group_results,
-        "trace": local_trace
+        "status": "SUCCESS",
+        "strategies": results, # Dictionary containing 'base_filtering', 'redundancy_filtering', etc.
+        "debug_scores": {
+            "baseline": baseline_scores,
+            "mirror": mirror_scores
+        }
     }
+
+def _calculate_baseline_difficulty(indices, data, api, config, n_samples):
+    scores = {}
+    print(f"   [Mirror] Calculating Baseline Difficulty for {len(indices)} validation samples...")
+    for idx in indices:
+        question = data[idx]['question']
+        ground_truth = data[idx]['solution']
+        
+        prompt = create_mirror_baseline_prompt(question, config)
+        
+        # Generate N attempts zero-shot
+        correct_count = 0
+        for _ in range(n_samples):
+            response = api.generate_content(prompt, temperature=0.7)
+            # Internal Evaluation
+            is_correct = _internal_evaluate(response, ground_truth, api, config)
+            if is_correct: correct_count += 1
+            
+        scores[idx] = correct_count / n_samples
+    return scores
+
+def _generate_hypotheses(target_query, candidate_indices, data, api, config):
+    hypotheses = {}
+    print(f"   [Mirror] Generating Hypotheses using {len(candidate_indices)} candidates...")
+    for c_idx in candidate_indices:
+        if c_idx == -1:
+            # R0: Zero-Shot Hypothesis
+            prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
+        else:
+            # R_cand: Few-Shot Hypothesis
+            ex_q = data[c_idx]['question']
+            ex_a = data[c_idx]['solution']
+            prompt = create_mirror_hypothesis_prompt(target_query, ex_q, ex_a, config)
+            
+        # Generate 1 robust hypothesis (Temperature 0.7)
+        response = api.generate_content(prompt, temperature=0.7)
+        
+        # We need to extract the Rationale/Answer from the response to use as a prompt later
+        # Assuming the response follows the format. We use the full text as the "Solution".
+        hypotheses[c_idx] = {
+            "question": target_query,
+            "solution": response
+        }
+    return hypotheses
+
+def _evaluate_mirror_consistency(hypotheses, validation_indices, data, api, config, n_samples):
+    scores = defaultdict(dict)
+    print(f"   [Mirror] Evaluating {len(hypotheses)} hypotheses against validation set...")
+    
+    for c_idx, hyp_data in hypotheses.items():
+        hyp_q = hyp_data['question']
+        hyp_a = hyp_data['solution']
+        
+        for v_idx in validation_indices:
+            # Skip self-validation (optional, but usually we keep it to see if it implies itself)
+            val_q = data[v_idx]['question']
+            val_gt = data[v_idx]['solution']
+            
+            prompt = create_mirror_verification_prompt(val_q, hyp_q, hyp_a, config)
+            
+            correct_count = 0
+            for _ in range(n_samples):
+                response = api.generate_content(prompt, temperature=0.7)
+                if _internal_evaluate(response, val_gt, api, config):
+                    correct_count += 1
+            
+            scores[c_idx][v_idx] = correct_count / n_samples
+    return scores
+
+def _rank_and_filter_candidates(candidates, validation_indices, baseline, mirror, config):
+    candidate_utility = []
+    
+    # Calculate Utility Score
+    for c_idx in candidates:
+        total_score = 0
+        contributions = {}
+        for v_idx in validation_indices:
+            m_score = mirror[c_idx][v_idx]
+            b_score = baseline[v_idx]
+            
+            # Contribution Function: Only count if Mirror > Baseline
+            gain = max(0, m_score - b_score)
+            contributions[v_idx] = gain
+            total_score += gain
+            
+        candidate_utility.append({
+            "index": c_idx,
+            "score": total_score,
+            "contributions": contributions
+        })
+    
+    # Sort by Score (Descending), then by Index (Ascending) for tie-breaking
+    # (Since R0 is -1, it naturally wins ties if we sort index ascending)
+    candidate_utility.sort(key=lambda x: (-x['score'], x['index']))
+    
+    # 1. Base Filter (Remove Score <= 0)
+    base_filtered = [item for item in candidate_utility if item['score'] > 0]
+    base_indices = [item['index'] for item in base_filtered]
+    
+    # If list is empty, fallback to R0 if it was in candidates, else top-1
+    if not base_indices:
+        base_indices = [-1] if -1 in candidates else [candidates[0]]
+
+    # 2. Redundancy Filter (Pairwise Dominance)
+    if config.get("MIRROR_ENABLE_REDUNDANCY_FILTER", True):
+        redundancy_filtered = []
+        for current in base_filtered:
+            is_redundant = False
+            for kept in redundancy_filtered:
+                # Check if 'kept' covers 'current' on ALL validation samples
+                # i.e., kept_contribution >= current_contribution for all v
+                covers_all = all(
+                    kept['contributions'][v] >= current['contributions'][v]
+                    for v in validation_indices
+                )
+                if covers_all:
+                    is_redundant = True
+                    break
+            
+            if not is_redundant:
+                redundancy_filtered.append(current)
+        
+        redundancy_indices = [item['index'] for item in redundancy_filtered]
+    else:
+        redundancy_indices = base_indices
+
+    # Ensure R0 is removed from the list indices if we want strictly standard indices
+    # BUT the pipeline expects -1 to handle Zero-Shot. So we keep it.
+
+    return {
+        "base_filtering": base_indices,
+        "redundancy_filtering": redundancy_indices
+    }
+
+def _internal_evaluate(model_output, ground_truth, api, config):
+    """Helper to check correctness using the LLM evaluator."""
+    prompt = create_evaluation_prompt(model_output, ground_truth, config)
+    # Use a cheap/fast model for evaluation if possible, or same provider
+    result = api.generate_content(prompt, temperature=0.0)
+    return "true" in result.lower()
+
+
+def solve_with_parallel_benchmarking(
+    target_query: str,
+    retrieved_indices: list,
+    exemplar_data: list,
+    api_manager,
+    config: dict
+):
+    """
+    Executes the generation phase as independent parallel tracks.
+    Iterates through 'GROUP_CONSISTENCY_CANDIDATES' (Strategies),
+    generates N samples for each, and returns distinct result sets.
+    """
+    strategies = config.get("GROUP_CONSISTENCY_CANDIDATES", [(0,)]) # Default to 1-shot
+    n_samples = config.get("GROUP_CONSISTENCY_SAMPLES_N", 1)
+    
+    benchmark_results = {}
+    
+    print(f"   [Benchmark] Running {len(strategies)} parallel strategies...")
+    
+    for group_tuple in strategies:
+        # 1. Define Strategy Name & Indices
+        strategy_name = f"strategy_{len(group_tuple)}shot_idx{''.join(map(str, group_tuple))}"
+        
+        # Map tuple indices (0, 1) to actual retrieved indices
+        # We must ensure we don't go out of bounds of what was actually retrieved
+        current_indices = []
+        valid_strategy = True
+        for ptr in group_tuple:
+            if ptr < len(retrieved_indices):
+                current_indices.append(retrieved_indices[ptr])
+            else:
+                valid_strategy = False
+                break
+        
+        if not valid_strategy:
+            print(f"   [Benchmark] Skipping {strategy_name} (Not enough retrieved samples)")
+            continue
+
+        # 2. Construct Prompt (Standard Prompting)
+        # We reuse the standard 'final_solver' template logic here
+        # Construct the examples block manually
+        examples_block = ""
+        for i, idx in enumerate(current_indices):
+            ex_q = exemplar_data[idx]['question']
+            ex_a = exemplar_data[idx]['solution']
+            # Format using standard exemplar format
+            examples_block += f"<Example {i+1}>\nQuestion: {ex_q}\nRationale and Answer: {ex_a}\n</Example {i+1}>\n\n"
+            
+        # Create final prompt
+        # We assume standard solver prompt v2/v3/v4 used in config
+        from src.prompts import create_final_reasoning_prompt
+        # Mocking the 'final_examples' list just for the prompt creator to work
+        # The prompt creator expects a list of strings, so we pass pre-formatted strings or raw text?
+        # Looking at 'create_final_reasoning_prompt', it takes a list of strings.
+        # Let's construct the list of strings.
+        formatted_examples = [
+             f"Question: {exemplar_data[idx]['question']}\nRationale and Answer: {exemplar_data[idx]['solution']}"
+             for idx in current_indices
+        ]
+        
+        final_prompt = create_final_reasoning_prompt(target_query, formatted_examples, config)
+        
+        # 3. Generate N Independent Samples
+        attempts = []
+        for _ in range(n_samples):
+            response = api_manager.generate_content(final_prompt, temperature=0.7)
+            attempts.append(response)
+            
+        # 4. Store Results
+        benchmark_results[strategy_name] = attempts
+
+    return benchmark_results
+
+
 
 class ReasoningNode:
     def __init__(self, question: str, depth: int):

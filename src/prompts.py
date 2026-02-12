@@ -1575,3 +1575,52 @@ def create_augmentation_with_solution_prompt(main_question: str, generated_solut
         return f"Error: Template {template_name} not found."
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question, generated_solution=generated_solution, n_samples=n_samples)
+
+
+def create_mirror_baseline_prompt(question: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve a retrieved sample zero-shot (Phase 0: Baseline).
+    """
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_BASELINE", "mirror_baseline_zero_shot_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(question=question)
+
+def create_mirror_hypothesis_prompt(target_query: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve the Target Query using a retrieved sample as a 1-shot exemplar (Phase 1).
+    """
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS", "mirror_hypothesis_gen_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(
+        target_query=target_query,
+        exemplar_question=exemplar_question,
+        exemplar_solution=exemplar_solution
+    )
+
+def create_mirror_hypothesis_zeroshot_prompt(target_query: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve the Target Query zero-shot (for the R0 candidate).
+    """
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT", "mirror_hypothesis_gen_zero_shot_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(target_query=target_query)
+
+def create_mirror_verification_prompt(validation_question: str, hypothesis_question: str, hypothesis_solution: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve an original retrieved sample using the generated Hypothesis as a 1-shot exemplar (Phase 2: Mirroring).
+    """
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_VERIFICATION", "mirror_verification_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(
+        validation_question=validation_question,
+        hypothesis_question=hypothesis_question,
+        hypothesis_solution=hypothesis_solution
+    )
