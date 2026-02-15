@@ -137,20 +137,26 @@ CONFIG = {
     "CONSISTENCY_LAYER_2_TEMPERATURE": 1.0,
     "CONSISTENCY_VOTING_THRESHOLD": 0.6,
 
-    # --- Parallel Research Benchmarking (formerly Group Consistency) ---
-    # If True, the system forks into independent generation tracks for each defined group.
-    # The system will NOT merge these; it will report Pass@K for each strategy separately.
+    # ==============================================================================
+    # --- MIRROR Track A: Ranking Robustness Benchmark ---
+    # ==============================================================================
+    # Formerly "Group Consistency". In the new "Acquire-Optimize-Fork" architecture,
+    # this defines Track A: The Statistical Benchmarking of the Master List (list_2).
+    
+    # If True, the pipeline executes the "Ranking Robustness" track.
+    # It applies the slicing defined below to the Master Sorted List (list_2).
     "APPLY_GROUP_CONSISTENCY_SELECTION": True,
 
-    # DEFINITION OF STRATEGIES (Benchmarks)
-    # Each tuple represents a specific Prompt Strategy (indices of retrieved exemplars).
-    # Group 1 (0,): 1-Shot Strategy (Top-1 exemplar only)
-    # Group 2 (0, 1): 2-Shot Strategy (Top-1 + Top-2)
-    # Group 3 (0, 1, 2): 3-Shot Strategy (Top-1 + Top-2 + Top-3)
+    # DEFINITION OF STRATEGIES (Slicing of list_2)
+    # Each tuple represents specific indices from the Master List (list_2) to use.
+    # Group 1 (0,): 1-Shot Benchmark -> Uses list_2[0]
+    # Group 2 (0, 1): 2-Shot Benchmark -> Uses list_2[0] and list_2[1]
+    # Group 3 (0, 1, 2): 3-Shot Benchmark -> Uses list_2[0], list_2[1], list_2[2]
     "GROUP_CONSISTENCY_CANDIDATES": [(0,), (0, 1), (0, 1, 2)],
 
     # N_gen (Evaluation Sampling):
-    # Number of independent generations per strategy to calculate Pass@K.
+    # Number of independent generations per slice to calculate Pass@K curves.
+    # This is the "N" in the Benchmark Track (Track A).
     # Recommended: 10 <= N <= 40 for statistically significant benchmarking.
     "GROUP_CONSISTENCY_SAMPLES_N": 10,
 
@@ -228,16 +234,19 @@ CONFIG = {
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
 
+    # ==============================================================================
     # --- MIRROR_AS_EVALUATOR (Analogical Mirroring) ---
+    # ==============================================================================
     # Master Switch: Enables the post-retrieval optimization loop.
+    # This triggers Phase 1: Acquire & Optimize (Creating list_2).
     "APPLY_MIRROR_AS_EVALUATOR": True,
 
-    # 2.1 Sampling Parameters
+    # 2.1 Sampling Parameters (Optimization Phase)
     # N_mirror: Number of zero-shot attempts used to calculate consistency scores.
     # Higher values = more robust scoring but higher cost. (Recommended: 3-5)
     "MIRROR_N_OPTIMIZATION": 3,
     
-    # 2.2 Feature Toggles
+    # 2.2 Feature Toggles (Optimization Phase)
     # enable_R0: If True, injects a virtual "Zero-Shot" candidate at Rank 0.
     "MIRROR_ENABLE_R0": True,
     
@@ -252,9 +261,11 @@ CONFIG = {
     # Only these candidates will be scored.
     "MIRROR_ACTIVE_CANDIDATE_LIMIT": 5,
 
+    # --- MIRROR Track B: Feature Validation ---
     # NEW: Multi-Strategy Branching Switch
-    # If True, the pipeline will fork to solve BOTH the "Base Filtered" list 
-    # AND the "Redundancy Filtered" list separately.
+    # If True, the pipeline executes the "Functional Validation" track (Track B).
+    # It solves the explicit "Base Filtered" list (list_3) and "Redundancy Filtered" list (list_4)
+    # using a single pass (N=1) to verify solvable context.
     "MIRROR_EVALUATE_BASE_FILTERING": True,
 
     # --- Mirroring Prompts (Keys pointing to templates in src/prompts.py) ---
