@@ -1341,6 +1341,7 @@ Calculate the kinetic energy of an object with a mass of 2kg moving at a velocit
 </Reference Solution>
 </Task>
 """,
+
     "self_sampling_augmentor_simplification_simple_shallow_with_solution": """Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements, using the provided Reference Solution as a guide.
 <Instructions>
 1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
@@ -1359,6 +1360,7 @@ Simplified Question:
 [Your simplified version]
 </Output Format>
 """,
+
      "self_sampling_augmentor_simplification_simple_shallow_with_solution":"""Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
 <Instructions>
 1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
@@ -1374,63 +1376,85 @@ Simplified Question:
 [Your simplified version]
 </Output Format>
 """,
+
     "mirror_baseline_zero_shot_v1": """You are an expert mathematician. Solve the following problem step-by-step.
 
-Problem:
+<Main Question to Solve>
 {question}
+</Main Question to Solve>
 
-Return your final answer in the format:
-Rationale: [Your step-by-step reasoning]
-Final Answer: [The final result]
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
 """,
 
-    "mirror_hypothesis_gen_v1": """You are an expert mathematician. Use the provided example to solve the new problem.
 
-[Example Problem]
+    "mirror_hypothesis_gen_v1": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
+
+<True Solved Example>
+question:
 {exemplar_question}
 
-[Example Solution]
+Solution:
 {exemplar_solution}
+</True Solved Example>
 
----
-
-[New Problem]
+<Main Question to Solve>
 {target_query}
+</Main Question to Solve>
 
-Solve the New Problem step-by-step, following the reasoning style of the Example.
-Return your response in the format:
-Rationale: [Your step-by-step reasoning]
-Final Answer: [The final result]
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
 """,
 
     "mirror_hypothesis_gen_zero_shot_v1": """You are an expert mathematician. Solve the following problem step-by-step.
 
-Problem:
+<Question to Solve>
 {target_query}
+</Question to Solve>
 
-Return your response in the format:
-Rationale: [Your step-by-step reasoning]
-Final Answer: [The final result]
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
 """,
 
-    "mirror_verification_v1": """You are an expert mathematician. Use the provided example to solve the new problem.
+    "mirror_verification_v1": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
 
-[Example Problem]
+<True Solved Example>
+question:
 {hypothesis_question}
 
-[Example Solution]
+Solution:
 {hypothesis_solution}
+</True Solved Example>
 
----
-
-[New Problem]
+<Main Question to Solve>
 {validation_question}
+</Main Question to Solve>
 
-Solve the New Problem step-by-step, strictly following the reasoning style of the Example.
-Return your response in the format:
-Rationale: [Your step-by-step reasoning]
-Final Answer: [The final result]
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
 """,
+
+
 }
 
 def create_normalization_prompt(original_example: str) -> str:
