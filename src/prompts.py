@@ -1427,7 +1427,7 @@ Rationale:
 [Formal step-by-step derivation]
 
 Final Answer:
-[Your final answer]
+[Your final answer] 
 </Your Answer/Output Format>
 """,
 
