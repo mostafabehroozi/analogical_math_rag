@@ -56,7 +56,6 @@ from src.pipeline_steps import (
     retrieve, adapt, merge, solve,
     self_sample, augment_question, select_augmented_questions, analogical_adapt,
     generate_reasoning_pathways, 
-    solve_with_group_consistency, 
     solve_hierarchical_tree, 
     solve_with_analogical_consistency, 
     simplify_retrieved_samples,
