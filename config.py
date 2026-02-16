@@ -1,7 +1,3 @@
-#======================================================================
-#   File: config.py
-#======================================================================
-
 import os
 
 # --- 1. Core Directory Structure ---
@@ -137,14 +133,7 @@ CONFIG = {
     "CONSISTENCY_LAYER_2_TEMPERATURE": 1.0,
     "CONSISTENCY_VOTING_THRESHOLD": 0.6,
 
-    # ==============================================================================
-    # --- MIRROR Track A: Ranking Robustness Benchmark ---
-    # ==============================================================================
-    # Formerly "Group Consistency". In the new "Acquire-Optimize-Fork" architecture,
-    # this defines Track A: The Statistical Benchmarking of the Master List (list_2).
-    
-    # If True, the pipeline executes the "Ranking Robustness" track.
-    # It applies the slicing defined below to the Master Sorted List (list_2).
+
     "APPLY_GROUP_CONSISTENCY_SELECTION": True,
 
     # DEFINITION OF STRATEGIES (Slicing of list_2)
@@ -234,41 +223,15 @@ CONFIG = {
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
 
-    # ==============================================================================
-    # --- MIRROR_AS_EVALUATOR (Analogical Mirroring) ---
-    # ==============================================================================
-    # Master Switch: Enables the post-retrieval optimization loop.
-    # This triggers Phase 1: Acquire & Optimize (Creating list_2).
+
     "APPLY_MIRROR_AS_EVALUATOR": True,
 
-    # 2.1 Sampling Parameters (Optimization Phase)
-    # N_mirror: Number of zero-shot attempts used to calculate consistency scores.
-    # Higher values = more robust scoring but higher cost. (Recommended: 3-5)
     "MIRROR_N_OPTIMIZATION": 3,
-    
-    # 2.2 Feature Toggles (Optimization Phase)
-    # enable_R0: If True, injects a virtual "Zero-Shot" candidate at Rank 0.
     "MIRROR_ENABLE_R0": True,
-    
-    # enable_filtering: Master switch for removing candidates (Score=0).
     "MIRROR_ENABLE_FILTERING": True,
-    
-    # enable_redundancy_filter: Sub-switch. If True, removes lower-ranked candidates 
-    # that are "covered" by higher-ranked ones (Parsimony).
     "MIRROR_ENABLE_REDUNDANCY_FILTER": True,
-    
-    # active_candidate_limit: Limits the process to the top-K retrieved samples to save API costs.
-    # Only these candidates will be scored.
     "MIRROR_ACTIVE_CANDIDATE_LIMIT": 5,
-
-    # --- MIRROR Track B: Feature Validation ---
-    # NEW: Multi-Strategy Branching Switch
-    # If True, the pipeline executes the "Functional Validation" track (Track B).
-    # It solves the explicit "Base Filtered" list (list_3) and "Redundancy Filtered" list (list_4)
-    # using a single pass (N=1) to verify solvable context.
     "MIRROR_EVALUATE_BASE_FILTERING": True,
-
-    # --- Mirroring Prompts (Keys pointing to templates in src/prompts.py) ---
     "PROMPT_TEMPLATE_MIRROR_BASELINE": "mirror_baseline_zero_shot_v1",
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS": "mirror_hypothesis_gen_v1",
     "PROMPT_TEMPLATE_MIRROR_VERIFICATION": "mirror_verification_v1",

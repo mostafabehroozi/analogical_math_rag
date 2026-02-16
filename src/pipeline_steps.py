@@ -377,7 +377,7 @@ def _rank_and_filter_candidates(
     candidate_contributions: dict,
     config: dict,
     trace_accumulator: list
-[cite_start]) -> tuple: # CHANGED: Returns tuple (final_indices, base_indices, master_indices) [cite: 291]
+) -> tuple:
     """
     Applies Usefulness Filtering (Score > 0) and Redundancy Filtering (Pairwise Dominance).
     Returns the Redundancy-Filtered list, Base (Noise-Filtered) list, and the Master Sorted list.
@@ -385,9 +385,7 @@ def _rank_and_filter_candidates(
     enable_filtering = config.get("MIRROR_ENABLE_FILTERING", True)
     enable_redundancy = config.get("MIRROR_ENABLE_REDUNDANCY_FILTER", True)
 
-    # [cite_start]1. Sort all candidates by Score (Desc), then Index (Asc for stability) [cite: 293]
-    #    Note: -x is used because we want ascending index for stability.
-    #    This 'sorted_candidates' is LIST 2 (The Master List)
+
     sorted_candidates = sorted(candidate_indices, key=lambda x: (candidate_scores[x], -x), reverse=True)
 
     # 2. Base Filtering: Remove Useless Candidates (Score <= 0)
@@ -1426,8 +1424,6 @@ def optimize_demonstrations_via_mirroring(query: str, retrieved_indices: list, c
     trace_accumulator = ["\n[MIRROR_AS_EVALUATOR] Started"]
     
     try:
-        # --- Phase 0: Initialization ---
-        # [cite_start]1. Apply Candidate Limit (Cost Saving) [cite: 459]
         limit = config.get("MIRROR_ACTIVE_CANDIDATE_LIMIT", 5)
         active_candidates = retrieved_indices[:limit]
         
@@ -1484,8 +1480,6 @@ def optimize_demonstrations_via_mirroring(query: str, retrieved_indices: list, c
             candidate_scores[cand_idx] = total_utility
             candidate_contributions[cand_idx] = contribs
 
-        # --- Phase 4: ReRanking and Filtering ---
-        # [cite_start]UPDATED CALL: Unpack THREE lists [cite: 468]
         final_indices, base_indices, master_sorted_indices = _rank_and_filter_candidates(
             active_candidates, candidate_scores, candidate_contributions, config, trace_accumulator
         )
@@ -1493,22 +1487,19 @@ def optimize_demonstrations_via_mirroring(query: str, retrieved_indices: list, c
         trace_accumulator.append(f"   > Final Optimized Indices (Redundancy Filtered): {final_indices}")
         trace_accumulator.append("[MIRROR_AS_EVALUATOR] Finished\n")
 
-        # --- UPDATED RETURN STRUCTURE FOR FORKED ARCHITECTURE ---
-        # We always return the master list AND the strategies. 
-        # The Orchestrator will decide which tracks to run based on the config.
+
         return {
             "status": "SUCCESS",
-            "master_sorted_indices": master_sorted_indices, # List 2 (For Track A Benchmark)
+            "master_sorted_indices": master_sorted_indices,
             "strategies": {
-                "redundancy_filtering": final_indices, # List 4 (For Track B Validation)
-                "base_filtering": base_indices         # List 3 (For Track B Validation)
+                "redundancy_filtering": final_indices,
+                "base_filtering": base_indices
             },
             "trace": trace_accumulator
         }
 
     except Exception as e:
         trace_accumulator.append(f"   [ERROR] Mirroring failed: {str(e)}")
-        # Fallback to original retrieval on error
         return {
             "status": "FAILED", 
             "error": str(e),

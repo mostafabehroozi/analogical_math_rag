@@ -1,5 +1,3 @@
-# src/api_manager.py
-
 """
 API management module for interacting with various LLM providers.
 
@@ -29,8 +27,6 @@ import ollama  # NEW: Import for local LLM support
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 
-# --- Formally define the structured API response using TypedDict ---
-# This improves code clarity and enables static analysis.
 class APIResponse(TypedDict):
     """A standardized structure for all API call results."""
     status: str  # e.g., "SUCCESS", "ERROR", "BLOCKED", "RATE_LIMITED"
@@ -64,10 +60,8 @@ class GeminiAPIManager:
         self.model_quotas: Dict[str, Dict[str, Any]] = model_quotas
         self.global_delay_seconds: int = global_delay_seconds
         
-        # Keep a reference to the config for accessing settings like max_tokens
         self.config = config if config else {}
         
-        # Internal state for tracking key usage
         self.key_usage_timestamps: Dict[Tuple[str, str], float] = {}
         self.key_daily_counts: Dict[Tuple[str, str, str], int] = {}
         self.last_global_call_timestamp: float = 0
@@ -75,14 +69,11 @@ class GeminiAPIManager:
         self.current_key_index: int = 0
         self._lock = False
 
-        # --- Read control flags from config ---
         self.print_details = self.config.get("PRINT_API_CALL_DETAILS", False)
         self.truncation_length = self.config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
         
-        # --- Timing Checkpoint Feature ---
         self._print_timing_checkpoints = self.config.get("PRINT_API_TIMING_CHECKPOINTS", False)
         self._last_checkpoint_timestamp: Optional[float] = None
-        # --- End of Timing Checkpoint Feature ---
 
         self.logger.info(f"GeminiAPIManager initialized with {len(self.api_keys_list)} keys.")
         
@@ -96,9 +87,6 @@ class GeminiAPIManager:
         """Returns the current UTC date as a formatted string."""
         return datetime.utcnow().strftime('%Y-%m-%d')
     
-    #======================================================================
-    # --- START OF REWRITTEN RATE-LIMITING LOGIC ---
-    #======================================================================
 
     def _select_key_and_apply_delay(self, model_name: str) -> Optional[str]:
         """
@@ -114,7 +102,7 @@ class GeminiAPIManager:
 
         if self._lock:
             self.logger.warning("Key selection is locked; waiting.")
-            return None # Force a retry by returning no key
+            return None 
 
         self._lock = True
         try:
@@ -150,17 +138,14 @@ class GeminiAPIManager:
                     print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
                     time.sleep(final_sleep_duration)
 
-                # --- CORRECTED TIMESTAMPING LOGIC ---
-                # Record the timestamp *after* sleeping and *before* the API call.
+
                 current_call_start_time = time.time()
                 
-                # Handle Timing Checkpoint
                 if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
                     elapsed = current_call_start_time - self._last_checkpoint_timestamp
                     print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
                 self._last_checkpoint_timestamp = current_call_start_time
                 
-                # Record timestamps for rate limiting
                 self.last_global_call_timestamp = current_call_start_time
                 self.key_usage_timestamps[(current_api_key, model_name)] = current_call_start_time
                 
@@ -178,9 +163,6 @@ class GeminiAPIManager:
         daily_usage_key = (api_key, model_name, current_date_str)
         self.key_daily_counts[daily_usage_key] = self.key_daily_counts.get(daily_usage_key, 0) + 1
         
-    #======================================================================
-    # --- END OF REWRITTEN RATE-LIMITING LOGIC ---
-    #======================================================================
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
         """Generates content using the Gemini API, handling key selection, rate limiting, and specific errors."""
@@ -192,7 +174,6 @@ class GeminiAPIManager:
             print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
-        # The new method handles key selection, sleeping, and timestamping.
         api_key = self._select_key_and_apply_delay(model_name)
 
         if api_key is None:
@@ -204,7 +185,6 @@ class GeminiAPIManager:
         caught_exception = None
 
         try:
-            # 1. Determine which max_tokens setting to use based on the model name
             max_tokens = None
             if model_name == self.config.get('GEMINI_MODEL_NAME_FINAL_SOLVER'):
                 max_tokens = self.config.get('DEFAULT_FINAL_SOLVER_MAX_TOKENS', 8192)
@@ -213,17 +193,14 @@ class GeminiAPIManager:
             elif model_name == self.config.get('GEMINI_MODEL_NAME_EVALUATOR'):
                 max_tokens = self.config.get('DEFAULT_EVALUATOR_MAX_TOKENS', 512)
             
-            # 2. Build the GenerationConfig parameter dictionary
             generation_config_params = {}
             if temperature is not None:
                 generation_config_params['temperature'] = temperature
             if max_tokens is not None:
                 generation_config_params['max_output_tokens'] = max_tokens
             
-            # 3. Create the GenerationConfig object
             generation_config = genai.types.GenerationConfig(**generation_config_params)
             
-            # 4. Configure API and make the call with the new config object
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(model_name)
             

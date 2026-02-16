@@ -133,8 +133,7 @@ def periodic_sync_check(loop_counter: int, config: dict):
 
     sync_interval = config.get("HF_SYNC_INTERVAL", 10)
 
-    # Sync after the specified number of items (e.g., if interval is 1, sync after item 1, 2, etc.)
-    # We check (loop_counter + 1) because loops are often 0-indexed.
+
     if (loop_counter + 1) % sync_interval == 0:
         print(f"\n--- Reached sync interval at item #{loop_counter + 1}. Syncing results to Hugging Face Hub. ---")
         sync_workspace_to_hub(config)

@@ -1,5 +1,3 @@
-# src/error_handler.py
-
 """
 Error handling, reporting, and retry module for the Analogical Reasoning RAG project.
 

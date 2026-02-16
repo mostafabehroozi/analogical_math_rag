@@ -1,7 +1,3 @@
-#======================================================================
-#   File: src/prompts.py
-#======================================================================
-
 from typing import List, Dict, Any
 
 EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
