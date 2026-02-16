@@ -222,7 +222,7 @@ def _calculate_baseline_difficulty(
         correct_count = 0
         for i in range(n_mirror):
             # Lower temp for baseline to capture "inherent" solvability
-            resp = api_manager.generate_content(prompt, model_name, temperature=0.5)
+            resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
             
             trace_accumulator.append(create_trace_entry(
                 "mirror_phase_0", f"baseline_idx_{idx}_attempt_{i}",
@@ -283,7 +283,7 @@ def _generate_hypotheses(
             )
 
         # Generate Hypothesis (Single attempt, Temp=0.7)
-        resp = api_manager.generate_content(prompt, model_name, temperature=0.7)
+        resp = api_manager.generate_content(prompt, model_name, temperature=0.0)
         
         trace_accumulator.append(create_trace_entry(
             "mirror_phase_1", f"hypothesis_cand_{cand_idx}",
@@ -353,7 +353,7 @@ def _evaluate_mirror_consistency(
             correct_count = 0
             
             for i in range(n_mirror):
-                resp = api_manager.generate_content(prompt, model_name, temperature=0.7)
+                resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
                 
                 trace_accumulator.append(create_trace_entry(
                     "mirror_phase_2", f"cand_{cand_id}_vs_val_{val_idx}_run_{i}",
