@@ -476,6 +476,25 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
+    "final_solver_v3": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
+
+<True Solved Example>
+{examples_block}
+</True Solved Example>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
     "final_solver_simple_v1": """**Objective:**
 Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
 
