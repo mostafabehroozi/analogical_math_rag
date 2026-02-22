@@ -1879,9 +1879,9 @@ def solve_with_analogical_consistency(
     
     local_trace = []
 
-    n_candidates = config.get("REVERSE_VALIDATION_CANDIDATES_N", 5)
-    k_validators = config.get("REVERSE_VALIDATION_RETRIEVAL_K", 3)
-    n_validation_attempts = config.get("REVERSE_VALIDATION_ATTEMPTS_N", 5)
+    n_candidates = config.get("BASELINE_CONSISTENCY_CANDIDATES_N", 5)
+    k_validators = config.get("BASELINE_CONSISTENCY_VALIDATORS_M", 3)
+    n_validation_attempts = config.get("BASELINE_CONSISTENCY_ATTEMPTS_K", 5)
     
     if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
     elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
