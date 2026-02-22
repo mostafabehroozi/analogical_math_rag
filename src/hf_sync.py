@@ -76,11 +76,10 @@ def initialize_workspace(config: dict):
             repo_id=repo_id,
             repo_type="dataset",
             local_dir=local_outputs_dir,
-            local_dir_use_symlinks=False, # Recommended for Kaggle/Docker
-            resume_download=True,
             token=hf_token,               # Pass the token for authentication
             revision=revision             # Pass the specific version or None for latest
         )
+
         logger.info(f"Workspace synchronized. Files from {repo_id} are downloaded to {local_outputs_dir}.")
 
     except HfHubHTTPError as e:
