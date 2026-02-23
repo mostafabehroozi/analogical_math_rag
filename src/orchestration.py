@@ -133,6 +133,7 @@ def run_pipeline_for_single_query(
                     # Reverse Validation Flags
                     "APPLY_REVERSE_VALIDATION", "REVERSE_VALIDATION_CANDIDATES_N",
                     "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N",
+                    "REVERSE_VALIDATION_ENABLE_BASELINE_CHECK",
                     # Simplification Flags
                     "APPLY_SIMPLIFICATION", "SIMPLIFY_RETRIEVED_SAMPLES", "SIMPLIFY_MAIN_QUESTION",
                     # Mirroring Flags (New)

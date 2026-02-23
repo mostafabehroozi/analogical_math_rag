@@ -1879,6 +1879,11 @@ def solve_with_analogical_consistency(
     
     local_trace = []
 
+    # --- NEW CONFIG FLAGS FOR UPGRADE ---
+    use_rag_generation = config.get("REVERSE_VALIDATION_USE_RAG_GENERATION", False)
+    gen_k = config.get("REVERSE_VALIDATION_GENERATION_K", 3)
+
+    # --- ORIGINAL CONFIG FLAGS ---
     n_candidates = config.get("REVERSE_VALIDATION_CANDIDATES_N", 5)
     k_validators = config.get("REVERSE_VALIDATION_RETRIEVAL_K", 3)
     n_validation_attempts = config.get("REVERSE_VALIDATION_ATTEMPTS_N", 5)
@@ -1888,46 +1893,114 @@ def solve_with_analogical_consistency(
     elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
     else: raise TypeError(f"Unsupported API manager: {type(api_manager_solve)}")
     
-    print(f"\n  [Phase 1] Generating {n_candidates} Candidate Solutions...")
-    
-    candidate_config = config.copy()
-    candidate_config["SELF_SAMPLING_N"] = n_candidates
-    
-    candidates_result = self_sample(target_query, api_manager_solve, candidate_config)
-    
-    if candidates_result.get('trace'):
-        local_trace.extend(candidates_result['trace'])
-    
-    if candidates_result['status'] == 'FAILURE':
-        logger.error("Failed to generate any candidates.")
-        return {"status": "FAILURE", "error": "Candidate generation failed", "trace": local_trace}
-        
-    candidates = candidates_result['self_sampled_texts'] 
-    print(f"    -> Generated {len(candidates)} candidates.")
+    candidates = []
+    validator_indices = []
 
-    print(f"\n  [Phase 2] Retrieving {k_validators} Validators (Ground Truths)...")
-    
-    retrieval_res = retrieve(
-        target_query, embedding_model, 
-        exemplar_data['questions'], exemplar_data['embeddings'], 
-        top_k=k_validators, question_to_index_map=exemplar_data.get('question_to_index')
-    )
-    if retrieval_res.get('trace'):
-        local_trace.extend(retrieval_res['trace'])
-    
-    if retrieval_res['status'] != 'SUCCESS' or not retrieval_res['retrieved_indices']:
-        logger.error("Failed to retrieve validators.")
-        return {"status": "FAILURE", "error": "Validator retrieval failed", "trace": local_trace}
+    if use_rag_generation:
+        # =========================================================================
+        # NEW UPGRADED PATH: PHASE 0 & 1 (Unified Retrieval + RAG Generation)
+        # =========================================================================
+        total_k_to_retrieve = gen_k + k_validators
+        print(f"\n  [Phase 0] Unified Retrieval for {gen_k} Helpers + {k_validators} Validators...")
         
-    validator_indices = retrieval_res['retrieved_indices']
+        retrieval_res = retrieve(
+            target_query, embedding_model, 
+            exemplar_data['questions'], exemplar_data['embeddings'], 
+            top_k=total_k_to_retrieve, question_to_index_map=exemplar_data.get('question_to_index')
+        )
+        if retrieval_res.get('trace'):
+            local_trace.extend(retrieval_res['trace'])
+            
+        if retrieval_res['status'] != 'SUCCESS' or not retrieval_res['retrieved_indices']:
+            logger.error("Failed to retrieve samples for Unified RAG Generation.")
+            return {"status": "FAILURE", "error": "Unified retrieval failed", "trace": local_trace}
+            
+        all_indices = retrieval_res['retrieved_indices']
+        helper_indices = all_indices[:gen_k]
+        validator_indices = all_indices[gen_k:]
+        
+        print(f"\n  [Phase 1] Generating Candidates using RAG Helpers ({len(helper_indices)} helpers)...")
+        for h_idx in helper_indices:
+            helper_q = exemplar_data['questions'][h_idx]
+            helper_a = exemplar_data['solutions'][h_idx]
+            helper_text = f"Question: {helper_q}\nRationale and Answer: {helper_a}"
+            
+            # Using the exact prompt structure as the evaluation phase
+            prompt = create_reverse_validation_prompt(target_query, helper_text, config)
+            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
+            
+            resp = api_manager_solve.generate_content(prompt, model_name, temp)
+            
+            local_trace.append(create_trace_entry(
+                "reverse_validation", f"generate_candidate_via_helper_{h_idx}",
+                {"prompt": prompt}, resp, {"model": model_name, "temp": temp}
+            ))
+
+            if resp['status'] == 'SUCCESS':
+                cand_text = f"Question: {target_query}\nRationale and Answer: {resp['text']}"
+                candidates.append(cand_text)
+            else:
+                logger.warning(f"Failed to generate candidate with helper {h_idx}.")
+                
+        print(f"    -> Generated {len(candidates)} candidates.")
+
+        print(f"\n  [Phase 2] Using {len(validator_indices)} Pre-retrieved Validators...")
+
+    else:
+        # =========================================================================
+        # ORIGINAL PATH: EXACTLY AS IT WAS WRITTEN BEFORE
+        # =========================================================================
+        print(f"\n  [Phase 1] Generating {n_candidates} Candidate Solutions...")
+        
+        candidate_config = config.copy()
+        candidate_config["SELF_SAMPLING_N"] = n_candidates
+        
+        candidates_result = self_sample(target_query, api_manager_solve, candidate_config)
+        
+        if candidates_result.get('trace'):
+            local_trace.extend(candidates_result['trace'])
+        
+        if candidates_result['status'] == 'FAILURE':
+            logger.error("Failed to generate any candidates.")
+            return {"status": "FAILURE", "error": "Candidate generation failed", "trace": local_trace}
+            
+        candidates = candidates_result['self_sampled_texts'] 
+        print(f"    -> Generated {len(candidates)} candidates.")
+
+        print(f"\n  [Phase 2] Retrieving {k_validators} Validators (Ground Truths)...")
+        
+        retrieval_res = retrieve(
+            target_query, embedding_model, 
+            exemplar_data['questions'], exemplar_data['embeddings'], 
+            top_k=k_validators, question_to_index_map=exemplar_data.get('question_to_index')
+        )
+        if retrieval_res.get('trace'):
+            local_trace.extend(retrieval_res['trace'])
+        
+        if retrieval_res['status'] != 'SUCCESS' or not retrieval_res['retrieved_indices']:
+            logger.error("Failed to retrieve validators.")
+            return {"status": "FAILURE", "error": "Validator retrieval failed", "trace": local_trace}
+            
+        validator_indices = retrieval_res['retrieved_indices']
+        print(f"    -> Retrieved {len(validator_indices)} validators.")
+
+    # =========================================================================
+    # PHASE 2.5: FORMAT VALIDATORS (Shared by both paths)
+    # =========================================================================
+    # Safety catch in case generation completely failed
+    if not candidates:
+        return {"status": "FAILURE", "error": "No candidates were generated", "trace": local_trace}
+
     validators = []
     for idx in validator_indices:
         validators.append({
             "question": exemplar_data['questions'][idx],
             "ground_truth": exemplar_data['solutions'][idx]
         })
-    print(f"    -> Retrieved {len(validators)} validators.")
 
+    # =========================================================================
+    # PHASE 3: ORIGINAL REVERSE VALIDATION LOOP (100% UNCHANGED)
+    # =========================================================================
     print(f"\n  [Phase 3] Reverse Validation Loop ({len(candidates)} Candidates x {len(validators)} Validators x {n_validation_attempts} Attempts)...")
     
     candidate_stats = []
@@ -1962,15 +2035,9 @@ def solve_with_analogical_consistency(
                         resp['text'], val_gt, api_manager_eval, config
                     )
                     
-                    # Log the evaluator's call if available (assuming evaluate returns standard result, 
-                    # but we can't easily capture the evaluator's internal trace here without modifying evaluate_single_answer.
-                    # For now, we rely on the evaluate function being largely independent or modify it separately if needed.
-                    # But since this file only imports it, we'll just skip evaluating trace for now unless requested.)
-                    
                     if eval_res['status'] == 'SUCCESS' and eval_res['is_correct']:
                         v_correct += 1
                         
-            
             total_attempts += n_validation_attempts
             correct_attempts += v_correct
             validator_details.append({"validator_idx": v_idx, "score": f"{v_correct}/{n_validation_attempts}"})
@@ -1986,6 +2053,9 @@ def solve_with_analogical_consistency(
             "validator_breakdown": validator_details
         })
 
+    # =========================================================================
+    # PHASE 4: ORIGINAL SELECTION LOGIC (100% UNCHANGED)
+    # =========================================================================
     if not candidate_stats:
         return {"status": "FAILURE", "error": "No stats generated", "trace": local_trace}
         

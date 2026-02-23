@@ -176,6 +176,10 @@ CONFIG = {
     "REVERSE_VALIDATION_CANDIDATES_N": 5,
     "REVERSE_VALIDATION_RETRIEVAL_K": 3,
     "REVERSE_VALIDATION_ATTEMPTS_N": 5,
+    "REVERSE_VALIDATION_ENABLE_BASELINE_CHECK": True,
+
+    "REVERSE_VALIDATION_USE_RAG_GENERATION": True,  # Turns ON the new helper/analogical generation
+    "REVERSE_VALIDATION_GENERATION_K": 3,           # How many past examples to fetch to help generate the candidates
 
     # --- Pass@N & Evaluation ---
     "N_PASS_ATTEMPTS": 3,
@@ -201,6 +205,7 @@ CONFIG = {
     "PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION": "analogical_adaptation_v1",
     "PROMPT_TEMPLATE_CONSISTENCY_SOLVER": "analogical_adaptation_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER": "analogical_adaptation_v1",
+    "PROMPT_TEMPLATE_REVERSE_VALIDATION_BASELINE": "mirror_baseline_zero_shot_v1"
 
     "PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR": "self_sampling_augmentor_decomposition_2",
     "PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER": "hierarchical_parent_solver_v1",
