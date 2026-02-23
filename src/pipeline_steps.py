@@ -1882,6 +1882,7 @@ def solve_with_analogical_consistency(
     # --- NEW CONFIG FLAGS FOR UPGRADE ---
     use_rag_generation = config.get("REVERSE_VALIDATION_USE_RAG_GENERATION", False)
     gen_k = config.get("REVERSE_VALIDATION_GENERATION_K", 3)
+    enable_baseline_check = config.get("REVERSE_VALIDATION_ENABLE_BASELINE_CHECK", True) # <-- NEW MASTER SWITCH
 
     # --- ORIGINAL CONFIG FLAGS ---
     n_candidates = config.get("REVERSE_VALIDATION_CANDIDATES_N", 5)
@@ -1985,9 +1986,8 @@ def solve_with_analogical_consistency(
         print(f"    -> Retrieved {len(validator_indices)} validators.")
 
     # =========================================================================
-    # PHASE 2.5: FORMAT VALIDATORS (Shared by both paths)
+    # PHASE 2.5: FORMAT VALIDATORS & CALCULATE BASELINES
     # =========================================================================
-    # Safety catch in case generation completely failed
     if not candidates:
         return {"status": "FAILURE", "error": "No candidates were generated", "trace": local_trace}
 
@@ -1998,8 +1998,37 @@ def solve_with_analogical_consistency(
             "ground_truth": exemplar_data['solutions'][idx]
         })
 
+    baseline_scores = {}
+    if enable_baseline_check:
+        print(f"\n  [Phase 2.75] Calculating Zero-Shot Baseline for {len(validators)} Validators...")
+        # Get template or default
+        base_template = PROMPT_TEMPLATES.get(
+            config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_BASELINE", "mirror_baseline_zero_shot_v1"),
+            "Problem: {question}\nSolve this step-by-step.\nFinal Answer:"
+        )
+        
+        for v_idx, val in enumerate(validators):
+            prompt = base_template.format(question=val['question'])
+            v_correct = 0
+            
+            for att in range(n_validation_attempts): # Reuse same N attempts for fair comparison
+                resp = api_manager_solve.generate_content(prompt, model_name, temperature=1.0)
+                
+                local_trace.append(create_trace_entry(
+                    "reverse_validation", f"baseline_validator_{v_idx}_attempt_{att}",
+                    {"prompt": prompt}, resp, {"model": model_name, "temp": 1.0}
+                ))
+
+                if resp['status'] == 'SUCCESS':
+                    eval_res = evaluate_single_answer_with_llm(resp['text'], val['ground_truth'], api_manager_eval, config)
+                    if eval_res['status'] == 'SUCCESS' and eval_res['is_correct']:
+                        v_correct += 1
+                        
+            baseline_scores[v_idx] = v_correct / n_validation_attempts
+            print(f"      -> Validator #{v_idx} Baseline Score: {baseline_scores[v_idx]:.2f}")
+
     # =========================================================================
-    # PHASE 3: ORIGINAL REVERSE VALIDATION LOOP (100% UNCHANGED)
+    # PHASE 3: REVERSE VALIDATION LOOP WITH BASELINE THRESHOLDS
     # =========================================================================
     print(f"\n  [Phase 3] Reverse Validation Loop ({len(candidates)} Candidates x {len(validators)} Validators x {n_validation_attempts} Attempts)...")
     
@@ -2007,8 +2036,9 @@ def solve_with_analogical_consistency(
     
     for c_idx, cand_text in enumerate(candidates):
         
+        total_utility = 0.0
+        correct_attempts = 0 # Track total correct just for logging
         total_attempts = 0
-        correct_attempts = 0
         validator_details = []
         
         print(f"    -> Testing Candidate #{c_idx + 1}...")
@@ -2038,12 +2068,34 @@ def solve_with_analogical_consistency(
                     if eval_res['status'] == 'SUCCESS' and eval_res['is_correct']:
                         v_correct += 1
                         
+            cand_val_score = v_correct / n_validation_attempts
             total_attempts += n_validation_attempts
             correct_attempts += v_correct
-            validator_details.append({"validator_idx": v_idx, "score": f"{v_correct}/{n_validation_attempts}"})
             
-        consistency_score = correct_attempts / total_attempts if total_attempts > 0 else 0
-        print(f"       -> Score: {consistency_score:.2f} ({correct_attempts}/{total_attempts})")
+            # --- THE NEW BASELINE COMPARISON LOGIC ---
+            if enable_baseline_check:
+                base_score = baseline_scores.get(v_idx, 0.0)
+                if cand_val_score > base_score:
+                    total_utility += cand_val_score  # Reward the candidate
+                    status_str = f"Considered (Beat Base {base_score:.2f})"
+                else:
+                    total_utility += 0.0 # Ignored
+                    status_str = f"Ignored (<= Base {base_score:.2f})"
+            else:
+                total_utility += cand_val_score
+                status_str = "Considered (Check OFF)"
+                
+            validator_details.append({
+                "validator_idx": v_idx, 
+                "score": f"{v_correct}/{n_validation_attempts}",
+                "status": status_str
+            })
+            
+        # For logging simplicity, if check is OFF, we average the utility. 
+        # If check is ON, we just use the raw utility sum as the consistency_score.
+        consistency_score = total_utility / len(validators) if not enable_baseline_check and validators else total_utility
+        
+        print(f"       -> Utility Score: {consistency_score:.2f} (Total Correct: {correct_attempts}/{total_attempts})")
         
         candidate_stats.append({
             "candidate_id": c_idx,
@@ -2054,21 +2106,30 @@ def solve_with_analogical_consistency(
         })
 
     # =========================================================================
-    # PHASE 4: ORIGINAL SELECTION LOGIC (100% UNCHANGED)
+    # PHASE 4: SELECTION & FALLBACK LOGIC
     # =========================================================================
     if not candidate_stats:
         return {"status": "FAILURE", "error": "No stats generated", "trace": local_trace}
         
     candidate_stats.sort(key=lambda x: x['consistency_score'], reverse=True)
+    best_candidate_stat = candidate_stats[0]
     
-    best_candidate = candidate_stats[0]
-    print(f"\n  [Selection] Selected Candidate #{best_candidate['candidate_id'] + 1} with Score {best_candidate['consistency_score']:.2f}")
+    # --- NEW FALLBACK LOGIC ---
+    if enable_baseline_check and best_candidate_stat['consistency_score'] <= 0.0:
+        print(f"\n  [Selection] ALL candidates failed to beat the baseline on all validators.")
+        print(f"  [Selection] Triggering FALLBACK to Candidate #1.")
+        selected_text = candidates[0]
+        selected_score = 0.0
+    else:
+        selected_text = best_candidate_stat['candidate_text']
+        selected_score = best_candidate_stat['consistency_score']
+        print(f"\n  [Selection] Selected Candidate #{best_candidate_stat['candidate_id'] + 1} with Utility Score {selected_score:.2f}")
     
     return {
         "status": "SUCCESS",
-        "selected_candidate": best_candidate['candidate_text'],
-        "selected_score": best_candidate['consistency_score'],
-        "solution_attempts": [best_candidate['candidate_text']], 
+        "selected_candidate": selected_text,
+        "selected_score": selected_score,
+        "solution_attempts": [selected_text], 
         "consistency_stats": candidate_stats,
         "trace": local_trace
     }
