@@ -66,7 +66,7 @@ def setup_logger(logger_name: str, log_dir: str, level=logging.INFO) -> logging.
     return logger
 
 
-# --- 2. Data Type Conversion Utilities ---
+# 2. Data Type Conversion Utilities 
 
 def convert_numpy_for_json(obj):
     """
@@ -92,7 +92,7 @@ def convert_numpy_for_json(obj):
     raise TypeError(f"<Object of type {obj.__class__.__name__} is not JSON serializable>")
 
 
-# --- 3. File I/O Utilities (JSON, Pickle) ---
+# 3. File I/O Utilities (JSON, Pickle)
 
 def save_json(data: dict or list, file_path: str, indent: int = 4) -> bool:
     """
@@ -277,7 +277,7 @@ def move_files_to_directories(files_to_move_map: dict) -> dict:
     }
 
 
-# --- 4. Logging & Trace Utilities ---
+#  4. Logging & Trace Utilities
 
 def create_trace_entry(
     step_name: str,
