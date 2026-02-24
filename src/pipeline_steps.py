@@ -1945,6 +1945,46 @@ def solve_with_analogical_consistency(
                 
         print(f"    -> Generated {len(candidates)} candidates.")
 
+        # Optional: add zero-shot candidates (no retrieved helpers)
+        if config.get("REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES", False):
+            rz_n = config.get("REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N", 3)
+            template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_ZERO_SHOT_SOLVER", "final_solver_simple_v1")
+            template = PROMPT_TEMPLATES.get(template_name)
+            print(f"\n  [Phase 1.5] Generating {rz_n} zero-shot candidates using template '{template_name}'...")
+            for z_idx in range(rz_n):
+                # support multiple possible placeholder names in templates
+                prompt = None
+                if template:
+                    try:
+                        prompt = template.format(main_question_text=target_query)
+                    except Exception:
+                        try:
+                            prompt = template.format(target_query=target_query)
+                        except Exception:
+                            try:
+                                prompt = template.format(question=target_query)
+                            except Exception:
+                                prompt = None
+
+                if prompt is None:
+                    # fallback to simplest zero-shot mirror prompt
+                    prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
+
+                temp_z = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
+                resp_z = api_manager_solve.generate_content(prompt, model_name, temp_z)
+
+                local_trace.append(create_trace_entry(
+                    "reverse_validation", f"generate_candidate_zeroshot_{z_idx}",
+                    {"prompt": prompt}, resp_z, {"model": model_name, "temp": temp_z}
+                ))
+
+                if resp_z['status'] == 'SUCCESS':
+                    cand_text_z = f"Question: {target_query}\nRationale and Answer: {resp_z['text']}"
+                    candidates.append(cand_text_z)
+                else:
+                    logger.warning(f"Failed to generate zero-shot candidate #{z_idx}.")
+
+            print(f"    -> Added {len(candidates)} total candidates after zero-shot generation.")
         print(f"\n  [Phase 2] Using {len(validator_indices)} Pre-retrieved Validators...")
 
     else:
@@ -1967,6 +2007,45 @@ def solve_with_analogical_consistency(
             
         candidates = candidates_result['self_sampled_texts'] 
         print(f"    -> Generated {len(candidates)} candidates.")
+
+        # Optional: add zero-shot candidates to self-sampled candidates
+        if config.get("REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES", False):
+            rz_n = config.get("REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N", 3)
+            template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_ZERO_SHOT_SOLVER", "final_solver_simple_v1")
+            template = PROMPT_TEMPLATES.get(template_name)
+            print(f"\n  [Phase 1.5] Generating {rz_n} zero-shot candidates using template '{template_name}'...")
+            for z_idx in range(rz_n):
+                prompt = None
+                if template:
+                    try:
+                        prompt = template.format(main_question_text=target_query)
+                    except Exception:
+                        try:
+                            prompt = template.format(target_query=target_query)
+                        except Exception:
+                            try:
+                                prompt = template.format(question=target_query)
+                            except Exception:
+                                prompt = None
+
+                if prompt is None:
+                    prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
+
+                temp_z = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
+                resp_z = api_manager_solve.generate_content(prompt, model_name, temp_z)
+
+                local_trace.append(create_trace_entry(
+                    "reverse_validation", f"generate_candidate_zeroshot_{z_idx}",
+                    {"prompt": prompt}, resp_z, {"model": model_name, "temp": temp_z}
+                ))
+
+                if resp_z['status'] == 'SUCCESS':
+                    cand_text_z = f"Question: {target_query}\nRationale and Answer: {resp_z['text']}"
+                    candidates.append(cand_text_z)
+                else:
+                    logger.warning(f"Failed to generate zero-shot candidate #{z_idx}.")
+
+            print(f"    -> Added {rz_n} zero-shot candidates. Total candidates: {len(candidates)}")
 
         print(f"\n  [Phase 2] Retrieving {k_validators} Validators (Ground Truths)...")
         

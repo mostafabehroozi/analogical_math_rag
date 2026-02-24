@@ -8,9 +8,8 @@ LOGS_DIR = os.path.join(OUTPUTS_DIR, "logs")
 EMBEDDINGS_DIR = os.path.join(OUTPUTS_DIR, "embeddings")
 RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
 
-# --- Main CONFIG Dictionary ---
 CONFIG = {
-    # --- Logging & Control ---
+    # Logging & Control
     "VERBOSE_LOGGING": True,
     "PRINT_API_CALL_DETAILS": True,
     "PRINT_API_TIMING_CHECKPOINTS": True,
@@ -20,19 +19,17 @@ CONFIG = {
     "OUTPUTS_DIR": OUTPUTS_DIR,
     "RESULTS_DIR": RESULTS_DIR,
 
-    # --- API Provider Selection ---
+    # API Provider Selection
     "API_PROVIDER_ADAPTATION": "gemini",
     "API_PROVIDER_SOLVER": "gemini",
     "API_PROVIDER_EVALUATOR": "gemini",
     "API_PROVIDER_AUGMENTATION": "gemini",
     "API_PROVIDER_SIMPLIFICATION": "gemini",
 
-    # --- Gemini API Settings ---
+    # Gemini API Settings
     "GEMINI_API_KEYS": [
-        # Add your Gemini API keys here
     ],
     "GEMINI_MODEL_QUOTAS": {
-        # UPDATED: Increased limits to accommodate Mirroring inner loops
         "models/gemma-3-27b-it": {"delay_seconds": 2, "rpd": 1000},
     },
     "GLOBAL_API_CALL_DELAY_SECONDS": 5,
@@ -55,7 +52,7 @@ CONFIG = {
     "AVALAI_MODEL_NAME_AUGMENTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_SIMPLIFICATION": "openai.gpt-oss-20b-1:0",
 
-    # --- Ollama (Local LLM) Settings ---
+    # Ollama (Local LLM) Settings
     "OLLAMA_BASE_URL": "http://localhost:11434",
     "OLLAMA_MODEL_NAME_ADAPTATION": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_FINAL_SOLVER": "gpt-oss:20b",
@@ -63,7 +60,7 @@ CONFIG = {
     "OLLAMA_MODEL_NAME_AUGMENTATION": "llama3:8b",
     "OLLAMA_MODEL_NAME_SIMPLIFICATION": "llama3:8b",
 
-    # --- Generic LLM Generation Settings ---
+    # Generic LLM Generation Settings
     "DEFAULT_ADAPTATION_TEMPERATURE": 0.0,
     "DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE": 1.0,
     "DEFAULT_FINAL_SOLVER_TEMPERATURE": 1.0,
@@ -76,7 +73,7 @@ CONFIG = {
     "DEFAULT_FINAL_SOLVER_MAX_TOKENS": 10000,
     "DEFAULT_EVALUATOR_MAX_TOKENS": 10000,
 
-    # --- File Paths & Data ---
+    # File Paths & Data
     "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',
     "HARD_QUESTIONS_INDICES_PATH": os.path.join(DATA_DIR, "hard_question_indices.json"),
     "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
@@ -89,7 +86,7 @@ CONFIG = {
     "ADVANCED_RAG_FULL_LOG_PATH": os.path.join(RESULTS_DIR, "advanced_rag_pipeline_full_log.json"),
     "ADVANCED_RAG_EVALUATION_RESULTS_PATH": os.path.join(RESULTS_DIR, "advanced_rag_evaluation_results.pkl"),
 
-    # --- Pipeline Control Flags ---
+    # Pipeline Control Flags
     "USE_RETRIEVAL": True,
     "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
     "DEFER_SOLVE_STEP": False,
@@ -97,7 +94,7 @@ CONFIG = {
     "FINAL_K_SELECTION_ADAPTATION": 1,
     "TARGET_ADAPTED_SAMPLES_MERGING": 1,
 
-    # --- Adaptation Steps ---
+    # Adaptation Steps
     "APPLY_NORMALIZATION": False,
     "APPLY_TRANSFORMATION": False,
     "APPLY_TRANSFORMATION_1": False,
@@ -105,16 +102,16 @@ CONFIG = {
     "APPLY_TRANSFORMATION_3": False,
     "APPLY_MERGING": False,
 
-    # --- Self-Sampling ---
+    # Self-Sampling
     "APPLY_SELF_SAMPLING": False,
     "SELF_SAMPLING_N": 3,
     "SELF_SAMPLING_TEMPERATURE": 1.0,
 
-    # --- Analogical Adaptation ---
+    # Analogical Adaptation
     "APPLY_ANALOGICAL_ADAPTATION": False,
     "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,
 
-    # --- Augmentation & Selection ---
+    # Augmentation & Selection
     "APPLY_SELF_SAMPLING_AUGMENTATION": False,
     "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION": False,
     "ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION": False,
@@ -124,7 +121,7 @@ CONFIG = {
     "AUGMENT_N": 3,
     "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",
 
-    # --- Consistency Check (Pathway) ---
+    # Consistency Check (Pathway)
     "APPLY_CONSISTENCY_ANALOGICAL_CHECK": False,
     "CONSISTENCY_GENERATION_MODE": "distinct_augmentations",
     "CONSISTENCY_PATHWAYS_K": 3,
@@ -132,7 +129,6 @@ CONFIG = {
     "CONSISTENCY_SAMPLES_PER_PATHWAY_N": 3,
     "CONSISTENCY_LAYER_2_TEMPERATURE": 1.0,
     "CONSISTENCY_VOTING_THRESHOLD": 0.6,
-
 
     "APPLY_GROUP_CONSISTENCY_SELECTION": True,
 
@@ -154,7 +150,7 @@ CONFIG = {
     "CONSISTENCY_SCORING_METHOD": "benchmark_report", 
     "SEMANTIC_CONSISTENCY_WEIGHT": 0.0,
 
-    # --- Hierarchical Augmentation ---
+    # Hierarchical Augmentation 
     "APPLY_HIERARCHICAL_AUGMENTATION": False,
     "HIERARCHICAL_AUGMENTATION_MODE": "decomposition", # "decomposition" or "simplification"
     "HIERARCHICAL_TREE_DEPTH": 2,
@@ -163,15 +159,15 @@ CONFIG = {
     "HIERARCHICAL_LEAF_RETRIEVAL_TOP_K": 3,
     "HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE": "leaf", # "leaf" or "root"
     
-    # --- NEW: Two-Step Augmentation ---
+    # Two-Step Augmentation 
     "HIERARCHICAL_AUGMENTATION_TWO_STEP": False,
 
-    # --- Simplification Mode ---
+    # Simplification Mode 
     "APPLY_SIMPLIFICATION": False,
     "SIMPLIFY_RETRIEVED_SAMPLES": False,
     "SIMPLIFY_MAIN_QUESTION": False,
 
-    # --- Reverse Validation ---
+    # Reverse Validation
     "APPLY_REVERSE_VALIDATION": False,
     "REVERSE_VALIDATION_CANDIDATES_N": 5,
     "REVERSE_VALIDATION_RETRIEVAL_K": 3,
@@ -181,12 +177,15 @@ CONFIG = {
     "REVERSE_VALIDATION_USE_RAG_GENERATION": True,  # Turns ON the new helper/analogical generation
     "REVERSE_VALIDATION_GENERATION_K": 3,           # How many past examples to fetch to help generate the candidates
 
-    # --- Pass@N & Evaluation ---
+    "REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES": False,
+    "REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N": 3,
+
+    # Pass@N & Evaluation
     "N_PASS_ATTEMPTS": 3,
     "APPLY_FULL_PIPELINE_RETRY": False,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
-    # --- Prompt Templates ---
+    # Prompt Templates
     "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",
     "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
     
@@ -206,12 +205,13 @@ CONFIG = {
     "PROMPT_TEMPLATE_CONSISTENCY_SOLVER": "analogical_adaptation_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER": "analogical_adaptation_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_BASELINE": "mirror_baseline_zero_shot_v1",
+    "PROMPT_TEMPLATE_REVERSE_VALIDATION_ZERO_SHOT_SOLVER": "final_solver_simple_v1",
 
     "PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR": "self_sampling_augmentor_decomposition_2",
     "PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER": "hierarchical_parent_solver_v1",
     "PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER": "final_solver_simple_v1",
 
-    # --- NEW: Two-Step Augmentation Prompts ---
+    # Two-Step Augmentation Prompts
     "PROMPT_TEMPLATE_AUGMENTATION_STEP1_SOLVER": "final_solver_simple_v2",
     "PROMPT_TEMPLATE_AUGMENTATION_STEP2_GENERATOR": "self_sampling_augmentor_simplification_with_solution",
 
@@ -219,7 +219,7 @@ CONFIG = {
     "PROMPT_TEMPLATE_SIMPLIFIED_SAMPLE_SOLVER": "simplified_sample_solver_v1",
     "PROMPT_TEMPLATE_SIMPLIFIED_MAIN_PROXY_SOLVER": "main_from_simplified_proxy_v1",
 
-    # --- Hugging Face Hub ---
+    # Hugging Face Hub
     "PERSIST_RESULTS_ONLINE": True,
     "HF_SYNC_TOKEN": "YOUR_HUGGING_FACE_TOKEN_HERE",
     "HF_HUB_USERNAME": "your-hf-username-here",
