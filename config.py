@@ -185,6 +185,21 @@ CONFIG = {
     "APPLY_FULL_PIPELINE_RETRY": False,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
+    # --- Dataset Construction Settings ---
+    # When enabled, the system will perform a specialized dataset generation
+    # phase.  It randomly selects a query from the exemplar corpus, finds the
+    # two most similar samples (A and B), attempts a two‑shot solve of the query
+    # using those samples, and if the evaluation LLM confirms correctness the
+    # example is added to the constructed dataset.  The resulting JSON contains
+    # both the raw material (question, A, B) and the input/output pairs.
+    "APPLY_DATASET_CONSTRUCTION": False,
+    "DATASET_CONSTRUCTION_MAX_SEARCH": 1000,    # how many random queries to examine
+    "DATASET_CONSTRUCTION_MAX_MEMBERS": 100,    # stop when this many valid entries are gathered
+    "DATASET_CONSTRUCTION_RANDOM_SEED": None,   # seed for reproducibility (optional)
+    "DATASET_CONSTRUCTION_PROMPT_TEMPLATE": None,  # overrides PROMPT_TEMPLATE_FINAL_SOLVER
+    "DATASET_CONSTRUCTION_SOLVER_TEMPERATURE": 1.0,
+    "DATASET_CONSTRUCTION_EVALUATOR_TEMPERATURE": 0.0,
+
     # Prompt Templates
     "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",
     "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",

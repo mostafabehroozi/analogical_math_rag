@@ -770,6 +770,37 @@ def run_experiments(
     logger = logging.getLogger(__name__)
     all_results = {}
 
+    # --- special case: dataset construction experiments ---
+    dataset_configs = [exp for exp in experiment_configs if exp.get("APPLY_DATASET_CONSTRUCTION")]
+    normal_configs = [exp for exp in experiment_configs if not exp.get("APPLY_DATASET_CONSTRUCTION")]
+
+    if dataset_configs:
+        logger.info(f"Found {len(dataset_configs)} dataset construction config(s); running them first.")
+        from src.dataset_builder import construct_two_shot_dataset
+        for exp_overrides in dataset_configs:
+            current_config = global_config.copy()
+            current_config.update(exp_overrides)
+            exp_name = current_config.get("experiment_name", "dataset_construction")
+            logger.info(f"--- Dataset experiment '{exp_name}' starting ---")
+            # pick appropriate managers
+            solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
+            eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", current_config.get("API_PROVIDER_SOLVER", "gemini")))
+            ds_result = construct_two_shot_dataset(
+                exemplar_data=exemplar_data,
+                embedding_model=embedding_model,
+                api_manager_solver=solver_mgr,
+                api_manager_eval=eval_mgr,
+                config=current_config
+            )
+            # results are saved by the builder; we just note them
+            all_results[exp_name] = ds_result
+            logger.info(f"--- Dataset experiment '{exp_name}' finished ---")
+        # replace list for the remaining pipeline with the normal ones
+        experiment_configs = normal_configs
+        if not experiment_configs:
+            # nothing else to do
+            return all_results
+
     # --- REWRITTEN LOGIC: Check for and handle cross-experiment deferred execution ---
     is_cross_experiment_defer_enabled = any(
         exp.get('DEFER_SOLVE_STEP', False) for exp in experiment_configs
