@@ -39,7 +39,10 @@ from src.prompts import (
     create_simplification_prompt,
     create_simplified_sample_solver_prompt,
     create_main_from_simplified_proxy_prompt,
-    create_augmentation_with_solution_prompt 
+    create_augmentation_with_solution_prompt,
+    create_reverse_transformation_main_to_exemplar_prompt,
+    create_reverse_transformation_solve_transformed_prompt,
+    create_reverse_transformation_final_solve_prompt
 )
 from src.utils import save_json, load_json, create_trace_entry
 from src.hf_sync import periodic_sync_check
@@ -911,6 +914,168 @@ def solve_via_main_simplification(
             
     return {"status": "SUCCESS", "solution_attempts": solution_attempts, "trace": local_trace}
 
+def reverse_transform_and_solve(
+    target_query: str,
+    retrieved_indices: List[int],
+    exemplar_questions: List[str],
+    exemplar_solutions: List[str],
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Implements Reverse Transformation workflow:
+    For each retrieved exemplar:
+    1. Transform the main question to match the exemplar
+    2. Solve the transformed question using the exemplar
+    3. Collect all transformed solutions
+    Then:
+    4. Solve the original main question using all transformed solutions as analogical support
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Reverse Transformation step.")
+    local_trace = []
+    
+    if isinstance(api_manager, GeminiAPIManager):
+        model_transform = config['GEMINI_MODEL_NAME_ADAPTATION']
+        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_transform = config['AVALAI_MODEL_NAME_ADAPTATION']
+        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_transform = config['OLLAMA_MODEL_NAME_ADAPTATION']
+        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    else:
+        raise TypeError(f"Unsupported API manager type for reverse transformation: {type(api_manager)}")
+    
+    temp_transform = config.get('REVERSE_TRANSFORMATION_TEMPERATURE', 0.3)
+    temp_solve = config.get('REVERSE_TRANSFORMATION_SOLVER_TEMPERATURE', 1.0)
+    temp_final = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
+    
+    transformed_solutions = []
+    failed_transformations = []
+    
+    print(f"    -> Starting Reverse Transformation for {len(retrieved_indices)} exemplars...")
+    
+    # Phase 1: For each retrieved exemplar, transform Q and solve Q_Transformed
+    for idx_num, idx in enumerate(retrieved_indices):
+        original_exemplar_q = exemplar_questions[idx]
+        original_exemplar_sol = exemplar_solutions[idx]
+        
+        print(f"\n      [Reverse Transform {idx_num+1}/{len(retrieved_indices)}] Processing exemplar {idx}...")
+        
+        # Step 1: Transform main question to match this exemplar
+        print(f"        -> Transforming main question to match exemplar {idx}...")
+        prompt_transform = create_reverse_transformation_main_to_exemplar_prompt(
+            target_query, original_exemplar_q, original_exemplar_sol, config
+        )
+        
+        resp_transform = api_manager.generate_content(prompt_transform, model_transform, temp_transform)
+        
+        local_trace.append(create_trace_entry(
+            "reverse_transform", f"transform_q_{idx}",
+            {"exemplar_idx": idx, "prompt": prompt_transform},
+            resp_transform,
+            {"model": model_transform, "temp": temp_transform}
+        ))
+        
+        if resp_transform['status'] != 'SUCCESS':
+            logger.warning(f"Failed to transform main question for exemplar {idx}")
+            failed_transformations.append({
+                "exemplar_idx": idx,
+                "phase": "transformation",
+                "error_info": resp_transform
+            })
+            continue
+        
+        transformed_q = resp_transform['text']
+        # Extract just the question part if the response includes "Transformed Main Question:"
+        if "Transformed Main Question:" in transformed_q:
+            transformed_q = transformed_q.split("Transformed Main Question:")[-1].strip()
+        
+        # Step 2: Solve the transformed question using the exemplar
+        print(f"        -> Solving transformed question using exemplar {idx}...")
+        prompt_solve_transformed = create_reverse_transformation_solve_transformed_prompt(
+            transformed_q, original_exemplar_q, original_exemplar_sol, config
+        )
+        
+        resp_solve_transformed = api_manager.generate_content(prompt_solve_transformed, model_solve, temp_solve)
+        
+        local_trace.append(create_trace_entry(
+            "reverse_transform", f"solve_transformed_{idx}",
+            {"exemplar_idx": idx, "transformed_q": transformed_q, "prompt": prompt_solve_transformed},
+            resp_solve_transformed,
+            {"model": model_solve, "temp": temp_solve}
+        ))
+        
+        if resp_solve_transformed['status'] != 'SUCCESS':
+            logger.warning(f"Failed to solve transformed question for exemplar {idx}")
+            failed_transformations.append({
+                "exemplar_idx": idx,
+                "phase": "solving_transformed",
+                "error_info": resp_solve_transformed
+            })
+            continue
+        
+        transformed_sol = resp_solve_transformed['text']
+        transformed_solutions.append({
+            "exemplar_idx": idx,
+            "transformed_question": transformed_q,
+            "transformed_solution": transformed_sol,
+            "original_exemplar_question": original_exemplar_q,
+            "original_exemplar_solution": original_exemplar_sol
+        })
+    
+    if not transformed_solutions:
+        logger.error("No successful reverse transformations completed.")
+        return {
+            "status": "FAILURE",
+            "solution_attempts": [{"status": "FAILURE", "error_info": {"message": "No successful reverse transformations"}}],
+            "trace": local_trace
+        }
+    
+    # Phase 2: Solve the original main question using transformed solutions
+    print(f"\n      [Final Solve] Solving original question using {len(transformed_solutions)} transformed solutions...")
+    
+    # Format transformed solutions for the final prompt
+    transformed_solutions_text = []
+    for i, trans_sol_info in enumerate(transformed_solutions):
+        sol_text = f"Solution {i+1} (from exemplar {trans_sol_info['exemplar_idx']}):\nTransformed Question: {trans_sol_info['transformed_question']}\n\n{trans_sol_info['transformed_solution']}"
+        transformed_solutions_text.append(sol_text)
+    
+    prompt_final = create_reverse_transformation_final_solve_prompt(
+        target_query, transformed_solutions_text, config
+    )
+    
+    n_attempts = config.get("N_PASS_ATTEMPTS", 1)
+    solution_attempts = []
+    
+    for i in range(n_attempts):
+        print(f"        -> Generating final solution attempt {i+1}/{n_attempts}...")
+        resp_final = api_manager.generate_content(prompt_final, model_solve, temp_final)
+        
+        local_trace.append(create_trace_entry(
+            "reverse_transform", f"final_attempt_{i+1}",
+            {"prompt": prompt_final},
+            resp_final,
+            {"model": model_solve, "temp": temp_final}
+        ))
+        
+        if resp_final['status'] == 'SUCCESS':
+            solution_attempts.append(resp_final['text'])
+        else:
+            solution_attempts.append({
+                "status": "FAILURE",
+                "error_info": resp_final
+            })
+    
+    return {
+        "status": "SUCCESS",
+        "solution_attempts": solution_attempts,
+        "transformed_solutions_count": len(transformed_solutions),
+        "failed_transformations": failed_transformations,
+        "trace": local_trace
+    }
+
 def self_sample(
     target_query: str,
     api_manager: Any,
@@ -1526,6 +1691,198 @@ def optimize_demonstrations_via_mirroring(
             "status": "FAILED", 
             "error": str(e),
             "fallback_indices": retrieved_indices,
+            "trace": trace_accumulator
+        }
+
+def apply_mirror_reranking(
+    target_query: str,
+    indices_to_rerank: List[int],
+    exemplar_data: Dict[str, Any],
+    api_manager: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Unified Mirror Re-Ranking Stage for Retrieved/Transformed Samples.
+    
+    Applies mirror-based re-ranking to optimize demonstration selection based on
+    analogical consistency (True Consistency Score) rather than just similarity.
+    
+    This function:
+    1. Generates Q_answered candidates for each demo (hypothesis generation)
+    2. Evaluates mirror consistency by testing each demo against others
+    3. Scores demos based on their utility (TCS > baseline similarity)
+    4. Optionally filters based on thresholds
+    5. Returns a re-ranked list optimized for analogical utility
+    
+    Args:
+        target_query: The target problem to solve
+        indices_to_rerank: List of indices to re-rank (from exemplar_data)
+        exemplar_data: Dict containing 'questions' and 'solutions' lists
+        api_manager: API manager instance for LLM calls
+        config: Configuration dict with re-ranking parameters
+    
+    Returns:
+        {
+            "status": "SUCCESS" | "FAILED",
+            "reranked_indices": [...],  # Re-ranked indices list (or original if failed)
+            "ranking_scores": {...},    # Score for each index
+            "trace": [...]              # Execution trace
+        }
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting unified mirror re-ranking for {len(indices_to_rerank)} samples")
+    
+    print(f"\n{'='*80}")
+    print(f"  [MIRROR RE-RANKING] Unified Analogical Consistency Re-Ranking")
+    print(f"  Input: {len(indices_to_rerank)} samples | Target Query: {target_query[:60]}...")
+    print(f"{'='*80}")
+    
+    trace_accumulator = []
+    
+    try:
+        if not indices_to_rerank:
+            logger.warning("No indices to re-rank, returning empty result")
+            return {
+                "status": "SUCCESS",
+                "reranked_indices": [],
+                "ranking_scores": {},
+                "trace": trace_accumulator
+            }
+        
+        # Extract configuration
+        enable_r0 = config.get("MIRROR_RERANKING_ENABLE_R0", False)
+        enable_filtering = config.get("MIRROR_RERANKING_ENABLE_FILTERING", True)
+        enable_redundancy = config.get("MIRROR_RERANKING_ENABLE_REDUNDANCY_FILTER", True)
+        evaluate_base = config.get("MIRROR_RERANKING_EVALUATE_BASE_FILTERING", False)
+        active_limit = config.get("MIRROR_RERANKING_ACTIVE_LIMIT", None)
+        
+        # --- Phase 0: Prepare Active Candidates ---
+        active_candidates = list(indices_to_rerank)
+        
+        # Apply limit if specified
+        if active_limit is not None and len(active_candidates) > active_limit:
+            active_candidates = active_candidates[:active_limit]
+            logger.info(f"Limiting candidates to {active_limit}")
+        
+        # Inject R0 if enabled
+        if enable_r0:
+            if -1 not in active_candidates:
+                active_candidates.insert(0, -1)
+                logger.info("Injected zero-shot candidate (R0)")
+        
+        # Validation set = all non-R0 candidates
+        validation_indices = [idx for idx in active_candidates if idx != -1]
+        
+        if not validation_indices:
+            logger.warning("No valid validation indices after filtering")
+            return {
+                "status": "FAILED",
+                "error": "No valid validation indices",
+                "fallback_indices": indices_to_rerank,
+                "trace": trace_accumulator
+            }
+        
+        # --- Phase 0.5: Calculate Baseline Scores ---
+        baseline_scores = _calculate_baseline_difficulty(
+            retrieved_indices=validation_indices,
+            exemplar_data=exemplar_data,
+            api_manager=api_manager,
+            config=config,
+            trace_accumulator=trace_accumulator
+        )
+        
+        # --- Phase 1: Hypothesis Generation (Q_answered Candidates) ---
+        hypotheses = _generate_hypotheses(
+            target_query=target_query,
+            candidate_indices=active_candidates,
+            exemplar_data=exemplar_data,
+            api_manager=api_manager,
+            config=config,
+            trace_accumulator=trace_accumulator
+        )
+        
+        # --- Phase 2: Mirror Evaluation (True Consistency Score) ---
+        consistency_matrix = _evaluate_mirror_consistency(
+            target_query=target_query,
+            hypotheses=hypotheses,
+            validation_indices=validation_indices,
+            exemplar_data=exemplar_data,
+            api_manager=api_manager,
+            config=config,
+            trace_accumulator=trace_accumulator
+        )
+        
+        # --- Phase 3: Utility Scoring ---
+        candidate_scores = {}
+        candidate_contributions = {}
+        
+        for cand_idx in active_candidates:
+            total_utility = 0.0
+            contribs = {}
+            
+            for val_idx in validation_indices:
+                if cand_idx == val_idx:
+                    continue
+                
+                mirror_acc = consistency_matrix.get(cand_idx, {}).get(val_idx, 0.0)
+                base_acc = baseline_scores.get(val_idx, 0.0)
+                
+                # Utility = amount by which this demo improves over baseline
+                if mirror_acc > base_acc:
+                    delta = mirror_acc - base_acc
+                    total_utility += delta
+                    contribs[val_idx] = delta
+            
+            candidate_scores[cand_idx] = total_utility
+            candidate_contributions[cand_idx] = contribs
+        
+        logger.info(f"Candidate utility scores calculated")
+        for cand_idx in active_candidates:
+            logger.info(f"  Index {cand_idx}: utility={candidate_scores[cand_idx]:.3f}")
+        
+        # --- Phase 4: Ranking and Filtering ---
+        final_indices, base_indices, master_sorted = _rank_and_filter_candidates(
+            candidate_indices=active_candidates,
+            candidate_scores=candidate_scores,
+            candidate_contributions=candidate_contributions,
+            config=config,
+            trace_accumulator=trace_accumulator
+        )
+        
+        # Choose which list to return based on filtering settings
+        if evaluate_base or (enable_filtering and not enable_redundancy):
+            # Return base-filtered list
+            reranked = base_indices
+        else:
+            # Return redundancy-filtered list (most selective)
+            reranked = final_indices
+        
+        # If all filtering is disabled, use master sorted list
+        if not enable_filtering and not enable_redundancy:
+            reranked = master_sorted
+        
+        logger.info(f"Re-ranking complete. Final order: {reranked}")
+        
+        return {
+            "status": "SUCCESS",
+            "reranked_indices": reranked,
+            "ranking_scores": candidate_scores,
+            "base_filtered_indices": base_indices,
+            "redundancy_filtered_indices": final_indices,
+            "master_sorted_indices": master_sorted,
+            "trace": trace_accumulator
+        }
+    
+    except Exception as e:
+        import traceback
+        logger.error(f"Mirror re-ranking failed: {e}", exc_info=True)
+        print(f"[ERROR] Mirror re-ranking failed: {e}")
+        print(traceback.format_exc())
+        
+        return {
+            "status": "FAILED",
+            "error": str(e),
+            "fallback_indices": indices_to_rerank,
             "trace": trace_accumulator
         }
 
@@ -2210,5 +2567,378 @@ def solve_with_analogical_consistency(
         "selected_score": selected_score,
         "solution_attempts": [selected_text], 
         "consistency_stats": candidate_stats,
+        "trace": local_trace
+    }
+
+
+def select_best_transformations(
+    retrieved_indices: List[int],
+    target_query: str,
+    exemplar_data: Dict[str, Any],
+    embedding_model: SentenceTransformer,
+    api_manager_adapt: Any,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    REFORMED Best-of-Transformation with Per-Retrieved-Sample Best Candidate Selection:
+    
+    Core Principle: Exact one best candidate per retrieved exemplar, enforced structurally.
+    
+    Algorithm:
+    1. RETRIEVE: Get K exemplars (retrieved_indices has K entries)
+    2. TRANSFORM: For each retrieved exemplar r_i (i=1..K):
+       - Generate N transformed variants t_i1, t_i2, ..., t_iN
+    3. GENERATE: For each transformed variant t_ij:
+       - Generate M candidate answers (attempts/generations)
+       - All candidates: K×N×M total
+    4. VALIDATE: Each candidate gets validation score (mirror eval + consistency check)
+    5. SELECT-PER-SAMPLE (CRITICAL): For each retrieved exemplar r_i:
+       - Isolate all candidates derived from r_i (subset of K×N×M)
+       - Rank candidates in this subset by validation score
+       - Select the single highest-scoring candidate from this subset
+       - Result: K best candidates, one per retrieved exemplar
+    6. OUTPUT: K best candidates with full traceability to source exemplar
+    
+    Per-Sample Selection Boundary:
+    - NO cross-sample competition before per-sample selection
+    - NO global ranking over all K×N×M candidates
+    - Per-sample boundary is structurally enforced via explicit aggregation
+    
+    Returns:
+        {
+            "status": "SUCCESS" | "FAILURE",
+            "best_candidates": [
+                {
+                    "retrieved_idx": int,
+                    "candidate_text": str,
+                    "candidate_answer": str,
+                    "source_transformation_idx": int,
+                    "validation_score": float,
+                    "per_sample_rank": int
+                },
+                ...  # One entry per retrieved sample
+            ],
+            "per_sample_candidate_counts": [N×M, ...],  # Candidates per sample
+            "per_sample_rankings": [
+                {
+                    "retrieved_idx": int,
+                    "total_candidates": int,
+                    "ranked_candidates": [
+                        {"candidate_preview": str, "score": float, "rank": int},
+                        ...
+                    ]
+                },
+                ...
+            ],
+            "trace": [...]
+        }
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting Per-Sample Best-of-Transformation selection for {len(retrieved_indices)} retrieved samples")
+    
+    print(f"\n{'='*80}")
+    print(f"  [BEST-OF-TRANSFORMATION] Per-Retrieved-Sample Best Candidate Selection")
+    print(f"  Architecture: Strict per-sample boundaries → diversity preservation")
+    print(f"{'='*80}")
+    
+    local_trace = []
+    
+    # Configuration parameters
+    n_transformations = config.get("BEST_OF_TRANSFORMATION_N_SAMPLES", 3)
+    n_attempts_per_transformation = config.get("BEST_OF_TRANSFORMATION_ATTEMPTS_PER_TRANSFORMATION", 1)
+    enable_mirror_eval = config.get("BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL", True)
+    mirror_eval_attempts = config.get("BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS", 3)
+    
+    # Determine model names
+    if isinstance(api_manager_adapt, GeminiAPIManager):
+        model_adapt = config['GEMINI_MODEL_NAME_ADAPTATION']
+        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager_adapt, AvalAIAPIManager):
+        model_adapt = config['AVALAI_MODEL_NAME_ADAPTATION']
+        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager_adapt, OllamaAPIManager):
+        model_adapt = config['OLLAMA_MODEL_NAME_ADAPTATION']
+        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    else:
+        raise TypeError(f"Unsupported API manager: {type(api_manager_adapt)}")
+    
+    temp_transform = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
+    temp_solve = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
+    temp_eval = config.get("DEFAULT_EVALUATOR_TEMPERATURE", 0.0)
+    
+    # =========================================================================
+    # DATA STRUCTURE FOR PER-SAMPLE CANDIDATE TRACKING
+    # =========================================================================
+    # Key invariant: This structure makes per-sample boundaries explicitly visible
+    per_sample_candidates = {}  # {retrieved_idx: [candidate_dict, ...]}
+    per_sample_rankings = {}    # {retrieved_idx: [ranked_candidate_dict, ...]}
+    best_candidates_per_sample = {}  # {retrieved_idx: best_candidate_dict}
+    per_sample_candidate_counts = {}  # {retrieved_idx: count}
+    
+    # =========================================================================
+    # PHASE 1: TRANSFORMATION GENERATION (Per Retrieved Sample)
+    # =========================================================================
+    print(f"\n[PHASE 1] TRANSFORMATION GENERATION")
+    print(f"  Target: {n_transformations} transformations × {len(retrieved_indices)} samples")
+    
+    per_sample_transformations = {}  # {retrieved_idx: [transformation, ...]}
+    
+    for sample_idx, retrieved_idx in enumerate(retrieved_indices):
+        original_sample_q = exemplar_data['questions'][retrieved_idx]
+        original_sample_sol = exemplar_data['solutions'][retrieved_idx]
+        
+        print(f"\n  [{sample_idx+1}/{len(retrieved_indices)}] Retrieved Sample #{retrieved_idx}")
+        print(f"      Original Q: {original_sample_q[:60]}...")
+        
+        # --- Transformation generation for this sample ---
+        transformations = []
+        
+        for t_idx in range(n_transformations):
+            combined_sample = f"Question: {original_sample_q}\nSolution: {original_sample_sol}"
+            
+            prompt_transform = create_transformation_prompt(
+                target_query=target_query,
+                text_to_transform=combined_sample,
+                config=config,
+                template_key_name='PROMPT_TEMPLATE_TRANSFORMATION_1'
+            )
+            
+            resp_transform = api_manager_adapt.generate_content(
+                prompt_transform, model_adapt, temp_transform
+            )
+            
+            local_trace.append(create_trace_entry(
+                "best_of_transformation_per_sample", 
+                f"sample_{retrieved_idx}_transform_{t_idx}",
+                {"prompt": prompt_transform}, resp_transform,
+                {"model": model_adapt, "temp": temp_transform}
+            ))
+            
+            if resp_transform['status'] == 'SUCCESS':
+                transformations.append({
+                    'idx': t_idx,
+                    'text': resp_transform['text'],
+                    'retrieved_idx': retrieved_idx
+                })
+            else:
+                logger.warning(f"Transform failed: sample {retrieved_idx}, transform {t_idx}")
+        
+        if not transformations:
+            logger.warning(f"No transformations for sample {retrieved_idx}, using original")
+            transformations.append({
+                'idx': -1,  # Special marker for original
+                'text': f"[ORIGINAL] Question: {original_sample_q}\nSolution: {original_sample_sol}",
+                'retrieved_idx': retrieved_idx
+            })
+        
+        per_sample_transformations[retrieved_idx] = transformations
+        print(f"      Transformations generated: {len(transformations)}/{n_transformations}")
+    
+    # =========================================================================
+    # PHASE 2: CANDIDATE GENERATION (Per Transformation, Per Retrieved Sample)
+    # =========================================================================
+    print(f"\n[PHASE 2] CANDIDATE GENERATION")
+    print(f"  Target: {n_attempts_per_transformation} attempts per transformation")
+    
+    for retrieved_idx in retrieved_indices:
+        original_sample_q = exemplar_data['questions'][retrieved_idx]
+        transformations = per_sample_transformations[retrieved_idx]
+        
+        sample_candidates = []  # All candidates for this retrieved sample
+        
+        for trans in transformations:
+            # For this transformation, generate multiple candidate attempts
+            for attempt_idx in range(n_attempts_per_transformation):
+                prompt_solve = create_analogical_adaptation_prompt(
+                    target_query,
+                    f"Question: {original_sample_q}\n{trans['text']}",
+                    config
+                )
+                
+                resp_candidate = api_manager_solve.generate_content(
+                    prompt_solve, model_solve, temp_solve
+                )
+                
+                local_trace.append(create_trace_entry(
+                    "best_of_transformation_per_sample",
+                    f"sample_{retrieved_idx}_transform_{trans['idx']}_attempt_{attempt_idx}",
+                    {"prompt": prompt_solve}, resp_candidate,
+                    {"model": model_solve, "temp": temp_solve}
+                ))
+                
+                if resp_candidate['status'] == 'SUCCESS':
+                    candidate_dict = {
+                        'retrieved_idx': retrieved_idx,
+                        'transformation_idx': trans['idx'],
+                        'attempt_idx': attempt_idx,
+                        'raw_response': resp_candidate['text'],
+                        'candidate_text': f"Question: {target_query}\nRationale and Answer: {resp_candidate['text']}",
+                        'validation_score': 0.0,  # Will be set in Phase 3
+                        'validation_details': {}
+                    }
+                    sample_candidates.append(candidate_dict)
+                else:
+                    logger.warning(
+                        f"Candidate generation failed: sample {retrieved_idx}, "
+                        f"transform {trans['idx']}, attempt {attempt_idx}"
+                    )
+        
+        if not sample_candidates:
+            logger.warning(f"No candidates for sample {retrieved_idx}, creating fallback")
+            original_sample_sol = exemplar_data['solutions'][retrieved_idx]
+            sample_candidates.append({
+                'retrieved_idx': retrieved_idx,
+                'transformation_idx': -1,
+                'attempt_idx': -1,
+                'raw_response': f"[FALLBACK] {original_sample_sol}",
+                'candidate_text': f"Question: {target_query}\nRationale and Answer: [FALLBACK] {original_sample_sol}",
+                'validation_score': -1.0,
+                'validation_details': {'fallback': True}
+            })
+        
+        per_sample_candidates[retrieved_idx] = sample_candidates
+        per_sample_candidate_counts[retrieved_idx] = len(sample_candidates)
+        print(f"  Sample #{retrieved_idx}: Generated {len(sample_candidates)} candidates")
+    
+    # =========================================================================
+    # PHASE 3: VALIDATION (Per Candidate, Still Within Per-Sample Context)
+    # =========================================================================
+    print(f"\n[PHASE 3] VALIDATION (Mirror Evaluation)")
+    
+    for retrieved_idx in retrieved_indices:
+        original_sample_q = exemplar_data['questions'][retrieved_idx]
+        original_sample_sol = exemplar_data['solutions'][retrieved_idx]
+        sample_candidates = per_sample_candidates[retrieved_idx]
+        
+        if enable_mirror_eval:
+            for cand in sample_candidates:
+                # Skip fallback candidates
+                if cand.get('validation_details', {}).get('fallback'):
+                    cand['validation_score'] = -1.0
+                    continue
+                
+                # Validate this candidate against the original sample
+                validation_score = 0.0
+                
+                for eval_attempt in range(mirror_eval_attempts):
+                    prompt_eval = create_reverse_validation_prompt(
+                        cand['raw_response'],
+                        f"Question: {original_sample_q}\nSolution: {original_sample_sol}",
+                        config
+                    )
+                    
+                    resp_eval = api_manager_eval.generate_content(
+                        prompt_eval, model_solve, temp_eval
+                    )
+                    
+                    local_trace.append(create_trace_entry(
+                        "best_of_transformation_per_sample",
+                        f"sample_{retrieved_idx}_validate_cand_{cand['transformation_idx']}_{cand['attempt_idx']}_eval_{eval_attempt}",
+                        {"prompt": prompt_eval}, resp_eval,
+                        {"model": model_solve, "temp": temp_eval}
+                    ))
+                    
+                    if resp_eval['status'] == 'SUCCESS':
+                        response_lower = resp_eval['text'].lower()
+                        if any(word in response_lower for word in ['correct', 'yes', 'accurate', 'valid', 'true']):
+                            validation_score += 1.0
+                
+                cand['validation_score'] = validation_score / mirror_eval_attempts
+        else:
+            # Equal scores if mirror eval disabled
+            for cand in sample_candidates:
+                if not cand.get('validation_details', {}).get('fallback'):
+                    cand['validation_score'] = 1.0
+                else:
+                    cand['validation_score'] = -1.0
+        
+        print(f"  Sample #{retrieved_idx}: Validated {len(sample_candidates)} candidates")
+    
+    # =========================================================================
+    # PHASE 4: PER-SAMPLE BEST CANDIDATE SELECTION (CRITICAL BOUNDARY ENFORCEMENT)
+    # =========================================================================
+    print(f"\n[PHASE 4] PER-SAMPLE BEST CANDIDATE SELECTION")
+    print(f"  Boundary Model: NEVER cross-sample competition before this phase")
+    
+    best_candidates_list = []
+    
+    for retrieved_idx in retrieved_indices:
+        sample_candidates = per_sample_candidates[retrieved_idx]
+        
+        # Sort candidates within this sample by validation score (descending)
+        ranked_candidates = sorted(
+            sample_candidates,
+            key=lambda c: (c['validation_score'], -c['attempt_idx']),  # Score desc, then attempt desc
+            reverse=True
+        )
+        
+        # Store ranking for this sample
+        per_sample_rankings[retrieved_idx] = [
+            {
+                'candidate_preview': ranked_candidates[i]['raw_response'][:80],
+                'score': ranked_candidates[i]['validation_score'],
+                'rank': i + 1,
+                'transformation_idx': ranked_candidates[i]['transformation_idx'],
+                'attempt_idx': ranked_candidates[i]['attempt_idx']
+            }
+            for i in range(len(ranked_candidates))
+        ]
+        
+        # *** SELECT EXACTLY ONE BEST CANDIDATE FOR THIS SAMPLE ***
+        best_candidate = ranked_candidates[0]
+        best_candidate['per_sample_rank'] = 1
+        best_candidates_per_sample[retrieved_idx] = best_candidate
+        best_candidates_list.append(best_candidate)
+        
+        print(f"  Sample #{retrieved_idx}:")
+        print(f"    Total candidates in sample: {len(ranked_candidates)}")
+        print(f"    Selected best (rank 1): transform_{best_candidate['transformation_idx']} "
+              f"attempt_{best_candidate['attempt_idx']}")
+        print(f"    Score: {best_candidate['validation_score']:.3f}")
+        print(f"    Answer preview: {best_candidate['raw_response'][:60]}...")
+    
+    # =========================================================================
+    # OUTPUT FORMATTING
+    # =========================================================================
+    print(f"\n{'='*80}")
+    print(f"  [BEST-OF-TRANSFORMATION] Per-Sample Selection Complete")
+    print(f"  Total Retrieved Samples: {len(retrieved_indices)}")
+    print(f"  Best Candidates Selected: {len(best_candidates_list)} (exactly 1 per sample)")
+    print(f"  Total Candidates Evaluated: {sum(per_sample_candidate_counts.values())}")
+    print(f"{'='*80}\n")
+    
+    if not best_candidates_list:
+        return {
+            "status": "FAILURE",
+            "error": "No best candidates selected",
+            "trace": local_trace
+        }
+    
+    # Format output with full traceability
+    return {
+        "status": "SUCCESS",
+        "best_candidates": [
+            {
+                "retrieved_idx": cand['retrieved_idx'],
+                "candidate_text": cand['candidate_text'],
+                "candidate_answer": cand['raw_response'],
+                "source_transformation_idx": cand['transformation_idx'],
+                "source_attempt_idx": cand['attempt_idx'],
+                "validation_score": cand['validation_score'],
+                "per_sample_rank": 1  # Always 1 by construction
+            }
+            for cand in best_candidates_list
+        ],
+        "per_sample_candidate_counts": per_sample_candidate_counts,
+        "per_sample_rankings": [
+            {
+                "retrieved_idx": retrieved_idx,
+                "total_candidates": per_sample_candidate_counts[retrieved_idx],
+                "ranked_candidates": per_sample_rankings[retrieved_idx]
+            }
+            for retrieved_idx in retrieved_indices
+        ],
         "trace": local_trace
     }
