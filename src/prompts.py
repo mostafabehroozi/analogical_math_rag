@@ -1469,8 +1469,264 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
+    "reverse_transformation_main_to_exemplar": """<Objective>
+Your task is to transform the given Main Question into a version that becomes more analogous and relevant to the Retrieved Exemplar.
+The transformation should be directed toward the Retrieved Exemplar, meaning every change you make should help the transformed main question better reflect, match, or resonate with the Retrieved Exemplar's theme, context, or style — while strictly preserving the main question's underlying logical structure and ensuring the transformed question remains solvable.
+</Objective>
+
+<Transformation Guidelines>
+Target-Directed Adaptation:
+- Adapt the main question's theme, context, and entities to mirror those in the Retrieved Exemplar.
+- Think of this as reframing the main question so it feels like it belongs to the same world or problem type as the Retrieved Exemplar.
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected if they affect the logical relationships.
+
+Preserve Core Logic:
+- The underlying logical pathway and problem-solving structure must remain identical or analogous.
+- Do not alter the sequence of logical steps or the fundamental problem type.
+- The core reasoning required to solve must be preserved.
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed main question must remain natural, realistic, and logically coherent.
+- Avoid any unnatural, illogical, or meaningless transformations.
+- If a transformation cannot be made safely or meaningfully, keep the main question as close to the original as possible.
+- Always prioritize clarity, realism, and logical consistency.
+
+</Transformation Guidelines>
+
+<Input>
+Original Main Question:
+{main_question}
+
+Retrieved Exemplar (Question and Solution):
+{exemplar_text}
+</Input>
+
+<Output Format (Strictly follow this format)>
+Transformed Main Question:
+[Your rewritten main question, closely aligned with the Retrieved Exemplar's theme and context]
+</Output Format>
+""",
+
+
+    "reverse_transformation_solve_transformed": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Examples>
+{exemplar_text}
+</Solved Examples>
+
+<Main Question to Solve>
+{transformed_question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+
+
+    "reverse_transformation_final_solve": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Examples>
+{transformed_solutions}
+</Solved Examples>
+
+<Main Question to Solve>
+{original_question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "reverse_transformation_shallow-&-moderately-deep" : """<Objective>   
+Your task is to transform the given Main Question into a new version that becomes more analogous and relevant to the Retrieved Exemplar.
+The transformation should be directed toward the Retrieved Exemplar, meaning every change you make should help the transformed main question better reflect, match, or resonate with the Retrieved Exemplar's area, structure, or style — while still preserving the main question's original logical structure, solvability, and required reasoning path.
+</Objective>
+
+<Transformation Guidelines>  
+Target-Directed Adaptation:  
+- Transform the Main Question in a way that brings it conceptually and structurally closer to the Retrieved Exemplar.  
+- Think of this as reframing the Main Question so it feels like it belongs to the same world or problem type as the Retrieved Exemplar.  
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately applied so that the mathematical and logical relationships remain perfectly intact.  
+
+Preserve Core Logic:
+- Keep the logical relations and the fundamental problem type intact. 
+- Do not change the essential operations or the fundamental reasoning pattern that the Main Question demands. The steps required to solve it should remain identical. 
+
+Avoid Deep or Complex Alterations:
+- Do not transform very deep or complex internal structures (like core logic patterns or the type of problem). 
+- Instead, you may adjust surface-level or moderately deep aspects — such as the domain, entities, or contextual narrative in the Main Question to match the Exemplar. 
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed Main Question must remain natural, realistic, and logically coherent. 
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., "a cat eats an apple"). 
+- If a transformation cannot be made safely or meaningfully, keep the Main Question as close to the original as possible rather than forcing changes. 
+- Always prioritize clarity, realism, and logical consistency over aggressive transformation. 
+
+</Transformation Guidelines>
+
+<Example Transformation>
+<Example Input>
+Retrieved Exemplar (Target Style):
+Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
+Rationale:
+To find the remaining cookies, we first need to calculate how many cookies were sold.
+The baker sold 7 boxes, and each box contains 6 cookies.
+Total cookies sold = 7 boxes * 6 cookies/box = 42 cookies.
+The baker started with 50 cookies.
+Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
+Final Answer: 8
+
+Original Main Question (To Transform): 
+A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
+</Example Input>
+
+<Example Output>
+Transformed Main Question:
+A pastry chef baked 35 cupcakes. She decides to arrange them onto display trays, with each tray holding 5 cupcakes. If she sets up 4 display trays, how many cupcakes are left over?
+</Example Output>
+</Example Transformation>
+
+<Task>  
+<Input>  
+Original Main Question:  
+{main_question}  
+
+Retrieved Exemplar (Question and Solution):
+{exemplar_text}
+</Input>
+
+<Output>  
+- Do not include any explanations, comments, or text outside this format.  
+
+Output Format (Strictly follow this format):
+Transformed Main Question:
+[Your rewritten main question, closely aligned with the Retrieved Exemplar's theme and context]
+</Output>
+</Task>
+""",
+
+    "reverse_transformation_shallow" : """<Objective>
+Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question's theme, context, or style — while strictly preserving the sample's original reasoning path and final answer.
+</Objective>
+
+<Transformation Guidelines>
+Target-Directed Adaptation:
+- Adapt the sample's theme, context, and entities to mirror those in the Target Question.
+- Think of this as reframing the sample so it feels like it belongs to the same world or problem type as the Target Question.
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.
+
+
+Preserve Core Reasoning:
+- The underlying logical pathway and mathematical operations must remain identical.
+- Do not alter the sequence of steps, the problem-solving strategy, or how one calculation leads to the next. The core method of solving must be perfectly preserved.
+
+Restrict Transformations to the Surface Level:
+- Your transformations must be limited to the surface and contextual layers of the problem.
+- This includes changing nouns (entities, objects), numbers and quantities (while ensuring the logic and final answer are preserved), and the overall setting or story.
+- Do not change the fundamental problem structure or the reasoning schema. The goal is to change the "story" of the problem, not the "logic" of the solution.
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed question and rationale must remain natural, realistic, and logically coherent.
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., "a cat eats an apple").
+- If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes.
+- Always prioritize clarity, realism, and logical consistency over aggressive transformation.
+
+Keep the Final Answer Unchanged:
+- The final numerical or categorical answer at the end of the rationale must not be changed. It should remain exactly as it was in the original sample.
+
+</Transformation Guidelines>
+</Example Transformation>
+
+<Example Input>
+Target Question: A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
+
+Sample to Transform:
+Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
+
+Rationale:
+To find the remaining cookies, we first need to calculate how many cookies were sold.
+The baker sold 7 boxes, and each box contains 6 cookies.
+Total cookies sold = 7 boxes * 6 cookies/box = 42 cookies.
+The baker started with 50 cookies.
+Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
+
+Final Answer: 8
+</Example Input>
+
+</Example Output>
+Question: A scientist starts with 28 test tubes for an analysis. She arranges them into racks, with each rack holding 4 test tubes. If she uses 5 full racks for her experiment, how many test tubes are left unused?
+
+Rationale:
+To find the remaining test tubes, we first need to calculate how many test tubes were used.
+The scientist used 5 racks, and each rack contains 4 test tubes.
+Total test tubes used = 5 racks * 4 test tubes/rack = 20 test tubes.
+The scientist started with 28 test tubes.
+Remaining test tubes = Initial amount - Amount used = 28 - 20 = 8 test tubes.
+
+Final Answer: 8
+</Example Output>
+</Example Transformation>
+
+<Task>
+<Input>
+Target Question:
+{main_question}
+
+Sample to Transform:
+{exemplar_text}
+</Input>
+
+<Output>
+- Do not include any explanations, comments, or text outside this format.
+
+Output Format (Strictly follow this format):
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output>
+</Task>
+""",
+
+
 
 }
+
+def create_reverse_transformation_main_to_exemplar_prompt(main_question: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
+    """Creates a prompt to transform the main question to match the retrieved exemplar."""
+    template = PROMPT_TEMPLATES["reverse_transformation_main_to_exemplar"]
+    exemplar_text = EXEMPLAR_FORMAT.format(question=exemplar_question, solution=exemplar_solution)
+    return template.format(main_question=main_question, exemplar_text=exemplar_text)
+
+def create_reverse_transformation_solve_transformed_prompt(transformed_question: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
+    """Creates a prompt to solve the transformed main question using the exemplar."""
+    template = PROMPT_TEMPLATES["reverse_transformation_solve_transformed"]
+    exemplar_text = EXEMPLAR_FORMAT.format(question=exemplar_question, solution=exemplar_solution)
+    return template.format(transformed_question=transformed_question, exemplar_text=exemplar_text)
+
+def create_reverse_transformation_final_solve_prompt(original_question: str, transformed_solutions: List[str], config: Dict[str, Any]) -> str:
+    """Creates a prompt to solve the original question using transformed solutions."""
+    template = PROMPT_TEMPLATES["reverse_transformation_final_solve"]
+    transformed_solutions_text = "\n\n".join([f"Transformed Solution {i+1}:\n{sol}" for i, sol in enumerate(transformed_solutions)])
+    return template.format(original_question=original_question, transformed_solutions=transformed_solutions_text)
 
 def create_normalization_prompt(original_example: str) -> str:
     template = PROMPT_TEMPLATES["standardization_v1"]
