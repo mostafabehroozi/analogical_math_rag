@@ -60,7 +60,10 @@ from src.pipeline_steps import (
     solve_with_analogical_consistency, 
     simplify_retrieved_samples,
     solve_via_main_simplification,
-    optimize_demonstrations_via_mirroring
+    optimize_demonstrations_via_mirroring,
+    apply_mirror_reranking,
+    reverse_transform_and_solve,
+    select_best_transformations
 )
 
 from src.utils import save_json, load_json
@@ -134,9 +137,17 @@ def run_pipeline_for_single_query(
                     "APPLY_REVERSE_VALIDATION", "REVERSE_VALIDATION_CANDIDATES_N",
                     "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N",
                     "REVERSE_VALIDATION_ENABLE_BASELINE_CHECK",
+                    # Best-of-Transformation Flags
+                    "APPLY_BEST_OF_TRANSFORMATION", "BEST_OF_TRANSFORMATION_N_SAMPLES",
+                    "BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE", "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL",
+                    # NEW: Unified Mirror Re-Ranking Flags
+                    "APPLY_MIRROR_RERANKING", "MIRROR_RERANKING_APPLY_AFTER",
+                    "MIRROR_RERANKING_N_OPTIMIZATION", "MIRROR_RERANKING_ENABLE_R0",
+                    "MIRROR_RERANKING_ENABLE_FILTERING", "MIRROR_RERANKING_ENABLE_REDUNDANCY_FILTER",
+                    "MIRROR_RERANKING_EVALUATE_BASE_FILTERING", "MIRROR_RERANKING_ACTIVE_LIMIT",
                     # Simplification Flags
                     "APPLY_SIMPLIFICATION", "SIMPLIFY_RETRIEVED_SAMPLES", "SIMPLIFY_MAIN_QUESTION",
-                    # Mirroring Flags (New)
+                    # Mirroring Flags (Original)
                     "APPLY_MIRROR_AS_EVALUATOR", "MIRROR_EVALUATE_BASE_FILTERING",
                     "MIRROR_ENABLE_R0", "MIRROR_ACTIVE_CANDIDATE_LIMIT",
                     "MIRROR_ENABLE_REDUNDANCY_FILTER",
@@ -168,6 +179,198 @@ def run_pipeline_for_single_query(
     # NEW: Specific Manager for Simplification
     provider_for_simp = config.get('API_PROVIDER_SIMPLIFICATION', provider_for_adapt)
     manager_for_simp = api_managers[provider_for_simp]
+
+    # --- BEST-OF-TRANSFORMATION Pre-processing (Enhancement to best-of-N) ---
+    if config.get('APPLY_BEST_OF_TRANSFORMATION', False):
+        print("\n[PRE-PROCESSING] BEST-OF-TRANSFORMATION ENABLED")
+        
+        # Step 1: Retrieve initial samples for transformation analysis
+        if config.get('USE_RETRIEVAL', True):
+            retrieval_result = retrieve(
+                target_query, embedding_model,
+                exemplar_data['questions'], exemplar_data['embeddings'],
+                top_k=config.get('TOP_N_CANDIDATES_RETRIEVAL', 3),
+                question_to_index_map=exemplar_data.get('question_to_index')
+            )
+            
+            if 'trace' in retrieval_result:
+                run_log['execution_trace'].extend(retrieval_result.pop('trace'))
+            
+            if retrieval_result['status'] == 'SUCCESS':
+                retrieved_indices = retrieval_result['retrieved_indices']
+                
+                # Step 2: Apply best-of-transformation to each retrieved sample
+                transform_result = select_best_transformations(
+                    retrieved_indices=retrieved_indices,
+                    target_query=target_query,
+                    exemplar_data=exemplar_data,
+                    embedding_model=embedding_model,
+                    api_manager_adapt=manager_for_adapt,
+                    api_manager_solve=manager_for_solve,
+                    api_manager_eval=manager_for_eval,
+                    config=config
+                )
+                
+                if 'trace' in transform_result:
+                    run_log['execution_trace'].extend(transform_result.pop('trace'))
+                
+                run_log['steps_alternatives']['best_of_transformation'] = transform_result
+                
+                if transform_result['status'] == 'SUCCESS':
+                    # Step 3: Store best candidates selected per retrieved sample
+                    # NEW ARCHITECTURE: Per-Retrieved-Sample Selection Enforced
+                    best_candidates = transform_result.get('best_candidates', [])
+                    per_sample_counts = transform_result.get('per_sample_candidate_counts', {})
+                    per_sample_rankings = transform_result.get('per_sample_rankings', [])
+                    
+                    # Store for downstream reference
+                    run_log['best_of_transformation_candidates'] = best_candidates
+                    run_log['best_of_transformation_per_sample_counts'] = per_sample_counts
+                    run_log['best_of_transformation_per_sample_rankings'] = per_sample_rankings
+                    
+                    # Extract candidate texts for optional use in further processing
+                    candidate_texts = [c['candidate_text'] for c in best_candidates]
+                    candidate_scores = [c['validation_score'] for c in best_candidates]
+                    
+                    run_log['best_transformations'] = candidate_texts  # For backwards compatibility
+                    run_log['transformation_scores'] = candidate_scores  # For backwards compatibility
+                    
+                    # Log the new per-sample selection architecture
+                    logger.info(
+                        f"Best-of-Transformation per-sample selection completed successfully. "
+                        f"Selected {len(best_candidates)} best candidates "
+                        f"(one per retrieved sample, enforcing diversity)"
+                    )
+                    for cand_info in per_sample_rankings:
+                        retrieved_idx = cand_info['retrieved_idx']
+                        total_cands = cand_info['total_candidates']
+                        logger.info(
+                            f"  Sample #{retrieved_idx}: {total_cands} total candidates evaluated, "
+                            f"selected rank-1 candidate with score {per_sample_rankings[0]['ranked_candidates'][0]['score']:.3f}"
+                        )
+                    
+                    # ========================================================================
+                    # NEW: Integrated Mirror Re-Ranking Stage (After Transformation)
+                    # ========================================================================
+                    if config.get('APPLY_MIRROR_RERANKING', False):
+                        print("\n[INTEGRATION] UNIFIED MIRROR RE-RANKING ENABLED")
+                        
+                        # Extract indices from best candidates for re-ranking
+                        candidate_indices_for_reranking = [c['retrieved_idx'] for c in best_candidates]
+                        
+                        logger.info(
+                            f"Applying mirror re-ranking to {len(candidate_indices_for_reranking)} "
+                            f"best-of-transformation candidates"
+                        )
+                        
+                        reranking_result = apply_mirror_reranking(
+                            target_query=target_query,
+                            indices_to_rerank=candidate_indices_for_reranking,
+                            exemplar_data=exemplar_data,
+                            api_manager=manager_for_eval,
+                            config=config
+                        )
+                        
+                        if 'trace' in reranking_result:
+                            run_log['execution_trace'].extend(reranking_result.pop('trace'))
+                        
+                        run_log['steps_alternatives']['mirror_reranking'] = reranking_result
+                        
+                        if reranking_result['status'] == 'SUCCESS':
+                            reranked_indices = reranking_result['reranked_indices']
+                            ranking_scores = reranking_result['ranking_scores']
+                            
+                            # Update the best_candidates ordering based on re-ranking
+                            # Create a mapping from retrieved_idx to candidate for reordering
+                            candidate_map = {c['retrieved_idx']: c for c in best_candidates}
+                            
+                            # Reorder best_candidates according to re-ranked indices
+                            reranked_candidates = [
+                                candidate_map[idx] for idx in reranked_indices 
+                                if idx in candidate_map
+                            ]
+                            
+                            run_log['best_of_transformation_candidates'] = reranked_candidates
+                            run_log['mirror_reranking_scores'] = ranking_scores
+                            
+                            logger.info(
+                                f"Mirror re-ranking completed successfully. "
+                                f"New order: {reranked_indices}"
+                            )
+                            
+                            # Update best_transformations for downstream compatibility
+                            run_log['best_transformations'] = [c['candidate_text'] for c in reranked_candidates]
+                        else:
+                            logger.warning(
+                                f"Mirror re-ranking failed: {reranking_result.get('error')}, "
+                                f"proceeding with original candidate order"
+                            )
+                else:
+                    logger.warning("Best-of-Transformation pre-processing failed, proceeding with standard best-of-N")
+                    run_log['best_of_transformation_candidates'] = None
+                    run_log['best_transformations'] = None
+            else:
+                logger.warning("Retrieval failed during best-of-transformation pre-processing")
+                run_log['best_transformations'] = None
+        else:
+            logger.warning("USE_RETRIEVAL is False, cannot apply best-of-transformation")
+            run_log['best_transformations'] = None
+
+    # --- ALTERNATIVE: Direct Mirror Re-Ranking After Retrieval (without Best-of-Transformation) ---
+    if config.get('APPLY_MIRROR_RERANKING', False) and not config.get('APPLY_BEST_OF_TRANSFORMATION', False):
+        if config.get('USE_RETRIEVAL', True):
+            print("\n[INTEGRATION] UNIFIED MIRROR RE-RANKING ENABLED (Direct After Retrieval)")
+            
+            retrieval_result = retrieve(
+                target_query, embedding_model,
+                exemplar_data['questions'], exemplar_data['embeddings'],
+                top_k=config.get('TOP_N_CANDIDATES_RETRIEVAL', 3),
+                question_to_index_map=exemplar_data.get('question_to_index')
+            )
+            
+            if 'trace' in retrieval_result:
+                run_log['execution_trace'].extend(retrieval_result.pop('trace'))
+            
+            if retrieval_result['status'] == 'SUCCESS':
+                retrieved_indices = retrieval_result['retrieved_indices']
+                
+                logger.info(
+                    f"Applying mirror re-ranking to {len(retrieved_indices)} retrieved samples"
+                )
+                
+                reranking_result = apply_mirror_reranking(
+                    target_query=target_query,
+                    indices_to_rerank=retrieved_indices,
+                    exemplar_data=exemplar_data,
+                    api_manager=manager_for_eval,
+                    config=config
+                )
+                
+                if 'trace' in reranking_result:
+                    run_log['execution_trace'].extend(reranking_result.pop('trace'))
+                
+                run_log['steps_alternatives']['mirror_reranking'] = reranking_result
+                
+                if reranking_result['status'] == 'SUCCESS':
+                    # Store re-ranked indices for downstream use
+                    reranked_indices = reranking_result['reranked_indices']
+                    ranking_scores = reranking_result['ranking_scores']
+                    
+                    run_log['retrieved_indices'] = reranked_indices
+                    run_log['mirror_reranking_scores'] = ranking_scores
+                    
+                    logger.info(
+                        f"Mirror re-ranking completed. Re-ranked indices: {reranked_indices}"
+                    )
+                else:
+                    logger.warning(
+                        f"Mirror re-ranking failed: {reranking_result.get('error')}, "
+                        f"proceeding with original retrieved order"
+                    )
+            else:
+                logger.warning("Retrieval failed during mirror re-ranking")
+        else:
+            logger.warning("USE_RETRIEVAL is False, cannot apply mirror re-ranking directly")
 
     # --- MODE: Reverse Validation (Analogical Consistency) ---
     if config.get('APPLY_REVERSE_VALIDATION', False):
@@ -615,6 +818,38 @@ def run_pipeline_for_single_query(
                         local_step_log['adaptation'] = adapt_result
                         current_exemplars_for_step.extend(adapt_result.get('adapted_texts', []))
                         
+                        # --- REVERSE TRANSFORMATION (Alternative/Complementary Branch) ---
+                        if config.get('APPLY_REVERSE_TRANSFORMATION', False):
+                            print(f"    -> Applying Reverse Transformation to indices {indices}...")
+                            
+                            rt_result = reverse_transform_and_solve(
+                                target_query=target_query,
+                                retrieved_indices=indices,
+                                exemplar_questions=exemplar_data['questions'],
+                                exemplar_solutions=exemplar_data['solutions'],
+                                api_manager=manager_for_solve,  # Using solver model for final answer generation
+                                config=config
+                            )
+                            
+                            if 'trace' in rt_result:
+                                run_log['execution_trace'].extend(rt_result.pop('trace'))
+                            local_step_log['reverse_transformation'] = rt_result
+                            
+                            # If reverse transformation is successful, use its solutions as exemplars for final solve
+                            if rt_result['status'] == 'SUCCESS':
+                                # RT already includes solving, so we extract the solution attempts
+                                # Format them as exemplars for potential further use
+                                current_exemplars_for_step.extend([
+                                    f"Question: Original Query\nRationale and Answer: {sol}"
+                                    if isinstance(sol, str) else f"Question: Original Query\nRationale and Answer: {sol.get('error_info', {})}"
+                                    for sol in rt_result.get('solution_attempts', [])
+                                ])
+                                
+                                # If reverse transformation already provides solutions, we might skip the merge step
+                                if config.get('REVERSE_TRANSFORMATION_SKIP_MERGE', False):
+                                    # directly use these as final exemplars
+                                    current_exemplars_for_step = rt_result.get('solution_attempts', [])
+                        
                         # Analogical Adapt
                         if config.get('APPLY_ANALOGICAL_ADAPTATION', False):
                              # (Existing logic for AA setup...)
@@ -676,21 +911,51 @@ def run_pipeline_for_single_query(
                 
                 print(f"  -> Solving {strat_name} (N={n_samples_for_task})...")
                 
-                # BRANCH: Main Question Simplification
-                if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_MAIN_QUESTION', False):
-                     solve_result = solve_via_main_simplification(
-                        target_query=target_query,
-                        final_exemplars=current_exemplars_for_step,
-                        api_manager=manager_for_simp,
-                        config=config
-                    )
+                # Check if reverse transformation already provided solutions
+                if config.get('APPLY_REVERSE_TRANSFORMATION', False) and 'reverse_transformation' in local_step_log:
+                    rt_log = local_step_log.get('reverse_transformation', {})
+                    if rt_log.get('status') == 'SUCCESS':
+                        # Reverse transformation already solved the problem, use its result directly
+                        print(f"  -> Using solution from Reverse Transformation step (skipping regular solve)...")
+                        solve_result = {
+                            'status': 'SUCCESS',
+                            'solution_attempts': rt_log.get('solution_attempts', []),
+                            'trace': []
+                        }
+                    else:
+                        # Reverse transformation failed, proceed with normal solve
+                        # BRANCH: Main Question Simplification
+                        if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_MAIN_QUESTION', False):
+                             solve_result = solve_via_main_simplification(
+                                target_query=target_query,
+                                final_exemplars=current_exemplars_for_step,
+                                api_manager=manager_for_simp,
+                                config=config
+                            )
+                        else:
+                            solve_result = solve(
+                                target_query=target_query, 
+                                final_exemplars=current_exemplars_for_step,
+                                api_manager=manager_for_solve, 
+                                config=current_solver_config
+                            )
                 else:
-                    solve_result = solve(
-                        target_query=target_query, 
-                        final_exemplars=current_exemplars_for_step,
-                        api_manager=manager_for_solve, 
-                        config=current_solver_config
-                    )
+                    # Normal solve path (no reverse transformation)
+                    # BRANCH: Main Question Simplification
+                    if config.get('APPLY_SIMPLIFICATION', False) and config.get('SIMPLIFY_MAIN_QUESTION', False):
+                         solve_result = solve_via_main_simplification(
+                            target_query=target_query,
+                            final_exemplars=current_exemplars_for_step,
+                            api_manager=manager_for_simp,
+                            config=config
+                        )
+                    else:
+                        solve_result = solve(
+                            target_query=target_query, 
+                            final_exemplars=current_exemplars_for_step,
+                            api_manager=manager_for_solve, 
+                            config=current_solver_config
+                        )
                 
                 if 'trace' in solve_result:
                     run_log['execution_trace'].extend(solve_result.pop('trace'))
@@ -769,6 +1034,37 @@ def run_experiments(
     """
     logger = logging.getLogger(__name__)
     all_results = {}
+
+    # --- special case: dataset construction experiments ---
+    dataset_configs = [exp for exp in experiment_configs if exp.get("APPLY_DATASET_CONSTRUCTION")]
+    normal_configs = [exp for exp in experiment_configs if not exp.get("APPLY_DATASET_CONSTRUCTION")]
+
+    if dataset_configs:
+        logger.info(f"Found {len(dataset_configs)} dataset construction config(s); running them first.")
+        from src.dataset_builder import construct_two_shot_dataset
+        for exp_overrides in dataset_configs:
+            current_config = global_config.copy()
+            current_config.update(exp_overrides)
+            exp_name = current_config.get("experiment_name", "dataset_construction")
+            logger.info(f"--- Dataset experiment '{exp_name}' starting ---")
+            # pick appropriate managers
+            solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
+            eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", current_config.get("API_PROVIDER_SOLVER", "gemini")))
+            ds_result = construct_two_shot_dataset(
+                exemplar_data=exemplar_data,
+                embedding_model=embedding_model,
+                api_manager_solver=solver_mgr,
+                api_manager_eval=eval_mgr,
+                config=current_config
+            )
+            # results are saved by the builder; we just note them
+            all_results[exp_name] = ds_result
+            logger.info(f"--- Dataset experiment '{exp_name}' finished ---")
+        # replace list for the remaining pipeline with the normal ones
+        experiment_configs = normal_configs
+        if not experiment_configs:
+            # nothing else to do
+            return all_results
 
     # --- REWRITTEN LOGIC: Check for and handle cross-experiment deferred execution ---
     is_cross_experiment_defer_enabled = any(
