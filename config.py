@@ -1,18 +1,25 @@
 import os
 
 # --- 1. Core Directory Structure ---
-BASE_OUTPUT_DIR = "/kaggle/working/"
-DATA_DIR = os.path.join(BASE_OUTPUT_DIR, "data")
+# Determine the project root directory
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCAL_DATA_BASE = os.path.join(PROJECT_ROOT, "local_data")
+
+BASE_OUTPUT_DIR = os.path.join(LOCAL_DATA_BASE, "outputs")
+DATA_DIR = os.path.join(LOCAL_DATA_BASE, "data")
 OUTPUTS_DIR = os.path.join(BASE_OUTPUT_DIR, "outputs")
-LOGS_DIR = os.path.join(OUTPUTS_DIR, "logs")
-EMBEDDINGS_DIR = os.path.join(OUTPUTS_DIR, "embeddings")
-RESULTS_DIR = os.path.join(OUTPUTS_DIR, "results")
+LOGS_DIR = os.path.join(BASE_OUTPUT_DIR, "logs")
+EMBEDDINGS_DIR = os.path.join(BASE_OUTPUT_DIR, "embeddings")
+RESULTS_DIR = os.path.join(BASE_OUTPUT_DIR, "results")
 
 CONFIG = {
     # Logging & Control
     "VERBOSE_LOGGING": True,
     "PRINT_API_CALL_DETAILS": True,
     "PRINT_API_TIMING_CHECKPOINTS": True,
+    "ENABLE_API_RETRY": True,          
+    "MAX_API_RETRIES": 200,              
+    "API_RETRY_DELAY_SECONDS": 20.0,    
     "API_RESPONSE_TRUNCATION_LENGTH": 50,
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "LOGS_DIR": LOGS_DIR,
@@ -42,7 +49,8 @@ CONFIG = {
 
     # --- AvalAI (OpenAI-Compatible) API Settings ---
     "AVALAI_API_KEY": "YOUR_AVALAI_API_KEY_HERE",
-    "AVALAI_BASE_URL": "https://api.avalai.ir/v1",
+    # "AVALAI_BASE_URL": "https://api.avalai.ir/v1",
+    "AVALAI_BASE_URL": "https://api.avalapis.ir/v1",
     "AVALAI_MODEL_QUOTAS": {
         "default": {"delay_seconds": 2}
     },
@@ -74,14 +82,23 @@ CONFIG = {
     "DEFAULT_EVALUATOR_MAX_TOKENS": 10000,
 
     # File Paths & Data
-    "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',
-    "HARD_QUESTIONS_INDICES_PATH": os.path.join(DATA_DIR, "hard_question_indices.json"),
-    "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
-    "EXEMPLAR_CORPUS_NAME": "AI-MO/NuminaMath-CoT",
+    # === HuggingFace Paths (used when downloading) ===
+    "EMBEDDING_MODEL_PATH_HF": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',
+    "EXEMPLAR_CORPUS_NAME_HF": "AI-MO/NuminaMath-CoT",
     "EXEMPLAR_CORPUS_HF_TOKEN": None,
-    "EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH": os.path.join(EMBEDDINGS_DIR, 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy'),
     "EXEMPLAR_EMBEDDINGS_HF_REPO_ID": "mostafabehroozi/embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath",
     "EXEMPLAR_EMBEDDINGS_HF_FILENAME": "embeddings.npy",
+    
+    # === Local Paths (used when running offline) ===
+    "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',  # Will be updated in notebook
+    "EXEMPLAR_CORPUS_NAME": "AI-MO/NuminaMath-CoT",  # Will be updated in notebook
+    "LOCAL_EMBEDDING_MODEL_PATH": os.path.join(DATA_DIR, "Bert-MLM_arXiv-MP-class_zbMath"),
+    "LOCAL_EXEMPLAR_CORPUS_PATH": os.path.join(DATA_DIR, "NuminaMath-CoT"),
+    "USE_LOCAL_MODEL": False,  # Set to True to load from disk instead of downloading
+    
+    "HARD_QUESTIONS_INDICES_PATH": os.path.join(DATA_DIR, "hard_question_indices.json"),
+    "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
+    "EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH": os.path.join(EMBEDDINGS_DIR, 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy'),
     
     "ADVANCED_RAG_FULL_LOG_PATH": os.path.join(RESULTS_DIR, "advanced_rag_pipeline_full_log.json"),
     "ADVANCED_RAG_EVALUATION_RESULTS_PATH": os.path.join(RESULTS_DIR, "advanced_rag_evaluation_results.pkl"),
@@ -93,6 +110,16 @@ CONFIG = {
     "TOP_N_CANDIDATES_RETRIEVAL": 1,
     "FINAL_K_SELECTION_ADAPTATION": 1,
     "TARGET_ADAPTED_SAMPLES_MERGING": 1,
+
+    # --- Reverse Transformation Flags ---
+    "APPLY_REVERSE_TRANSFORMATION": False,  
+    "REVERSE_TRANSFORMATION_ORDER": "after_retrieve",  # "after_retrieve" or "after_adapt"
+    "REVERSE_TRANSFORMATION_COMBINED_WITH_ADAPT": "sequential",  # "sequential", "integrated", or "replace_adapt"
+    "REVERSE_TRANSFORMATION_USE_TRANSFORMED_R": True,  # Use transformed R when other steps are combined with reverse transformation
+    "REVERSE_TRANSFORMATION_TEMPERATURE": 0.3,  # Temperature for transformation step
+    "REVERSE_TRANSFORMATION_SOLVER_TEMPERATURE": 1.0,  # Temperature for solving transformed questions
+    "REVERSE_TRANSFORMATION_FINAL_SOLVER_TEMPLATE": "reverse_transformation_final_solve",  # Template for final solve
+    "REVERSE_TRANSFORMATION_SKIP_MERGE": True,  # Skip merge step when reverse transformation is used (since RT provides complete solution)
 
     # Adaptation Steps
     "APPLY_NORMALIZATION": False,
@@ -130,7 +157,7 @@ CONFIG = {
     "CONSISTENCY_LAYER_2_TEMPERATURE": 1.0,
     "CONSISTENCY_VOTING_THRESHOLD": 0.6,
 
-    "APPLY_GROUP_CONSISTENCY_SELECTION": True,
+    "APPLY_GROUP_CONSISTENCY_SELECTION": False,
 
     # DEFINITION OF STRATEGIES (Slicing of list_2)
     # Each tuple represents specific indices from the Master List (list_2) to use.
@@ -180,10 +207,46 @@ CONFIG = {
     "REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES": False,
     "REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N": 3,
 
+    # Best-of-Transformation (Enhancement to Reverse Validation)
+    # REFORMED: Per-Retrieved-Sample Best Candidate Selection
+    # 
+    # When APPLY_BEST_OF_TRANSFORMATION is True, the system performs:
+    # 1. RETRIEVE: K examined exemplars
+    # 2. TRANSFORM: For each exemplar, generate N transformed variants
+    # 3. GENERATE: For each transformation, generate M candidate attempts
+    #    Total candidates: K × N × M
+    # 4. VALIDATE: Score all candidates using mirror evaluation
+    # 5. SELECT-PER-SAMPLE: For each retrieved exemplar, select exactly 1 best candidate
+    #    (no cross-sample competition). Result: K best candidates.
+    #
+    # Key improvement: Enforces structural diversity by selecting one best candidate
+    # per retrieved sample, preventing any single sample from occupying multiple slots.
+    "APPLY_BEST_OF_TRANSFORMATION": False,
+    "BEST_OF_TRANSFORMATION_N_SAMPLES": 3,  # N: transformations per retrieved sample
+    "BEST_OF_TRANSFORMATION_ATTEMPTS_PER_TRANSFORMATION": 1,  # M: candidate attempts per transformation
+    "BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE": "transformation_shallow-&-moderately-deep",
+    "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL": True,  # Use mirror evaluation to score candidates
+    "BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS": 3,  # Quick validation attempts per candidate
+
     # Pass@N & Evaluation
     "N_PASS_ATTEMPTS": 3,
     "APPLY_FULL_PIPELINE_RETRY": False,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
+
+    # --- Dataset Construction Settings ---
+    # When enabled, the system will perform a specialized dataset generation
+    # phase.  It randomly selects a query from the exemplar corpus, finds the
+    # two most similar samples (A and B), attempts a two‑shot solve of the query
+    # using those samples, and if the evaluation LLM confirms correctness the
+    # example is added to the constructed dataset.  The resulting JSON contains
+    # both the raw material (question, A, B) and the input/output pairs.
+    "APPLY_DATASET_CONSTRUCTION": False,
+    "DATASET_CONSTRUCTION_MAX_SEARCH": 1000,    # how many random queries to examine
+    "DATASET_CONSTRUCTION_MAX_MEMBERS": 100,    # stop when this many valid entries are gathered
+    "DATASET_CONSTRUCTION_RANDOM_SEED": None,   # seed for reproducibility (optional)
+    "DATASET_CONSTRUCTION_PROMPT_TEMPLATE": None,  # overrides PROMPT_TEMPLATE_FINAL_SOLVER
+    "DATASET_CONSTRUCTION_SOLVER_TEMPERATURE": 1.0,
+    "DATASET_CONSTRUCTION_EVALUATOR_TEMPERATURE": 0.0,
 
     # Prompt Templates
     "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",
@@ -219,6 +282,11 @@ CONFIG = {
     "PROMPT_TEMPLATE_SIMPLIFIED_SAMPLE_SOLVER": "simplified_sample_solver_v1",
     "PROMPT_TEMPLATE_SIMPLIFIED_MAIN_PROXY_SOLVER": "main_from_simplified_proxy_v1",
 
+    # Reverse Transformation Prompts
+    "PROMPT_TEMPLATE_REVERSE_TRANSFORMATION_MAIN_TO_EXEMPLAR": "reverse_transformation_main_to_exemplar",
+    "PROMPT_TEMPLATE_REVERSE_TRANSFORMATION_SOLVE_TRANSFORMED": "reverse_transformation_solve_transformed",
+    "PROMPT_TEMPLATE_REVERSE_TRANSFORMATION_FINAL_SOLVE": "reverse_transformation_final_solve",
+
     # Hugging Face Hub
     "PERSIST_RESULTS_ONLINE": True,
     "HF_SYNC_TOKEN": "YOUR_HUGGING_FACE_TOKEN_HERE",
@@ -228,6 +296,31 @@ CONFIG = {
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
 
+    # ============================================================================
+    # UNIFIED MIRROR RERANKING STAGE (Integration of Re-Ranking into Pipeline)
+    # ============================================================================
+    # New Integrated Feature: After retrieval and optional transformation,
+    # apply mirror-based re-ranking to optimize demonstration selection based on
+    # analogical consistency (True Consistency Score) rather than just similarity.
+    # 
+    # This stage can be applied in two contexts:
+    # 1. After BEST_OF_TRANSFORMATION: Re-rank the per-sample best candidates
+    # 2. After standard RETRIEVAL: Re-rank the retrieved samples directly
+    # 
+    # When enabled, the re-ranking generates Q_answered candidates for each demo,
+    # evaluates them using mirror consistency scoring against other demos,
+    # and produces a re-ranked list optimized for analogical utility.
+    
+    "APPLY_MIRROR_RERANKING": False,  # Enable/disable the unified re-ranking stage
+    "MIRROR_RERANKING_APPLY_AFTER": "transformation",  # "transformation", "retrieval", or "both"
+    
+    # Re-ranking Configuration Parameters (apply to the unified stage)
+    "MIRROR_RERANKING_N_OPTIMIZATION": 3,  # Number of Q_answered candidates to generate per demo
+    "MIRROR_RERANKING_ENABLE_R0": False,  # Include zero-shot candidate (R0) in re-ranking
+    "MIRROR_RERANKING_ENABLE_FILTERING": True,  # Filter out demos with TCS <= baseline similarity
+    "MIRROR_RERANKING_ENABLE_REDUNDANCY_FILTER": True,  # Remove redundant/similar demos
+    "MIRROR_RERANKING_EVALUATE_BASE_FILTERING": False,  # Use "base" vs "redundancy" filtering comparison
+    "MIRROR_RERANKING_ACTIVE_LIMIT": None,  # Optional: limit demos to re-rank (None = use all)
 
     "APPLY_MIRROR_AS_EVALUATOR": True,
 
