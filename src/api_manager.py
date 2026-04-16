@@ -17,6 +17,7 @@ Currently supported providers:
 - AvalAIAPIManager: For OpenAI-compatible endpoints like AvalAI.
 """
 
+import sys
 import time
 import logging
 from datetime import datetime
@@ -27,6 +28,18 @@ import ollama  # NEW: Import for local LLM support
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 
+
+# Error types that are safe to retry (transient network/server issues)
+RETRYABLE_ERROR_TYPES = {
+    "APITimeoutError",
+    "APIConnectionError",
+    "ResourceExhausted",
+    "OllamaConnectionError",
+    "UnknownError",
+    "APIStatusError",
+}
+
+
 class APIResponse(TypedDict):
     """A standardized structure for all API call results."""
     status: str  # e.g., "SUCCESS", "ERROR", "BLOCKED", "RATE_LIMITED"
@@ -34,6 +47,77 @@ class APIResponse(TypedDict):
     error_type: Optional[str]
     error_message: Optional[str]
     error_details: Optional[Any]
+
+
+def execute_with_retry(config: dict, api_call_func) -> APIResponse:
+    """
+    Executes an API call function with optional retry logic based on config flags.
+
+    Args:
+        config (dict): The main configuration dictionary.
+        api_call_func (callable): A zero-argument callable that performs the API call
+                                  and returns an APIResponse.
+
+    Returns:
+        APIResponse: The result of the API call (successful or final failed attempt).
+    """
+    logger = logging.getLogger(__name__)
+
+    enable_retry = config.get("ENABLE_API_RETRY", False)
+    max_retries = config.get("MAX_API_RETRIES", 3)
+    retry_delay = config.get("API_RETRY_DELAY_SECONDS", 5)
+
+    if not enable_retry:
+        return api_call_func()
+
+    last_response: Optional[APIResponse] = None
+
+    for attempt in range(1, max_retries + 1):
+        response = api_call_func()
+
+        # Success or non-retryable statuses — return immediately
+        if response["status"] == "SUCCESS":
+            return response
+
+        if response["status"] in ("BLOCKED", "RATE_LIMITED"):
+            logger.warning(
+                f"API call returned non-retryable status '{response['status']}' "
+                f"(type: {response['error_type']}). Not retrying."
+            )
+            return response
+
+        # status == "ERROR" — check if the error type is retryable
+        error_type = response.get("error_type", "")
+        if error_type not in RETRYABLE_ERROR_TYPES:
+            logger.warning(
+                f"API call failed with non-retryable error type '{error_type}'. Not retrying."
+            )
+            return response
+
+        last_response = response
+
+        if attempt < max_retries:
+            logger.warning(
+                f"Retryable API error '{error_type}' on attempt {attempt}/{max_retries}. "
+                f"Retrying in {retry_delay}s..."
+            )
+            print(f"[RETRY] Attempt {attempt}/{max_retries} failed ({error_type}). Retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+        else:
+            logger.critical(
+                f"API call failed after {max_retries} attempts. "
+                f"Last error: {error_type} — {response.get('error_message')}. "
+                f"Halting application."
+            )
+            print(
+                f"\n[FATAL] API call failed after {max_retries} attempts.\n"
+                f"Last error type: {error_type}\n"
+                f"Last error message: {response.get('error_message')}\n"
+                f"Halting application."
+            )
+            sys.exit(1)
+
+    return last_response
 
 
 class GeminiAPIManager:
@@ -179,75 +263,77 @@ class GeminiAPIManager:
         if api_key is None:
             error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
             if self.print_details:
-                print(f"\n!!! [API Call FAILED: Gemini] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                print(f"\n!!! [API Call FAILED: Gemini] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
             return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
 
-        caught_exception = None
+        def _inner_call() -> APIResponse:
+            caught_exception = None
+            try:
+                max_tokens = None
+                if model_name == self.config.get('GEMINI_MODEL_NAME_FINAL_SOLVER'):
+                    max_tokens = self.config.get('DEFAULT_FINAL_SOLVER_MAX_TOKENS', 8192)
+                elif model_name == self.config.get('GEMINI_MODEL_NAME_ADAPTATION'):
+                    max_tokens = self.config.get('DEFAULT_ADAPTATION_MAX_TOKENS', 2048)
+                elif model_name == self.config.get('GEMINI_MODEL_NAME_EVALUATOR'):
+                    max_tokens = self.config.get('DEFAULT_EVALUATOR_MAX_TOKENS', 512)
+                
+                generation_config_params = {}
+                if temperature is not None:
+                    generation_config_params['temperature'] = temperature
+                if max_tokens is not None:
+                    generation_config_params['max_output_tokens'] = max_tokens
+                
+                generation_config = genai.types.GenerationConfig(**generation_config_params)
+                
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel(model_name)
+                
+                self.logger.info(f"Calling Gemini model '{model_name}' with key ending in ...{api_key[-4:]} and config: {generation_config_params}")
+                
+                response = model.generate_content(
+                    prompt,
+                    generation_config=generation_config
+                )
 
-        try:
-            max_tokens = None
-            if model_name == self.config.get('GEMINI_MODEL_NAME_FINAL_SOLVER'):
-                max_tokens = self.config.get('DEFAULT_FINAL_SOLVER_MAX_TOKENS', 8192)
-            elif model_name == self.config.get('GEMINI_MODEL_NAME_ADAPTATION'):
-                max_tokens = self.config.get('DEFAULT_ADAPTATION_MAX_TOKENS', 2048)
-            elif model_name == self.config.get('GEMINI_MODEL_NAME_EVALUATOR'):
-                max_tokens = self.config.get('DEFAULT_EVALUATOR_MAX_TOKENS', 512)
-            
-            generation_config_params = {}
-            if temperature is not None:
-                generation_config_params['temperature'] = temperature
-            if max_tokens is not None:
-                generation_config_params['max_output_tokens'] = max_tokens
-            
-            generation_config = genai.types.GenerationConfig(**generation_config_params)
-            
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            
-            self.logger.info(f"Calling Gemini model '{model_name}' with key ending in ...{api_key[-4:]} and config: {generation_config_params}")
-            
-            response = model.generate_content(
-                prompt,
-                generation_config=generation_config
-            )
+                self._increment_daily_usage(api_key, model_name)
 
-            self._increment_daily_usage(api_key, model_name)
-
-            if not response.parts:
-                block_reason = "Unknown"
-                if response.prompt_feedback and response.prompt_feedback.block_reason:
-                    block_reason = response.prompt_feedback.block_reason.name
-                error_msg = f"Response was empty or blocked. Reason: {block_reason}."
+                if not response.parts:
+                    block_reason = "Unknown"
+                    if response.prompt_feedback and response.prompt_feedback.block_reason:
+                        block_reason = response.prompt_feedback.block_reason.name
+                    error_msg = f"Response was empty or blocked. Reason: {block_reason}."
+                    if self.print_details:
+                        print(f"\n!!! [API Call BLOCKED: Gemini] !!!\nReason: {block_reason}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                    return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": error_msg, "error_details": str(response.prompt_feedback)}
+                
+                response_text = response.text
                 if self.print_details:
-                    print(f"\n!!! [API Call BLOCKED: Gemini] !!!\nReason: {block_reason}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": error_msg, "error_details": str(response.prompt_feedback)}
-            
-            response_text = response.text
-            if self.print_details:
-                print("--- [API Call SUCCESS: Gemini] ---")
-                print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
-                print("----------------------------------\n")
-            
-            return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
+                    print("--- [API Call SUCCESS: Gemini] ---")
+                    print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
+                    print("----------------------------------\n")
+                
+                return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
 
-        except google_exceptions.ResourceExhausted as e:
-            status, error_type, msg = "RATE_LIMITED", "ResourceExhausted", f"Gemini API rate limit exceeded: {e}"
-            caught_exception = e
-        except google_exceptions.InvalidArgument as e:
-            status, error_type, msg = "ERROR", "InvalidArgument", f"Invalid argument sent to Gemini API: {e}"
-            caught_exception = e
-        except Exception as e:
-            status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the Gemini API: {e}"
-            caught_exception = e
-        
-        self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {error_type}. Error: {msg}", exc_info=True)
-        self._increment_daily_usage(api_key, model_name) 
-        if self.print_details:
-            print(f"\n!!! [API Call FAILED: Gemini] !!!")
-            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
-            print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-        
-        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
+            except google_exceptions.ResourceExhausted as e:
+                status, error_type, msg = "RATE_LIMITED", "ResourceExhausted", f"Gemini API rate limit exceeded: {e}"
+                caught_exception = e
+            except google_exceptions.InvalidArgument as e:
+                status, error_type, msg = "ERROR", "InvalidArgument", f"Invalid argument sent to Gemini API: {e}"
+                caught_exception = e
+            except Exception as e:
+                status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the Gemini API: {e}"
+                caught_exception = e
+            
+            self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {error_type}. Error: {msg}", exc_info=True)
+            self._increment_daily_usage(api_key, model_name)
+            if self.print_details:
+                print(f"\n!!! [API Call FAILED: Gemini] !!!")
+                print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
+                print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+            
+            return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
+
+        return execute_with_retry(self.config, _inner_call)
 
 
 class AvalAIAPIManager:
@@ -273,6 +359,7 @@ class AvalAIAPIManager:
         
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
         self.model_quotas = model_quotas
+        self.config = config if config else {}
         
         self.global_delay_seconds = global_delay_seconds
         self.last_global_call_timestamp: float = 0
@@ -335,55 +422,57 @@ class AvalAIAPIManager:
             print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
-        caught_exception = None
+        def _inner_call() -> APIResponse:
+            caught_exception = None
+            try:
+                self.logger.info(f"Calling OpenAI-compatible model '{model_name}'.")
+                
+                completion = self.client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature
+                )
 
-        try:
-            self.logger.info(f"Calling OpenAI-compatible model '{model_name}'.")
-            
-            completion = self.client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature
-            )
+                if not completion.choices:
+                    error_msg = "Response was empty or blocked (no choices returned)."
+                    self.logger.warning(f"API call to '{model_name}' returned no choices.")
+                    if self.print_details:
+                        print(f"\n!!! [API Call BLOCKED: AvalAI] !!!\nReason: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                    return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": error_msg, "error_details": None}
 
-            if not completion.choices:
-                error_msg = "Response was empty or blocked (no choices returned)."
-                self.logger.warning(f"API call to '{model_name}' returned no choices.")
+                response_text = completion.choices[0].message.content
                 if self.print_details:
-                    print(f"\n!!! [API Call BLOCKED: AvalAI] !!!\nReason: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": error_msg, "error_details": None}
+                    print("--- [API Call SUCCESS: AvalAI] ---")
+                    print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
+                    print("----------------------------------\n")
 
-            response_text = completion.choices[0].message.content
+                return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
+
+            except openai.RateLimitError as e:
+                status, error_type, msg = "RATE_LIMITED", "RateLimitError", f"OpenAI API rate limit exceeded: {e}"
+                caught_exception = e
+            except openai.APIStatusError as e:
+                status, error_type, msg = "ERROR", "APIStatusError", f"OpenAI API returned an error status {e.status_code}: {e.response}"
+                caught_exception = e
+            except openai.APITimeoutError as e:
+                status, error_type, msg = "ERROR", "APITimeoutError", f"OpenAI API request timed out: {e}"
+                caught_exception = e
+            except openai.APIConnectionError as e:
+                status, error_type, msg = "ERROR", "APIConnectionError", f"Failed to connect to OpenAI API: {e}"
+                caught_exception = e
+            except Exception as e:
+                status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the OpenAI API: {e}"
+                caught_exception = e
+
+            self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
             if self.print_details:
-                print("--- [API Call SUCCESS: AvalAI] ---")
-                print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
-                print("----------------------------------\n")
+                print(f"\n!!! [API Call FAILED: AvalAI] !!!")
+                print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
+                print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+            
+            return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
 
-            return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
-
-        except openai.RateLimitError as e:
-            status, error_type, msg = "RATE_LIMITED", "RateLimitError", f"OpenAI API rate limit exceeded: {e}"
-            caught_exception = e
-        except openai.APIStatusError as e:
-            status, error_type, msg = "ERROR", "APIStatusError", f"OpenAI API returned an error status {e.status_code}: {e.response}"
-            caught_exception = e
-        except openai.APITimeoutError as e:
-            status, error_type, msg = "ERROR", "APITimeoutError", f"OpenAI API request timed out: {e}"
-            caught_exception = e
-        except openai.APIConnectionError as e:
-            status, error_type, msg = "ERROR", "APIConnectionError", f"Failed to connect to OpenAI API: {e}"
-            caught_exception = e
-        except Exception as e:
-            status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the OpenAI API: {e}"
-            caught_exception = e
-
-        self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
-        if self.print_details:
-            print(f"\n!!! [API Call FAILED: AvalAI] !!!")
-            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
-            print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-        
-        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
+        return execute_with_retry(self.config, _inner_call)
 
 
 class OllamaAPIManager:
@@ -423,40 +512,43 @@ class OllamaAPIManager:
             print(f"Prompt Sent (truncated): {prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
-        caught_exception = None
-        try:
-            options = {}
-            if temperature is not None:
-                options['temperature'] = temperature
+        def _inner_call() -> APIResponse:
+            caught_exception = None
+            try:
+                options = {}
+                if temperature is not None:
+                    options['temperature'] = temperature
 
-            self.logger.info(f"Calling Ollama model '{model_name}'.")
-            
-            response = self.client.generate(
-                model=model_name,
-                prompt=prompt,
-                options=options
-            )
-            
-            response_text = response['response']
-            
+                self.logger.info(f"Calling Ollama model '{model_name}'.")
+                
+                response = self.client.generate(
+                    model=model_name,
+                    prompt=prompt,
+                    options=options
+                )
+                
+                response_text = response['response']
+                
+                if self.print_details:
+                    print("--- [API Call SUCCESS: Ollama] ---")
+                    print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
+                    print("----------------------------------\n")
+
+                return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
+
+            except ollama.ResponseError as e:
+                status, error_type, msg = "ERROR", "OllamaResponseError", f"Ollama API returned an error: {e.error}"
+                caught_exception = e
+            except Exception as e:  # Catches connection errors etc.
+                status, error_type, msg = "ERROR", "OllamaConnectionError", f"An unexpected error occurred with the Ollama client: {e}"
+                caught_exception = e
+
+            self.logger.error(f"Ollama API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
             if self.print_details:
-                print("--- [API Call SUCCESS: Ollama] ---")
-                print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
-                print("----------------------------------\n")
+                print(f"\n!!! [API Call FAILED: Ollama] !!!")
+                print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
+                print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+            
+            return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
 
-            return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
-
-        except ollama.ResponseError as e:
-            status, error_type, msg = "ERROR", "OllamaResponseError", f"Ollama API returned an error: {e.error}"
-            caught_exception = e
-        except Exception as e: # Catches connection errors etc.
-            status, error_type, msg = "ERROR", "OllamaConnectionError", f"An unexpected error occurred with the Ollama client: {e}"
-            caught_exception = e
-
-        self.logger.error(f"Ollama API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
-        if self.print_details:
-            print(f"\n!!! [API Call FAILED: Ollama] !!!")
-            print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
-            print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-        
-        return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
+        return execute_with_retry(self.config, _inner_call)
