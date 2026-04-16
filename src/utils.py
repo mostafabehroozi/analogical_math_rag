@@ -58,8 +58,18 @@ def setup_logger(logger_name: str, log_dir: str, level=logging.INFO) -> logging.
     logger.addHandler(file_handler)
 
     # Create a stream handler to print logs to the console
+    # Handle Windows console encoding issues with a custom filter
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
+    
+    # Add a filter to handle encoding issues by replacing problematic Unicode characters
+    class UnicodeFilter(logging.Filter):
+        def filter(self, record):
+            # Replace common Unicode symbols with ASCII equivalents
+            record.msg = str(record.msg).replace('\u2717', '[X]').replace('\u2713', '[OK]').replace('\u2728', '*')
+            return True
+    
+    stream_handler.addFilter(UnicodeFilter())
     logger.addHandler(stream_handler)
 
     logger.info(f"Logger '{logger_name}' initialized. Logging to {log_file_path}")
@@ -314,3 +324,165 @@ def create_trace_entry(
         "output_result": output_result,
         "error_info": error_info
     }
+
+
+# --- 7. Local Resource Loading Utilities ---
+
+def load_embedding_model(config: dict, logger=None):
+    """
+    Load a SentenceTransformer embedding model from either local disk or HuggingFace.
+    
+    Intelligently decides whether to load from a local path or download from HuggingFace
+    based on the config settings and path existence.
+    
+    Args:
+        config (dict): Configuration dictionary containing:
+            - USE_LOCAL_MODEL (bool): Whether to prefer local loading
+            - LOCAL_EMBEDDING_MODEL_PATH (str): Path to local model directory
+            - EMBEDDING_MODEL_PATH (str): HuggingFace repo name or local path
+            - EMBEDDING_MODEL_PATH_HF (str): HuggingFace repo name (backup)
+        logger (logging.Logger, optional): Logger instance for logging messages.
+    
+    Returns:
+        SentenceTransformer or None: The loaded model, or None if loading fails.
+    """
+    from sentence_transformers import SentenceTransformer
+    
+    try:
+        use_local = config.get('USE_LOCAL_MODEL', False)
+        local_path = config.get('LOCAL_EMBEDDING_MODEL_PATH')
+        current_path = config.get('EMBEDDING_MODEL_PATH')
+        hf_path = config.get('EMBEDDING_MODEL_PATH_HF')
+        
+        # Determine the actual path to use
+        if use_local and local_path and os.path.exists(local_path):
+            load_path = local_path
+            source = "local disk"
+        elif os.path.isdir(current_path):
+            load_path = current_path
+            source = "local disk"
+        else:
+            load_path = hf_path or current_path
+            source = "HuggingFace"
+        
+        if logger:
+            logger.info(f"Loading embedding model from {source}: {load_path}")
+        
+        model = SentenceTransformer(load_path)
+        
+        if logger:
+            logger.info(f"[OK] Successfully loaded embedding model from {source}")
+        
+        return model
+        
+    except Exception as e:
+        if logger:
+            logger.critical(f"Failed to load embedding model. Error: {e}", exc_info=True)
+        else:
+            print(f"ERROR: Failed to load embedding model. Error: {e}")
+        return None
+
+
+def load_exemplar_corpus(config: dict, logger=None):
+    """
+    Load the exemplar corpus dataset from either local disk or HuggingFace.
+    
+    Intelligently decides whether to load from a local path or download from HuggingFace
+    based on the config settings and path existence.
+    
+    Args:
+        config (dict): Configuration dictionary containing:
+            - USE_LOCAL_MODEL (bool): Whether to prefer local loading
+            - LOCAL_EXEMPLAR_CORPUS_PATH (str): Path to local dataset directory
+            - EXEMPLAR_CORPUS_NAME (str): HuggingFace repo name or local path
+            - EXEMPLAR_CORPUS_NAME_HF (str): HuggingFace repo name (backup)
+        logger (logging.Logger, optional): Logger instance for logging messages.
+    
+    Returns:
+        datasets.Dataset or None: The loaded dataset, or None if loading fails.
+    """
+    from datasets import load_dataset, load_from_disk
+    
+    try:
+        use_local = config.get('USE_LOCAL_MODEL', False)
+        local_path = config.get('LOCAL_EXEMPLAR_CORPUS_PATH')
+        current_path = config.get('EXEMPLAR_CORPUS_NAME')
+        hf_path = config.get('EXEMPLAR_CORPUS_NAME_HF')
+        
+        # Determine the actual path to use
+        if use_local and local_path and os.path.isdir(local_path):
+            load_path = local_path
+            source = "local disk"
+            use_disk = True
+        elif os.path.isdir(current_path):
+            load_path = current_path
+            source = "local disk"
+            use_disk = True
+        else:
+            load_path = hf_path or current_path
+            source = "HuggingFace"
+            use_disk = False
+        
+        if logger:
+            logger.info(f"Loading exemplar corpus from {source}: {load_path}")
+        
+        if use_disk:
+            dataset = load_from_disk(load_path)
+        else:
+            dataset = load_dataset(load_path, split='train')
+        
+        if logger:
+            logger.info(f"[OK] Successfully loaded exemplar corpus from {source}")
+        
+        return dataset
+        
+    except Exception as e:
+        if logger:
+            logger.critical(f"Failed to load exemplar corpus. Error: {e}", exc_info=True)
+        else:
+            print(f"ERROR: Failed to load exemplar corpus. Error: {e}")
+        return None
+
+
+def verify_local_resources(config: dict, logger=None) -> dict:
+    """
+    Verify that all required local resources exist and are accessible.
+    
+    Args:
+        config (dict): Configuration dictionary with resource paths.
+        logger (logging.Logger, optional): Logger instance for logging messages.
+    
+    Returns:
+        dict: Verification report with keys like 'embedding_model', 'corpus', 'embeddings',
+              'hard_questions_indices', each with 'exists' and 'path' fields.
+    """
+    resources = {
+        'embedding_model': {
+            'path': config.get('LOCAL_EMBEDDING_MODEL_PATH'),
+            'exists': False
+        },
+        'corpus': {
+            'path': config.get('LOCAL_EXEMPLAR_CORPUS_PATH'),
+            'exists': False
+        },
+        'embeddings': {
+            'path': config.get('EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH'),
+            'exists': False
+        },
+        'hard_questions_indices': {
+            'path': config.get('HARD_QUESTIONS_INDICES_PATH'),
+            'exists': False
+        }
+    }
+    
+    for resource_name, resource_info in resources.items():
+        path = resource_info['path']
+        if path and os.path.exists(path):
+            resource_info['exists'] = True
+            if logger:
+                logger.info(f"[OK] {resource_name}: Available at {path}")
+        else:
+            if logger:
+                logger.warning(f"[WARNING] {resource_name}: Not found at {path}")
+    
+    return resources
