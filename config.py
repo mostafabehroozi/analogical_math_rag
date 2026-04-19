@@ -228,6 +228,45 @@ CONFIG = {
     "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL": True,  # Use mirror evaluation to score candidates
     "BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS": 3,  # Quick validation attempts per candidate
 
+    # ========================================================================
+    # MULTI-BRANCH TRANSFORMATION EXPERIMENTS
+    # ========================================================================
+    # Extends best-of-transformation to support three parallel experimental
+    # scenarios on a centralized candidate pool:
+    # 1. Tx1: Single transformation baseline (intervention rate = 100%)
+    # 2. BoT-N: Best-of-N transformations (exclusive of original)
+    # 3. BoT-N+R: Best-of-N+original (inclusive with tie-breaking)
+    #
+    # ARCHITECTURE:
+    # - Phase 1: Build centralized pool [R_main, T_1, T_2, ..., T_N]
+    # - Phase 2: Score all candidates in single batch
+    # - Phase 3: Apply three selection strategies via array slicing
+    # - Phase 4: Fan out to independent solvers per branch
+    
+    "APPLY_MULTIBRANCH_TRANSFORMATION": False,  # Master control flag
+    
+    # Branch Control: Which scenarios to execute
+    "RUN_TX1_BASELINE": True,          # Scenario 1: Single transformation baseline
+    "RUN_BOT_N_ONLY": True,            # Scenario 2: Best-of-N (exclusive)
+    "RUN_BOT_N_PLUS_R": True,          # Scenario 3: Best-of-N+R (inclusive)
+    
+    # Centralized Pool Configuration
+    "MULTIBRANCH_N_TRANSFORMATIONS": 3,                    # N: number of transformations
+    "MULTIBRANCH_TRANSFORMATION_TEMPLATE": "transformation_shallow-&-moderately-deep",
+    "MULTIBRANCH_TRANSFORMATION_TEMPERATURE": 0.0,         # Temperature for transformation step
+    
+    # Unified Scoring Configuration
+    "MULTIBRANCH_ENABLE_MIRROR_SCORING": True,            # Use mirror-style evaluation
+    "MULTIBRANCH_MIRROR_SCORING_ATTEMPTS": 3,             # Attempts per candidate scoring
+    
+    # Deterministic Tie-Breaking
+    "MULTIBRANCH_TIEBREAK_FAVOR_ORIGINAL": True,          # On ties, prefer R_main (safety principle)
+    "MULTIBRANCH_TIEBREAK_EPSILON": 1e-6,                # Threshold for considering scores "tied"
+    
+    # Solver Configuration (per branch)
+    "MULTIBRANCH_SOLVER_TEMPERATURE": 1.0,                # Temperature for final solving
+    "MULTIBRANCH_SOLVER_ATTEMPTS_PER_BRANCH": 3,          # Pass@K attempts per branch
+    
     # Pass@N & Evaluation
     "N_PASS_ATTEMPTS": 3,
     "APPLY_FULL_PIPELINE_RETRY": False,
