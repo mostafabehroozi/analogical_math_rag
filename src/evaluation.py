@@ -36,7 +36,6 @@ from sentence_transformers import SentenceTransformer
 from collections import Counter, defaultdict
 
 # Import custom project modules
-from src.prompts import create_evaluation_prompt
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 # MODIFIED: Import manager classes for type checking and APIResponse type
@@ -89,6 +88,8 @@ def evaluate_single_answer_with_llm(
         
     evaluator_temp = config['DEFAULT_EVALUATOR_TEMPERATURE']
 
+    # Lazy import to avoid circular dependencies
+    from src.prompts import create_evaluation_prompt
     prompt = create_evaluation_prompt(model_answer, ground_truth, config)
     
     # print(f"      [API Context] Calling LLM for: Evaluation")
