@@ -22,9 +22,11 @@ CONFIG = {
     "API_RETRY_DELAY_SECONDS": 20.0,    
     "API_RESPONSE_TRUNCATION_LENGTH": 50,
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
+    "DATA_DIR": DATA_DIR,
     "LOGS_DIR": LOGS_DIR,
     "OUTPUTS_DIR": OUTPUTS_DIR,
     "RESULTS_DIR": RESULTS_DIR,
+    "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
 
     # API Provider Selection
     "API_PROVIDER_ADAPTATION": "gemini",
@@ -50,7 +52,6 @@ CONFIG = {
     # --- AvalAI (OpenAI-Compatible) API Settings ---
     "AVALAI_API_KEY": "YOUR_AVALAI_API_KEY_HERE",
     # "AVALAI_BASE_URL": "https://api.avalai.ir/v1",
-    
     "AVALAI_BASE_URL": "https://api.avalapis.ir/v1",
     "AVALAI_MODEL_QUOTAS": {
         "default": {"delay_seconds": 2}
@@ -377,16 +378,19 @@ CONFIG = {
 }
 
 def setup_directories():
-    """Creates the necessary directory structure."""
+    """Creates the necessary directory structure using CONFIG values."""
     print("--- Setting up project directories ---")
-    for dir_path in [DATA_DIR, OUTPUTS_DIR, LOGS_DIR, EMBEDDINGS_DIR, RESULTS_DIR]:
+    dirs_to_create = [
+        CONFIG.get("DATA_DIR", DATA_DIR),
+        CONFIG.get("OUTPUTS_DIR", OUTPUTS_DIR),
+        CONFIG.get("LOGS_DIR", LOGS_DIR),
+        CONFIG.get("EMBEDDINGS_DIR", EMBEDDINGS_DIR),
+        CONFIG.get("RESULTS_DIR", RESULTS_DIR),
+    ]
+    for dir_path in dirs_to_create:
         try:
             os.makedirs(dir_path, exist_ok=True)
             print(f"Directory ensured: {dir_path}")
         except OSError as e:
             print(f"Error creating directory {dir_path}: {e}")
     print("--- Directory setup complete ---\n")
-
-
-
-
