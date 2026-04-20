@@ -66,6 +66,8 @@ from src.pipeline_steps import (
     select_best_transformations
 )
 
+from src.multibranch_transformation import multibranch_transformation_experiment
+
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
 from src.prompts import EXEMPLAR_FORMAT, create_analogical_adaptation_prompt
@@ -140,6 +142,11 @@ def run_pipeline_for_single_query(
                     # Best-of-Transformation Flags
                     "APPLY_BEST_OF_TRANSFORMATION", "BEST_OF_TRANSFORMATION_N_SAMPLES",
                     "BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE", "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL",
+                    # Multi-Branch Transformation Flags
+                    "APPLY_MULTIBRANCH_TRANSFORMATION", "RUN_TX1_BASELINE", "RUN_BOT_N_ONLY",
+                    "RUN_BOT_N_PLUS_R", "MULTIBRANCH_N_TRANSFORMATIONS",
+                    "MULTIBRANCH_TRANSFORMATION_TEMPLATE", "MULTIBRANCH_ENABLE_MIRROR_SCORING",
+                    "MULTIBRANCH_SOLVER_ATTEMPTS_PER_BRANCH", "MULTIBRANCH_TIEBREAK_FAVOR_ORIGINAL",
                     # NEW: Unified Mirror Re-Ranking Flags
                     "APPLY_MIRROR_RERANKING", "MIRROR_RERANKING_APPLY_AFTER",
                     "MIRROR_RERANKING_N_OPTIMIZATION", "MIRROR_RERANKING_ENABLE_R0",
@@ -180,6 +187,166 @@ def run_pipeline_for_single_query(
     provider_for_simp = config.get('API_PROVIDER_SIMPLIFICATION', provider_for_adapt)
     manager_for_simp = api_managers[provider_for_simp]
 
+    # --- MULTI-BRANCH TRANSFORMATION EXPERIMENTS ---
+    if config.get('APPLY_MULTIBRANCH_TRANSFORMATION', False):
+        print("\n[PRE-PROCESSING] MULTI-BRANCH TRANSFORMATION EXPERIMENTS ENABLED")
+        print("  Architecture: Centralized pool with three parallel selection strategies")
+        print("  Scenarios: Tx1 | BoT-N | BoT-N+R")
+        
+        # Step 1: Retrieve initial samples
+        if config.get('USE_RETRIEVAL', True):
+            retrieval_result = retrieve(
+                target_query, embedding_model,
+                exemplar_data['questions'], exemplar_data['embeddings'],
+                top_k=config.get('TOP_N_CANDIDATES_RETRIEVAL', 3),
+                question_to_index_map=exemplar_data.get('question_to_index')
+            )
+            
+            if 'trace' in retrieval_result:
+                run_log['execution_trace'].extend(retrieval_result.pop('trace'))
+            
+            if retrieval_result['status'] == 'SUCCESS':
+                retrieved_indices = retrieval_result['retrieved_indices']
+                
+                # Step 2: Run multi-branch transformation experiment
+                multibranch_result = multibranch_transformation_experiment(
+                    target_query=target_query,
+                    retrieved_indices=retrieved_indices,
+                    exemplar_data=exemplar_data,
+                    api_manager_adapt=manager_for_adapt,
+                    api_manager_solve=manager_for_solve,
+                    api_manager_eval=manager_for_eval,
+                    config=config
+                )
+                
+                if 'trace' in multibranch_result:
+                    run_log['execution_trace'].extend(multibranch_result.pop('trace'))
+                
+                run_log['steps_alternatives']['multibranch_transformation'] = multibranch_result
+                
+                if multibranch_result['status'] == 'SUCCESS':
+                    # Store results
+                    evaluation_contexts = multibranch_result.get('evaluation_contexts', {})
+                    telemetry = multibranch_result.get('telemetry', {})
+                    
+                    run_log['multibranch_evaluation_contexts'] = evaluation_contexts
+                    run_log['multibranch_telemetry'] = telemetry
+                    
+                    logger.info(
+                        f"Multi-branch transformation experiment completed successfully. "
+                        f"Branches enabled: {telemetry.get('branches_enabled', {})}"
+                    )
+                    
+                    # Log selection summaries per branch
+                    selections = telemetry.get('selections', {})
+                    for sample_idx, selection_data in selections.items():
+                        logger.info(
+                            f"  Sample #{sample_idx}: Pool size={selection_data.get('pool_size', 'N/A')}, "
+                            f"BoT-N→idx {selection_data.get('bot_n_idx', 'N/A')}, "
+                            f"BoT-N+R→idx {selection_data.get('bot_n_plus_r_idx', 'N/A')} "
+                            f"({selection_data.get('bot_n_plus_r_source', 'N/A')})"
+                        )
+                    
+                    # Set up downstream pipeline with multi-branch contexts
+                    # The solve step will iterate over contexts and generate solutions for each
+                    print("  [STATUS] Multi-branch contexts prepared for downstream solving")
+                    print(f"  [CONTEXTS] Branches enabled: {telemetry.get('branches_enabled', {})}")
+                    
+                    # Early return if we're only doing multi-branch (no standard pipeline after)
+                    if config.get('DEFER_SOLVE_STEP', False):
+                        logger.info("Deferred solve mode: Intermediate steps completed, solve will run later")
+                        run_log['pipeline_status'] = "INTERMEDIATE_COMPLETE"
+                        return run_log
+                    
+                    # Otherwise, proceed to extract and aggregate solutions from each context
+                    logger.info("Starting solution aggregation for multi-branch contexts...")
+                    
+                    # === EXTRACT & AGGREGATE SOLUTIONS FROM ALL BRANCHES ===
+                    generated_answers = {}
+                    multibranch_branch_solutions = {}
+                    
+                    for branch_name, context in evaluation_contexts.items():
+                        branch_scenario = context.get('scenario', 'unknown')
+                        branch_selections = context.get('selections', {})
+                        branch_solutions_raw = context.get('solutions', {})
+                        intervention_rate = context.get('intervention_rate', None)
+                        
+                        # Flatten solutions: {retrieved_idx: [sol1, sol2, ...]} → [sol1, sol2, ...]
+                        all_solutions = []
+                        for retrieved_idx in sorted(branch_selections.keys()):
+                            solutions_for_sample = branch_solutions_raw.get(retrieved_idx, [])
+                            if isinstance(solutions_for_sample, list):
+                                all_solutions.extend(solutions_for_sample)
+                            else:
+                                all_solutions.append(solutions_for_sample)
+                        
+                        # Store aggregated solutions for this branch
+                        generated_answers[branch_name] = all_solutions
+                        multibranch_branch_solutions[branch_name] = {
+                            "scenario": branch_scenario,
+                            "solution_attempts": all_solutions,
+                            "num_samples": len(branch_selections),
+                            "intervention_rate": intervention_rate,
+                            "selections": branch_selections
+                        }
+                        
+                        logger.info(
+                            f"Branch '{branch_name}' ({branch_scenario}): "
+                            f"Extracted {len(all_solutions)} solutions from {len(branch_selections)} samples"
+                        )
+                    
+                    # Store results in run_log
+                    run_log['multibranch_generated_answers'] = generated_answers
+                    run_log['multibranch_branch_solutions'] = multibranch_branch_solutions
+                    
+                    logger.info(
+                        f"Solution aggregation complete. "
+                        f"Branches processed: {list(generated_answers.keys())}"
+                    )
+                    
+                    # ========================================================================
+                    # OPTIONAL: Set primary solving results to the strongest branch (bot_n_plus_r)
+                    # This allows downstream evaluation to work transparently
+                    # ========================================================================
+                    if 'bot_n_plus_r' in generated_answers:
+                        primary_solutions = generated_answers['bot_n_plus_r']
+                        primary_branch = 'bot_n_plus_r'
+                    elif 'bot_n' in generated_answers:
+                        primary_solutions = generated_answers['bot_n']
+                        primary_branch = 'bot_n'
+                    elif 'tx1' in generated_answers:
+                        primary_solutions = generated_answers['tx1']
+                        primary_branch = 'tx1'
+                    else:
+                        primary_solutions = []
+                        primary_branch = None
+                    
+                    # Populate the location the evaluator expects
+                    run_log['steps']['solving'] = {
+                        "status": "SUCCESS" if primary_solutions else "FAILURE",
+                        "solution_attempts": primary_solutions
+                    }
+                    run_log['llm_final_solution_attempts_texts'] = primary_solutions
+                    run_log['multibranch_primary_branch'] = primary_branch
+                    
+                    logger.info(
+                        f"Set primary solutions from branch '{primary_branch}': "
+                        f"{len(primary_solutions)} solution attempts"
+                    )
+                    
+                else:
+                    logger.error(f"Multi-branch transformation failed: {multibranch_result.get('phase_failed', 'unknown phase')}")
+                    run_log['pipeline_status'] = "FAILURE"
+                    return run_log
+            else:
+                logger.error("Retrieval failed, cannot run multi-branch transformation")
+                run_log['pipeline_status'] = "FAILURE"
+                return run_log
+        else:
+            logger.warning("USE_RETRIEVAL is False, cannot apply multi-branch transformation")
+            run_log['pipeline_status'] = "FAILURE"
+            return run_log
+
     # --- BEST-OF-TRANSFORMATION Pre-processing (Enhancement to best-of-N) ---
     if config.get('APPLY_BEST_OF_TRANSFORMATION', False):
         print("\n[PRE-PROCESSING] BEST-OF-TRANSFORMATION ENABLED")
@@ -217,16 +384,15 @@ def run_pipeline_for_single_query(
                 run_log['steps_alternatives']['best_of_transformation'] = transform_result
                 
                 if transform_result['status'] == 'SUCCESS':
-                    # Step 3: Store best candidates selected per retrieved sample
-                    # NEW ARCHITECTURE: Per-Retrieved-Sample Selection Enforced
+                    # NEW ARCHITECTURE: Centralized Pool with Per-Sample Selection
+                    evaluation_contexts = transform_result.get('evaluation_contexts', {})
                     best_candidates = transform_result.get('best_candidates', [])
-                    per_sample_counts = transform_result.get('per_sample_candidate_counts', {})
-                    per_sample_rankings = transform_result.get('per_sample_rankings', [])
+                    telemetry = transform_result.get('telemetry', {})
                     
                     # Store for downstream reference
+                    run_log['best_of_transformation_evaluation_contexts'] = evaluation_contexts
                     run_log['best_of_transformation_candidates'] = best_candidates
-                    run_log['best_of_transformation_per_sample_counts'] = per_sample_counts
-                    run_log['best_of_transformation_per_sample_rankings'] = per_sample_rankings
+                    run_log['best_of_transformation_telemetry'] = telemetry
                     
                     # Extract candidate texts for optional use in further processing
                     candidate_texts = [c['candidate_text'] for c in best_candidates]
@@ -235,18 +401,21 @@ def run_pipeline_for_single_query(
                     run_log['best_transformations'] = candidate_texts  # For backwards compatibility
                     run_log['transformation_scores'] = candidate_scores  # For backwards compatibility
                     
-                    # Log the new per-sample selection architecture
+                    # Log the centralized pool architecture 
                     logger.info(
-                        f"Best-of-Transformation per-sample selection completed successfully. "
-                        f"Selected {len(best_candidates)} best candidates "
-                        f"(one per retrieved sample, enforcing diversity)"
+                        f"Best-of-Transformation centralized pool architecture completed successfully. "
+                        f"Selected {len(best_candidates)} best candidates from {len(evaluation_contexts)} retrieved samples"
                     )
-                    for cand_info in per_sample_rankings:
-                        retrieved_idx = cand_info['retrieved_idx']
-                        total_cands = cand_info['total_candidates']
+                    
+                    # Log pool statistics per sample
+                    selections = telemetry.get('selections', {})
+                    for retrieved_idx, selection_info in selections.items():
                         logger.info(
-                            f"  Sample #{retrieved_idx}: {total_cands} total candidates evaluated, "
-                            f"selected rank-1 candidate with score {per_sample_rankings[0]['ranked_candidates'][0]['score']:.3f}"
+                            f"  Sample #{retrieved_idx}: "
+                            f"Pool size={selection_info.get('pool_size', 'N/A')}, "
+                            f"Selected index={selection_info.get('selected_index', 'N/A')}, "
+                            f"Score={selection_info.get('selected_score', 'N/A'):.3f}, "
+                            f"Source={selection_info.get('selected_source', 'N/A')}"
                         )
                     
                     # ========================================================================
