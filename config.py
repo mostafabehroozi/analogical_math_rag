@@ -13,6 +13,9 @@ EMBEDDINGS_DIR = os.path.join(BASE_OUTPUT_DIR, "embeddings")
 RESULTS_DIR = os.path.join(BASE_OUTPUT_DIR, "results")
 
 CONFIG = {
+    # Execution Mode
+    "OFFLINE_MODE": True,  # Set to False for Kaggle/online execution
+    
     # Logging & Control
     "VERBOSE_LOGGING": True,
     "PRINT_API_CALL_DETAILS": True,
@@ -94,16 +97,16 @@ CONFIG = {
     # === Local Paths (used when running offline) ===
     "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',  # Will be updated in notebook
     "EXEMPLAR_CORPUS_NAME": "AI-MO/NuminaMath-CoT",  # Will be updated in notebook
-    "LOCAL_EMBEDDING_MODEL_PATH": os.path.join(DATA_DIR, "Bert-MLM_arXiv-MP-class_zbMath"),
-    "LOCAL_EXEMPLAR_CORPUS_PATH": os.path.join(DATA_DIR, "NuminaMath-CoT"),
+    "LOCAL_EMBEDDING_MODEL_PATH": None,  # Will be computed by rebuild_derived_paths()
+    "LOCAL_EXEMPLAR_CORPUS_PATH": None,  # Will be computed by rebuild_derived_paths()
     "USE_LOCAL_MODEL": False,  # Set to True to load from disk instead of downloading
     
-    "HARD_QUESTIONS_INDICES_PATH": os.path.join(DATA_DIR, "hard_question_indices.json"),
+    "HARD_QUESTIONS_INDICES_PATH": None,  # Will be computed by rebuild_derived_paths()
     "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
-    "EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH": os.path.join(EMBEDDINGS_DIR, 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy'),
+    "EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH": None,  # Will be computed by rebuild_derived_paths()
     
-    "ADVANCED_RAG_FULL_LOG_PATH": os.path.join(RESULTS_DIR, "advanced_rag_pipeline_full_log.json"),
-    "ADVANCED_RAG_EVALUATION_RESULTS_PATH": os.path.join(RESULTS_DIR, "advanced_rag_evaluation_results.pkl"),
+    "ADVANCED_RAG_FULL_LOG_PATH": None,  # Will be computed by rebuild_derived_paths()
+    "ADVANCED_RAG_EVALUATION_RESULTS_PATH": None,  # Will be computed by rebuild_derived_paths()
 
     # Pipeline Control Flags
     "USE_RETRIEVAL": True,
@@ -377,8 +380,41 @@ CONFIG = {
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT": "mirror_hypothesis_gen_zero_shot_v1",
 }
 
+# Initialize derived paths on module load (before any functions are called)
+def _initialize_derived_paths():
+    """Internal function to initialize derived paths when module is loaded."""
+    CONFIG["LOCAL_EMBEDDING_MODEL_PATH"] = os.path.join(CONFIG["DATA_DIR"], "Bert-MLM_arXiv-MP-class_zbMath")
+    CONFIG["LOCAL_EXEMPLAR_CORPUS_PATH"] = os.path.join(CONFIG["DATA_DIR"], "NuminaMath-CoT")
+    CONFIG["HARD_QUESTIONS_INDICES_PATH"] = os.path.join(CONFIG["DATA_DIR"], "hard_question_indices.json")
+    CONFIG["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"] = os.path.join(CONFIG["EMBEDDINGS_DIR"], 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy')
+    CONFIG["ADVANCED_RAG_FULL_LOG_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_pipeline_full_log.json")
+    CONFIG["ADVANCED_RAG_EVALUATION_RESULTS_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_evaluation_results.pkl")
+
+_initialize_derived_paths()
+
+
+def rebuild_derived_paths():
+    """
+    Rebuilds all derived paths based on current CONFIG directory settings.
+    
+    Call this function after updating CONFIG directory values to ensure
+    all downstream paths are computed with the new base directories.
+    
+    This is essential for supporting multiple execution modes (offline/online, local/Kaggle).
+    """
+    CONFIG["LOCAL_EMBEDDING_MODEL_PATH"] = os.path.join(CONFIG["DATA_DIR"], "Bert-MLM_arXiv-MP-class_zbMath")
+    CONFIG["LOCAL_EXEMPLAR_CORPUS_PATH"] = os.path.join(CONFIG["DATA_DIR"], "NuminaMath-CoT")
+    CONFIG["HARD_QUESTIONS_INDICES_PATH"] = os.path.join(CONFIG["DATA_DIR"], "hard_question_indices.json")
+    CONFIG["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"] = os.path.join(CONFIG["EMBEDDINGS_DIR"], 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy')
+    CONFIG["ADVANCED_RAG_FULL_LOG_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_pipeline_full_log.json")
+    CONFIG["ADVANCED_RAG_EVALUATION_RESULTS_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_evaluation_results.pkl")
+
+
 def setup_directories():
     """Creates the necessary directory structure using CONFIG values."""
+    # Ensure all derived paths are up-to-date
+    rebuild_derived_paths()
+    
     print("--- Setting up project directories ---")
     dirs_to_create = [
         CONFIG.get("DATA_DIR", DATA_DIR),
@@ -394,3 +430,66 @@ def setup_directories():
         except OSError as e:
             print(f"Error creating directory {dir_path}: {e}")
     print("--- Directory setup complete ---\n")
+
+
+def setup_kaggle_mode(outputs_base_dir="/kaggle/working"):
+    """
+    Configure CONFIG for Kaggle/online execution.
+    
+    This function sets all directory paths to Kaggle-appropriate locations
+    and rebuilds all derived paths accordingly.
+    
+    Args:
+        outputs_base_dir (str): Base directory for outputs on Kaggle (default: "/kaggle/working")
+    
+    Example:
+        setup_kaggle_mode()  # Uses default /kaggle/working
+        # or
+        setup_kaggle_mode("/path/to/custom/base")
+    """
+    CONFIG["OFFLINE_MODE"] = False
+    CONFIG["BASE_OUTPUT_DIR"] = outputs_base_dir
+    CONFIG["DATA_DIR"] = os.path.join(outputs_base_dir, "data")
+    CONFIG["OUTPUTS_DIR"] = os.path.join(outputs_base_dir, "outputs")
+    CONFIG["LOGS_DIR"] = os.path.join(outputs_base_dir, "outputs", "logs")
+    CONFIG["EMBEDDINGS_DIR"] = os.path.join(outputs_base_dir, "outputs", "embeddings")
+    CONFIG["RESULTS_DIR"] = os.path.join(outputs_base_dir, "outputs", "results")
+    
+    # Rebuild all derived paths with the new base directories
+    rebuild_derived_paths()
+    
+    # Create the directory structure
+    setup_directories()
+    
+    print("Kaggle mode configured. Directories:")
+    print(f"  DATA_DIR: {CONFIG['DATA_DIR']}")
+    print(f"  LOGS_DIR: {CONFIG['LOGS_DIR']}")
+    print(f"  EMBEDDINGS_DIR: {CONFIG['EMBEDDINGS_DIR']}")
+    print(f"  RESULTS_DIR: {CONFIG['RESULTS_DIR']}\n")
+
+
+def setup_offline_mode():
+    """
+    Configure CONFIG for offline/local execution (default mode).
+    
+    This function resets all directory paths to the default local project structure.
+    """
+    CONFIG["OFFLINE_MODE"] = True
+    CONFIG["BASE_OUTPUT_DIR"] = BASE_OUTPUT_DIR
+    CONFIG["DATA_DIR"] = DATA_DIR
+    CONFIG["OUTPUTS_DIR"] = OUTPUTS_DIR
+    CONFIG["LOGS_DIR"] = LOGS_DIR
+    CONFIG["EMBEDDINGS_DIR"] = EMBEDDINGS_DIR
+    CONFIG["RESULTS_DIR"] = RESULTS_DIR
+    
+    # Rebuild all derived paths with the new base directories
+    rebuild_derived_paths()
+    
+    # Create the directory structure
+    setup_directories()
+    
+    print("Offline mode configured. Directories:")
+    print(f"  DATA_DIR: {CONFIG['DATA_DIR']}")
+    print(f"  LOGS_DIR: {CONFIG['LOGS_DIR']}")
+    print(f"  EMBEDDINGS_DIR: {CONFIG['EMBEDDINGS_DIR']}")
+    print(f"  RESULTS_DIR: {CONFIG['RESULTS_DIR']}\n")
