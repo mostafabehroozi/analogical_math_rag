@@ -1,2907 +1,1921 @@
-#======================================================================
-#   File: src/pipeline_steps.py
-#======================================================================
-
-import logging
-import re
-import numpy as np
-import uuid
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Union, Tuple, Optional
-import time
-from collections import deque
-from src.evaluation import evaluate_single_answer_with_llm
-from src.prompts import PROMPT_TEMPLATES
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
-# --- CRITICAL: Ensure these API classes are imported ---
-# (Adjust the path 'src.api_manager' if your file is named differently)
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager 
-
-from src.utils import create_trace_entry
-from src.evaluation import evaluate_single_answer_with_llm
-from src.prompts import PROMPT_TEMPLATES
-
-from config import CONFIG
-from src.prompts import (
-    EXEMPLAR_FORMAT,
-    create_normalization_prompt,
-    create_transformation_prompt,
-    create_merging_prompt,
-    create_final_reasoning_prompt,
-    create_final_reasoning_prompt_simple,
-    create_duplicate_check_prompt,
-    create_self_sampling_prompt,
-    create_augmentation_prompt,
-    create_analogical_adaptation_prompt,
-    create_hierarchical_parent_solver_prompt,
-    create_reverse_validation_prompt,
-    create_simplification_prompt,
-    create_simplified_sample_solver_prompt,
-    create_main_from_simplified_proxy_prompt,
-    create_augmentation_with_solution_prompt,
-    create_reverse_transformation_main_to_exemplar_prompt,
-    create_reverse_transformation_solve_transformed_prompt,
-    create_reverse_transformation_final_solve_prompt
-)
-from src.utils import save_json, load_json, create_trace_entry
-from src.hf_sync import periodic_sync_check
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
-from src.evaluation import evaluate_single_answer_with_llm
-from collections import defaultdict
-from src.prompts import (
-    create_mirror_baseline_prompt,
-    create_mirror_hypothesis_prompt,
-    create_mirror_hypothesis_zeroshot_prompt,
-    create_mirror_verification_prompt,
-    create_evaluation_prompt,
-    EXEMPLAR_FORMAT
-)
-
-def log_time_diagnostic(message: str, start_time: float, indent: int = 0) -> float:
-    end_time = time.time()
-    elapsed = end_time - start_time
-    indent_str = "  " * indent
-    if elapsed > 0.001: 
-        print(f"{indent_str}⏱️  DIAGNOSTIC: {message} took {elapsed:.4f} seconds.")
-    return end_time
-
-def _generate_embeddings(
-    texts: List[str],
-    embedding_model: SentenceTransformer,
-    batch_size: int = 32
-) -> np.ndarray:
-    if not isinstance(embedding_model, SentenceTransformer) or not texts:
-        return np.array([])
-    try:
-        return embedding_model.encode(
-            texts,
-            batch_size=batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True
-        )
-    except Exception as e:
-        logging.getLogger(__name__).error(f"Failed to generate embeddings: {e}", exc_info=True)
-        return np.array([])
-
-def retrieve(
-    target_query: str,
-    embedding_model: SentenceTransformer,
-    exemplar_questions: List[str],
-    embedded_exemplars: np.ndarray,
-    top_k: int,
-    question_to_index_map: Optional[Dict[str, int]] = None
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info(f"Starting retrieval for Top-{top_k} exemplars.")
-    
-    local_trace = []
-    
-    current_diag_time = time.time() 
-    indent_level = 3
-    
-    print(f"{'  '*indent_level}--- STARTING DETAILED RETRIEVAL DIAGNOSTICS ---")
-    print(f"{'  '*indent_level}Target Query (start): '{target_query[:100]}...'")
-    print(f"{'  '*indent_level}Exemplar corpus size: {len(exemplar_questions)}")
-    print(f"{'  '*indent_level}Embedded exemplars shape: {embedded_exemplars.shape}")
-    print(f"{'  '*indent_level}Requested top_k: {top_k}")
-
-    query_embedding_start_time = time.time()
-    query_embedding = _generate_embeddings([target_query], embedding_model)
-    current_diag_time = log_time_diagnostic("Generate query embedding", query_embedding_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}Query embedding shape: {query_embedding.shape}")
-    
-    if query_embedding.size == 0:
-        logger.error("Failed to generate embedding for the target query. Retrieval cannot proceed.")
-        local_trace.append(create_trace_entry("retrieve", "embedding_generation", {"target": target_query}, {"error": "Failed to generate embedding"}, error_info={"msg": "Empty embedding"}))
-        return {"status": "FAILURE", "retrieved_indices": [], "retrieved_exemplars": [], "trace": local_trace}
-    
-    cosine_similarity_start_time = time.time()
-    print(f"{'  '*indent_level}Starting cosine similarity calculation (query_embedding shape: {query_embedding.shape}, embedded_exemplars shape: {embedded_exemplars.shape})...")
-    similarities = cosine_similarity(query_embedding, embedded_exemplars)[0]
-    current_diag_time = log_time_diagnostic("Calculate cosine_similarity", cosine_similarity_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}Similarities array shape: {similarities.shape}")
-    
-    self_match_start_time = time.time()
-
-    if question_to_index_map is not None:
-        query_index_in_corpus = question_to_index_map.get(target_query)
-        if query_index_in_corpus is not None:
-            similarities[query_index_in_corpus] = -np.inf
-            print(f"{'  '*indent_level}Self-match found at index {query_index_in_corpus}, set to -np.inf.")
-        else:
-            print(f"{'  '*indent_level}Target query not found in corpus (no self-match to remove).")
-    else:
-        print(f"{'  '*indent_level}Warning: question_to_index_map not provided. Skipping self-match check.")
-        logger.warning("retrieve() called without question_to_index_map. Self-match detection skipped.")
-
-    current_diag_time = log_time_diagnostic("Handle self-match (O(1) lookup)", self_match_start_time, indent=indent_level)
-
-    k_retrieve_start_time = time.time()
-    k_to_retrieve = min(top_k, len(similarities))
-    current_diag_time = log_time_diagnostic("Determine k_to_retrieve", k_retrieve_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}Effective k_to_retrieve: {k_to_retrieve}")
-
-    print(f"{'  '*indent_level}Starting granular timing for top-k selection...")
-        
-    argpartition_start_time = time.time()
-    print(f"{'  '*indent_level}  Calling np.argpartition on similarities array (shape: {similarities.shape}) for k={k_to_retrieve}...")
-    
-    partitioned_indices = np.argpartition(similarities, -k_to_retrieve)
-    current_diag_time = log_time_diagnostic("np.argpartition (full array)", argpartition_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}  Resulting partitioned_indices shape: {partitioned_indices.shape}")
-
-    slice_partitioned_start_time = time.time()
-    print(f"{'  '*indent_level}  Slicing to get the top {k_to_retrieve} indices from partitioned_indices...")
-    
-    top_k_indices_unsorted = partitioned_indices[-k_to_retrieve:]
-    current_diag_time = log_time_diagnostic("Slicing partitioned indices", slice_partitioned_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}  top_k_indices_unsorted shape: {top_k_indices_unsorted.shape}, Content (first 5): {top_k_indices_unsorted[:5]}...")
-
-    argsort_slice_start_time = time.time()
-    print(f"{'  '*indent_level}  Calling np.argsort on the {k_to_retrieve} selected indices based on their similarities...")
-    print(f"{'  '*indent_level}  Accessing similarities values for sorting (similarities[top_k_indices_unsorted])...")
-
-    relevant_similarities = similarities[top_k_indices_unsorted]
-    
-    sorted_order_in_slice = np.argsort(relevant_similarities)[::-1] 
-    
-    top_k_indices = top_k_indices_unsorted[sorted_order_in_slice]
-
-    current_diag_time = log_time_diagnostic("np.argsort & final sort (on small slice)", argsort_slice_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}  Final top_k_indices shape: {top_k_indices.shape}, Content: {top_k_indices.tolist()}")
-    print(f"{'  '*indent_level}--- ENDING DETAILED RETRIEVAL DIAGNOSTICS ---")
-
-    logger.info(f"Successfully retrieved indices: {top_k_indices.tolist()}")
-
-    # Log the retrieval result as a trace event
-    local_trace.append(create_trace_entry(
-        step_name="retrieve",
-        sub_step="cosine_similarity_search",
-        input_context={"target_query": target_query, "top_k": top_k},
-        output_result={"retrieved_indices": top_k_indices.tolist()}
-    ))
-    
-    return {
-        "status": "SUCCESS",
-        "retrieved_indices": top_k_indices.tolist(),
-        "trace": local_trace
-    }
-
-
-def _calculate_baseline_difficulty(
-    retrieved_indices: List[int],
-    exemplar_data: Dict[str, Any],
-    api_manager: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> Dict[int, float]:
-    """
-    Phase 0: Calculates S_base for each retrieved sample (Zero-Shot).
-    Returns a dict mapping {index: baseline_score}.
-    """
-    logger = logging.getLogger(__name__)
-    n_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
-    
-    # Determine Model Name
-    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    
-    # Load Template
-    template_name = config.get("PROMPT_TEMPLATE_MIRROR_BASELINE", "mirror_baseline_zero_shot_v1")
-    base_template = PROMPT_TEMPLATES.get(template_name, "Problem: {question}\nSolve this step-by-step.\nFinal Answer:")
-    
-    baseline_scores = {}
-    print(f"    -> [Mirror Phase 0] Calculating Baseline Difficulty for {len(retrieved_indices)} samples...")
-
-    for idx in retrieved_indices:
-        question = exemplar_data['questions'][idx]
-        ground_truth = exemplar_data['solutions'][idx]
-        
-        # Format the template
-        prompt = base_template.format(question=question)
-        
-        correct_count = 0
-        for i in range(n_mirror):
-            # Lower temp for baseline to capture "inherent" solvability
-            resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
-            
-            trace_accumulator.append(create_trace_entry(
-                "mirror_phase_0", f"baseline_idx_{idx}_attempt_{i}",
-                {"question": question, "ground_truth": ground_truth}, 
-                resp, {"model": model_name}
-            ))
-            
-            if resp['status'] == 'SUCCESS':
-                eval_res = evaluate_single_answer_with_llm(
-                    resp['text'], ground_truth, api_manager, config
-                )
-                if eval_res['is_correct']:
-                    correct_count += 1
-        
-        score = correct_count / n_mirror
-        baseline_scores[idx] = score
-
-    return baseline_scores
-
-def _generate_hypotheses(
-    target_query: str,
-    candidate_indices: List[int], # Includes -1 for R0 if enabled
-    exemplar_data: Dict[str, Any],
-    api_manager: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> Dict[int, str]:
-    """
-    Phase 1: Generates a Hypothesis (H) for the target query using each candidate.
-    Returns a dict mapping {candidate_index: hypothesis_text}.
-    """
-    logger = logging.getLogger(__name__)
-    
-    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    
-    hypotheses = {}
-    
-    # Load templates
-    tmpl_zero = PROMPT_TEMPLATES.get("mirror_hypothesis_gen_zero_shot_v1", "{target_query}")
-    tmpl_few = PROMPT_TEMPLATES.get("mirror_hypothesis_gen_v1", "{target_query}")
-
-    print(f"    -> [Mirror Phase 1] Generating Hypotheses for {len(candidate_indices)} candidates...")
-
-    for cand_idx in candidate_indices:
-        if cand_idx == -1:
-            # R0: Zero-Shot
-            prompt = tmpl_zero.format(target_query=target_query)
-        else:
-            # R_cand: Few-Shot
-            q_ex = exemplar_data['questions'][cand_idx]
-            s_ex = exemplar_data['solutions'][cand_idx]
-            prompt = tmpl_few.format(
-                exemplar_question=q_ex,
-                exemplar_solution=s_ex,
-                target_query=target_query
-            )
-
-        # Generate Hypothesis (Single attempt, Temp=0.7)
-        resp = api_manager.generate_content(prompt, model_name, temperature=0.0)
-        
-        trace_accumulator.append(create_trace_entry(
-            "mirror_phase_1", f"hypothesis_cand_{cand_idx}",
-            {"prompt": prompt}, resp, {"model": model_name}
-        ))
-        
-        if resp['status'] == 'SUCCESS':
-            hypotheses[cand_idx] = resp['text']
-        else:
-            hypotheses[cand_idx] = ""
-
-    return hypotheses
-
-def _evaluate_mirror_consistency(
-    target_query: str,
-    hypotheses: Dict[int, str],
-    validation_indices: List[int],
-    exemplar_data: Dict[str, Any],
-    api_manager: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> Dict[int, Dict[int, float]]:
-    """
-    Phase 2: Mirror Evaluation (Backward Pass).
-    Tests if the Hypothesis (H) can solve the Validation Samples (R_val).
-    """
-    logger = logging.getLogger(__name__)
-    n_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
-    
-    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    
-    # Load Template
-    tmpl_verify = PROMPT_TEMPLATES.get(
-        config.get("PROMPT_TEMPLATE_MIRROR_VERIFICATION", "mirror_verification_v1"), 
-        "Example Q:\n{hypothesis_question}\nExample A:\n{hypothesis_solution}\n\nProblem:\n{validation_question}\n\nFinal Answer:"
-    )
-
-    mirror_results = {}
-    print(f"    -> [Mirror Phase 2] Running Consistency Check ({len(hypotheses)} Candidates x {len(validation_indices)} Validation Samples)...")
-
-    for cand_id, hypothesis_text in hypotheses.items():
-        if not hypothesis_text:
-            mirror_results[cand_id] = {v_idx: 0.0 for v_idx in validation_indices}
-            continue
-            
-        mirror_results[cand_id] = {}
-        formatted_hypothesis_sol = f"{hypothesis_text}"
-
-        for val_idx in validation_indices:
-            # Skip self-test (trivial)
-            if cand_id == val_idx:
-                mirror_results[cand_id][val_idx] = 0.0 
-                continue
-
-            val_q = exemplar_data['questions'][val_idx]
-            val_gt = exemplar_data['solutions'][val_idx]
-            
-            # Construct Prompt
-            prompt = tmpl_verify.format(
-                hypothesis_question=target_query, 
-                hypothesis_solution=formatted_hypothesis_sol,
-                validation_question=val_q
-            )
-            
-            correct_count = 0
-            
-            for i in range(n_mirror):
-                resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
-                
-                trace_accumulator.append(create_trace_entry(
-                    "mirror_phase_2", f"cand_{cand_id}_vs_val_{val_idx}_run_{i}",
-                    {"prompt": prompt}, resp, {"model": model_name}
-                ))
-                
-                if resp['status'] == 'SUCCESS':
-                    eval_res = evaluate_single_answer_with_llm(
-                        resp['text'], val_gt, api_manager, config
-                    )
-                    if eval_res['is_correct']:
-                        correct_count += 1
-            
-            mirror_results[cand_id][val_idx] = correct_count / n_mirror
-
-    return mirror_results
-
-def _rank_and_filter_candidates(
-    candidate_indices: list,
-    candidate_scores: dict,
-    candidate_contributions: dict,
-    config: dict,
-    trace_accumulator: list
-) -> tuple:
-    """
-    Applies Usefulness Filtering (Score > 0) and Redundancy Filtering (Pairwise Dominance).
-    Returns the Redundancy-Filtered list, Base (Noise-Filtered) list, and the Master Sorted list.
-    """
-    enable_filtering = config.get("MIRROR_ENABLE_FILTERING", True)
-    enable_redundancy = config.get("MIRROR_ENABLE_REDUNDANCY_FILTER", True)
-
-
-    sorted_candidates = sorted(candidate_indices, key=lambda x: (candidate_scores[x], -x), reverse=True)
-
-    # 2. Base Filtering: Remove Useless Candidates (Score <= 0)
-    if enable_filtering:
-        base_indices = [c for c in sorted_candidates if candidate_scores[c] > 0]
-        # Trace log
-        trace_accumulator.append(f"   > Base Filtering: Kept {len(base_indices)}/{len(sorted_candidates)} (Score > 0)")
-    else:
-        base_indices = sorted_candidates
-        trace_accumulator.append("   > Base Filtering: DISABLED (All candidates kept)")
-
-    # 3. Redundancy Filtering: Remove Covered Candidates
-    if not enable_redundancy or not enable_filtering:
-        # If redundancy is off, the final selection IS the base selection
-        # We still return sorted_candidates as the master list
-        return base_indices, base_indices, sorted_candidates
-
-    final_selection = []
-    
-    # We iterate through the sorted 'useful' candidates (highest score first)
-    for current_cand in base_indices:
-        is_covered = False
-        
-        # Check against already accepted candidates (which have higher/equal scores)
-        for accepted_cand in final_selection:
-            # Check if 'accepted_cand' covers 'current_cand'
-            # Definition: accepted covers current if for ALL validation samples j:
-            # contribution(accepted, j) >= contribution(current, j)
-            
-            accepted_contribs = candidate_contributions.get(accepted_cand, {})
-            current_contribs = candidate_contributions.get(current_cand, {})
-            
-            covered_completely = True
-            
-            # We must check against ALL validation samples that 'current_cand' helped with
-            for val_idx, score_gain in current_contribs.items():
-                if score_gain > 0:
-                    # If the accepted candidate didn't help here, or helped less/equal...
-                    if accepted_contribs.get(val_idx, 0.0) < score_gain:
-                        covered_completely = False
-                        break
-            
-            if covered_completely:
-                is_covered = True
-                trace_accumulator.append(f"     - Dropped Candidate {current_cand} (Covered by {accepted_cand})")
-                break
-        
-        if not is_covered:
-            final_selection.append(current_cand)
-
-    trace_accumulator.append(f"   > Redundancy Filtering: Kept {len(final_selection)}/{len(base_indices)}")
-
-    # RETURN THREE LISTS: [Redundancy Filtered], [Base Filtered], [Master Sorted]
-    return final_selection, base_indices, sorted_candidates
-
-
-def simplify_retrieved_samples(
-    retrieved_indices: List[int],
-    exemplar_questions: List[str],
-    exemplar_solutions: List[str],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting Simplification of Retrieved Samples.")
-    
-    local_trace = []
-    successful_simplifications = []
-    failed_indices = []
-
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config.get('GEMINI_MODEL_NAME_SIMPLIFICATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config.get('AVALAI_MODEL_NAME_SIMPLIFICATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config.get('OLLAMA_MODEL_NAME_SIMPLIFICATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
-    else:
-        raise TypeError(f"Unsupported API manager type: {type(api_manager)}")
-        
-    temp = config.get("DEFAULT_SIMPLIFICATION_TEMPERATURE", 0.3)
-
-    for idx in retrieved_indices:
-        original_q = exemplar_questions[idx]
-        original_s = exemplar_solutions[idx]
-        original_exemplar_text = EXEMPLAR_FORMAT.format(question=original_q, solution=original_s)
-        
-        print(f"    -> Processing Sample #{idx} for Simplification...")
-
-        # 1. Simplify Question
-        prompt_simp = create_simplification_prompt(original_q, config)
-        resp_simp = api_manager.generate_content(prompt_simp, model_name, temp)
-        
-        local_trace.append(create_trace_entry(
-            "simplify_samples", "simplify_question", 
-            {"original_idx": idx, "original_q": original_q, "prompt": prompt_simp},
-            resp_simp, 
-            {"model": model_name, "temp": temp}
-        ))
-        
-        if resp_simp['status'] != 'SUCCESS':
-            logger.warning(f"Failed to simplify question for sample {idx}: {resp_simp.get('error_message')}")
-            failed_indices.append({"index": idx, "step": "simplify_q", "error": resp_simp})
-            continue
-            
-        simple_q = resp_simp['text'].strip()
-        
-        # 2. Solve Simplified Question using Original Rationale
-        prompt_solve = create_simplified_sample_solver_prompt(simple_q, original_exemplar_text, config)
-        resp_solve = api_manager.generate_content(prompt_solve, model_name, temp)
-        
-        local_trace.append(create_trace_entry(
-            "simplify_samples", "solve_simplified_sample",
-            {"original_idx": idx, "simple_q": simple_q, "prompt": prompt_solve},
-            resp_solve,
-            {"model": model_name, "temp": temp}
-        ))
-        
-        if resp_solve['status'] != 'SUCCESS':
-            logger.warning(f"Failed to solve simplified question for sample {idx}: {resp_solve.get('error_message')}")
-            failed_indices.append({"index": idx, "step": "solve_simple_q", "error": resp_solve})
-            continue
-            
-        simple_solution = resp_solve['text'].strip()
-        
-        new_exemplar_text = f"Question: {simple_q}\nRationale and Answer: {simple_solution}"
-        successful_simplifications.append(new_exemplar_text)
-        print(f"      -> Success. New simplified exemplar created.")
-
-    status = "SUCCESS" if successful_simplifications else "FAILURE"
-    if successful_simplifications and failed_indices: status = "PARTIAL_SUCCESS"
-
-    return {
-        "status": status,
-        "simplified_exemplars": successful_simplifications,
-        "failed_indices": failed_indices,
-        "trace": local_trace
-    }
-
-def adapt(
-    target_query: str,
-    retrieved_indices: List[int],
-    exemplar_questions: List[str],
-    exemplar_solutions: List[str],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting multi-stage adaptation step.")
-    
-    local_trace = []
-    successful_texts = []
-    failed_adaptations = []
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-    else:
-        raise TypeError(f"Unsupported API manager type for adaptation: {type(api_manager)}")
-        
-    temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
-
-    for idx in retrieved_indices:
-        original_question = exemplar_questions[idx]
-        original_solution = exemplar_solutions[idx]
-        current_text = EXEMPLAR_FORMAT.format(question=original_question, solution=original_solution)
-        
-        step_failed = False
-
-        if config.get('APPLY_NORMALIZATION', False) and not step_failed:
-            logger.info(f"Applying normalization to exemplar index {idx}.")
-            print(f"    -> Normalizing exemplar {idx}...")
-            prompt = create_normalization_prompt(current_text)
-            
-            print(f"      [API Context] Calling LLM for: Normalization (Exemplar #{idx})")
-            response = api_manager.generate_content(prompt, model_name, temperature)
-            
-            local_trace.append(create_trace_entry(
-                "adapt", "normalization",
-                {"source_index": idx, "prompt": prompt},
-                response,
-                {"model": model_name, "temp": temperature}
-            ))
-            
-            if response['status'] == 'SUCCESS':
-                current_text = response['text']
-            else:
-                logger.warning(f"Normalization failed for exemplar {idx}: {response['error_message']}")
-                failed_adaptations.append({"source_index": idx, "failed_at_step": "normalization", "error_info": response})
-                step_failed = True
-
-        if config.get('APPLY_TRANSFORMATION_1', False) and not step_failed:
-            logger.info(f"Applying transformation 1 to exemplar index {idx}.")
-            print(f"    -> Applying Transformation 1 to exemplar {idx}...")
-            prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_1")
-            print(f"      [API Context] Calling LLM for: Transformation 1 (Exemplar #{idx})")
-            response = api_manager.generate_content(prompt, model_name, temperature)
-
-            local_trace.append(create_trace_entry(
-                "adapt", "transformation_1",
-                {"source_index": idx, "prompt": prompt},
-                response,
-                {"model": model_name, "temp": temperature}
-            ))
-
-            if response['status'] == 'SUCCESS':
-                current_text = response['text']
-            else:
-                logger.warning(f"Transformation 1 failed for exemplar {idx}: {response['error_message']}")
-                failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_1", "error_info": response})
-                step_failed = True
-        
-        if config.get('APPLY_TRANSFORMATION_2', False) and not step_failed:
-            logger.info(f"Applying transformation 2 to exemplar index {idx}.")
-            print(f"    -> Applying Transformation 2 to exemplar {idx}...")
-            prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_2")
-            print(f"      [API Context] Calling LLM for: Transformation 2 (Exemplar #{idx})")
-            response = api_manager.generate_content(prompt, model_name, temperature)
-
-            local_trace.append(create_trace_entry(
-                "adapt", "transformation_2",
-                {"source_index": idx, "prompt": prompt},
-                response,
-                {"model": model_name, "temp": temperature}
-            ))
-
-            if response['status'] == 'SUCCESS':
-                current_text = response['text']
-            else:
-                logger.warning(f"Transformation 2 failed for exemplar {idx}: {response['error_message']}")
-                failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_2", "error_info": response})
-                step_failed = True
-
-        if config.get('APPLY_TRANSFORMATION_3', False) and not step_failed:
-            logger.info(f"Applying transformation 3 to exemplar index {idx}.")
-            print(f"    -> Applying Transformation 3 to exemplar {idx}...")
-            prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_3")
-            print(f"      [API Context] Calling LLM for: Transformation 3 (Exemplar #{idx})")
-            response = api_manager.generate_content(prompt, model_name, temperature)
-
-            local_trace.append(create_trace_entry(
-                "adapt", "transformation_3",
-                {"source_index": idx, "prompt": prompt},
-                response,
-                {"model": model_name, "temp": temperature}
-            ))
-
-            if response['status'] == 'SUCCESS':
-                current_text = response['text']
-            else:
-                logger.warning(f"Transformation 3 failed for exemplar {idx}: {response['error_message']}")
-                failed_adaptations.append({"source_index": idx, "failed_at_step": "transformation_3", "error_info": response})
-                step_failed = True
-        
-        if not step_failed:
-            successful_texts.append(current_text)
-
-    if not retrieved_indices:
-        final_status = "SUCCESS"
-    elif not successful_texts and failed_adaptations:
-        final_status = "FAILURE"
-    elif successful_texts and failed_adaptations:
-        final_status = "PARTIAL_SUCCESS"
-    else:
-        final_status = "SUCCESS"
-
-    return {
-        "status": final_status,
-        "adapted_texts": successful_texts,
-        "failed_adaptations": failed_adaptations,
-        "trace": local_trace
-    }
-
-def merge(
-    target_query: str,
-    adapted_texts: List[str],
-    embedding_model: SentenceTransformer,
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
-
-    if not config.get('APPLY_MERGING', False):
-        logger.info("APPLY_MERGING is False. Skipping merge step.")
-        return {"status": "SKIPPED", "merged_texts": adapted_texts[:target_count], "failed_merges": [], "trace": []}
-
-    logger.info("Starting merging step.")
-    local_trace = []
-    current_texts = list(adapted_texts)
-    failed_merges = []
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-    else:
-        raise TypeError(f"Unsupported API manager type for merging: {type(api_manager)}")
-        
-    temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
-    
-    iteration = 0
-    while len(current_texts) > target_count and len(current_texts) >= 2:
-        iteration += 1
-        logger.info(f"Merge iteration {iteration}: Merging from {len(current_texts)} samples.")
-        print(f"    -> Merging {len(current_texts)} samples down...")
-        
-        pair_to_merge = [current_texts.pop(0), current_texts.pop(0)]
-        
-        prompt = create_merging_prompt(target_query, pair_to_merge)
-        if "Error:" in prompt:
-            logger.error(f"Failed to create merging prompt: {prompt}")
-            failed_merges.append({"pair_to_merge": pair_to_merge, "error_info": {"error_message": "Prompt creation failed."}})
-            continue
-            
-        print(f"      [API Context] Calling LLM for: Merging (Iteration #{iteration})")
-        response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "merge", f"iteration_{iteration}",
-            {"input_pair_count": 2, "prompt": prompt},
-            response,
-            {"model": model_name, "temp": temperature}
-        ))
-        
-        if response['status'] == 'SUCCESS':
-            current_texts.append(response['text'])
-        else:
-            logger.warning(f"Merging failed: {response['error_message']}. Discarding pair.")
-            failed_merges.append({"pair_to_merge": pair_to_merge, "error_info": response})
-
-    return {"status": "SUCCESS", "merged_texts": current_texts, "failed_merges": failed_merges, "trace": local_trace}
-
-def solve(
-    target_query: str,
-    final_exemplars: List[str],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting final solver step.")
-    local_trace = []
-    
-    final_solver_prompt_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER")
-    if final_solver_prompt_name == "duplicate_question_check_v1":
-        logger.info("Running in 'Duplicate Question Check' mode.")
-        
-        retrieved_questions = []
-        for exemplar_text in final_exemplars:
-            match = re.search(r"Question:\s*(.*?)\s*Rationale and Answer:", exemplar_text, re.DOTALL)
-            if match:
-                retrieved_questions.append(match.group(1).strip())
-        
-        if not retrieved_questions:
-            logger.warning("Duplicate check mode ran but no retrieved questions were found to check.")
-            return {"status": "SUCCESS", "solution_attempts": ["no_retrieval"], "trace": local_trace}
-
-        prompt = create_duplicate_check_prompt(target_query, retrieved_questions)
-        
-        if isinstance(api_manager, GeminiAPIManager):
-            model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-        elif isinstance(api_manager, AvalAIAPIManager):
-            model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-        elif isinstance(api_manager, OllamaAPIManager):
-            model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-        else:
-            raise TypeError(f"Unsupported API manager type for duplicate check: {type(api_manager)}")
-            
-        temperature = 0.0 
-        
-        print("    -> Checking for duplicate questions...")
-        print("      [API Context] Calling LLM for: Duplicate Check")
-        response = api_manager.generate_content(prompt, model_name, temperature)
-
-        local_trace.append(create_trace_entry(
-            "solve", "duplicate_check",
-            {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-        ))
-
-        if response['status'] == 'SUCCESS':
-            classification = response['text'].strip().lower()
-            if "yes" in classification:
-                result = "yes"
-            elif "no" in classification:
-                result = "no"
-            else:
-                result = "parsing_failed"
-            return {"status": "SUCCESS", "solution_attempts": [result], "trace": local_trace}
-        else:
-            return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": response}], "trace": local_trace}
-
-    prompt = create_final_reasoning_prompt(target_query, final_exemplars, config) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
-    logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
-
-    if "Error:" in prompt:
-        error_msg = f"Failed to create final reasoning prompt: {prompt}"
-        logger.error(error_msg)
-        return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": {"error_message": error_msg}}], "trace": local_trace}
-
-    n_attempts = config.get("N_PASS_ATTEMPTS", 1)
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager type for solver: {type(api_manager)}")
-        
-    temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
-    
-    solution_attempts: List[Union[str, Dict]] = []
-    
-    logger.info(f"Generating {n_attempts} solution attempts for Pass@{n_attempts}.")
-    for i in range(n_attempts):
-        logger.info(f"Generating attempt {i+1}/{n_attempts}.")
-        print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
-        
-        print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
-        
-        response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "solve", f"attempt_{i+1}",
-            {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-        ))
-
-        if response['status'] == 'SUCCESS':
-            solution_attempts.append(response['text'])
-        else:
-            solution_attempts.append({
-                "status": "FAILURE",
-                "error_info": response
-            })
-            
-    return {"status": "SUCCESS", "solution_attempts": solution_attempts, "trace": local_trace}
-
-def solve_via_main_simplification(
-    target_query: str,
-    final_exemplars: List[str],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting Solver via Main Question Simplification.")
-    local_trace = []
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_simp = config.get('GEMINI_MODEL_NAME_SIMPLIFICATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
-        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_simp = config.get('AVALAI_MODEL_NAME_SIMPLIFICATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
-        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_simp = config.get('OLLAMA_MODEL_NAME_SIMPLIFICATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
-        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager type.")
-
-    temp_simp = config.get("DEFAULT_SIMPLIFICATION_TEMPERATURE", 0.3)
-    temp_solve = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-    
-    print("    -> [Simplification] Generating Simplified Main Question...")
-    prompt_simp = create_simplification_prompt(target_query, config)
-    resp_simp = api_manager.generate_content(prompt_simp, model_simp, temp_simp)
-    
-    local_trace.append(create_trace_entry(
-        "solve_via_simplification", "simplify_main",
-        {"prompt": prompt_simp}, resp_simp, {"model": model_simp, "temp": temp_simp}
-    ))
-
-    if resp_simp['status'] != 'SUCCESS':
-        logger.error(f"Failed to simplify main question: {resp_simp.get('error_message')}")
-        return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": resp_simp, "phase": "simplify_main"}], "trace": local_trace}
-    
-    simple_main_q = resp_simp['text'].strip()
-    print(f"       Simplified Q: '{simple_main_q[:50]}...'")
+from typing import List, Dict, Any
 
-    print("    -> [Simplification] Solving Simplified Main Question...")
-    
-    if final_exemplars:
-        prompt_solve_simple = create_final_reasoning_prompt(simple_main_q, final_exemplars, config)
-    else:
-        prompt_solve_simple = create_final_reasoning_prompt_simple(simple_main_q, config)
-        
-    resp_solve_simple = api_manager.generate_content(prompt_solve_simple, model_solve, temp_solve)
-    
-    local_trace.append(create_trace_entry(
-        "solve_via_simplification", "solve_simple_q",
-        {"simple_q": simple_main_q, "prompt": prompt_solve_simple}, resp_solve_simple, {"model": model_solve, "temp": temp_solve}
-    ))
-
-    if resp_solve_simple['status'] != 'SUCCESS':
-        logger.error(f"Failed to solve simplified main question: {resp_solve_simple.get('error_message')}")
-        return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": resp_solve_simple, "phase": "solve_simple"}], "trace": local_trace}
-    
-    simple_solution = resp_solve_simple['text']
-    
-    print("    -> [Simplification] Solving Original Main Question via Proxy...")
-    prompt_proxy = create_main_from_simplified_proxy_prompt(target_query, simple_solution, config)
-    
-    n_attempts = config.get("N_PASS_ATTEMPTS", 1)
-    solution_attempts = []
-    
-    for i in range(n_attempts):
-        print(f"       Generating Attempt {i+1}/{n_attempts}...")
-        resp_final = api_manager.generate_content(prompt_proxy, model_solve, temp_solve)
-        
-        local_trace.append(create_trace_entry(
-            "solve_via_simplification", f"final_attempt_{i+1}",
-            {"prompt": prompt_proxy}, resp_final, {"model": model_solve, "temp": temp_solve}
-        ))
-        
-        if resp_final['status'] == 'SUCCESS':
-            solution_attempts.append(resp_final['text'])
-        else:
-            solution_attempts.append({"status": "FAILURE", "error_info": resp_final})
-            
-    return {"status": "SUCCESS", "solution_attempts": solution_attempts, "trace": local_trace}
-
-def reverse_transform_and_solve(
-    target_query: str,
-    retrieved_indices: List[int],
-    exemplar_questions: List[str],
-    exemplar_solutions: List[str],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Implements Reverse Transformation workflow:
-    For each retrieved exemplar:
-    1. Transform the main question to match the exemplar
-    2. Solve the transformed question using the exemplar
-    3. Collect all transformed solutions
-    Then:
-    4. Solve the original main question using all transformed solutions as analogical support
-    """
-    logger = logging.getLogger(__name__)
-    logger.info("Starting Reverse Transformation step.")
-    local_trace = []
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_transform = config['GEMINI_MODEL_NAME_ADAPTATION']
-        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_transform = config['AVALAI_MODEL_NAME_ADAPTATION']
-        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_transform = config['OLLAMA_MODEL_NAME_ADAPTATION']
-        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager type for reverse transformation: {type(api_manager)}")
-    
-    temp_transform = config.get('REVERSE_TRANSFORMATION_TEMPERATURE', 0.3)
-    temp_solve = config.get('REVERSE_TRANSFORMATION_SOLVER_TEMPERATURE', 1.0)
-    temp_final = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
-    
-    transformed_solutions = []
-    failed_transformations = []
-    
-    print(f"    -> Starting Reverse Transformation for {len(retrieved_indices)} exemplars...")
-    
-    # Phase 1: For each retrieved exemplar, transform Q and solve Q_Transformed
-    for idx_num, idx in enumerate(retrieved_indices):
-        original_exemplar_q = exemplar_questions[idx]
-        original_exemplar_sol = exemplar_solutions[idx]
-        
-        print(f"\n      [Reverse Transform {idx_num+1}/{len(retrieved_indices)}] Processing exemplar {idx}...")
-        
-        # Step 1: Transform main question to match this exemplar
-        print(f"        -> Transforming main question to match exemplar {idx}...")
-        prompt_transform = create_reverse_transformation_main_to_exemplar_prompt(
-            target_query, original_exemplar_q, original_exemplar_sol, config
-        )
-        
-        resp_transform = api_manager.generate_content(prompt_transform, model_transform, temp_transform)
-        
-        local_trace.append(create_trace_entry(
-            "reverse_transform", f"transform_q_{idx}",
-            {"exemplar_idx": idx, "prompt": prompt_transform},
-            resp_transform,
-            {"model": model_transform, "temp": temp_transform}
-        ))
-        
-        if resp_transform['status'] != 'SUCCESS':
-            logger.warning(f"Failed to transform main question for exemplar {idx}")
-            failed_transformations.append({
-                "exemplar_idx": idx,
-                "phase": "transformation",
-                "error_info": resp_transform
-            })
-            continue
-        
-        transformed_q = resp_transform['text']
-        # Extract just the question part if the response includes "Transformed Main Question:"
-        if "Transformed Main Question:" in transformed_q:
-            transformed_q = transformed_q.split("Transformed Main Question:")[-1].strip()
-        
-        # Step 2: Solve the transformed question using the exemplar
-        print(f"        -> Solving transformed question using exemplar {idx}...")
-        prompt_solve_transformed = create_reverse_transformation_solve_transformed_prompt(
-            transformed_q, original_exemplar_q, original_exemplar_sol, config
-        )
-        
-        resp_solve_transformed = api_manager.generate_content(prompt_solve_transformed, model_solve, temp_solve)
-        
-        local_trace.append(create_trace_entry(
-            "reverse_transform", f"solve_transformed_{idx}",
-            {"exemplar_idx": idx, "transformed_q": transformed_q, "prompt": prompt_solve_transformed},
-            resp_solve_transformed,
-            {"model": model_solve, "temp": temp_solve}
-        ))
-        
-        if resp_solve_transformed['status'] != 'SUCCESS':
-            logger.warning(f"Failed to solve transformed question for exemplar {idx}")
-            failed_transformations.append({
-                "exemplar_idx": idx,
-                "phase": "solving_transformed",
-                "error_info": resp_solve_transformed
-            })
-            continue
-        
-        transformed_sol = resp_solve_transformed['text']
-        transformed_solutions.append({
-            "exemplar_idx": idx,
-            "transformed_question": transformed_q,
-            "transformed_solution": transformed_sol,
-            "original_exemplar_question": original_exemplar_q,
-            "original_exemplar_solution": original_exemplar_sol
-        })
-    
-    if not transformed_solutions:
-        logger.error("No successful reverse transformations completed.")
-        return {
-            "status": "FAILURE",
-            "solution_attempts": [{"status": "FAILURE", "error_info": {"message": "No successful reverse transformations"}}],
-            "trace": local_trace
-        }
-    
-    # Phase 2: Solve the original main question using transformed solutions
-    print(f"\n      [Final Solve] Solving original question using {len(transformed_solutions)} transformed solutions...")
-    
-    # Format transformed solutions for the final prompt
-    transformed_solutions_text = []
-    for i, trans_sol_info in enumerate(transformed_solutions):
-        sol_text = f"Solution {i+1} (from exemplar {trans_sol_info['exemplar_idx']}):\nTransformed Question: {trans_sol_info['transformed_question']}\n\n{trans_sol_info['transformed_solution']}"
-        transformed_solutions_text.append(sol_text)
-    
-    prompt_final = create_reverse_transformation_final_solve_prompt(
-        target_query, transformed_solutions_text, config
-    )
-    
-    n_attempts = config.get("N_PASS_ATTEMPTS", 1)
-    solution_attempts = []
-    
-    for i in range(n_attempts):
-        print(f"        -> Generating final solution attempt {i+1}/{n_attempts}...")
-        resp_final = api_manager.generate_content(prompt_final, model_solve, temp_final)
-        
-        local_trace.append(create_trace_entry(
-            "reverse_transform", f"final_attempt_{i+1}",
-            {"prompt": prompt_final},
-            resp_final,
-            {"model": model_solve, "temp": temp_final}
-        ))
-        
-        if resp_final['status'] == 'SUCCESS':
-            solution_attempts.append(resp_final['text'])
-        else:
-            solution_attempts.append({
-                "status": "FAILURE",
-                "error_info": resp_final
-            })
-    
-    return {
-        "status": "SUCCESS",
-        "solution_attempts": solution_attempts,
-        "transformed_solutions_count": len(transformed_solutions),
-        "failed_transformations": failed_transformations,
-        "trace": local_trace
-    }
-
-def self_sample(
-    target_query: str,
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting self-sampling step.")
-    local_trace = []
-    
-    n_samples = config.get("SELF_SAMPLING_N", 3)
-    temperature = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-    else:
-        raise TypeError(f"Unsupported API manager type for self-sampling: {type(api_manager)}")
-
-    prompt = create_self_sampling_prompt(target_query, config)
-    
-    successful_texts = []
-    failed_samples = []
-    
-    for i in range(n_samples):
-        print(f"    -> Generating self-sample {i+1}/{n_samples} for query '{target_query[:50]}...'")
-        response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "self_sample", f"sample_{i+1}",
-            {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-        ))
-        
-        if response['status'] == 'SUCCESS':
-            formatted_text = f"Question: {target_query}\nRationale and Answer: {response['text']}"
-            successful_texts.append(formatted_text)
-        else:
-            failed_samples.append({"sample_index": i, "error_info": response})
-    
-    if not successful_texts and failed_samples: status = "FAILURE"
-    elif successful_texts and failed_samples: status = "PARTIAL_SUCCESS"
-    else: status = "SUCCESS"
-    
-    return {"status": status, "self_sampled_texts": successful_texts, "failed_samples": failed_samples, "trace": local_trace}
-
-def parse_numbered_questions(text: str) -> List[str]:
-    questions = []
-    matches = re.findall(r'^\s*\d+\.\s*(.*)', text, re.MULTILINE)
-    for match in matches:
-        questions.append(match.strip())
-    return questions
-
-def augment_question(
-    target_query: str,
-    n_augmentations: int,
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    local_trace = []
-
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config.get('GEMINI_MODEL_NAME_AUGMENTATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config.get('AVALAI_MODEL_NAME_AUGMENTATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config.get('OLLAMA_MODEL_NAME_AUGMENTATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
-    else:
-        raise TypeError(f"Unsupported API manager type for augmentation: {type(api_manager)}")
-    
-    temperature = config.get("DEFAULT_AUGMENTATION_TEMPERATURE", 0.7)
-    aug_mode = config.get("HIERARCHICAL_AUGMENTATION_MODE", "decomposition")
-    schedule = config.get("AUGMENTATION_SCHEDULE")
-
-    # --- NEW: Two-Step Augmentation Mode (Solve -> Simplify) ---
-    if config.get("HIERARCHICAL_AUGMENTATION_TWO_STEP", False):
-        logger.info("Running Two-Step Augmentation (Solve -> Simplify).")
-        
-        # Step 1: Solve Base Question
-        step1_template = config.get("PROMPT_TEMPLATE_AUGMENTATION_STEP1_SOLVER", "final_solver_simple_v2")
-        step1_config = config.copy()
-        step1_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = step1_template
-        
-        prompt_s1 = create_final_reasoning_prompt_simple(target_query, step1_config)
-        print(f"    -> [Augment Step 1] Solving base question...")
-        resp_s1 = api_manager.generate_content(prompt_s1, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "augment", "step1_solve_base",
-            {"prompt": prompt_s1}, resp_s1, {"model": model_name, "temp": temperature}
-        ))
-
-        if resp_s1['status'] != 'SUCCESS':
-            return {"status": "FAILURE", "error_info": resp_s1, "trace": local_trace} 
-        
-        solution_text = resp_s1['text']
-
-        # Step 2: Augment using Context
-        prompt_s2 = create_augmentation_with_solution_prompt(target_query, solution_text, n_augmentations, config)
-        print(f"    -> [Augment Step 2] Generating simplified question using solution context...")
-        response = api_manager.generate_content(prompt_s2, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "augment", "step2_generate_augmented",
-            {"prompt": prompt_s2}, response, {"model": model_name, "temp": temperature}
-        ))
-
-        if response['status'] != 'SUCCESS':
-            return {"status": "FAILURE", "augmented_questions": [], "error_info": response, "trace": local_trace}
-        
-        if aug_mode == "simplification":
-            augmented_questions = [response['text'].strip()]
-        else:
-            augmented_questions = parse_numbered_questions(response['text'])
-        
-        return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None, "trace": local_trace}
-
-    # --- Existing Schedule-based Logic ---
-    if isinstance(schedule, list) and len(schedule) == 2:
-        num_calls, questions_per_call = schedule
-        logger.info(f"Using augmentation schedule: {num_calls} calls, {questions_per_call} questions per call.")
-        
-        all_augmented_questions = []
-        failed_calls = []
-
-        for i in range(num_calls):
-            print(f"    -> Generating augmented questions (Call {i+1}/{num_calls})...")
-            prompt = create_augmentation_prompt(target_query, questions_per_call, config)
-            response = api_manager.generate_content(prompt, model_name, temperature)
-            
-            local_trace.append(create_trace_entry(
-                "augment", f"schedule_call_{i+1}",
-                {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-            ))
-
-            if response['status'] == 'SUCCESS':
-                if aug_mode == "simplification":
-                    parsed_qs = [response['text'].strip()]
-                else:
-                    parsed_qs = parse_numbered_questions(response['text'])
-
-                if len(parsed_qs) < questions_per_call and aug_mode == "decomposition":
-                    logger.warning(f"Augmentation call {i+1} expected {questions_per_call} questions, but only parsed {len(parsed_qs)}.")
-                all_augmented_questions.extend(parsed_qs)
-            else:
-                logger.error(f"Augmentation call {i+1}/{num_calls} failed: {response['error_message']}")
-                failed_calls.append({"call_index": i + 1, "error_info": response})
-
-        status = "SUCCESS"
-        if failed_calls and not all_augmented_questions:
-            status = "FAILURE"
-        elif failed_calls:
-            status = "PARTIAL_SUCCESS"
-            
-        return {
-            "status": status, 
-            "augmented_questions": all_augmented_questions, 
-            "failed_calls": failed_calls,
-            "trace": local_trace
-        }
-
-    # --- Existing Single-Call Logic ---
-    else:
-        logger.info(f"Generating {n_augmentations} augmented questions in a single call.")
-        prompt = create_augmentation_prompt(target_query, n_augmentations, config)
-        
-        print(f"    -> Generating {n_augmentations} augmented questions...")
-        response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "augment", "single_call",
-            {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-        ))
-        
-        if response['status'] != 'SUCCESS':
-            return {"status": "FAILURE", "augmented_questions": [], "error_info": response, "trace": local_trace}
-        
-        if aug_mode == "simplification":
-            augmented_questions = [response['text'].strip()]
-        else:
-            augmented_questions = parse_numbered_questions(response['text'])
-        
-        if len(augmented_questions) < n_augmentations and aug_mode == "decomposition":
-            logger.warning(f"Augmentation expected {n_augmentations} questions, but only parsed {len(augmented_questions)}.")
-        
-        return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None, "trace": local_trace}
-
-def _select_diverse_questions(questions: List[str], embeddings: np.ndarray, n: int) -> List[str]:
-    if embeddings.shape[0] < n: return questions
-    
-    similarity_matrix = cosine_similarity(embeddings)
-    np.fill_diagonal(similarity_matrix, 0)
-    avg_similarities = similarity_matrix.mean(axis=1)
-    selected_indices = np.argsort(avg_similarities)[:n]
-    return [questions[i] for i in selected_indices]
-
-def _select_relevant_questions(aug_questions: List[str], aug_embeddings: np.ndarray, sample_embeddings: np.ndarray, n: int) -> List[str]:
-    if aug_embeddings.shape[0] < n: return aug_questions
-    
-    cross_similarity = cosine_similarity(aug_embeddings, sample_embeddings)
-    max_similarities = cross_similarity.max(axis=1)
-    selected_indices = np.argsort(max_similarities)[-n:][::-1] 
-    return [aug_questions[i] for i in selected_indices]
-
-def select_augmented_questions(
-    augmented_questions: List[str],
-    config: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    retrieved_sample_texts: Optional[List[str]] = None
-) -> List[str]:
-    logger = logging.getLogger(__name__)
-    target_n = config['AUGMENT_N']
-    mode = config['SELECTIVE_AUGMENTATION_SAMPLING_MODE']
-
-    if len(augmented_questions) <= target_n:
-        return augmented_questions
-
-    aug_embeddings = _generate_embeddings(augmented_questions, embedding_model)
-    if aug_embeddings.size == 0:
-        logger.error("Failed to generate embeddings for augmented questions. Cannot perform selection.")
-        return augmented_questions[:target_n]
-    
-    if mode == "diversity" or (mode == "auto" and retrieved_sample_texts is None):
-        logger.info(f"Selecting {target_n} most DIVERSE augmented questions.")
-        return _select_diverse_questions(augmented_questions, aug_embeddings, target_n)
-    
-    elif mode == "relevance" or (mode == "auto" and retrieved_sample_texts is not None):
-        logger.info(f"Selecting {target_n} most RELEVANT augmented questions.")
-        sample_embeddings = _generate_embeddings(retrieved_sample_texts, embedding_model)
-        if sample_embeddings.size == 0:
-            logger.error("Failed to generate embeddings for samples. Falling back to diversity selection.")
-            return _select_diverse_questions(augmented_questions, aug_embeddings, target_n)
-        return _select_relevant_questions(augmented_questions, aug_embeddings, sample_embeddings, target_n)
-    
-    return augmented_questions[:target_n]
-
-def _count_processing_nodes(structure: Any) -> int:
-    count = 0
-    if isinstance(structure, (list, tuple)):
-        count = 1 
-        for item in structure:
-            count += _count_processing_nodes(item)
-    return count
-
-def _process_node_recursively(
-    node: Any,
-    aug_q_queue: deque,
-    retrieved_texts_map: Dict[int, str],
-    api_manager: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict], # Passed down to capture recursion
-    depth: int = 0
-) -> Union[str, None]:
-    indent = "  " * (depth + 2)
-    
-    if isinstance(node, int):
-        text = retrieved_texts_map.get(node)
-        if not text:
-            logging.getLogger(__name__).warning(f"{indent}Index {node} not found in retrieved map.")
-            return None
-        return text
-
-    elif isinstance(node, (list, tuple)):
-        child_exemplars = []
-        for child in node:
-            child_result = _process_node_recursively(child, aug_q_queue, retrieved_texts_map, api_manager, config, trace_accumulator, depth + 1)
-            if child_result:
-                child_exemplars.append(child_result)
-            else:
-                logging.getLogger(__name__).warning(f"{indent}Child node {child} failed or returned None.")
-
-        if not aug_q_queue:
-            error_msg = "Augmented question queue exhausted! Check AUGMENT_K vs Structure complexity."
-            logging.getLogger(__name__).error(error_msg)
-            return None
-        
-        current_aug_q = aug_q_queue.popleft()
-        print(f"{indent}-> Processing Node at depth {depth}. Context: {len(child_exemplars)} samples. solving AugQ: '{current_aug_q[:30]}...'")
-
-        if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-        elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-        elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-        else: return None
-        
-        if not child_exemplars:
-            prompt = create_self_sampling_prompt(current_aug_q, config)
-            temp = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
-        else:
-            prompt = create_analogical_adaptation_prompt(current_aug_q, child_exemplars, config)
-            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
-            
-        response = api_manager.generate_content(prompt, model_name, temp)
-        
-        # Append to the accumulator instead of a local list, effectively flattening the trace
-        trace_accumulator.append(create_trace_entry(
-            "analogical_adapt_recursion", f"depth_{depth}",
-            {"aug_q": current_aug_q, "child_count": len(child_exemplars), "prompt": prompt},
-            response, {"model": model_name, "temp": temp}
-        ))
-        
-        if response['status'] == 'SUCCESS':
-            return f"Question: {current_aug_q}\nRationale and Answer: {response['text']}"
-        else:
-            logging.getLogger(__name__).warning(f"{indent}Generation failed for node at depth {depth}.")
-            return None
-
-    return None
-
-def analogical_adapt(
-    target_query: str,
-    retrieved_indices: List[int],
-    exemplar_data: Dict[str, Any],
-    api_manager: Any,
-    api_manager_augment: Any, 
-    config: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    augmented_questions: Optional[List[str]] = None
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting recursive analogical adaptation step.")
-    local_trace = []
-    
-    group_sets = config.get("ANALOGICAL_GROUP_SETS", [])
-    if not group_sets:
-        logger.warning("ANALOGICAL_GROUP_SETS is empty. Skipping.")
-        return {"status": "SKIPPED", "reason": "No groups defined.", "trace": local_trace}
-
-    retrieved_texts_map = {}
-    for i, idx in enumerate(retrieved_indices):
-        q = exemplar_data['questions'][idx]
-        s = exemplar_data['solutions'][idx]
-        retrieved_texts_map[i + 1] = EXEMPLAR_FORMAT.format(question=q, solution=s)
-
-    total_nodes_needed = 0
-    for group in group_sets:
-        total_nodes_needed += _count_processing_nodes(group)
-    
-    logger.info(f"Structure requires {total_nodes_needed} augmented questions total.")
-
-    if config.get("ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION", False):
-        logger.info("Identity Augmentation Mode ENABLED. Injecting Main Question into all nodes.")
-        final_aug_qs = [target_query] * total_nodes_needed
-    else:
-        if augmented_questions and len(augmented_questions) >= total_nodes_needed:
-            final_aug_qs = augmented_questions[:total_nodes_needed]
-        else:
-            logger.info(f"Generating {total_nodes_needed} new augmented questions to satisfy structure demand.")
-            aug_res = augment_question(target_query, total_nodes_needed, api_manager_augment, config)
-            # Capture trace from augmentation call
-            if aug_res.get('trace'):
-                local_trace.extend(aug_res['trace'])
-                
-            if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
-                return {"status": "FAILURE", "error_info": aug_res.get('error_info'), "trace": local_trace}
-            
-            final_aug_qs = aug_res['augmented_questions']
-            
-            if config.get('SELECTIVE_AUGMENTATION_SAMPLING') and len(final_aug_qs) > total_nodes_needed:
-                 final_aug_qs = select_augmented_questions(final_aug_qs, config, embedding_model)
-                 if len(final_aug_qs) < total_nodes_needed:
-                     logger.warning("Selection reduced pool below required size. Using unselected pool.")
-                     final_aug_qs = aug_res['augmented_questions'][:total_nodes_needed]
-
-    if len(final_aug_qs) < total_nodes_needed:
-        msg = f"Not enough augmented questions generated. Needed {total_nodes_needed}, got {len(final_aug_qs)}."
-        logger.error(msg)
-        return {"status": "FAILURE", "error_message": msg, "trace": local_trace}
-
-    aug_q_queue = deque(final_aug_qs)
-    
-    successful_adaptations = []
-    failed_adaptations = []
-    
-    for group_idx, group_structure in enumerate(group_sets):
-        print(f"    -> Processing Top-Level Group #{group_idx + 1}: {group_structure}")
-        
-        result_text = _process_node_recursively(
-            node=group_structure, 
-            aug_q_queue=aug_q_queue,
-            retrieved_texts_map=retrieved_texts_map,
-            api_manager=api_manager, 
-            config=config,
-            trace_accumulator=local_trace, # Pass the local trace to gather recursive events
-            depth=0
-        )
-        
-        if result_text:
-            successful_adaptations.append(result_text)
-        else:
-            failed_adaptations.append({
-                "group_structure": str(group_structure),
-                "error": "Recursive processing failed"
-            })
-
-    status = "SUCCESS" if successful_adaptations else "FAILURE"
-    if successful_adaptations and failed_adaptations: status = "PARTIAL_SUCCESS"
-
-    return {
-        "status": status, 
-        "analogically_adapted_texts": successful_adaptations, 
-        "failed_adaptations": failed_adaptations,
-        "trace": local_trace
-    }
-
-def generate_reasoning_pathways(
-    target_query: str,
-    api_manager: Any, 
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    local_trace = []
-    mode = config.get("CONSISTENCY_GENERATION_MODE", "distinct_augmentations")
-    k_pathways = config.get("CONSISTENCY_PATHWAYS_K", 3)
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config.get('GEMINI_MODEL_NAME_AUGMENTATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config.get('AVALAI_MODEL_NAME_AUGMENTATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config.get('OLLAMA_MODEL_NAME_AUGMENTATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
-    else:
-        raise TypeError(f"Unsupported API manager type: {type(api_manager)}")
-        
-    temp = config.get("CONSISTENCY_LAYER_1_TEMPERATURE", 0.7)
-    
-    pathways = []
-    errors = []
-
-    logger.info(f"Generating reasoning pathways in mode: {mode} (K={k_pathways})")
-
-    if mode == "distinct_augmentations":
-        aug_res = augment_question(target_query, k_pathways, api_manager, config)
-        if aug_res.get('trace'):
-            local_trace.extend(aug_res['trace'])
-
-        if aug_res['status'] == 'FAILURE':
-            return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info'), "trace": local_trace}
-        
-        aug_qs = aug_res['augmented_questions']
-        
-        if len(aug_qs) < k_pathways:
-            logger.warning(f"Augmentation only returned {len(aug_qs)} questions, requested {k_pathways}.")
-            
-        for i, q in enumerate(aug_qs[:k_pathways]):
-            print(f"    -> Solving Pathway {i+1} (Augmented Q): '{q[:50]}...'")
-            prompt = create_self_sampling_prompt(q, config)
-            resp = api_manager.generate_content(prompt, model_name, temp)
-            
-            local_trace.append(create_trace_entry(
-                "pathways", f"solve_pathway_{i+1}",
-                {"pathway_q": q, "prompt": prompt}, resp, {"model": model_name, "temp": temp}
-            ))
-            
-            if resp['status'] == 'SUCCESS':
-                exemplar = f"Question: {q}\nRationale and Answer: {resp['text']}"
-                pathways.append(exemplar)
-            else:
-                errors.append(resp)
-
-    elif mode == "single_augmentation_sampling":
-        aug_res = augment_question(target_query, 1, api_manager, config)
-        if aug_res.get('trace'):
-            local_trace.extend(aug_res['trace'])
-            
-        if aug_res['status'] != 'SUCCESS' or not aug_res['augmented_questions']:
-             return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info'), "trace": local_trace}
-        
-        q = aug_res['augmented_questions'][0]
-        logger.info(f"Using single augmented question for sampling: '{q[:50]}...'")
-        
-        prompt = create_self_sampling_prompt(q, config)
-        for i in range(k_pathways):
-            print(f"    -> Solving Pathway Sample {i+1} for Single AugQ.")
-            resp = api_manager.generate_content(prompt, model_name, temp)
-            
-            local_trace.append(create_trace_entry(
-                "pathways", f"solve_sample_{i+1}",
-                {"base_aug_q": q, "prompt": prompt}, resp, {"model": model_name, "temp": temp}
-            ))
-
-            if resp['status'] == 'SUCCESS':
-                exemplar = f"Question: {q}\nRationale and Answer: {resp['text']}"
-                pathways.append(exemplar)
-            else:
-                errors.append(resp)
-
-    else:
-        return {"status": "FAILURE", "error_message": f"Unknown consistency mode: {mode}", "trace": local_trace}
-
-    status = "SUCCESS"
-    if not pathways: status = "FAILURE"
-    elif errors: status = "PARTIAL_SUCCESS"
-
-    return {"status": status, "pathway_exemplars": pathways, "errors": errors, "trace": local_trace}
-
-
-
-
-
-# ==============================================================================
-#   Analogical Mirroring Logic (MIRROR_AS_EVALUATOR)
-# ==============================================================================
-
-def optimize_demonstrations_via_mirroring(
-    target_query: str,
-    retrieved_indices: List[int],
-    exemplar_data: Dict[str, Any],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Main entry point for MIRROR_AS_EVALUATOR.
-    Orchestrates Phases 0-4: Baseline -> Hypothesis -> Verification -> ReRanking -> Filtering.
-    """
-    # Initialize trace accumulator for this step
-    trace_accumulator = [] 
-    
-    try:
-        # --- Phase 0: Initialization ---
-        # 1. Apply Candidate Limit (Cost Saving)
-        limit = config.get("MIRROR_ACTIVE_CANDIDATE_LIMIT", 5)
-        active_candidates = retrieved_indices[:limit]
-        
-        # 2. Inject Zero-Shot Candidate (R0) if enabled
-        if config.get("MIRROR_ENABLE_R0", True):
-            # We use -1 to represent R0 (Zero-Shot)
-            if -1 not in active_candidates:
-                active_candidates.insert(0, -1)
-        
-        # 3. Calculate Baseline Difficulty (S_base)
-        # We use the retrieved samples themselves as the Evaluation Set
-        validation_set_indices = [idx for idx in retrieved_indices if idx != -1]
-        
-        baseline_scores = _calculate_baseline_difficulty(
-            retrieved_indices=validation_set_indices,
-            exemplar_data=exemplar_data,
-            api_manager=api_manager,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-
-        # --- Phase 1: Hypothesis Generation (Forward Pass) ---
-        hypotheses = _generate_hypotheses(
-            target_query=target_query,
-            candidate_indices=active_candidates,
-            exemplar_data=exemplar_data,
-            api_manager=api_manager,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-        
-        # --- Phase 2: Mirror Evaluation (Backward Pass) ---
-        # Returns matrix: {candidate_idx: {validation_idx: score}}
-        consistency_matrix = _evaluate_mirror_consistency(
-            target_query=target_query,
-            hypotheses=hypotheses,
-            validation_indices=validation_set_indices,
-            exemplar_data=exemplar_data,
-            api_manager=api_manager,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-        
-        # --- Phase 3: Utility Scoring ---
-        candidate_scores = {} 
-        candidate_contributions = {} 
-        
-        for cand_idx in active_candidates:
-            total_utility = 0.0
-            contribs = {}
-            
-            for val_idx in validation_set_indices:
-                if cand_idx == val_idx: continue
-                
-                mirror_acc = consistency_matrix.get(cand_idx, {}).get(val_idx, 0.0)
-                base_acc = baseline_scores.get(val_idx, 0.0)
-                
-                if mirror_acc > base_acc:
-                    delta = mirror_acc
-                    total_utility += delta
-                    contribs[val_idx] = delta
-            
-            candidate_scores[cand_idx] = total_utility
-            candidate_contributions[cand_idx] = contribs
-
-        # --- Phase 4: ReRanking and Filtering ---
-        final_indices, base_indices, master_sorted_indices = _rank_and_filter_candidates(
-            candidate_indices=active_candidates,
-            candidate_scores=candidate_scores,
-            candidate_contributions=candidate_contributions,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-        
-        return {
-            "status": "SUCCESS",
-            "master_sorted_indices": master_sorted_indices, # List 2 (For Track A Benchmark)
-            "strategies": {
-                "redundancy_filtering": final_indices, # List 4 (For Track B Validation)
-                "base_filtering": base_indices         # List 3 (For Track B Validation)
-            },
-            "trace": trace_accumulator
-        }
-
-    except Exception as e:
-        import traceback
-        print(f"Mirroring failed: {e}")
-        print(traceback.format_exc())
-        # Fallback to original retrieval on error
-        return {
-            "status": "FAILED", 
-            "error": str(e),
-            "fallback_indices": retrieved_indices,
-            "trace": trace_accumulator
-        }
-
-def apply_mirror_reranking(
-    target_query: str,
-    indices_to_rerank: List[int],
-    exemplar_data: Dict[str, Any],
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Unified Mirror Re-Ranking Stage for Retrieved/Transformed Samples.
-    
-    Applies mirror-based re-ranking to optimize demonstration selection based on
-    analogical consistency (True Consistency Score) rather than just similarity.
-    
-    This function:
-    1. Generates Q_answered candidates for each demo (hypothesis generation)
-    2. Evaluates mirror consistency by testing each demo against others
-    3. Scores demos based on their utility (TCS > baseline similarity)
-    4. Optionally filters based on thresholds
-    5. Returns a re-ranked list optimized for analogical utility
-    
-    Args:
-        target_query: The target problem to solve
-        indices_to_rerank: List of indices to re-rank (from exemplar_data)
-        exemplar_data: Dict containing 'questions' and 'solutions' lists
-        api_manager: API manager instance for LLM calls
-        config: Configuration dict with re-ranking parameters
-    
-    Returns:
-        {
-            "status": "SUCCESS" | "FAILED",
-            "reranked_indices": [...],  # Re-ranked indices list (or original if failed)
-            "ranking_scores": {...},    # Score for each index
-            "trace": [...]              # Execution trace
-        }
-    """
-    logger = logging.getLogger(__name__)
-    logger.info(f"Starting unified mirror re-ranking for {len(indices_to_rerank)} samples")
-    
-    print(f"\n{'='*80}")
-    print(f"  [MIRROR RE-RANKING] Unified Analogical Consistency Re-Ranking")
-    print(f"  Input: {len(indices_to_rerank)} samples | Target Query: {target_query[:60]}...")
-    print(f"{'='*80}")
-    
-    trace_accumulator = []
-    
-    try:
-        if not indices_to_rerank:
-            logger.warning("No indices to re-rank, returning empty result")
-            return {
-                "status": "SUCCESS",
-                "reranked_indices": [],
-                "ranking_scores": {},
-                "trace": trace_accumulator
-            }
-        
-        # Extract configuration
-        enable_r0 = config.get("MIRROR_RERANKING_ENABLE_R0", False)
-        enable_filtering = config.get("MIRROR_RERANKING_ENABLE_FILTERING", True)
-        enable_redundancy = config.get("MIRROR_RERANKING_ENABLE_REDUNDANCY_FILTER", True)
-        evaluate_base = config.get("MIRROR_RERANKING_EVALUATE_BASE_FILTERING", False)
-        active_limit = config.get("MIRROR_RERANKING_ACTIVE_LIMIT", None)
-        
-        # --- Phase 0: Prepare Active Candidates ---
-        active_candidates = list(indices_to_rerank)
-        
-        # Apply limit if specified
-        if active_limit is not None and len(active_candidates) > active_limit:
-            active_candidates = active_candidates[:active_limit]
-            logger.info(f"Limiting candidates to {active_limit}")
-        
-        # Inject R0 if enabled
-        if enable_r0:
-            if -1 not in active_candidates:
-                active_candidates.insert(0, -1)
-                logger.info("Injected zero-shot candidate (R0)")
-        
-        # Validation set = all non-R0 candidates
-        validation_indices = [idx for idx in active_candidates if idx != -1]
-        
-        if not validation_indices:
-            logger.warning("No valid validation indices after filtering")
-            return {
-                "status": "FAILED",
-                "error": "No valid validation indices",
-                "fallback_indices": indices_to_rerank,
-                "trace": trace_accumulator
-            }
-        
-        # --- Phase 0.5: Calculate Baseline Scores ---
-        baseline_scores = _calculate_baseline_difficulty(
-            retrieved_indices=validation_indices,
-            exemplar_data=exemplar_data,
-            api_manager=api_manager,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-        
-        # --- Phase 1: Hypothesis Generation (Q_answered Candidates) ---
-        hypotheses = _generate_hypotheses(
-            target_query=target_query,
-            candidate_indices=active_candidates,
-            exemplar_data=exemplar_data,
-            api_manager=api_manager,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-        
-        # --- Phase 2: Mirror Evaluation (True Consistency Score) ---
-        consistency_matrix = _evaluate_mirror_consistency(
-            target_query=target_query,
-            hypotheses=hypotheses,
-            validation_indices=validation_indices,
-            exemplar_data=exemplar_data,
-            api_manager=api_manager,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-        
-        # --- Phase 3: Utility Scoring ---
-        candidate_scores = {}
-        candidate_contributions = {}
-        
-        for cand_idx in active_candidates:
-            total_utility = 0.0
-            contribs = {}
-            
-            for val_idx in validation_indices:
-                if cand_idx == val_idx:
-                    continue
-                
-                mirror_acc = consistency_matrix.get(cand_idx, {}).get(val_idx, 0.0)
-                base_acc = baseline_scores.get(val_idx, 0.0)
-                
-                # Utility = amount by which this demo improves over baseline
-                if mirror_acc > base_acc:
-                    delta = mirror_acc - base_acc
-                    total_utility += delta
-                    contribs[val_idx] = delta
-            
-            candidate_scores[cand_idx] = total_utility
-            candidate_contributions[cand_idx] = contribs
-        
-        logger.info(f"Candidate utility scores calculated")
-        for cand_idx in active_candidates:
-            logger.info(f"  Index {cand_idx}: utility={candidate_scores[cand_idx]:.3f}")
-        
-        # --- Phase 4: Ranking and Filtering ---
-        final_indices, base_indices, master_sorted = _rank_and_filter_candidates(
-            candidate_indices=active_candidates,
-            candidate_scores=candidate_scores,
-            candidate_contributions=candidate_contributions,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-        
-        # Choose which list to return based on filtering settings
-        if evaluate_base or (enable_filtering and not enable_redundancy):
-            # Return base-filtered list
-            reranked = base_indices
-        else:
-            # Return redundancy-filtered list (most selective)
-            reranked = final_indices
-        
-        # If all filtering is disabled, use master sorted list
-        if not enable_filtering and not enable_redundancy:
-            reranked = master_sorted
-        
-        logger.info(f"Re-ranking complete. Final order: {reranked}")
-        
-        return {
-            "status": "SUCCESS",
-            "reranked_indices": reranked,
-            "ranking_scores": candidate_scores,
-            "base_filtered_indices": base_indices,
-            "redundancy_filtered_indices": final_indices,
-            "master_sorted_indices": master_sorted,
-            "trace": trace_accumulator
-        }
-    
-    except Exception as e:
-        import traceback
-        logger.error(f"Mirror re-ranking failed: {e}", exc_info=True)
-        print(f"[ERROR] Mirror re-ranking failed: {e}")
-        print(traceback.format_exc())
-        
-        return {
-            "status": "FAILED",
-            "error": str(e),
-            "fallback_indices": indices_to_rerank,
-            "trace": trace_accumulator
-        }
-
-def solve_with_parallel_benchmarking(
-    target_query: str,
-    retrieved_indices: list,
-    exemplar_data: list,
-    api_manager,
-    config: dict
-):
-    """
-    Executes the generation phase as independent parallel tracks.
-    Iterates through 'GROUP_CONSISTENCY_CANDIDATES' (Strategies),
-    generates N samples for each, and returns distinct result sets.
-    """
-    strategies = config.get("GROUP_CONSISTENCY_CANDIDATES", [(0,)]) # Default to 1-shot
-    n_samples = config.get("GROUP_CONSISTENCY_SAMPLES_N", 1)
-    
-    benchmark_results = {}
-    
-    print(f"   [Benchmark] Running {len(strategies)} parallel strategies...")
+EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
+
+PROMPT_TEMPLATES: Dict[str, str] = {
+
+    "standardization_v1": """You are a helpful math assistant.
+Your task is to rewrite the following solved math example into a **clear, well-structured, and standardized format** that is easier for a language model to learn from.
+
+Make the question and its reasoning more readable, formal, and useful for solving similar problems — **without changing the logic, reasoning steps, or final answer**.
+
+---
+**Guidelines**:
+1. Keep the original reasoning process and final answer exactly the same — only improve the writing and formatting.
+2. Use correct grammar, clean math language, and consistent formatting.
+3. Write the reasoning step by step in a formal, easy-to-follow style.
+4. Clarify any unclear or missing reasoning, and highlight helpful patterns.
+5. Format the question, rationale, and final answer like a standard math textbook.
+6. Do **not** add extra comments or explanations outside the rewritten version.
+
+---
+**Original Example (Input)**:
+{original_example}
+
+---
+**Output Format (Strictly follow this format, including the exact headers 'Question:', 'Rationale:', and 'Final Answer:')**:
+
+Question: [Your rewritten question]
+
+Rationale: [Your rewritten reasoning here, written clearly and step by step]
+
+Final Answer: [Your clean and direct final answer]
+""",
     
-    for group_tuple in strategies:
-        # 1. Define Strategy Name & Indices
-        strategy_name = f"strategy_{len(group_tuple)}shot_idx{''.join(map(str, group_tuple))}"
-        
-        # Map tuple indices (0, 1) to actual retrieved indices
-        # We must ensure we don't go out of bounds of what was actually retrieved
-        current_indices = []
-        valid_strategy = True
-        for ptr in group_tuple:
-            if ptr < len(retrieved_indices):
-                current_indices.append(retrieved_indices[ptr])
-            else:
-                valid_strategy = False
-                break
-        
-        if not valid_strategy:
-            print(f"   [Benchmark] Skipping {strategy_name} (Not enough retrieved samples)")
-            continue
-
-        # 2. Construct Prompt (Standard Prompting)
-        # We reuse the standard 'final_solver' template logic here
-        # Construct the examples block manually
+    "transformation_v1": """You are provided with a **Main Question** and a **Sample to Transform**.
+Your task is to transform the **Sample's Rationale** into a version that is more aligned with the **Main Question**, while ensuring it remains accurate to its own question.
+
+**Main Question:**
+{target_query}
+
+**Sample to Transform:**
+{text_to_transform}
+
+**Instructions for Transforming the Sample's Rationale:**
+1. Analyze the **Sample's Rationale** in the context of its own question to understand its core reasoning.
+2. Rewrite the rationale, prioritizing elements most transferable to solving the **Main Question**.
+3. Use clear, straightforward language.
+4. Do not alter the core logic to solve the **Main Question**, nor modify the **Sample's Question** or its **Final Answer** (as presented in the 'Sample to Transform').
+5. Ensure the transformed rationale clearly conveys the reasoning flow.
+
+**Output Format (Strictly follow this format, including the exact headers 'Question:' and 'Rationale and Answer:')**:
+Question: [Original Question from the 'Sample to Transform']
+Rationale and Answer: [Transformed Rationale, followed by the Original Answer from the 'Sample to Transform']
+""",
+    
+    "transformation_shallow" : """<Objective>
+Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question's theme, context, or style — while strictly preserving the sample's original reasoning path and final answer.
+</Objective>
+
+<Transformation Guidelines>
+Target-Directed Adaptation:
+- Adapt the sample's theme, context, and entities to mirror those in the Target Question.
+- Think of this as reframing the sample so it feels like it belongs to the same world or problem type as the Target Question.
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.
+
+
+Preserve Core Reasoning:
+- The underlying logical pathway and mathematical operations must remain identical.
+- Do not alter the sequence of steps, the problem-solving strategy, or how one calculation leads to the next. The core method of solving must be perfectly preserved.
+
+Restrict Transformations to the Surface Level:
+- Your transformations must be limited to the surface and contextual layers of the problem.
+- This includes changing nouns (entities, objects), numbers and quantities (while ensuring the logic and final answer are preserved), and the overall setting or story.
+- Do not change the fundamental problem structure or the reasoning schema. The goal is to change the "story" of the problem, not the "logic" of the solution.
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed question and rationale must remain natural, realistic, and logically coherent.
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., "a cat eats an apple").
+- If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes.
+- Always prioritize clarity, realism, and logical consistency over aggressive transformation.
+
+Keep the Final Answer Unchanged:
+- The final numerical or categorical answer at the end of the rationale must not be changed. It should remain exactly as it was in the original sample.
+
+</Transformation Guidelines>
+</Example Transformation>
+
+<Example Input>
+Target Question: A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
+
+Sample to Transform:
+Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
+
+Rationale:
+To find the remaining cookies, we first need to calculate how many cookies were sold.
+The baker sold 7 boxes, and each box contains 6 cookies.
+Total cookies sold = 7 boxes * 6 cookies/box = 42 cookies.
+The baker started with 50 cookies.
+Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
+
+Final Answer: 8
+</Example Input>
+
+</Example Output>
+Question: A scientist starts with 28 test tubes for an analysis. She arranges them into racks, with each rack holding 4 test tubes. If she uses 5 full racks for her experiment, how many test tubes are left unused?
+
+Rationale:
+To find the remaining test tubes, we first need to calculate how many test tubes were used.
+The scientist used 5 racks, and each rack contains 4 test tubes.
+Total test tubes used = 5 racks * 4 test tubes/rack = 20 test tubes.
+The scientist started with 28 test tubes.
+Remaining test tubes = Initial amount - Amount used = 28 - 20 = 8 test tubes.
+
+Final Answer: 8
+</Example Output>
+</Example Transformation>
+
+<Task>
+<Input>
+Target Question:
+{target_query}
+
+Sample to Transform:
+{text_to_transform}
+</Input>
+
+<Output>
+- Do not include any explanations, comments, or text outside this format.
+
+Output Format (Strictly follow this format):
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output>
+</Task>
+""",
+
+    "transformation_complete":"""<Objective>
+Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
+The transformation should be holistic, aiming to align the sample with the Target Question on multiple levels—from surface features like entities and context to deeper conceptual and structural similarities. The goal is to reframe the sample to make its reasoning pattern as clear and applicable as possible for solving the Target Question, while strictly preserving the sample's original reasoning process and final answer.
+</Objective>
+
+<Transformation Guidelines>
+Target-Directed Adaptation:
+- Transform the sample in a way that brings it conceptually, thematically, and structurally closer to the Target Question.
+- Think of this as reframing the sample so it feels like it belongs to the same problem family or domain as the Target Question.
+- Any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.
+
+Depth-Aware Adaptation:
+- Transformations can occur at any depth. Shallow changes (e.g., swapping entities, adjusting context) are often safer and should be prioritized when they effectively create a strong analogy.
+- Moderately deep changes (e.g., altering the scenario to match the target's domain) are also encouraged.
+- Deeper structural or conceptual transformations are permissible but should only be performed if they are meaningful, non-disruptive, and significantly improve the analogical link without corrupting the core logic.
+- Gently favor shallow-to-mid-level adaptations, as they are less likely to introduce errors, but do not avoid deeper changes if the opportunity for a safe and powerful transformation exists.
+
+Preserve Core Reasoning:
+- The fundamental logical steps, mathematical operations, and the overall reasoning strategy of the sample must remain completely intact.
+- The method of solving the problem is the core pattern to be preserved; do not alter how the solution is derived.
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed question and rationale must be natural, realistic, and logically coherent.
+- Avoid any nonsensical or forced transformations. If a meaningful adaptation is not possible at a certain depth, it is better to keep that part of the sample closer to the original.
+- Always prioritize logical consistency and clarity over aggressive or risky transformations.
+
+Keep the Final Answer Unchanged:
+- The final numerical or categorical answer at the end of the rationale must not be changed. It must remain exactly as it was in the original sample.
+
+</Transformation Guidelines>
+</Example Transformation>
+
+<Example Input>
+Target Question: A spaceship has 120 units of fuel. Its main engine consumes 15 units per hour, and its auxiliary systems consume 5 units per hour. How many hours can the spaceship operate before running out of fuel?
+
+Sample to Transform:
+
+Question: A charity has a fund of $5,000. It spends $400 per month on rent and $100 per month on utilities. How many months can the charity operate before the fund is depleted?
+
+Rationale:
+To find out how long the fund will last, we first need to calculate the total monthly expenses.
+The total monthly expense is the sum of rent and utilities.
+Total expenses per month = $400 (rent) + $100 (utilities) = $500.
+The total fund is $5,000.
+Number of months the fund will last = Total fund / Total monthly expenses = $5,000 / $500 = 10 months.
+
+Final Answer: 10
+</Example Input>
+
+</Example Output>
+Question: A research station has a 5000-liter water tank. The main water purifier processes 400 liters per day, and a secondary filtration system uses an additional 100 liters per day. For how many days will the water supply last?
+
+Rationale:
+To find out how long the water supply will last, we first need to calculate the total daily water consumption.
+The total daily consumption is the sum of water for the purifier and the filtration system.
+Total consumption per day = 400 liters (purifier) + 100 liters (filtration) = 500 liters.
+The total water supply is 5000 liters.
+Number of days the supply will last = Total supply / Total daily consumption = 5000 / 500 = 10 days.
+
+Final Answer: 10
+</Example Output>
+</Example Transformation>
+
+<Task>
+<Input>
+Target Question:
+{target_query}
+
+Sample to Transform:
+{text_to_transform}
+</Input>
+
+<Output>
+- Do not include any explanations, comments, or text outside this format.
+
+Output Format (Strictly follow this format):
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output>
+</Task>
+""" ,
+    
+    "transformation_shallow-&-moderately-deep" : """<Objective>   
+Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question's area, structure, or style — while still preserving the sample's original reasoning path and final answer.
+</Objective>
+
+<Transformation Guidelines>  
+Target-Directed Adaptation:  
+- Transform the sample in a way that brings it conceptually and structurally closer to the Target Question.  
+- Think of this as reframing the sample so it feels like it belongs to the same world or problem type as the Target Question.  
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.  
+
+Preserve Core Reasoning:
+- Keep the logical relations, steps, and reasoning strategy intact. 
+- Do not change the essential operations or the fundamental reasoning pattern that lead to the solution. The method of solving should be identical. 
+
+Avoid Deep or Complex Alterations:
+- Do not transform very deep or complex internal structures (like full reasoning chains or logic patterns). 
+- Instead, you may adjust surface-level or moderately deep aspects — such as the domain, quantities, entities, or context in both the question and the rationale. 
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed question and rationale must remain natural, realistic, and logically coherent. 
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., "a cat eats an apple"). 
+- If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes. 
+- Always prioritize clarity, realism, and logical consistency over aggressive transformation. 
+
+Keep the Final Answer Unchanged:
+- The final numerical or categorical answer at the end of the rationale must not be changed. It should remain exactly as it was in the original sample.
+
+</Transformation Guidelines>
+</Example Transformation>
+
+<Example Input>
+Target Question: A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
+
+Sample to Transform:
+
+Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
+
+Rationale:
+To find the remaining cookies, we first need to calculate how many cookies were sold.
+The baker sold 7 boxes, and each box contains 6 cookies.
+Total cookies sold = 7 boxes * 6 cookies/box = 42 cookies.
+The baker started with 50 cookies.
+Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
+
+Final Answer: 8
+</Example Input>
+
+</Example Output>
+Question: A scientist starts with 28 test tubes for an analysis. She arranges them into racks, with each rack holding 4 test tubes. If she uses 5 full racks for her experiment, how many test tubes are left unused?
+
+Rationale:
+To find the remaining test tubes, we first need to calculate how many test tubes were used.
+The scientist used 5 racks, and each rack contains 4 test tubes.
+Total test tubes used = 5 racks * 4 test tubes/rack = 20 test tubes.
+The scientist started with 28 test tubes.
+Remaining test tubes = Initial amount - Amount used = 28 - 20 = 8 test tubes.
+
+Final Answer: 8
+</Example Output>
+</Example Transformation>
+
+<Task>  
+<Input>  
+Target Question:  
+{target_query}  
+
+Sample to Transform:
+{text_to_transform}
+</Input>
+
+<Output>  
+- Do not include any explanations, comments, or text outside this format.  
+
+Output Format (Strictly follow this format):
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output>
+</Task>
+""" ,
+
+    "merging_v1": """You are provided with a main question and two samples, each consisting of a question and its rationale plus answer. Your task is to merge these samples into a single, more potent sample. Combine their rationales into a cohesive and concise rationale that is highly relevant to solving the main question. The merged sample must retain the same format and preserve critical reasoning.
+
+**Main Question:**
+{target_query}
+
+**Sample 1:**
+{sample_1}
+
+**Sample 2:**
+{sample_2}
+
+**Instructions:**
+- Analyze both samples' rationales in the context of the main question.
+- Combine the rationales, integrating complementary reasoning steps, facts, and knowledge.
+- Ensure the merged rationale is concise, clear, and directly relevant to the main question.
+- Preserve all critical patterns and logical steps useful for the main question.
+- Resolve inconsistencies or redundancies, selecting the most accurate and relevant information.
+- Create a new question for the merged sample that reflects the combined focus and aligns with the main question's domain.
+- Use an answer from one sample if identical; if different, select the most consistent or combine logically. Ensure the final answer part is preserved.
+- Ensure the output format matches the input samples format.
+
+**Output Format (Strictly follow this format):**
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+""",
+
+    "merging_v2" : """You are an expert in analogical reasoning for mathematical problem-solving.  
+Your task is to merge two solved math problems into a single new, synthesized problem-solution pair that will serve as a strong exemplar for solving a target question.  
+
+These two input samples are called Parent Sample A and Parent Sample B, because they will be merged to form one new "child" example.   
+The child example should combine the most relevant and valuable reasoning patterns from its parents in a coherent, context-aware manner.
+
+<Your Objective> 
+Create a new merged example that:
+1. Retains the core reasoning structures and mathematical logic from both Parent A and Parent B.
+2. Selectively integrates only the parts most relevant to the Target Question. 
+3. Produces a new, logically consistent and useful exemplar that the LLM can learn from for analogical reasoning.
+</Your Objective> 
+
+<Core Guidelines> 
+1. Principled Construction from Parent Materials   
+- Use the reasoning chains, strategies, and key steps from both parents.  
+- Avoid inventing completely new mathematical methods.  
+- Preserve the internal logic and structure of the parent materials.
+
+2. Guided by the Target Question   
+- The merge must be performed in the context of the Target Question.   
+- Keep and emphasize the parts of each parent that are most helpful for solving the target question.   
+- If one parent is much more relevant, prioritize it — the merge does not need to be symmetrical.
+
+3. Coherence and Controlled Generation  
+- You may add minor connective text to make the final reasoning smooth and clear.  
+- The merged result must be mathematically correct, coherent, and self-contained.
+
+4. Superficial Re-contextualization 
+- Adapt the merged sample's phrasing and structure so it stylistically resembles the Target Question.  
+- Do not alter the core mathematics — only adjust presentation and framing.
+
+5. Relevance-Driven Asymmetry 
+- It is acceptable if the final merged sample resembles one parent more than the other.  
+- Discard irrelevant parts. The goal is maximum usefulness, not balance. 
+</Core Guidelines> 
+
+</Input Materials>  
+Parent Sample A: 
+{sample_1}
+
+Parent Sample B:
+{sample_2}
+
+Target Question: 
+{target_query}
+</Input Materials> 
+
+<Output Instructions> 
+You must output ONLY in the following format.   
+Do not include any explanations, comments, or text outside this format.  
+
+Output Format (Strictly follow this format):  
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output Instructions> 
+""",
+
+    "final_solver_v1": """**Objective:**
+Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
+
+**Your Method & Constraints:**
+1.  **Use Provided Inputs Only:** Base your solution *exclusively* on the given **Main Question** and the **Adapted Samples**. Do **not** use external information or prior knowledge beyond basic arithmetic/logic.
+2.  **Reason from Adapted Samples:** Analyze the **Adapted Samples** for logic, methods, and key facts. Intelligently generalize and apply these to the **Main Question**.
+3.  **Construct Your Solution:** Develop a logical, step-by-step **Rationale** for the **Main Question**. This rationale should implicitly show how the Adapted Samples informed your thinking, **without explicitly mentioning them**. Perform calculations accurately. Clearly state the **Final Answer**.
+
+**Required Output Format (Strictly Adhere):**
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+
+---
+**Inputs:**
+**Main Question:**
+{main_question_text}
+{adapted_samples_block}
+---
+**Your Solution:**
+""",
+
+    "final_solver_v3": """You are an expert solver. Solve the Main Question, using the Solved Examples as inspiration for your methodology.
+    
+<Instructions>
+Look for patterns in the Solved Examples that might help solve the Main Question. Adopt these strategies where they fit, but feel free to deviate from them if the new question requires a different logic. Treat the examples as suggestions, not strict rules.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+"final_solver_v4": """Use the Solved Examples as a blueprint to solve the Main Question.
+<Instructions>
+- Study the examples to understand the logical method used to reach the solution.
+- Extract the key reasoning pattern.
+- Apply this pattern to the Main Question.
+- Provide the solution as a concise, technical derivation. Focus strictly on the mathematical steps and logic, avoiding conversational language.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
+""",
+    
+    "final_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "final_solver_v3": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
+
+<True Solved Example>
+{examples_block}
+</True Solved Example>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "final_solver_simple_v1": """**Objective:**
+Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
+
+**Your Method & Constraints:**
+1.  **Construct Your Solution:** Develop a logical, step-by-step **Rationale** for the **Main Question**.
+2.  Perform calculations accurately and show your work.
+3.  Clearly state the **Final Answer** at the end.
+
+**Required Output Format (Strictly Adhere):**
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+
+---
+**Inputs:**
+**Main Question:**
+{main_question_text}
+---
+**Your Solution:**
+""",
+    "final_solver_simple_v2": """Solve the Main Question using standard mathematical methods.
+
+<Instructions>
+1. Analyze the question to identify the necessary logical steps.
+2. Provide the solution as a concise, technical derivation.
+3. Focus strictly on the mathematical steps and logic, avoiding conversational language, teaching explanations, or filler words.
+</Instructions>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
+""",
+
+    "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
+Both 'Model Output' and 'Ground Truth' may contain intermediate steps (Chain-of-Thought) leading to a final answer.
+
+Follow these two steps precisely:
+
+Step 1: Extract Final Answers
+- From 'Model Output', extract only the final numerical or definitive answer. Try to isolate the number or simple expression.
+- From 'Ground Truth', extract only the final numerical or definitive answer. Try to isolate the number or simple expression.
+- Present these extracted answers clearly. If you cannot confidently extract an answer, state "Extraction Failed" for that part.
+
+Step 2: Evaluate Equivalence
+- Compare the 'Extracted Model Answer' with the 'Extracted Ground Truth Answer'.
+- If either extraction failed, the evaluation must be 'false'.
+- Consider common mathematical equivalences (e.g., "2+2" vs "4", "sqrt(9)" vs "3", "1/2" vs "0.5", "1,000" vs "1000", "$5" vs "5").
+- Respond ONLY with the single word 'true' or 'false' for this evaluation part.
+
+Output Format (Strictly follow this format):
+Extracted Model Answer: [Your extracted answer from Model Output]
+Extracted Ground Truth Answer: [Your extracted answer from Ground Truth]
+Evaluation: [true OR false]
+
+---
+Model Output:
+{model_answer}
+---
+Ground Truth:
+{ground_truth}
+---
+Begin Output:
+""",
+
+    "duplicate_question_check_v1": """You are a text comparison assistant. Your task is to determine if the 'Main Question' is identical to ANY of the questions in the 'Retrieved Questions' list.
+
+**Rules:**
+1.  Compare the text of the 'Main Question' against each 'Retrieved Question' verbatim.
+2.  Ignore differences in whitespace, capitalization, or minor punctuation unless they change the meaning.
+3.  If you find an exact match, your job is done.
+4.  Your entire output must be a single word: **yes** or **no**. Do not provide any explanation.
+
+---
+**Main Question:**
+{main_question_text}
+---
+**Retrieved Questions:**
+{retrieved_questions_block}
+---
+**Is there an exact match? (yes/no):**
+""",
+
+    "self_sampling_generator": """Objective:
+Your task is to solve the Main Question by providing a formal, step-by-step solution and a final answer. The solution should be presented in an academic, textbook-style format.
+    
+Style Guidelines:
+Avoid conversational language: Do not use phrases like "Let's start by...", "Now, we will...", or any chatbot-like pleasantries.
+Be direct and concise: Focus on showing the mathematical steps, formulas, and calculations directly.
+Formal Tone: The entire output should be objective and formal, as if written in a mathematics textbook.
+
+Required Output Format (Strictly Adhere):
+Solution:
+[Your step-by-step solution, presenting the mathematical derivation directly.]
+
+Final Answer:
+[Your final answer to the Main Question.]
+
+Inputs:
+Main Question:
+{main_question_text}
+
+Your Solution:
+""",
+
+    "self_sampling_augmentor_v1": """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
+
+<Instructions>
+1. Read the 'Base Question' to understand its core mathematical concept, structure, and context.
+2. Create {n_samples} new questions s that are relevant to the base question. Your new questions should be distinct from each other and from the base question (e.g., involving different numbers and names).
+3. Crucially, you must NOT provide any rationale or answer. Your output should consist ONLY of the generated question statements.
+4. Ensure the generated questions are unique from each other and from the base question.
+5. Present your output as a numbered list, as shown in the example.
+</Instructions>
+
+<Example>
+<Base Question>
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
+</Base Question>
+
+<Your Output (for n_samples = 2)>
+1. In a bag, there are 5 red balls and 3 blue balls. If two balls are drawn at random without replacement, what is the probability that both balls are red?
+2. A box contains 10 red marbles and 5 blue marbles. If three marbles are drawn at random without replacement, what is the probability that all three marbles are red?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+
+
+    "self_sampling_augmentor_decomposition":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
+2. Create {n_samples} new math questions.
+3. CRITICAL CONSTRAINTS for the new questions:
+    - Simpler: They must be somewhat easier than the Base Question.
+    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
+    - Distinct: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the numbered list of question statements.
+</Instructions>
+
+<Example>
+<Base Question>
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
+</Base Question>
+
+<Your Output (for n_samples = 2)>
+1. How many distinct ways can you arrange 3 red balls and 3 blue balls in a row of 6 slots?
+2. There are 6 seats numbered 1 to 6. If we choose 2 seats at random to be the "Captain's seats", what is the probability that we chose specifically seat #1 and seat #2?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+
+    "self_sampling_augmentor_decomposition_2":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
+2. Create {n_samples} new math questions.
+3. CRITICAL CONSTRAINTS for the new questions:
+    - Simpler: They must be somewhat easier than the Base Question.
+    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
+    - Distinct: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the numbered list of question statements.
+</Instructions>
+
+<Example>
+<Base Question>
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
+</Base Question>
+
+<Your Output (for n_samples = 2)>
+1. A flight attendant has 3 steak meals and 3 fish meals on a cart. In how many distinct ways can these 6 meals be distributed to 6 specific crew members?
+2. A crew of 6 people includes exactly 2 pilots. If we randomly select a group of 3 crew members to receive the fish meals, what is the probability that the group chosen includes both pilots?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+    "self_sampling_augmentor_decomposition_3":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
+2. Create {n_samples} new math questions.
+3. CRITICAL CONSTRAINTS for the new questions:
+    - Simpler: They must be moderately simpler than the Base Question and conceptually isolated to reduce overall difficulty.
+    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
+    - Distinct: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the numbered list of question statements.
+</Instructions>
+
+<Example>
+<Base Question>
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
+</Base Question>
+
+<Your Output (for n_samples = 2)>
+1. A flight attendant has 3 steak meals and 3 fish meals on a cart. In how many distinct ways can these 6 meals be distributed to 6 specific crew members?
+2. A crew of 6 people includes exactly 2 pilots. If we randomly select a group of 3 crew members to receive the fish meals, what is the probability that the group chosen includes both pilots?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+    "self_sampling_augmentor_decomposition_4":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
+<Instructions>
+1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
+2. Create {n_samples} new math questions.
+3. CRITICAL CONSTRAINTS for the new questions:
+    - Moderately Simpler & Reduced Complexity: The new questions must be distinctly easier than the Base Question. Reduce the cognitive load by lowering numerical magnitudes or removing multi-step logic layers, ensuring the core concept remains but the execution is more straightforward.
+    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
+    - Distinct Contexts: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the numbered list of question statements.
+</Instructions>
+
+<Example>
+<Base Question>
+An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
+</Base Question>
+<Your Output (for n_samples = 2)>
+1. A flight attendant has 3 steak meals and 3 fish meals on a cart. In how many distinct ways can these 6 meals be distributed to 6 specific crew members?
+2. A crew of 6 people includes exactly 2 pilots. If we randomly select a group of 3 crew members to receive the fish meals, what is the probability that the group chosen includes both pilots?
+</Your Output>
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+    "self_sampling_augmentor_decomposition_complex":"""You are an expert Logical Decomposition Specialist and Mathematical Architect. Your objective is not merely to simplify a problem, but to deconstruct a complex 'Base Question' into {n_samples} distinct, orthogonal sub-problems using the method of **Variable Isolation via Zero-State Application**.
+
+<Core_Philosophy>
+You must view the Base Question as a system composed of a **Trunk** and multiple **Aspects**.
+1.  **The Trunk (The Skeleton):** The fundamental reasoning pathway, physical law, or algorithmic structure that defines the problem type. This MUST exist in every sub-question. You effectively "freeze" the core logic.
+2.  **The Aspects (The Variables):** The specific constraints, complexities, or forces acting upon the Trunk (e.g., friction, tax rates, conditional probabilities).
+3.  **Orthogonality:** Each sub-question must focus on exactly ONE active Aspect while the others are dormant.
+4.  **The Zero-State Rule:** You do not *delete* the other aspects; you set them to their "Identity Value" or "Ideal State" so they no longer contribute to the difficulty but the Trunk remains valid.
+</Core_Philosophy>
+
+<Instructions>
+1.  **Analyze the Base Question:**
+    *   Identify the **Trunk**. (e.g., "Newton's Second Law" or "Compound Interest Formula").
+    *   List all distinct **Aspects** (complexities) present in the prompt.
+    *   Determine the **Zero-State** for each aspect (e.g., Friction → 0, Efficiency → 100%, Delay → 0 seconds).
+
+2.  **Generate {n_samples} Sub-Questions:**
+    *   For each sub-question, select **ONE** target Aspect to highlight.
+    *   Apply the **Zero-State Rule** to all *other* non-target aspects.
+    *   **Preserve the Trunk:** Ensure the core solving method remains identical to the Base Question, even if the values are simplified.
+
+3.  **Strict Constraints:**
+    *   **No Logic Deletion:** Do not remove the Trunk. If the Base Question is about calculating speed, every sub-question must still be about calculating speed/motion, not just "counting objects."
+    *   **Independence:** The specific challenge in Question 1 must not overlap with the specific challenge in Question 2. They must be orthogonal.
+    *   **Contextual Divergence (CRITICAL):** To prevent analogical hallucination, the sub-questions must NOT use the same setting or objects as the Base Question. If the Base Question is about "Cars," the sub-questions must be about "Blocks," "Particles," or "Widgets." Change the *Skin*, keep the *Math*.
+
+4.  **Verification:**
+    *   Ensure that if a student solves all {n_samples} questions, they have practiced every mechanism required to solve the Base Question.
+</Instructions>
+
+<Zero_State_Protocol>
+When deactivating an Aspect, use these canonical values:
+*   **Additive constraints** (e.g., wind speed, fees): Set to **0**.
+*   **Multiplicative constraints** (e.g., coefficients, efficiency): Set to **1** (or 100%).
+*   **Logic gates** (e.g., "if it is raining"): Set to the **Simplest Valid Truth Value** (e.g., "It is sunny/dry").
+*   *Warning:* Do not set values that cause division by zero or logical paradoxes.
+</Zero_State_Protocol>
+
+<One_Shot_Example>
+<Base_Question>
+A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction is 0.1, and air resistance acts against the car with a force of 200N. Calculate the total engine force required to maintain a constant velocity.
+</Base_Question>
+
+<Reasoning_Trace>
+*   **Trunk:** Forces Logic (Sum of opposing forces = Engine Force).
+*   **Aspects:** 1. Gravity (Incline), 2. Friction, 3. Air Resistance.
+*   **Zero-States:** Incline → 0 degrees (Flat), Friction → $\mu=0$ (Smooth), Air Resistance → 0N (Vacuum).
+*   **Context Strategy:** Change "Car/Road" to "Block/Ramp", "Crate/Floor", "Sled/Track".
+</Reasoning_Trace>
+
+<Your_Output (for n_samples = 3)>
+1. A heavy stone block of mass 1000kg is being pushed up a smooth, frictionless ramp angled at 30 degrees. Assuming a vacuum (no air resistance), calculate the pushing force required to keep the block moving at a constant velocity.
+2. A large wooden crate (1000kg) slides across a flat, horizontal warehouse floor (0-degree incline). The floor is rough with a kinetic friction coefficient of 0.1, and we assume air resistance is negligible. Calculate the horizontal force needed to maintain constant velocity.
+3. A 1000kg test sled moves along a flat, smooth horizontal track (no friction). However, a parachute attached to the back creates a drag force of 200N. Calculate the propulsion force required to maintain constant velocity.
+</Your_Output>
+</One_Shot_Example>
+
+<Task>
+<Base_Question>
+{main_question_text}
+</Base_Question>
+</Task>
+
+<Output_Requirement>
+Output ONLY the numbered list of question statements. Do not include your reasoning trace or target labels in the final output.
+</Output_Requirement>
+""",
+
+    "self_sampling_augmentor_decomposition_complex_2":"""You are an expert Logical Decomposition Specialist and Mathematical Architect. Your objective is to deconstruct a complex 'Base Question' into {n_samples} distinct, orthogonal sub-problems using the method of **Variable Isolation via Zero-State Application**.
+
+<Core_Philosophy>
+You must view the Base Question as a system composed of a **Trunk** and multiple **Aspects**.
+1.  **The Trunk (The Skeleton):** The fundamental reasoning pathway or formula. This MUST exist in every sub-question.
+2.  **The Aspects (The Variables):** The specific constraints acting upon the Trunk.
+3.  **Orthogonality:** Each sub-question must focus on exactly ONE active Aspect while the others are dormant (Zero-State).
+4.  **The Zero-State Rule:** Do not delete aspects; set them to their "Identity Value" or "Ideal State" so the Trunk remains executable but the aspect is trivialized.
+</Core_Philosophy>
+
+<Instructions>
+1.  **Analyze the Base Question:** Identify the Trunk (logic), the Aspects (complexities), and the Zero-State for each aspect.
+2.  **Generate {n_samples} Sub-Questions:**
+    *   Select **ONE** target Aspect to highlight per question.
+    *   Apply the **Zero-State Rule** to all *other* non-target aspects.
+    *   **Preserve the Trunk:** Ensure the core solving method remains identical.
+3.  **Strict Constraints:**
+    *   **No Logic Deletion:** Do not remove the Trunk. The underlying equation/logic must remain isomorphic.
+    *   **Contextual Divergence (CRITICAL):** To prevent analogical hallucination, the sub-questions must NOT use the same setting or objects as the Base Question. If the Base Question is about "Cars," the sub-questions must be about "Blocks," "Particles," or "Widgets." Change the *Skin*, keep the *Math*.
+    *   **Independence:** The specific challenge in Question 1 must not overlap with Question 2.
+
+<Zero_State_Protocol>
+*   **Additive constraints** (e.g., wind, fees): Set to **0**.
+*   **Multiplicative constraints** (e.g., efficiency): Set to **1** (or 100%).
+*   **Logic gates**: Set to the **Simplest Valid Truth Value**.
+</Zero_State_Protocol>
+
+<One_Shot_Example>
+<Base_Question>
+A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction is 0.1, and air resistance acts against the car with a force of 200N. Calculate the total engine force required to maintain a constant velocity.
+</Base_Question>
+
+<Reasoning_Trace>
+*   **Trunk:** Forces Logic (Sum of opposing forces = Forward Force).
+*   **Aspects:** Gravity (Incline), Friction, Drag.
+*   **Context Strategy:** Base is "Car/Road". Sub-questions must use different scenarios like "Block/Ramp" or "Sled/Ice".
+</Reasoning_Trace>
+
+<Your_Output (for n_samples = 3)>
+1. A heavy stone block of mass 1000kg is being pushed up a smooth, frictionless ramp angled at 30 degrees. Assuming a vacuum (no air resistance), what is the pushing force required to keep the block moving at a constant velocity?
+2. A large wooden crate (1000kg) slides across a flat, horizontal warehouse floor. The floor is rough with a kinetic friction coefficient of 0.1. Ignoring air resistance, calculate the horizontal force needed to maintain constant velocity.
+3. A 1000kg test sled moves along a flat, frictionless magnetic track. A parachute attached to the back creates a drag force of 200N. Calculate the propulsion force required to maintain constant velocity.
+</Your_Output>
+</One_Shot_Example>
+
+<Task>
+<Base_Question>
+{main_question_text}
+</Base_Question>
+</Task>
+
+<Output_Requirement>
+Output ONLY the numbered list of question statements. Do not include your reasoning trace.
+</Output_Requirement>
+""",
+    
+    "self_sampling_augmentor_simplification":"""You are an expert mathematical simplification assistant. Your task is to take a 'Base Question' and produce a ONE-STEP SIMPLIFIED version of it. This simplified version will be used as a stepping stone to solve the original problem.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify the "Core Logic" (the main rule or formula needed) and the "Complexity Layers" (large numbers, extra arithmetic steps, or difficult variables).
+2. Create EXACTLY ONE new math question.
+3. CRITICAL CONSTRAINTS for the new question:
+    - Lite Simplification: Make the question ONLY slightly easier. Do not make it trivial.
+    - Prune One Leaf: Remove exactly one layer of complexity. For example:
+        *   If the numbers are large, make them smaller integers.
+        *   If there is a pre-calculation required (e.g., "radius is 2+3"), change it to the direct value ("radius is 5").
+        *   If there are many variables, remove one variable.
+    - Preserve the Trunk: The main mathematical logic required to solve the simplified question MUST remain the same as the Base Question.
+    - Standalone: The new question must be a complete sentence and solvable.
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the simplified question statement.
+</Instructions>
+
+<Example>
+<Base Question>
+Find the area of a circle inscribed in a square that has a diagonal length of 8.
+</Base Question>
+
+<Your Output>
+Find the area of a circle inscribed in a square that has a side length of 4.
+</Your Output>
+(Note: The simplification removed the step of calculating the side from the diagonal, but kept the core logic of the circle-square relationship.)
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+
+    "self_sampling_augmentor_simplification_shallow":"""You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical.
+
+<Instructions>
+1. Analyze the 'Base Question' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\pi$), messy units, or overly wordy variable descriptions.
+2. Create EXACTLY ONE new math question.
+3. CRITICAL CONSTRAINTS for the new question:
+    - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt 3$ with 4).
+    - Syntactic Cleanup: If the question uses complex units or wordy names for variables, standardize them (e.g., change "nautical miles" to "meters", change "the number of apples John holds" to "x").
+    - Logic Lock: Do NOT remove any reasoning steps, formulas, or intermediate derivations. The path to the solution must remain exactly the same, only the arithmetic should become effortless.
+    - Standalone: The new question must be a complete sentence and solvable.
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the simplified question statement.
+</Instructions>
+
+<Example>
+<Base Question>
+Calculate the kinetic energy of an object with a mass of 4.5kg moving at a velocity of $12.2 m/s$.
+</Base Question>
+
+<Your Output>
+Calculate the kinetic energy of an object with a mass of 2kg moving at a velocity of $4 m/s$.
+</Your Output>
+(Note: The decimal values were replaced with simple integers to make the calculation trivial, but the physics formula required remains exactly the same.)
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+</Task>
+""",
+    "self_sampling_augmentor_simplification_simple_shallow":"""Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
+<Instructions>
+1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
+2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
+3. Reduce the number of steps or constraints slightly, as long as the underlying relationship remains the same.
+4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
+</Instructions>
+<Main Question>
+{main_question_text}
+</Main Question>
+<Output Format>
+Simplified Question:
+[Your simplified version]
+</Output Format>
+""",
+
+    "self_sampling_augmentor_simplification_safe":"""You are a Logic Preservation Engine. Your goal is to analyze the <Main Question> to determine if it can be "Safely Simplified" for an Analogical Reasoning task.
+
+<Definition of Safe Simplification>
+A "Safe f" creates an easier version of the problem to solve as a reference, BUT it must adhere to these strict rules:
+1. PRESERVE LOGIC: The mathematical formulas, logical relationships, and required solution steps must remain identical to the original.
+2. REDUCE NOISE: You may replace large numbers with small integers (e.g., 5,392 -> 3), or remove narrative fluff (names, backstory).
+3. DO NO HARM: If changing a number or removing a sentence alters the fundamental question type or logic, it is UNSAFE.
+</Definition of Safe Simplification>
+
+<Evaluation Protocol>
+Before generating an output, analyze the question for these conditions:
+- Condition A (Simplifiable): The question uses large numbers or distracting text that are NOT essential to the logic.
+- Condition B (Unsafe/Core Only): The question is already short, abstract, or every number/constraint is structurally vital (e.g., specific constants, core puzzle constraints).
+
+<Instructions>
+- IF Condition A is met: Rewrite the question using small numbers and plain language. Keep the core logic exactly the same.
+- IF Condition B is met (or if you are unsure): Do NOT simplify. Output the <Main Question> exactly as it appears word-for-word.
+- WARNING: Better to output the original complex question than a simplified version with broken logic.
+</Instructions>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Output Format>
+Simplified Question:
+[Your Output Here]
+</Output Format>
+""",
+
+    "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
+
+Your task is to solve the Main Question by using analogical reasoning based on the provided group of Solved Sample Problems.
+
+<Instructions>
+1. Carefully analyze each solved sample problem to understand its reasoning pattern, problem-solving strategy, and logical structure.
+2. Identify the core reasoning principles and mathematical techniques that can be transferred to the Main Question.
+3. Apply these analogical insights to solve the Main Question, adapting the reasoning patterns to fit the specific context and requirements of the Main Question.
+4. Present your solution in a clear, step-by-step format that shows how you applied analogical reasoning.
+5. Do NOT simply copy the solutions from the samples—adapt and apply their reasoning patterns intelligently.
+</Instructions>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Solved Sample Problems>
+{samples_block}
+</Solved Sample Problems>
+
+<Output Format (Strictly follow this format)>
+Question: [The Main Question]
+Rationale and Answer: [Your step-by-step solution using analogical reasoning from the samples, followed by the final answer]
+</Output Format>
+""",
+
+
+    "analogical_adaptation_v2": """You are an expert in analogical reasoning for mathematical problem-solving.
+
+<Instructions>
+1. Carefully analyze each solved sample problem to understand its reasoning pattern, problem-solving strategy, and logical structure.
+2. Identify the core reasoning principles and mathematical techniques that can be transferred to the Main Question.
+3. Apply these analogical insights to solve the Main Question, adapting the reasoning patterns to fit the specific context and requirements of the Main Question.
+4. Present your solution in a clear, step-by-step format that shows how you applied analogical reasoning.
+5. Do NOT simply copy the solutions from the samples—adapt and apply their reasoning patterns intelligently.
+</Instructions>
+
+<Solved Examples>
+{samples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+    
+    "analogical_refinement":"""You are an expert mathematical problem solver.
+
+<Instructions>
+1. Review the <Solved Examples> to see how similar problems might be approached.
+2. **Use judgment:** Only use the logic from the examples if it actually works for the Main Question.
+3. **Refine and Correct:** If the examples use a pattern that doesn't fit or is incorrect for the Main Question, discard it and use the correct mathematical method instead.
+4. Solve the Main Question. Your priority is getting the correct answer, not mimicking the examples.
+</Instructions>
+
+<Solved Examples>
+{samples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Explain your steps. Briefly state which parts of the examples helped and which parts you had to change or ignore to solve this specific question correctly.]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your Answer/Output Format>
+""",
+    
+    "hierarchical_parent_solver_v1": """You are an expert mathematical problem solver.
+You are tasked with solving a **Main Question**.
+To assist you, we have broken this problem down into several related sub-problems or variations, and provided their solutions below.
+
+<Instructions>
+1. Analyze the 'Solved Variations'. Identify the underlying mathematical principles, formulas, or logic used to solve them.
+2. Apply these principles to the 'Main Question'. The Main Question is the parent problem of these variations, so the logic should be directly applicable or composable.
+3. Provide a clear, step-by-step rationale for the Main Question.
+4. State the Final Answer clearly.
+</Instructions>
+
+<Solved Examples>
+{child_solutions_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Output Format>
+Rationale:
+[Step-by-step derivation]
+
+Final Answer:
+[The final result]
+</Output Format>
+""",
+    "hierarchical_parent_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved variations.
+
+<Instructions>
+Carefully analyze each variation: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these variations as supportive guides. Adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Variations>
+{child_solutions_block}
+</Solved Variations>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "hierarchical_parent_solver_v3": """Use the Solved Examples as a blueprint to solve the Main Question.
+<Instructions>
+- Study the examples to understand the logical method used to reach the solution.
+- Extract the key reasoning pattern.
+- Apply this pattern to the Main Question.
+- Provide the solution as a concise, technical derivation. Focus strictly on the mathematical steps and logic, avoiding conversational language.
+</Instructions>
+
+<Solved Variations>
+{child_solutions_block}
+</Solved Variations>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+    "hierarchical_parent_solver_v4": """Use the Solved Examples as a blueprint to solve the Main Question.
+<Instructions>
+- Study the examples to understand the logical method used to reach the solution.
+- Extract the key reasoning pattern.
+- Apply this pattern to the Main Question.
+</Instructions>
+
+<Solved Variations>
+{child_solutions_block}
+</Solved Variations>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+    "hierarchical_parent_solver_v5": """Use the method from the Simplified Reference to solve the Main Question.
+
+<Instructions>
+1. The Simplified Reference solves the same problem with easier numbers/logic.
+2. Follow the exact same sequence of steps used in the Reference, but apply them to the Main Question's values.
+3. Perform the calculations carefully. The logic is identical, but the arithmetic is more complex.
+</Instructions>
+
+<Simplified Reference>
+{child_solutions_block}
+</Simplified Reference>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
+""",
+
+
+    "reverse_validation_v1": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved variations.
+
+<Instructions>
+Carefully analyze each variation: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these variations as supportive guides. Adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Variations>
+{candidate_exemplar}
+</Solved Variations>
+
+<Main Question to Solve>
+{validator_question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "simplification_generator_v1": """Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
+<Instructions>
+1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
+2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
+3. Reduce the number of steps or constraints slightly, as long as the underlying relationship remains the same.
+4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
+</Instructions>
+<Main Question>
+{text_to_simplify}
+</Main Question>
+<Output Format>
+Simplified Question:
+[Your simplified version]
+</Output Format>
+""",
+
+    "simplified_sample_solver_v1": """You are an expert mathematician. Your task is to solve a 'Simplified Question' by applying the logic found in an 'Original Solved Example'.
+
+<Original Solved Example>
+{original_exemplar}
+</Original Solved Example>
+
+<Simplified Question>
+{simplified_question}
+</Simplified Question>
+
+<Instructions>
+1. Analyze the Original Solved Example to understand the underlying logic and problem-solving method.
+2. Apply that SAME logic to solve the Simplified Question.
+3. Output the solution in the standard format.
+</Instructions>
+
+<Output Format (Strictly follow this format)>
+Rationale:
+[Your step-by-step rationale for the Simplified Question]
+
+Final Answer:
+[Your final answer]
+</Output Format>
+""",
+
+    "main_from_simplified_proxy_v1": """You are an expert mathematician. You have a 'Complex Main Question' and a solution to a 'Simplified Version' of that question.
+Use the logic from the Simplified Solution to solve the Complex Main Question.
+
+<Simplified Version Solution>
+{simplified_solution}
+</Simplified Version Solution>
+
+<Complex Main Question>
+{original_main_question}
+</Complex Main Question>
+
+<Instructions>
+1. Read the Simplified Version Solution to understand the method used.
+2. Apply that same method to the Complex Main Question (handling the extra complexity or larger numbers).
+3. Output the solution in the standard format.
+</Instructions>
+
+<Output Format (Strictly follow this format)>
+Rationale:
+[Your step-by-step rationale for the Complex Main Question]
+
+Final Answer:
+[Your final answer]
+</Output Format>
+""",
+
+    "self_sampling_augmentor_simplification_with_solution": """You are a Logic Preservation Engine. Your goal is to analyze the <Main Question> and its <Reference Solution> to determine if it can be "Safely Simplified" for an Analogical Reasoning task.
+
+<Definition of Safe Simplification>
+A "Safe Simplification" creates an easier version of the problem to solve as a reference, BUT it must adhere to these strict rules:
+1. PRESERVE LOGIC: The mathematical formulas, logical relationships, and required solution steps must remain identical to the original.
+2. REDUCE NOISE: You may replace large numbers with small integers (e.g., 5,392 -> 3), or remove narrative fluff (names, backstory).
+3. DO NO HARM: If changing a number or removing a sentence alters the fundamental question type or logic, it is UNSAFE.
+</Definition of Safe Simplification>
+
+<Evaluation Protocol>
+Before generating an output, analyze the question and solution for these conditions:
+- Condition A (Simplifiable): The question uses large numbers or distracting text that are NOT essential to the logic (as confirmed by the Reference Solution).
+- Condition B (Unsafe/Core Only): The question is already short, abstract, or every number/constraint is structurally vital (e.g., specific constants, core puzzle constraints).
+
+<Instructions>
+- IF Condition A is met: Rewrite the question using small numbers and plain language. Keep the core logic exactly the same.
+- IF Condition B is met (or if you are unsure): Do NOT simplify. Output the <Main Question> exactly as it appears word-for-word.
+- WARNING: Better to output the original complex question than a simplified version with broken logic.
+</Instructions>
+
+<Main Question>
+{main_question_text}
+</Main Question>
+
+<Reference Solution>
+{generated_solution}
+</Reference Solution>
+
+<Output Format>
+Simplified Question:
+[Your Output Here]
+</Output Format>
+""",
+
+    "self_sampling_augmentor_simplification_shallow_with_solution": """You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical, aided by the provided 'Reference Solution'.
+
+<Instructions>
+1. Analyze the 'Base Question' and 'Reference Solution' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\pi$), messy units, or overly wordy variable descriptions visible in the calculation steps.
+2. Create EXACTLY ONE new math question.
+3. CRITICAL CONSTRAINTS for the new question:
+    - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt 3$ with 4).
+    - Syntactic Cleanup: If the question uses complex units or wordy names for variables, standardize them (e.g., change "nautical miles" to "meters", change "the number of apples John holds" to "x").
+    - Logic Lock: Do NOT remove any reasoning steps, formulas, or intermediate derivations found in the Reference Solution. The path to the solution must remain exactly the same, only the arithmetic should become effortless.
+    - Standalone: The new question must be a complete sentence and solvable.
+4. Do NOT provide any rationale, steps, or solutions.
+5. Output ONLY the simplified question statement.
+</Instructions>
+
+<Example>
+<Base Question>
+Calculate the kinetic energy of an object with a mass of 4.5kg moving at a velocity of $12.2 m/s$.
+</Base Question>
+
+<Your Output>
+Calculate the kinetic energy of an object with a mass of 2kg moving at a velocity of $4 m/s$.
+</Your Output>
+(Note: The decimal values were replaced with simple integers to make the calculation trivial, but the physics formula required remains exactly the same.)
+</Example>
+
+<Task>
+<Base Question>
+{main_question_text}
+</Base Question>
+
+<Reference Solution>
+{generated_solution}
+</Reference Solution>
+</Task>
+""",
+
+    "self_sampling_augmentor_simplification_simple_shallow_with_solution": """Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements, using the provided Reference Solution as a guide.
+<Instructions>
+1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
+2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
+3. Reduce the number of steps or constraints slightly, as long as the underlying relationship (as shown in the solution) remains the same.
+4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
+</Instructions>
+<Main Question>
+{main_question_text}
+</Main Question>
+<Reference Solution>
+{generated_solution}
+</Reference Solution>
+<Output Format>
+Simplified Question:
+[Your simplified version]
+</Output Format>
+""",
+
+     "self_sampling_augmentor_simplification_simple_shallow_with_solution":"""Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
+<Instructions>
+1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
+2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
+3. Reduce the number of steps or constraints slightly, as long as the underlying relationship remains the same.
+4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
+</Instructions>
+<Main Question>
+{main_question_text}
+</Main Question>
+<Output Format>
+Simplified Question:
+[Your simplified version]
+</Output Format>
+""",
+
+    "mirror_baseline_zero_shot_v1": """You are an expert mathematician. Solve the following problem step-by-step.
+
+<Main Question to Solve>
+{question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
+""",
+
+
+    "mirror_hypothesis_gen_v1": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
+
+<True Solved Example>
+question:
+{exemplar_question}
+
+Solution:
+{exemplar_solution}
+</True Solved Example>
+
+<Main Question to Solve>
+{target_query}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "mirror_hypothesis_gen_zero_shot_v1": """You are an expert mathematician. Solve the following problem step-by-step.
+
+<Question to Solve>
+{target_query}
+</Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+
+Final Answer:
+[Your final answer] 
+</Your Answer/Output Format>
+""",
+
+    "mirror_verification_v1": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
+
+<True Solved Example>
+question:
+{hypothesis_question}
+
+Solution:
+{hypothesis_solution}
+</True Solved Example>
+
+<Main Question to Solve>
+{validation_question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "reverse_transformation_main_to_exemplar": """<Objective>
+Your task is to transform the given Main Question into a version that becomes more analogous and relevant to the Retrieved Exemplar.
+The transformation should be directed toward the Retrieved Exemplar, meaning every change you make should help the transformed main question better reflect, match, or resonate with the Retrieved Exemplar's theme, context, or style — while strictly preserving the main question's underlying logical structure and ensuring the transformed question remains solvable.
+</Objective>
+
+<Transformation Guidelines>
+Target-Directed Adaptation:
+- Adapt the main question's theme, context, and entities to mirror those in the Retrieved Exemplar.
+- Think of this as reframing the main question so it feels like it belongs to the same world or problem type as the Retrieved Exemplar.
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected if they affect the logical relationships.
+
+Preserve Core Logic:
+- The underlying logical pathway and problem-solving structure must remain identical or analogous.
+- Do not alter the sequence of logical steps or the fundamental problem type.
+- The core reasoning required to solve must be preserved.
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed main question must remain natural, realistic, and logically coherent.
+- Avoid any unnatural, illogical, or meaningless transformations.
+- If a transformation cannot be made safely or meaningfully, keep the main question as close to the original as possible.
+- Always prioritize clarity, realism, and logical consistency.
+
+</Transformation Guidelines>
+
+<Input>
+Original Main Question:
+{main_question}
+
+Retrieved Exemplar (Question and Solution):
+{exemplar_text}
+</Input>
+
+<Output Format (Strictly follow this format)>
+Transformed Main Question:
+[Your rewritten main question, closely aligned with the Retrieved Exemplar's theme and context]
+</Output Format>
+""",
+
+
+    "reverse_transformation_solve_transformed": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Examples>
+{exemplar_text}
+</Solved Examples>
+
+<Main Question to Solve>
+{transformed_question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+
+
+    "reverse_transformation_final_solve": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+</Instructions>
+
+<Solved Examples>
+{transformed_solutions}
+</Solved Examples>
+
+<Main Question to Solve>
+{original_question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "reverse_transformation_shallow-&-moderately-deep" : """<Objective>   
+Your task is to transform the given Main Question into a new version that becomes more analogous and relevant to the Retrieved Exemplar.
+The transformation should be directed toward the Retrieved Exemplar, meaning every change you make should help the transformed main question better reflect, match, or resonate with the Retrieved Exemplar's area, structure, or style — while still preserving the main question's original logical structure, solvability, and required reasoning path.
+</Objective>
+
+<Transformation Guidelines>  
+Target-Directed Adaptation:  
+- Transform the Main Question in a way that brings it conceptually and structurally closer to the Retrieved Exemplar.  
+- Think of this as reframing the Main Question so it feels like it belongs to the same world or problem type as the Retrieved Exemplar.  
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately applied so that the mathematical and logical relationships remain perfectly intact.  
+
+Preserve Core Logic:
+- Keep the logical relations and the fundamental problem type intact. 
+- Do not change the essential operations or the fundamental reasoning pattern that the Main Question demands. The steps required to solve it should remain identical. 
+
+Avoid Deep or Complex Alterations:
+- Do not transform very deep or complex internal structures (like core logic patterns or the type of problem). 
+- Instead, you may adjust surface-level or moderately deep aspects — such as the domain, entities, or contextual narrative in the Main Question to match the Exemplar. 
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed Main Question must remain natural, realistic, and logically coherent. 
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., "a cat eats an apple"). 
+- If a transformation cannot be made safely or meaningfully, keep the Main Question as close to the original as possible rather than forcing changes. 
+- Always prioritize clarity, realism, and logical consistency over aggressive transformation. 
+
+</Transformation Guidelines>
+
+<Example Transformation>
+<Example Input>
+Retrieved Exemplar (Target Style):
+Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
+Rationale:
+To find the remaining cookies, we first need to calculate how many cookies were sold.
+The baker sold 7 boxes, and each box contains 6 cookies.
+Total cookies sold = 7 boxes * 6 cookies/box = 42 cookies.
+The baker started with 50 cookies.
+Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
+Final Answer: 8
+
+Original Main Question (To Transform): 
+A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
+</Example Input>
+
+<Example Output>
+Transformed Main Question:
+A pastry chef baked 35 cupcakes. She decides to arrange them onto display trays, with each tray holding 5 cupcakes. If she sets up 4 display trays, how many cupcakes are left over?
+</Example Output>
+</Example Transformation>
+
+<Task>  
+<Input>  
+Original Main Question:  
+{main_question}  
+
+Retrieved Exemplar (Question and Solution):
+{exemplar_text}
+</Input>
+
+<Output>  
+- Do not include any explanations, comments, or text outside this format.  
+
+Output Format (Strictly follow this format):
+Transformed Main Question:
+[Your rewritten main question, closely aligned with the Retrieved Exemplar's theme and context]
+</Output>
+</Task>
+""",
+
+    "reverse_transformation_shallow" : """<Objective>
+Your task is to transform the given Sample (which includes a question and its step-by-step rationale) into a new version that becomes more analogous and relevant to the Target Question.
+The transformation should be directed toward the Target Question, meaning every change you make should help the transformed sample better reflect, match, or resonate with the Target Question's theme, context, or style — while strictly preserving the sample's original reasoning path and final answer.
+</Objective>
+
+<Transformation Guidelines>
+Target-Directed Adaptation:
+- Adapt the sample's theme, context, and entities to mirror those in the Target Question.
+- Think of this as reframing the sample so it feels like it belongs to the same world or problem type as the Target Question.
+- Crucially, any changes made to the question (e.g., numbers, objects, context) must be consistently and accurately reflected throughout the transformed rationale.
+
+
+Preserve Core Reasoning:
+- The underlying logical pathway and mathematical operations must remain identical.
+- Do not alter the sequence of steps, the problem-solving strategy, or how one calculation leads to the next. The core method of solving must be perfectly preserved.
+
+Restrict Transformations to the Surface Level:
+- Your transformations must be limited to the surface and contextual layers of the problem.
+- This includes changing nouns (entities, objects), numbers and quantities (while ensuring the logic and final answer are preserved), and the overall setting or story.
+- Do not change the fundamental problem structure or the reasoning schema. The goal is to change the "story" of the problem, not the "logic" of the solution.
+
+Maintain Naturalness, Clarity, and Safety:
+- The transformed question and rationale must remain natural, realistic, and logically coherent.
+- Avoid any unnatural, illogical, or meaningless transformations (e.g., "a cat eats an apple").
+- If a transformation cannot be made safely or meaningfully, keep the sample as close to the original as possible rather than forcing changes.
+- Always prioritize clarity, realism, and logical consistency over aggressive transformation.
+
+Keep the Final Answer Unchanged:
+- The final numerical or categorical answer at the end of the rationale must not be changed. It should remain exactly as it was in the original sample.
+
+</Transformation Guidelines>
+</Example Transformation>
+
+<Example Input>
+Target Question: A laboratory has 35 beakers. A new experiment requires 5 beakers per station. If the lab manager sets up 4 stations, how many beakers are left over?
+
+Sample to Transform:
+Question: A baker has 50 cookies. He decides to package them into boxes, with each box holding 6 cookies. If he sells 7 boxes, how many cookies does he have left?
+
+Rationale:
+To find the remaining cookies, we first need to calculate how many cookies were sold.
+The baker sold 7 boxes, and each box contains 6 cookies.
+Total cookies sold = 7 boxes * 6 cookies/box = 42 cookies.
+The baker started with 50 cookies.
+Remaining cookies = Initial amount - Amount sold = 50 - 42 = 8 cookies.
+
+Final Answer: 8
+</Example Input>
+
+</Example Output>
+Question: A scientist starts with 28 test tubes for an analysis. She arranges them into racks, with each rack holding 4 test tubes. If she uses 5 full racks for her experiment, how many test tubes are left unused?
+
+Rationale:
+To find the remaining test tubes, we first need to calculate how many test tubes were used.
+The scientist used 5 racks, and each rack contains 4 test tubes.
+Total test tubes used = 5 racks * 4 test tubes/rack = 20 test tubes.
+The scientist started with 28 test tubes.
+Remaining test tubes = Initial amount - Amount used = 28 - 20 = 8 test tubes.
+
+Final Answer: 8
+</Example Output>
+</Example Transformation>
+
+<Task>
+<Input>
+Target Question:
+{main_question}
+
+Sample to Transform:
+{exemplar_text}
+</Input>
+
+<Output>
+- Do not include any explanations, comments, or text outside this format.
+
+Output Format (Strictly follow this format):
+Question: [New Merged Question]
+Rationale and Answer: [Merged Rationale and Answer]
+</Output>
+</Task>
+""",
+
+
+
+}
+
+def create_reverse_transformation_main_to_exemplar_prompt(main_question: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
+    """Creates a prompt to transform the main question to match the retrieved exemplar."""
+    template = PROMPT_TEMPLATES["reverse_transformation_main_to_exemplar"]
+    exemplar_text = EXEMPLAR_FORMAT.format(question=exemplar_question, solution=exemplar_solution)
+    return template.format(main_question=main_question, exemplar_text=exemplar_text)
+
+def create_reverse_transformation_solve_transformed_prompt(transformed_question: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
+    """Creates a prompt to solve the transformed main question using the exemplar."""
+    template = PROMPT_TEMPLATES["reverse_transformation_solve_transformed"]
+    exemplar_text = EXEMPLAR_FORMAT.format(question=exemplar_question, solution=exemplar_solution)
+    return template.format(transformed_question=transformed_question, exemplar_text=exemplar_text)
+
+def create_reverse_transformation_final_solve_prompt(original_question: str, transformed_solutions: List[str], config: Dict[str, Any]) -> str:
+    """Creates a prompt to solve the original question using transformed solutions."""
+    template = PROMPT_TEMPLATES["reverse_transformation_final_solve"]
+    transformed_solutions_text = "\n\n".join([f"Transformed Solution {i+1}:\n{sol}" for i, sol in enumerate(transformed_solutions)])
+    return template.format(original_question=original_question, transformed_solutions=transformed_solutions_text)
+
+def create_normalization_prompt(original_example: str) -> str:
+    template = PROMPT_TEMPLATES["standardization_v1"]
+    return template.format(original_example=original_example)
+
+create_standardization_prompt = create_normalization_prompt
+
+def create_transformation_prompt(target_query: str, text_to_transform: str, config: Dict[str, Any], template_key_name: str) -> str:
+    template_name = config.get(template_key_name, "transformation_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' specified by key '{template_key_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(target_query=target_query, text_to_transform=text_to_transform)
+
+
+def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str:
+    if len(samples_to_merge) != 2:
+        return "Error: create_merging_prompt requires exactly two samples."
+    template = PROMPT_TEMPLATES["merging_v1"]
+    return template.format(target_query=target_query, sample_1=samples_to_merge[0], sample_2=samples_to_merge[1])
+
+def create_final_reasoning_prompt(main_question_text: str, final_examples: List[str], config: Dict[str, Any]) -> str:
+    if not final_examples:
+        return "Error: At least one example is required for the RAG-based final reasoning prompt."
+
+    template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER", "final_solver_v2")
+    template = PROMPT_TEMPLATES[template_name]
+    
+    if template_name in ["final_solver_v2", "final_solver_v3", "final_solver_v4", "analogical_adaptation_v2"]:
         examples_block = ""
-        for i, idx in enumerate(current_indices):
-            ex_q = exemplar_data[idx]['question']
-            ex_a = exemplar_data[idx]['solution']
-            # Format using standard exemplar format
-            examples_block += f"<Example {i+1}>\nQuestion: {ex_q}\nRationale and Answer: {ex_a}\n</Example {i+1}>\n\n"
-            
-        # Create final prompt
-        # We assume standard solver prompt v2/v3/v4 used in config
-        from src.prompts import create_final_reasoning_prompt
-        # Mocking the 'final_examples' list just for the prompt creator to work
-        # The prompt creator expects a list of strings, so we pass pre-formatted strings or raw text?
-        # Looking at 'create_final_reasoning_prompt', it takes a list of strings.
-        # Let's construct the list of strings.
-        formatted_examples = [
-             f"Question: {exemplar_data[idx]['question']}\nRationale and Answer: {exemplar_data[idx]['solution']}"
-             for idx in current_indices
-        ]
-        
-        final_prompt = create_final_reasoning_prompt(target_query, formatted_examples, config)
-        
-        # 3. Generate N Independent Samples
-        attempts = []
-        for _ in range(n_samples):
-            response = api_manager.generate_content(final_prompt, temperature=0.7)
-            attempts.append(response)
-            
-        # 4. Store Results
-        benchmark_results[strategy_name] = attempts
-
-    return benchmark_results
-
-
-
-class ReasoningNode:
-    def __init__(self, question: str, depth: int):
-        self.id = str(uuid.uuid4())
-        self.question = question
-        self.depth = depth
-        self.children: List['ReasoningNode'] = []
-        self.retrieved_context: List[str] = [] 
-        self.solution: Optional[str] = None    
-        self.solution_attempts: List[str] = [] 
-        self.status: str = "PENDING"           
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "question": self.question,
-            "depth": self.depth,
-            "children": [child.to_dict() for child in self.children],
-            "retrieved_context_count": len(self.retrieved_context),
-            "solution_preview": (self.solution[:100] + "...") if self.solution else None,
-            "solution_attempts_count": len(self.solution_attempts),
-            "status": self.status
-        }
-
-def build_hierarchical_tree(
-    current_question: str,
-    current_depth: int,
-    max_depth: int,
-    branching_factor: int,
-    api_manager_augment: Any, 
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> ReasoningNode:
-    logger = logging.getLogger(__name__)
-    node = ReasoningNode(current_question, current_depth)
+        for i, sample_text in enumerate(final_examples):
+            examples_block += f"<Example {i+1}>\n{sample_text}\n</Example {i+1}>\n\n"
+        return template.format(main_question_text=main_question_text, examples_block=examples_block.strip())
     
-    if current_depth >= max_depth:
-        return node
+    elif template_name == "final_solver_v1":
+        samples_block = ""
+        for i, sample_text in enumerate(final_examples):
+            samples_block += f"\n**Adapted Sample {i+1}:**\n{sample_text}\n"
+        return template.format(main_question_text=main_question_text, adapted_samples_block=samples_block.strip())
     
-    print(f"  -> [Tree Build] Expanding Node at Depth {current_depth} (Branching: {branching_factor})...")
-    
-    local_config = config.copy()
-    if config.get("PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"):
-        local_config["PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR"] = config["PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"]
-        
-    aug_res = augment_question(current_question, branching_factor, api_manager_augment, local_config)
-    
-    # Capture the trace from the augmentation call
-    if aug_res.get('trace'):
-        trace_accumulator.extend(aug_res['trace'])
-    
-    if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
-        logger.warning(f"Failed to expand node at depth {current_depth}. Stopping this branch.")
-        return node
-        
-    child_questions = aug_res['augmented_questions']
-    
-    for child_q in child_questions:
-        child_node = build_hierarchical_tree(child_q, current_depth + 1, max_depth, branching_factor, api_manager_augment, config, trace_accumulator)
-        node.children.append(child_node)
-        
-    return node
-
-def _process_leaves(
-    root: ReasoningNode,
-    target_query: str, 
-    exemplar_data: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    api_manager_adapt: Any,
-    api_manager_solve: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> None:
-    if not root.children:
-        print(f"    -> Processing Leaf Node (Depth {root.depth})...")
-        
-        if config.get("HIERARCHICAL_LEAF_RETRIEVAL_ENABLED", True):
-            top_k = config.get("HIERARCHICAL_LEAF_RETRIEVAL_TOP_K", 3)
-            query_mode = config.get("HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE", "leaf")
-            
-            if query_mode == "root":
-                search_query = target_query
-                print(f"      [Retrieval] Mode: ROOT (Using Main Question: '{search_query[:50]}...')")
-            else:
-                search_query = root.question
-                print(f"      [Retrieval] Mode: LEAF (Using Simplified Question: '{search_query[:50]}...')")
-            
-            ret_res = retrieve(
-                search_query, 
-                embedding_model, 
-                exemplar_data['questions'], exemplar_data['embeddings'], 
-                top_k, exemplar_data.get('question_to_index')
-            )
-            # Capture retrieval trace
-            if ret_res.get('trace'):
-                trace_accumulator.extend(ret_res['trace'])
-            
-            if ret_res['status'] == 'SUCCESS':
-                adapt_res = adapt(
-                    root.question, ret_res['retrieved_indices'], 
-                    exemplar_data['questions'], exemplar_data['solutions'], 
-                    api_manager_adapt, config
-                )
-                # Capture adaptation trace
-                if adapt_res.get('trace'):
-                    trace_accumulator.extend(adapt_res['trace'])
-                
-                if adapt_res.get('adapted_texts'):
-                    root.retrieved_context = adapt_res['adapted_texts']
-                    print(f"      -> Leaf retrieved {len(root.retrieved_context)} samples.")
-        
-        template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER", "final_solver_simple_v1")
-        
-        if root.retrieved_context:
-            local_config = config.copy()
-            local_config["PROMPT_TEMPLATE_FINAL_SOLVER"] = template_name 
-            prompt = create_final_reasoning_prompt(root.question, root.retrieved_context, local_config)
-        else:
-            local_config = config.copy()
-            local_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = template_name
-            prompt = create_final_reasoning_prompt_simple(root.question, local_config)
-            
-        model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") 
-        if isinstance(api_manager_solve, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
-        elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
-        
-        temp = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-        
-        resp = api_manager_solve.generate_content(prompt, model_name, temp)
-        
-        trace_accumulator.append(create_trace_entry(
-            "hierarchical_tree", "solve_leaf",
-            {"question": root.question, "prompt": prompt}, resp, {"model": model_name, "temp": temp}
-        ))
-        
-        if resp['status'] == 'SUCCESS':
-            root.solution = resp['text']
-            root.status = "SOLVED"
-        else:
-            root.status = "FAILED"
-            
     else:
-        for child in root.children:
-            _process_leaves(child, target_query, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config, trace_accumulator)
-
-def propagate_solutions_upward(
-    node: ReasoningNode,
-    api_manager: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> None:
-    for child in node.children:
-        propagate_solutions_upward(child, api_manager, config, trace_accumulator)
-    
-    if node.status == "SOLVED":
-        return
-
-    child_data = []
-    for child in node.children:
-        if child.status == "SOLVED" and child.solution:
-            child_data.append({"question": child.question, "solution": child.solution})
-            
-    if not child_data:
-        logging.getLogger(__name__).warning(f"Node at depth {node.depth} has no solved children. Cannot propagate.")
-        node.status = "FAILED_PROPAGATION"
-        return
-        
-    print(f"  -> [Propagation] Solving Node at Depth {node.depth} using {len(child_data)} child solutions...")
-    
-    prompt = create_hierarchical_parent_solver_prompt(node.question, child_data, config)
-    
-    model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") 
-    if isinstance(api_manager, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
-    
-    temp = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-    
-    if node.depth > 0:
-        resp = api_manager.generate_content(prompt, model_name, temp)
-        
-        trace_accumulator.append(create_trace_entry(
-            "hierarchical_tree", "propagate_solve_node",
-            {"depth": node.depth, "prompt": prompt}, resp, {"model": model_name, "temp": temp}
-        ))
-
-        if resp['status'] == 'SUCCESS':
-            node.solution = resp['text']
-            node.status = "SOLVED"
-        else:
-            node.status = "FAILED"
-    else:
-        n_attempts = config.get("N_PASS_ATTEMPTS", 1)
-        print(f"    -> Root Node detected. Solving {n_attempts} times (Pass@{n_attempts})...")
-        
-        success_count = 0
-        for i in range(n_attempts):
-            resp = api_manager.generate_content(prompt, model_name, temp)
-            
-            trace_accumulator.append(create_trace_entry(
-                "hierarchical_tree", f"solve_root_attempt_{i+1}",
-                {"prompt": prompt}, resp, {"model": model_name, "temp": temp}
-            ))
-
-            if resp['status'] == 'SUCCESS':
-                node.solution_attempts.append(resp['text'])
-                success_count += 1
-                if node.solution is None:
-                    node.solution = resp['text']
-        
-        if success_count > 0:
-            node.status = "SOLVED"
-        else:
-            node.status = "FAILED"
+        return f"Error: Unknown final solver template '{template_name}' specified in config."
 
 
+def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE", "final_solver_simple_v1")
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question_text)
+
+def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(model_answer=model_answer, ground_truth=ground_truth)
+
+def create_duplicate_check_prompt(main_question_text: str, retrieved_questions: List[str]) -> str:
+    template = PROMPT_TEMPLATES["duplicate_question_check_v1"]
+    retrieved_block = "\n".join(f"{i+1}. {q}" for i, q in enumerate(retrieved_questions))
+    return template.format(main_question_text=main_question_text, retrieved_questions_block=retrieved_block.strip())
 
 
-def solve_hierarchical_tree(
-    target_query: str,
-    exemplar_data: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    api_manager_adapt: Any,
-    api_manager_solve: Any,
-    api_manager_augment: Any, 
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting Hierarchical Augmentation Pipeline.")
-    local_trace = []
-    
-    max_depth = config.get("HIERARCHICAL_TREE_DEPTH", 2)
-    branching = config.get("HIERARCHICAL_BRANCHING_FACTOR", 3)
-    
-    print("\n[HIERARCHICAL] Phase 1: Building Tree...")
-    root = build_hierarchical_tree(target_query, 0, max_depth, branching, api_manager_augment, config, local_trace)
-    
-    print("\n[HIERARCHICAL] Phase 2: Processing Leaves...")
-    
-    _process_leaves(root, target_query, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config, local_trace)
-    
-    print("\n[HIERARCHICAL] Phase 3: Backward Propagation...")
-    propagate_solutions_upward(root, api_manager_solve, config, local_trace)
-    
-    final_status = "SUCCESS" if root.status == "SOLVED" else "FAILURE"
-    
-    final_attempts = []
-    if root.solution_attempts:
-        final_attempts = root.solution_attempts
-    elif root.solution:
-        final_attempts = [root.solution]
-
-    return {
-        "status": final_status,
-        "root_solution": root.solution,
-        "root_solution_attempts": final_attempts,
-        "tree_structure": root.to_dict(),
-        "trace": local_trace
-    }
+def create_self_sampling_prompt(main_question: str, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR", "self_sampling_generator")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question)
 
 
-def solve_with_analogical_consistency(
-    target_query: str,
-    exemplar_data: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    api_manager_solve: Any,
-    api_manager_eval: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info(f"Starting Analogical Consistency Check for query: {target_query[:50]}...")
-    print("\n" + "="*60)
-    print("  [ANALOGICAL CONSISTENCY CHECK] Reverse Validation Mode")
-    print("="*60)
-    
-    local_trace = []
+def create_augmentation_prompt(main_question: str, n_samples: int, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR", "self_sampling_augmentor_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question, n_samples=n_samples)
 
-    # --- NEW CONFIG FLAGS FOR UPGRADE ---
-    use_rag_generation = config.get("REVERSE_VALIDATION_USE_RAG_GENERATION", False)
-    gen_k = config.get("REVERSE_VALIDATION_GENERATION_K", 3)
-    enable_baseline_check = config.get("REVERSE_VALIDATION_ENABLE_BASELINE_CHECK", True) # <-- NEW MASTER SWITCH
 
-    # --- ORIGINAL CONFIG FLAGS ---
-    n_candidates = config.get("REVERSE_VALIDATION_CANDIDATES_N", 5)
-    k_validators = config.get("REVERSE_VALIDATION_RETRIEVAL_K", 3)
-    n_validation_attempts = config.get("REVERSE_VALIDATION_ATTEMPTS_N", 5)
-    
-    if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else: raise TypeError(f"Unsupported API manager: {type(api_manager_solve)}")
-    
-    candidates = []
-    validator_indices = []
+def create_analogical_adaptation_prompt(main_question: str, sample_group: List[str], config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION", "analogical_adaptation_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    samples_block = "\n\n".join([f"<Sample {i+1}>\n{s}\n</Sample {i+1}>" for i, s in enumerate(sample_group)])
+    return template.format(
+        main_question_text=main_question, 
+        samples_block=samples_block,
+        examples_block=samples_block
+    )
 
-    if use_rag_generation:
-        # =========================================================================
-        # NEW UPGRADED PATH: PHASE 0 & 1 (Unified Retrieval + RAG Generation)
-        # =========================================================================
-        total_k_to_retrieve = gen_k + k_validators
-        print(f"\n  [Phase 0] Unified Retrieval for {gen_k} Helpers + {k_validators} Validators...")
-        
-        retrieval_res = retrieve(
-            target_query, embedding_model, 
-            exemplar_data['questions'], exemplar_data['embeddings'], 
-            top_k=total_k_to_retrieve, question_to_index_map=exemplar_data.get('question_to_index')
+def create_hierarchical_parent_solver_prompt(main_question: str, child_nodes_data: List[Dict[str, str]], config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER", "hierarchical_parent_solver_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    child_block = ""
+    for i, child in enumerate(child_nodes_data):
+        child_block += f"<Variation {i+1}>\nQuestion: {child.get('question', '')}\nSolution: {child.get('solution', '')}\n</Variation {i+1}>\n\n"
+    return template.format(main_question_text=main_question, child_solutions_block=child_block.strip())
+
+def create_reverse_validation_prompt(validator_question: str, candidate_text: str, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER", "reverse_validation_v1")
+    if template_name == "analogical_adaptation_v1" or template_name == "analogical_adaptation_v2":
+        if template_name not in PROMPT_TEMPLATES:
+            return f"Error: Template {template_name} not found."
+        samples_block = f"<Sample>\n{candidate_text}\n</Sample>"
+        template = PROMPT_TEMPLATES[template_name]
+        return template.format(
+            main_question_text=validator_question,
+            samples_block=samples_block,
+            examples_block=samples_block
         )
-        if retrieval_res.get('trace'):
-            local_trace.extend(retrieval_res['trace'])
-            
-        if retrieval_res['status'] != 'SUCCESS' or not retrieval_res['retrieved_indices']:
-            logger.error("Failed to retrieve samples for Unified RAG Generation.")
-            return {"status": "FAILURE", "error": "Unified retrieval failed", "trace": local_trace}
-            
-        all_indices = retrieval_res['retrieved_indices']
-        helper_indices = all_indices[:gen_k]
-        validator_indices = all_indices[gen_k:]
-        
-        print(f"\n  [Phase 1] Generating Candidates using RAG Helpers ({len(helper_indices)} helpers)...")
-        for h_idx in helper_indices:
-            helper_q = exemplar_data['questions'][h_idx]
-            helper_a = exemplar_data['solutions'][h_idx]
-            helper_text = f"Question: {helper_q}\nRationale and Answer: {helper_a}"
-            
-            # Using the exact prompt structure as the evaluation phase
-            prompt = create_reverse_validation_prompt(target_query, helper_text, config)
-            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
-            
-            resp = api_manager_solve.generate_content(prompt, model_name, temp)
-            
-            local_trace.append(create_trace_entry(
-                "reverse_validation", f"generate_candidate_via_helper_{h_idx}",
-                {"prompt": prompt}, resp, {"model": model_name, "temp": temp}
-            ))
-
-            if resp['status'] == 'SUCCESS':
-                cand_text = f"Question: {target_query}\nRationale and Answer: {resp['text']}"
-                candidates.append(cand_text)
-            else:
-                logger.warning(f"Failed to generate candidate with helper {h_idx}.")
-                
-        print(f"    -> Generated {len(candidates)} candidates.")
-
-        # Optional: add zero-shot candidates (no retrieved helpers)
-        if config.get("REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES", False):
-            rz_n = config.get("REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N", 3)
-            template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_ZERO_SHOT_SOLVER", "final_solver_simple_v1")
-            template = PROMPT_TEMPLATES.get(template_name)
-            print(f"\n  [Phase 1.5] Generating {rz_n} zero-shot candidates using template '{template_name}'...")
-            for z_idx in range(rz_n):
-                # support multiple possible placeholder names in templates
-                prompt = None
-                if template:
-                    try:
-                        prompt = template.format(main_question_text=target_query)
-                    except Exception:
-                        try:
-                            prompt = template.format(target_query=target_query)
-                        except Exception:
-                            try:
-                                prompt = template.format(question=target_query)
-                            except Exception:
-                                prompt = None
-
-                if prompt is None:
-                    # fallback to simplest zero-shot mirror prompt
-                    prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
-
-                temp_z = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-                resp_z = api_manager_solve.generate_content(prompt, model_name, temp_z)
-
-                local_trace.append(create_trace_entry(
-                    "reverse_validation", f"generate_candidate_zeroshot_{z_idx}",
-                    {"prompt": prompt}, resp_z, {"model": model_name, "temp": temp_z}
-                ))
-
-                if resp_z['status'] == 'SUCCESS':
-                    cand_text_z = f"Question: {target_query}\nRationale and Answer: {resp_z['text']}"
-                    candidates.append(cand_text_z)
-                else:
-                    logger.warning(f"Failed to generate zero-shot candidate #{z_idx}.")
-
-            print(f"    -> Added {len(candidates)} total candidates after zero-shot generation.")
-        print(f"\n  [Phase 2] Using {len(validator_indices)} Pre-retrieved Validators...")
-
-    else:
-        # =========================================================================
-        # ORIGINAL PATH: EXACTLY AS IT WAS WRITTEN BEFORE
-        # =========================================================================
-        print(f"\n  [Phase 1] Generating {n_candidates} Candidate Solutions...")
-        
-        candidate_config = config.copy()
-        candidate_config["SELF_SAMPLING_N"] = n_candidates
-        
-        candidates_result = self_sample(target_query, api_manager_solve, candidate_config)
-        
-        if candidates_result.get('trace'):
-            local_trace.extend(candidates_result['trace'])
-        
-        if candidates_result['status'] == 'FAILURE':
-            logger.error("Failed to generate any candidates.")
-            return {"status": "FAILURE", "error": "Candidate generation failed", "trace": local_trace}
-            
-        candidates = candidates_result['self_sampled_texts'] 
-        print(f"    -> Generated {len(candidates)} candidates.")
-
-        # Optional: add zero-shot candidates to self-sampled candidates
-        if config.get("REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES", False):
-            rz_n = config.get("REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N", 3)
-            template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_ZERO_SHOT_SOLVER", "final_solver_simple_v1")
-            template = PROMPT_TEMPLATES.get(template_name)
-            print(f"\n  [Phase 1.5] Generating {rz_n} zero-shot candidates using template '{template_name}'...")
-            for z_idx in range(rz_n):
-                prompt = None
-                if template:
-                    try:
-                        prompt = template.format(main_question_text=target_query)
-                    except Exception:
-                        try:
-                            prompt = template.format(target_query=target_query)
-                        except Exception:
-                            try:
-                                prompt = template.format(question=target_query)
-                            except Exception:
-                                prompt = None
-
-                if prompt is None:
-                    prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
-
-                temp_z = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-                resp_z = api_manager_solve.generate_content(prompt, model_name, temp_z)
-
-                local_trace.append(create_trace_entry(
-                    "reverse_validation", f"generate_candidate_zeroshot_{z_idx}",
-                    {"prompt": prompt}, resp_z, {"model": model_name, "temp": temp_z}
-                ))
-
-                if resp_z['status'] == 'SUCCESS':
-                    cand_text_z = f"Question: {target_query}\nRationale and Answer: {resp_z['text']}"
-                    candidates.append(cand_text_z)
-                else:
-                    logger.warning(f"Failed to generate zero-shot candidate #{z_idx}.")
-
-            print(f"    -> Added {rz_n} zero-shot candidates. Total candidates: {len(candidates)}")
-
-        print(f"\n  [Phase 2] Retrieving {k_validators} Validators (Ground Truths)...")
-        
-        retrieval_res = retrieve(
-            target_query, embedding_model, 
-            exemplar_data['questions'], exemplar_data['embeddings'], 
-            top_k=k_validators, question_to_index_map=exemplar_data.get('question_to_index')
-        )
-        if retrieval_res.get('trace'):
-            local_trace.extend(retrieval_res['trace'])
-        
-        if retrieval_res['status'] != 'SUCCESS' or not retrieval_res['retrieved_indices']:
-            logger.error("Failed to retrieve validators.")
-            return {"status": "FAILURE", "error": "Validator retrieval failed", "trace": local_trace}
-            
-        validator_indices = retrieval_res['retrieved_indices']
-        print(f"    -> Retrieved {len(validator_indices)} validators.")
-
-    # =========================================================================
-    # PHASE 2.5: FORMAT VALIDATORS & CALCULATE BASELINES
-    # =========================================================================
-    if not candidates:
-        return {"status": "FAILURE", "error": "No candidates were generated", "trace": local_trace}
-
-    validators = []
-    for idx in validator_indices:
-        validators.append({
-            "question": exemplar_data['questions'][idx],
-            "ground_truth": exemplar_data['solutions'][idx]
-        })
-
-    baseline_scores = {}
-    if enable_baseline_check:
-        print(f"\n  [Phase 2.75] Calculating Zero-Shot Baseline for {len(validators)} Validators...")
-        # Get template or default
-        base_template = PROMPT_TEMPLATES.get(
-            config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_BASELINE", "mirror_baseline_zero_shot_v1"),
-            "Problem: {question}\nSolve this step-by-step.\nFinal Answer:"
-        )
-        
-        for v_idx, val in enumerate(validators):
-            prompt = base_template.format(question=val['question'])
-            v_correct = 0
-            
-            for att in range(n_validation_attempts): # Reuse same N attempts for fair comparison
-                resp = api_manager_solve.generate_content(prompt, model_name, temperature=1.0)
-                
-                local_trace.append(create_trace_entry(
-                    "reverse_validation", f"baseline_validator_{v_idx}_attempt_{att}",
-                    {"prompt": prompt}, resp, {"model": model_name, "temp": 1.0}
-                ))
-
-                if resp['status'] == 'SUCCESS':
-                    eval_res = evaluate_single_answer_with_llm(resp['text'], val['ground_truth'], api_manager_eval, config)
-                    if eval_res['status'] == 'SUCCESS' and eval_res['is_correct']:
-                        v_correct += 1
-                        
-            baseline_scores[v_idx] = v_correct / n_validation_attempts
-            print(f"      -> Validator #{v_idx} Baseline Score: {baseline_scores[v_idx]:.2f}")
-
-    # =========================================================================
-    # PHASE 3: REVERSE VALIDATION LOOP WITH BASELINE THRESHOLDS
-    # =========================================================================
-    print(f"\n  [Phase 3] Reverse Validation Loop ({len(candidates)} Candidates x {len(validators)} Validators x {n_validation_attempts} Attempts)...")
-    
-    candidate_stats = []
-    
-    for c_idx, cand_text in enumerate(candidates):
-        
-        total_utility = 0.0
-        correct_attempts = 0 # Track total correct just for logging
-        total_attempts = 0
-        validator_details = []
-        
-        print(f"    -> Testing Candidate #{c_idx + 1}...")
-        
-        for v_idx, val in enumerate(validators):
-            val_q = val['question']
-            val_gt = val['ground_truth']
-            
-            prompt = create_reverse_validation_prompt(val_q, cand_text, config)
-            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0) 
-            
-            v_correct = 0
-            
-            for att in range(n_validation_attempts):
-                resp = api_manager_solve.generate_content(prompt, model_name, temp)
-                
-                local_trace.append(create_trace_entry(
-                    "reverse_validation", f"solve_candidate_{c_idx}_validator_{v_idx}_attempt_{att}",
-                    {"prompt": prompt}, resp, {"model": model_name, "temp": temp}
-                ))
-
-                if resp['status'] == 'SUCCESS':
-                    eval_res = evaluate_single_answer_with_llm(
-                        resp['text'], val_gt, api_manager_eval, config
-                    )
-                    
-                    if eval_res['status'] == 'SUCCESS' and eval_res['is_correct']:
-                        v_correct += 1
-                        
-            cand_val_score = v_correct / n_validation_attempts
-            total_attempts += n_validation_attempts
-            correct_attempts += v_correct
-            
-            # --- THE NEW BASELINE COMPARISON LOGIC ---
-            if enable_baseline_check:
-                base_score = baseline_scores.get(v_idx, 0.0)
-                if cand_val_score > base_score:
-                    total_utility += cand_val_score  # Reward the candidate
-                    status_str = f"Considered (Beat Base {base_score:.2f})"
-                else:
-                    total_utility += 0.0 # Ignored
-                    status_str = f"Ignored (<= Base {base_score:.2f})"
-            else:
-                total_utility += cand_val_score
-                status_str = "Considered (Check OFF)"
-                
-            validator_details.append({
-                "validator_idx": v_idx, 
-                "score": f"{v_correct}/{n_validation_attempts}",
-                "status": status_str
-            })
-            
-        # For logging simplicity, if check is OFF, we average the utility. 
-        # If check is ON, we just use the raw utility sum as the consistency_score.
-        consistency_score = total_utility / len(validators) if not enable_baseline_check and validators else total_utility
-        
-        print(f"       -> Utility Score: {consistency_score:.2f} (Total Correct: {correct_attempts}/{total_attempts})")
-        
-        candidate_stats.append({
-            "candidate_id": c_idx,
-            "candidate_text": cand_text,
-            "consistency_score": consistency_score,
-            "raw_score": f"{correct_attempts}/{total_attempts}",
-            "validator_breakdown": validator_details
-        })
-
-    # =========================================================================
-    # PHASE 4: SELECTION & FALLBACK LOGIC
-    # =========================================================================
-    if not candidate_stats:
-        return {"status": "FAILURE", "error": "No stats generated", "trace": local_trace}
-        
-    candidate_stats.sort(key=lambda x: x['consistency_score'], reverse=True)
-    best_candidate_stat = candidate_stats[0]
-    
-    # --- NEW FALLBACK LOGIC ---
-    if enable_baseline_check and best_candidate_stat['consistency_score'] <= 0.0:
-        print(f"\n  [Selection] ALL candidates failed to beat the baseline on all validators.")
-        print(f"  [Selection] Triggering FALLBACK to Candidate #1.")
-        selected_text = candidates[0]
-        selected_score = 0.0
-    else:
-        selected_text = best_candidate_stat['candidate_text']
-        selected_score = best_candidate_stat['consistency_score']
-        print(f"\n  [Selection] Selected Candidate #{best_candidate_stat['candidate_id'] + 1} with Utility Score {selected_score:.2f}")
-    
-    return {
-        "status": "SUCCESS",
-        "selected_candidate": selected_text,
-        "selected_score": selected_score,
-        "solution_attempts": [selected_text], 
-        "consistency_stats": candidate_stats,
-        "trace": local_trace
-    }
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(validator_question=validator_question, candidate_exemplar=candidate_text)
 
 
-def select_best_transformations(
-    retrieved_indices: List[int],
-    target_query: str,
-    exemplar_data: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    api_manager_adapt: Any,
-    api_manager_solve: Any,
-    api_manager_eval: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
+def create_simplification_prompt(text_to_simplify: str, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_SIMPLIFICATION_GENERATOR", "simplification_generator_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(text_to_simplify=text_to_simplify)
+
+def create_simplified_sample_solver_prompt(simplified_question: str, original_exemplar: str, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_SIMPLIFIED_SAMPLE_SOLVER", "simplified_sample_solver_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(simplified_question=simplified_question, original_exemplar=original_exemplar)
+
+def create_main_from_simplified_proxy_prompt(original_main_question: str, simplified_solution: str, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_SIMPLIFIED_MAIN_PROXY_SOLVER", "main_from_simplified_proxy_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Prompt template '{template_name}' not found in registry."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(original_main_question=original_main_question, simplified_solution=simplified_solution)
+
+def create_augmentation_with_solution_prompt(main_question: str, generated_solution: str, n_samples: int, config: Dict[str, Any]) -> str:
+    template_name = config.get("PROMPT_TEMPLATE_AUGMENTATION_STEP2_GENERATOR", "self_sampling_augmentor_simplification_with_solution")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(main_question_text=main_question, generated_solution=generated_solution, n_samples=n_samples)
+
+
+def create_mirror_baseline_prompt(question: str, config: Dict[str, Any]) -> str:
     """
-    REFACTORED Best-of-Transformation: Centralized Candidate Pool Architecture
-    
-    Core Principle: Build ONE unified candidate pool per retrieved sample, run mirror
-    evaluation ONCE over the entire pool, then use deterministic selection.
-    
-    Architecture (per retrieved sample):
-    
-    PHASE 1: CENTRALIZED POOL CONSTRUCTION
-    - Build: [R_main, T_1, T_2, ..., T_N] (original + N transformations)
-    - Index 0 = R_main (original)
-    - Indices 1 to N = Transformations T_1 through T_N
-    - Single pass: no redundant API calls
-    
-    PHASE 2: UNIFIED MIRROR SCORING (once per pool)
-    - Score all N+1 candidates in single pass
-    - Returns: Scores = [S_0, S_1, S_2, ..., S_N]
-    
-    PHASE 3: DETERMINISTIC SELECTION WITH TIE-BREAKING
-    - Best = argmax_tiebreak(Scores)
-    - Tie-breaking rule: (score DESC, index ASC)
-    - On ties, favor lower indices (prefer R_main for safety)
-    
-    PHASE 4: STATE FAN-OUT
-    - Selected context stored for downstream use
-    - Solver runs with this single context
-    
-    Args:
-        retrieved_indices: List of K retrieved exemplar indices
-        target_query: Main problem query
-        exemplar_data: Contains questions, solutions, embeddings
-        api_manager_adapt: API manager for transformations
-        api_manager_solve: API manager for solving
-        api_manager_eval: API manager for evaluation
-        config: Pipeline configuration
-    
-    Returns:
-        {
-            "status": "SUCCESS" | "FAILURE",
-            "evaluation_contexts": {
-                retrieved_idx: {
-                    "scenario": "Best-of-Transformation (Centralized Pool)",
-                    "pool_index": int,  # 0 = R_main, 1+ = transformations
-                    "pool_size": int,
-                    "selected_candidate": {...},
-                    "selection_score": float,
-                    "all_scores": [...],
-                    "source": "original_retrieval" or "transformation"
-                },
-                ...
-            },
-            "telemetry": {
-                "pool_construction_passes": K,
-                "scoring_passes": K,
-                "total_transformations": K*N,
-                "selections": {
-                    retrieved_idx: {
-                        "pool_size": int,
-                        "selected_index": int,
-                        "selected_score": float,
-                        "selected_source": str,
-                        "all_scores": [...]
-                    },
-                    ...
-                }
-            },
-            "trace": [...]
-        }
+    Creates a prompt to solve a retrieved sample zero-shot (Phase 0: Baseline).
     """
-    logger = logging.getLogger(__name__)
-    logger.info(f"Starting Best-of-Transformation with centralized pool for {len(retrieved_indices)} retrieved samples")
-    
-    print(f"\n{'='*80}")
-    print(f"  [BEST-OF-TRANSFORMATION] Centralized Candidate Pool Architecture")
-    print(f"  Phase 1: Pool Construction | Phase 2: Unified Scoring | Phase 3: Selection")
-    print(f"{'='*80}")
-    
-    local_trace = []
-    
-    # Configuration
-    n_transformations = config.get("BEST_OF_TRANSFORMATION_N_SAMPLES", 3)
-    enable_mirror_eval = config.get("BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL", True)
-    mirror_eval_attempts = config.get("BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS", 3)
-    
-    # Determine model names
-    if isinstance(api_manager_adapt, GeminiAPIManager):
-        model_adapt = config['GEMINI_MODEL_NAME_ADAPTATION']
-        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_adapt, AvalAIAPIManager):
-        model_adapt = config['AVALAI_MODEL_NAME_ADAPTATION']
-        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_adapt, OllamaAPIManager):
-        model_adapt = config['OLLAMA_MODEL_NAME_ADAPTATION']
-        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager: {type(api_manager_adapt)}")
-    
-    temp_transform = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
-    temp_solve = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
-    temp_eval = config.get("DEFAULT_EVALUATOR_TEMPERATURE", 0.0)
-    
-    evaluation_contexts = {}
-    telemetry_selections = {}
-    
-    def argmax_tiebreak(scores: List[float]) -> int:
-        """Deterministic argmax with tie-breaking favoring lower indices."""
-        if not scores:
-            return 0
-        best_candidate = max(
-            enumerate(scores),
-            key=lambda pr: (pr[1], -pr[0])
-        )
-        return best_candidate[0]
-    
-    # =========================================================================
-    # PROCESS EACH RETRIEVED SAMPLE WITH CENTRALIZED POOL ARCHITECTURE
-    # =========================================================================
-    for sample_idx, retrieved_idx in enumerate(retrieved_indices):
-        original_q = exemplar_data['questions'][retrieved_idx]
-        original_sol = exemplar_data['solutions'][retrieved_idx]
-        original_combined = f"Question: {original_q}\nSolution: {original_sol}"
-        
-        print(f"\n[SAMPLE {sample_idx+1}/{len(retrieved_indices)}] Retrieved Index #{retrieved_idx}")
-        print(f"  Original Q: {original_q[:60]}...")
-        
-        # ===== PHASE 1: CENTRALIZED POOL CONSTRUCTION =====
-        print(f"  [PHASE 1] Building centralized candidate pool...")
-        
-        pool = []
-        
-        # Index 0: Original retrieval (R_main)
-        pool.append({
-            "pool_index": 0,
-            "text": original_combined,
-            "is_original": True,
-            "transformation_idx": None,
-            "source": "original_retrieval"
-        })
-        
-        # Indices 1+: Transformations (T_1, T_2, ..., T_N)
-        for t_idx in range(n_transformations):
-            prompt_transform = create_transformation_prompt(
-                target_query=target_query,
-                text_to_transform=original_combined,
-                config=config,
-                template_key_name=config.get("BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE", "transformation_shallow-&-moderately-deep")
-            )
-            
-            resp_transform = api_manager_adapt.generate_content(
-                prompt_transform, model_adapt, temp_transform
-            )
-            
-            local_trace.append(create_trace_entry(
-                "best_of_transformation_centralized_pool",
-                f"sample_{retrieved_idx}_transform_{t_idx}",
-                {"prompt": prompt_transform}, resp_transform,
-                {"model": model_adapt, "temp": temp_transform}
-            ))
-            
-            if resp_transform['status'] == 'SUCCESS':
-                pool.append({
-                    "pool_index": t_idx + 1,
-                    "text": resp_transform['text'],
-                    "is_original": False,
-                    "transformation_idx": t_idx,
-                    "source": "transformation"
-                })
-            else:
-                logger.warning(f"Transformation failed for sample {retrieved_idx}, transform {t_idx}")
-                # Fallback: duplicate original
-                pool.append({
-                    "pool_index": t_idx + 1,
-                    "text": f"[FALLBACK_T{t_idx}] {original_combined}",
-                    "is_original": False,
-                    "transformation_idx": t_idx,
-                    "source": "transformation_fallback"
-                })
-        
-        pool_size = len(pool)
-        print(f"  Pool size: {pool_size} (1 original + {n_transformations} transformations)")
-        
-        # ===== PHASE 2: UNIFIED MIRROR SCORING (ONCE PER POOL) =====
-        print(f"  [PHASE 2] Running unified mirror scoring over entire pool...")
-        
-        scores = []
-        candidate_texts = []
-        
-        for pool_idx, candidate_dict in enumerate(pool):
-            # Generate solution for this candidate
-            prompt_solve = create_analogical_adaptation_prompt(
-                target_query,
-                candidate_dict['text'],
-                config
-            )
-            
-            resp_solve = api_manager_solve.generate_content(
-                prompt_solve, model_solve, temp_solve
-            )
-            
-            local_trace.append(create_trace_entry(
-                "best_of_transformation_centralized_pool",
-                f"sample_{retrieved_idx}_pool_{pool_idx}_solve",
-                {"prompt": prompt_solve}, resp_solve,
-                {"model": model_solve, "temp": temp_solve}
-            ))
-            
-            if resp_solve['status'] == 'FAILURE':
-                logger.warning(f"Solve failed for sample {retrieved_idx}, pool index {pool_idx}")
-                scores.append(0.0)
-                candidate_texts.append("[SOLVE_FAILED]")
-                continue
-            
-            solution_text = resp_solve['text']
-            candidate_texts.append(solution_text)
-            
-            # Score this candidate via mirror evaluation
-            score = 0.0
-            
-            if enable_mirror_eval:
-                for eval_attempt in range(mirror_eval_attempts):
-                    prompt_eval = create_reverse_validation_prompt(
-                        solution_text,
-                        original_combined,
-                        config
-                    )
-                    
-                    resp_eval = api_manager_eval.generate_content(
-                        prompt_eval, model_solve, temp_eval
-                    )
-                    
-                    local_trace.append(create_trace_entry(
-                        "best_of_transformation_centralized_pool",
-                        f"sample_{retrieved_idx}_pool_{pool_idx}_eval_{eval_attempt}",
-                        {"prompt": prompt_eval}, resp_eval,
-                        {"model": model_solve, "temp": temp_eval}
-                    ))
-                    
-                    if resp_eval['status'] == 'SUCCESS':
-                        response_lower = resp_eval['text'].lower()
-                        if any(word in response_lower for word in ['correct', 'yes', 'accurate', 'valid', 'true']):
-                            score += 1.0
-                
-                score = score / mirror_eval_attempts
-            else:
-                score = 1.0  # Default if mirror eval disabled
-            
-            scores.append(score)
-        
-        print(f"  Scored all {len(pool)} candidates: {scores}")
-        
-        # ===== PHASE 3: DETERMINISTIC SELECTION WITH TIE-BREAKING =====
-        print(f"  [PHASE 3] Applying deterministic selection with tie-breaking...")
-        
-        best_idx = argmax_tiebreak(scores)
-        best_candidate = pool[best_idx]
-        best_score = scores[best_idx]
-        best_source = "original_retrieval" if best_candidate['is_original'] else "transformation"
-        
-        print(f"  Selected: Index {best_idx} ({best_source}), Score: {best_score:.3f}")
-        
-        # ===== BUILD EVALUATION CONTEXT =====
-        evaluation_contexts[retrieved_idx] = {
-            "scenario": "Best-of-Transformation (Centralized Pool)",
-            "pool_index": best_idx,
-            "pool_size": pool_size,
-            "selected_candidate": {
-                "text": best_candidate['text'],
-                "source": best_source,
-                "transformation_idx": best_candidate['transformation_idx']
-            },
-            "selection_score": best_score,
-            "all_scores": scores,
-            "candidate_texts": candidate_texts
-        }
-        
-        telemetry_selections[retrieved_idx] = {
-            "pool_size": pool_size,
-            "selected_index": best_idx,
-            "selected_score": best_score,
-            "selected_source": best_source,
-            "all_scores": scores
-        }
-    
-    # =========================================================================
-    # BUILD OUTPUT
-    # =========================================================================
-    print(f"\n{'='*80}")
-    print(f"  [BEST-OF-TRANSFORMATION] Centralized Pool Processing Complete")
-    print(f"  Total Retrieved Samples: {len(retrieved_indices)}")
-    print(f"  Total Transformations Generated: {len(retrieved_indices) * n_transformations}")
-    print(f"  Total Candidates Evaluated: {len(retrieved_indices) * (1 + n_transformations)}")
-    print(f"{'='*80}\n")
-    
-    if not evaluation_contexts:
-        return {
-            "status": "FAILURE",
-            "error": "No evaluation contexts created",
-            "trace": local_trace
-        }
-    
-    # Extract best candidates for backwards compatibility
-    best_candidates = [
-        {
-            "retrieved_idx": retrieved_idx,
-            "candidate_text": ctx["selected_candidate"]["text"],
-            "candidate_answer": ctx["selected_candidate"]["text"],
-            "source_transformation_idx": ctx["selected_candidate"]["transformation_idx"],
-            "validation_score": ctx["selection_score"]
-        }
-        for retrieved_idx, ctx in evaluation_contexts.items()
-    ]
-    
-    return {
-        "status": "SUCCESS",
-        "evaluation_contexts": evaluation_contexts,
-        "best_candidates": best_candidates,
-        "telemetry": {
-            "pool_construction_passes": len(retrieved_indices),
-            "scoring_passes": len(retrieved_indices),
-            "total_transformations": len(retrieved_indices) * n_transformations,
-            "selections": telemetry_selections
-        },
-        "trace": local_trace
-    }
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_BASELINE", "mirror_baseline_zero_shot_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(question=question)
+
+def create_mirror_hypothesis_prompt(target_query: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve the Target Query using a retrieved sample as a 1-shot exemplar (Phase 1).
+    """
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS", "mirror_hypothesis_gen_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(
+        target_query=target_query,
+        exemplar_question=exemplar_question,
+        exemplar_solution=exemplar_solution
+    )
+
+def create_mirror_hypothesis_zeroshot_prompt(target_query: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve the Target Query zero-shot (for the R0 candidate).
+    """
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT", "mirror_hypothesis_gen_zero_shot_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(target_query=target_query)
+
+def create_mirror_verification_prompt(validation_question: str, hypothesis_question: str, hypothesis_solution: str, config: Dict[str, Any]) -> str:
+    """
+    Creates a prompt to solve an original retrieved sample using the generated Hypothesis as a 1-shot exemplar (Phase 2: Mirroring).
+    """
+    template_name = config.get("PROMPT_TEMPLATE_MIRROR_VERIFICATION", "mirror_verification_v1")
+    if template_name not in PROMPT_TEMPLATES:
+        return f"Error: Template {template_name} not found."
+    template = PROMPT_TEMPLATES[template_name]
+    return template.format(
+        validation_question=validation_question,
+        hypothesis_question=hypothesis_question,
+        hypothesis_solution=hypothesis_solution
+    )
