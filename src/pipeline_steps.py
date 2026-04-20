@@ -2582,72 +2582,86 @@ def select_best_transformations(
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    REFORMED Best-of-Transformation with Per-Retrieved-Sample Best Candidate Selection:
+    REFACTORED Best-of-Transformation: Centralized Candidate Pool Architecture
     
-    Core Principle: Exact one best candidate per retrieved exemplar, enforced structurally.
+    Core Principle: Build ONE unified candidate pool per retrieved sample, run mirror
+    evaluation ONCE over the entire pool, then use deterministic selection.
     
-    Algorithm:
-    1. RETRIEVE: Get K exemplars (retrieved_indices has K entries)
-    2. TRANSFORM: For each retrieved exemplar r_i (i=1..K):
-       - Generate N transformed variants t_i1, t_i2, ..., t_iN
-    3. GENERATE: For each transformed variant t_ij:
-       - Generate M candidate answers (attempts/generations)
-       - All candidates: K×N×M total
-    4. VALIDATE: Each candidate gets validation score (mirror eval + consistency check)
-    5. SELECT-PER-SAMPLE (CRITICAL): For each retrieved exemplar r_i:
-       - Isolate all candidates derived from r_i (subset of K×N×M)
-       - Rank candidates in this subset by validation score
-       - Select the single highest-scoring candidate from this subset
-       - Result: K best candidates, one per retrieved exemplar
-    6. OUTPUT: K best candidates with full traceability to source exemplar
+    Architecture (per retrieved sample):
     
-    Per-Sample Selection Boundary:
-    - NO cross-sample competition before per-sample selection
-    - NO global ranking over all K×N×M candidates
-    - Per-sample boundary is structurally enforced via explicit aggregation
+    PHASE 1: CENTRALIZED POOL CONSTRUCTION
+    - Build: [R_main, T_1, T_2, ..., T_N] (original + N transformations)
+    - Index 0 = R_main (original)
+    - Indices 1 to N = Transformations T_1 through T_N
+    - Single pass: no redundant API calls
+    
+    PHASE 2: UNIFIED MIRROR SCORING (once per pool)
+    - Score all N+1 candidates in single pass
+    - Returns: Scores = [S_0, S_1, S_2, ..., S_N]
+    
+    PHASE 3: DETERMINISTIC SELECTION WITH TIE-BREAKING
+    - Best = argmax_tiebreak(Scores)
+    - Tie-breaking rule: (score DESC, index ASC)
+    - On ties, favor lower indices (prefer R_main for safety)
+    
+    PHASE 4: STATE FAN-OUT
+    - Selected context stored for downstream use
+    - Solver runs with this single context
+    
+    Args:
+        retrieved_indices: List of K retrieved exemplar indices
+        target_query: Main problem query
+        exemplar_data: Contains questions, solutions, embeddings
+        api_manager_adapt: API manager for transformations
+        api_manager_solve: API manager for solving
+        api_manager_eval: API manager for evaluation
+        config: Pipeline configuration
     
     Returns:
         {
             "status": "SUCCESS" | "FAILURE",
-            "best_candidates": [
-                {
-                    "retrieved_idx": int,
-                    "candidate_text": str,
-                    "candidate_answer": str,
-                    "source_transformation_idx": int,
-                    "validation_score": float,
-                    "per_sample_rank": int
-                },
-                ...  # One entry per retrieved sample
-            ],
-            "per_sample_candidate_counts": [N×M, ...],  # Candidates per sample
-            "per_sample_rankings": [
-                {
-                    "retrieved_idx": int,
-                    "total_candidates": int,
-                    "ranked_candidates": [
-                        {"candidate_preview": str, "score": float, "rank": int},
-                        ...
-                    ]
+            "evaluation_contexts": {
+                retrieved_idx: {
+                    "scenario": "Best-of-Transformation (Centralized Pool)",
+                    "pool_index": int,  # 0 = R_main, 1+ = transformations
+                    "pool_size": int,
+                    "selected_candidate": {...},
+                    "selection_score": float,
+                    "all_scores": [...],
+                    "source": "original_retrieval" or "transformation"
                 },
                 ...
-            ],
+            },
+            "telemetry": {
+                "pool_construction_passes": K,
+                "scoring_passes": K,
+                "total_transformations": K*N,
+                "selections": {
+                    retrieved_idx: {
+                        "pool_size": int,
+                        "selected_index": int,
+                        "selected_score": float,
+                        "selected_source": str,
+                        "all_scores": [...]
+                    },
+                    ...
+                }
+            },
             "trace": [...]
         }
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"Starting Per-Sample Best-of-Transformation selection for {len(retrieved_indices)} retrieved samples")
+    logger.info(f"Starting Best-of-Transformation with centralized pool for {len(retrieved_indices)} retrieved samples")
     
     print(f"\n{'='*80}")
-    print(f"  [BEST-OF-TRANSFORMATION] Per-Retrieved-Sample Best Candidate Selection")
-    print(f"  Architecture: Strict per-sample boundaries → diversity preservation")
+    print(f"  [BEST-OF-TRANSFORMATION] Centralized Candidate Pool Architecture")
+    print(f"  Phase 1: Pool Construction | Phase 2: Unified Scoring | Phase 3: Selection")
     print(f"{'='*80}")
     
     local_trace = []
     
-    # Configuration parameters
+    # Configuration
     n_transformations = config.get("BEST_OF_TRANSFORMATION_N_SAMPLES", 3)
-    n_attempts_per_transformation = config.get("BEST_OF_TRANSFORMATION_ATTEMPTS_PER_TRANSFORMATION", 1)
     enable_mirror_eval = config.get("BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL", True)
     mirror_eval_attempts = config.get("BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS", 3)
     
@@ -2668,41 +2682,51 @@ def select_best_transformations(
     temp_solve = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
     temp_eval = config.get("DEFAULT_EVALUATOR_TEMPERATURE", 0.0)
     
-    # =========================================================================
-    # DATA STRUCTURE FOR PER-SAMPLE CANDIDATE TRACKING
-    # =========================================================================
-    # Key invariant: This structure makes per-sample boundaries explicitly visible
-    per_sample_candidates = {}  # {retrieved_idx: [candidate_dict, ...]}
-    per_sample_rankings = {}    # {retrieved_idx: [ranked_candidate_dict, ...]}
-    best_candidates_per_sample = {}  # {retrieved_idx: best_candidate_dict}
-    per_sample_candidate_counts = {}  # {retrieved_idx: count}
+    evaluation_contexts = {}
+    telemetry_selections = {}
+    
+    def argmax_tiebreak(scores: List[float]) -> int:
+        """Deterministic argmax with tie-breaking favoring lower indices."""
+        if not scores:
+            return 0
+        best_candidate = max(
+            enumerate(scores),
+            key=lambda pr: (pr[1], -pr[0])
+        )
+        return best_candidate[0]
     
     # =========================================================================
-    # PHASE 1: TRANSFORMATION GENERATION (Per Retrieved Sample)
+    # PROCESS EACH RETRIEVED SAMPLE WITH CENTRALIZED POOL ARCHITECTURE
     # =========================================================================
-    print(f"\n[PHASE 1] TRANSFORMATION GENERATION")
-    print(f"  Target: {n_transformations} transformations × {len(retrieved_indices)} samples")
-    
-    per_sample_transformations = {}  # {retrieved_idx: [transformation, ...]}
-    
     for sample_idx, retrieved_idx in enumerate(retrieved_indices):
-        original_sample_q = exemplar_data['questions'][retrieved_idx]
-        original_sample_sol = exemplar_data['solutions'][retrieved_idx]
+        original_q = exemplar_data['questions'][retrieved_idx]
+        original_sol = exemplar_data['solutions'][retrieved_idx]
+        original_combined = f"Question: {original_q}\nSolution: {original_sol}"
         
-        print(f"\n  [{sample_idx+1}/{len(retrieved_indices)}] Retrieved Sample #{retrieved_idx}")
-        print(f"      Original Q: {original_sample_q[:60]}...")
+        print(f"\n[SAMPLE {sample_idx+1}/{len(retrieved_indices)}] Retrieved Index #{retrieved_idx}")
+        print(f"  Original Q: {original_q[:60]}...")
         
-        # --- Transformation generation for this sample ---
-        transformations = []
+        # ===== PHASE 1: CENTRALIZED POOL CONSTRUCTION =====
+        print(f"  [PHASE 1] Building centralized candidate pool...")
         
+        pool = []
+        
+        # Index 0: Original retrieval (R_main)
+        pool.append({
+            "pool_index": 0,
+            "text": original_combined,
+            "is_original": True,
+            "transformation_idx": None,
+            "source": "original_retrieval"
+        })
+        
+        # Indices 1+: Transformations (T_1, T_2, ..., T_N)
         for t_idx in range(n_transformations):
-            combined_sample = f"Question: {original_sample_q}\nSolution: {original_sample_sol}"
-            
             prompt_transform = create_transformation_prompt(
                 target_query=target_query,
-                text_to_transform=combined_sample,
+                text_to_transform=original_combined,
                 config=config,
-                template_key_name='PROMPT_TEMPLATE_TRANSFORMATION_1'
+                template_key_name=config.get("BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE", "transformation_shallow-&-moderately-deep")
             )
             
             resp_transform = api_manager_adapt.generate_content(
@@ -2710,122 +2734,76 @@ def select_best_transformations(
             )
             
             local_trace.append(create_trace_entry(
-                "best_of_transformation_per_sample", 
+                "best_of_transformation_centralized_pool",
                 f"sample_{retrieved_idx}_transform_{t_idx}",
                 {"prompt": prompt_transform}, resp_transform,
                 {"model": model_adapt, "temp": temp_transform}
             ))
             
             if resp_transform['status'] == 'SUCCESS':
-                transformations.append({
-                    'idx': t_idx,
-                    'text': resp_transform['text'],
-                    'retrieved_idx': retrieved_idx
+                pool.append({
+                    "pool_index": t_idx + 1,
+                    "text": resp_transform['text'],
+                    "is_original": False,
+                    "transformation_idx": t_idx,
+                    "source": "transformation"
                 })
             else:
-                logger.warning(f"Transform failed: sample {retrieved_idx}, transform {t_idx}")
+                logger.warning(f"Transformation failed for sample {retrieved_idx}, transform {t_idx}")
+                # Fallback: duplicate original
+                pool.append({
+                    "pool_index": t_idx + 1,
+                    "text": f"[FALLBACK_T{t_idx}] {original_combined}",
+                    "is_original": False,
+                    "transformation_idx": t_idx,
+                    "source": "transformation_fallback"
+                })
         
-        if not transformations:
-            logger.warning(f"No transformations for sample {retrieved_idx}, using original")
-            transformations.append({
-                'idx': -1,  # Special marker for original
-                'text': f"[ORIGINAL] Question: {original_sample_q}\nSolution: {original_sample_sol}",
-                'retrieved_idx': retrieved_idx
-            })
+        pool_size = len(pool)
+        print(f"  Pool size: {pool_size} (1 original + {n_transformations} transformations)")
         
-        per_sample_transformations[retrieved_idx] = transformations
-        print(f"      Transformations generated: {len(transformations)}/{n_transformations}")
-    
-    # =========================================================================
-    # PHASE 2: CANDIDATE GENERATION (Per Transformation, Per Retrieved Sample)
-    # =========================================================================
-    print(f"\n[PHASE 2] CANDIDATE GENERATION")
-    print(f"  Target: {n_attempts_per_transformation} attempts per transformation")
-    
-    for retrieved_idx in retrieved_indices:
-        original_sample_q = exemplar_data['questions'][retrieved_idx]
-        transformations = per_sample_transformations[retrieved_idx]
+        # ===== PHASE 2: UNIFIED MIRROR SCORING (ONCE PER POOL) =====
+        print(f"  [PHASE 2] Running unified mirror scoring over entire pool...")
         
-        sample_candidates = []  # All candidates for this retrieved sample
+        scores = []
+        candidate_texts = []
         
-        for trans in transformations:
-            # For this transformation, generate multiple candidate attempts
-            for attempt_idx in range(n_attempts_per_transformation):
-                prompt_solve = create_analogical_adaptation_prompt(
-                    target_query,
-                    f"Question: {original_sample_q}\n{trans['text']}",
-                    config
-                )
-                
-                resp_candidate = api_manager_solve.generate_content(
-                    prompt_solve, model_solve, temp_solve
-                )
-                
-                local_trace.append(create_trace_entry(
-                    "best_of_transformation_per_sample",
-                    f"sample_{retrieved_idx}_transform_{trans['idx']}_attempt_{attempt_idx}",
-                    {"prompt": prompt_solve}, resp_candidate,
-                    {"model": model_solve, "temp": temp_solve}
-                ))
-                
-                if resp_candidate['status'] == 'SUCCESS':
-                    candidate_dict = {
-                        'retrieved_idx': retrieved_idx,
-                        'transformation_idx': trans['idx'],
-                        'attempt_idx': attempt_idx,
-                        'raw_response': resp_candidate['text'],
-                        'candidate_text': f"Question: {target_query}\nRationale and Answer: {resp_candidate['text']}",
-                        'validation_score': 0.0,  # Will be set in Phase 3
-                        'validation_details': {}
-                    }
-                    sample_candidates.append(candidate_dict)
-                else:
-                    logger.warning(
-                        f"Candidate generation failed: sample {retrieved_idx}, "
-                        f"transform {trans['idx']}, attempt {attempt_idx}"
-                    )
-        
-        if not sample_candidates:
-            logger.warning(f"No candidates for sample {retrieved_idx}, creating fallback")
-            original_sample_sol = exemplar_data['solutions'][retrieved_idx]
-            sample_candidates.append({
-                'retrieved_idx': retrieved_idx,
-                'transformation_idx': -1,
-                'attempt_idx': -1,
-                'raw_response': f"[FALLBACK] {original_sample_sol}",
-                'candidate_text': f"Question: {target_query}\nRationale and Answer: [FALLBACK] {original_sample_sol}",
-                'validation_score': -1.0,
-                'validation_details': {'fallback': True}
-            })
-        
-        per_sample_candidates[retrieved_idx] = sample_candidates
-        per_sample_candidate_counts[retrieved_idx] = len(sample_candidates)
-        print(f"  Sample #{retrieved_idx}: Generated {len(sample_candidates)} candidates")
-    
-    # =========================================================================
-    # PHASE 3: VALIDATION (Per Candidate, Still Within Per-Sample Context)
-    # =========================================================================
-    print(f"\n[PHASE 3] VALIDATION (Mirror Evaluation)")
-    
-    for retrieved_idx in retrieved_indices:
-        original_sample_q = exemplar_data['questions'][retrieved_idx]
-        original_sample_sol = exemplar_data['solutions'][retrieved_idx]
-        sample_candidates = per_sample_candidates[retrieved_idx]
-        
-        if enable_mirror_eval:
-            for cand in sample_candidates:
-                # Skip fallback candidates
-                if cand.get('validation_details', {}).get('fallback'):
-                    cand['validation_score'] = -1.0
-                    continue
-                
-                # Validate this candidate against the original sample
-                validation_score = 0.0
-                
+        for pool_idx, candidate_dict in enumerate(pool):
+            # Generate solution for this candidate
+            prompt_solve = create_analogical_adaptation_prompt(
+                target_query,
+                candidate_dict['text'],
+                config
+            )
+            
+            resp_solve = api_manager_solve.generate_content(
+                prompt_solve, model_solve, temp_solve
+            )
+            
+            local_trace.append(create_trace_entry(
+                "best_of_transformation_centralized_pool",
+                f"sample_{retrieved_idx}_pool_{pool_idx}_solve",
+                {"prompt": prompt_solve}, resp_solve,
+                {"model": model_solve, "temp": temp_solve}
+            ))
+            
+            if resp_solve['status'] == 'FAILURE':
+                logger.warning(f"Solve failed for sample {retrieved_idx}, pool index {pool_idx}")
+                scores.append(0.0)
+                candidate_texts.append("[SOLVE_FAILED]")
+                continue
+            
+            solution_text = resp_solve['text']
+            candidate_texts.append(solution_text)
+            
+            # Score this candidate via mirror evaluation
+            score = 0.0
+            
+            if enable_mirror_eval:
                 for eval_attempt in range(mirror_eval_attempts):
                     prompt_eval = create_reverse_validation_prompt(
-                        cand['raw_response'],
-                        f"Question: {original_sample_q}\nSolution: {original_sample_sol}",
+                        solution_text,
+                        original_combined,
                         config
                     )
                     
@@ -2834,8 +2812,8 @@ def select_best_transformations(
                     )
                     
                     local_trace.append(create_trace_entry(
-                        "best_of_transformation_per_sample",
-                        f"sample_{retrieved_idx}_validate_cand_{cand['transformation_idx']}_{cand['attempt_idx']}_eval_{eval_attempt}",
+                        "best_of_transformation_centralized_pool",
+                        f"sample_{retrieved_idx}_pool_{pool_idx}_eval_{eval_attempt}",
                         {"prompt": prompt_eval}, resp_eval,
                         {"model": model_solve, "temp": temp_eval}
                     ))
@@ -2843,102 +2821,87 @@ def select_best_transformations(
                     if resp_eval['status'] == 'SUCCESS':
                         response_lower = resp_eval['text'].lower()
                         if any(word in response_lower for word in ['correct', 'yes', 'accurate', 'valid', 'true']):
-                            validation_score += 1.0
+                            score += 1.0
                 
-                cand['validation_score'] = validation_score / mirror_eval_attempts
-        else:
-            # Equal scores if mirror eval disabled
-            for cand in sample_candidates:
-                if not cand.get('validation_details', {}).get('fallback'):
-                    cand['validation_score'] = 1.0
-                else:
-                    cand['validation_score'] = -1.0
+                score = score / mirror_eval_attempts
+            else:
+                score = 1.0  # Default if mirror eval disabled
+            
+            scores.append(score)
         
-        print(f"  Sample #{retrieved_idx}: Validated {len(sample_candidates)} candidates")
+        print(f"  Scored all {len(pool)} candidates: {scores}")
+        
+        # ===== PHASE 3: DETERMINISTIC SELECTION WITH TIE-BREAKING =====
+        print(f"  [PHASE 3] Applying deterministic selection with tie-breaking...")
+        
+        best_idx = argmax_tiebreak(scores)
+        best_candidate = pool[best_idx]
+        best_score = scores[best_idx]
+        best_source = "original_retrieval" if best_candidate['is_original'] else "transformation"
+        
+        print(f"  Selected: Index {best_idx} ({best_source}), Score: {best_score:.3f}")
+        
+        # ===== BUILD EVALUATION CONTEXT =====
+        evaluation_contexts[retrieved_idx] = {
+            "scenario": "Best-of-Transformation (Centralized Pool)",
+            "pool_index": best_idx,
+            "pool_size": pool_size,
+            "selected_candidate": {
+                "text": best_candidate['text'],
+                "source": best_source,
+                "transformation_idx": best_candidate['transformation_idx']
+            },
+            "selection_score": best_score,
+            "all_scores": scores,
+            "candidate_texts": candidate_texts
+        }
+        
+        telemetry_selections[retrieved_idx] = {
+            "pool_size": pool_size,
+            "selected_index": best_idx,
+            "selected_score": best_score,
+            "selected_source": best_source,
+            "all_scores": scores
+        }
     
     # =========================================================================
-    # PHASE 4: PER-SAMPLE BEST CANDIDATE SELECTION (CRITICAL BOUNDARY ENFORCEMENT)
-    # =========================================================================
-    print(f"\n[PHASE 4] PER-SAMPLE BEST CANDIDATE SELECTION")
-    print(f"  Boundary Model: NEVER cross-sample competition before this phase")
-    
-    best_candidates_list = []
-    
-    for retrieved_idx in retrieved_indices:
-        sample_candidates = per_sample_candidates[retrieved_idx]
-        
-        # Sort candidates within this sample by validation score (descending)
-        ranked_candidates = sorted(
-            sample_candidates,
-            key=lambda c: (c['validation_score'], -c['attempt_idx']),  # Score desc, then attempt desc
-            reverse=True
-        )
-        
-        # Store ranking for this sample
-        per_sample_rankings[retrieved_idx] = [
-            {
-                'candidate_preview': ranked_candidates[i]['raw_response'][:80],
-                'score': ranked_candidates[i]['validation_score'],
-                'rank': i + 1,
-                'transformation_idx': ranked_candidates[i]['transformation_idx'],
-                'attempt_idx': ranked_candidates[i]['attempt_idx']
-            }
-            for i in range(len(ranked_candidates))
-        ]
-        
-        # *** SELECT EXACTLY ONE BEST CANDIDATE FOR THIS SAMPLE ***
-        best_candidate = ranked_candidates[0]
-        best_candidate['per_sample_rank'] = 1
-        best_candidates_per_sample[retrieved_idx] = best_candidate
-        best_candidates_list.append(best_candidate)
-        
-        print(f"  Sample #{retrieved_idx}:")
-        print(f"    Total candidates in sample: {len(ranked_candidates)}")
-        print(f"    Selected best (rank 1): transform_{best_candidate['transformation_idx']} "
-              f"attempt_{best_candidate['attempt_idx']}")
-        print(f"    Score: {best_candidate['validation_score']:.3f}")
-        print(f"    Answer preview: {best_candidate['raw_response'][:60]}...")
-    
-    # =========================================================================
-    # OUTPUT FORMATTING
+    # BUILD OUTPUT
     # =========================================================================
     print(f"\n{'='*80}")
-    print(f"  [BEST-OF-TRANSFORMATION] Per-Sample Selection Complete")
+    print(f"  [BEST-OF-TRANSFORMATION] Centralized Pool Processing Complete")
     print(f"  Total Retrieved Samples: {len(retrieved_indices)}")
-    print(f"  Best Candidates Selected: {len(best_candidates_list)} (exactly 1 per sample)")
-    print(f"  Total Candidates Evaluated: {sum(per_sample_candidate_counts.values())}")
+    print(f"  Total Transformations Generated: {len(retrieved_indices) * n_transformations}")
+    print(f"  Total Candidates Evaluated: {len(retrieved_indices) * (1 + n_transformations)}")
     print(f"{'='*80}\n")
     
-    if not best_candidates_list:
+    if not evaluation_contexts:
         return {
             "status": "FAILURE",
-            "error": "No best candidates selected",
+            "error": "No evaluation contexts created",
             "trace": local_trace
         }
     
-    # Format output with full traceability
+    # Extract best candidates for backwards compatibility
+    best_candidates = [
+        {
+            "retrieved_idx": retrieved_idx,
+            "candidate_text": ctx["selected_candidate"]["text"],
+            "candidate_answer": ctx["selected_candidate"]["text"],
+            "source_transformation_idx": ctx["selected_candidate"]["transformation_idx"],
+            "validation_score": ctx["selection_score"]
+        }
+        for retrieved_idx, ctx in evaluation_contexts.items()
+    ]
+    
     return {
         "status": "SUCCESS",
-        "best_candidates": [
-            {
-                "retrieved_idx": cand['retrieved_idx'],
-                "candidate_text": cand['candidate_text'],
-                "candidate_answer": cand['raw_response'],
-                "source_transformation_idx": cand['transformation_idx'],
-                "source_attempt_idx": cand['attempt_idx'],
-                "validation_score": cand['validation_score'],
-                "per_sample_rank": 1  # Always 1 by construction
-            }
-            for cand in best_candidates_list
-        ],
-        "per_sample_candidate_counts": per_sample_candidate_counts,
-        "per_sample_rankings": [
-            {
-                "retrieved_idx": retrieved_idx,
-                "total_candidates": per_sample_candidate_counts[retrieved_idx],
-                "ranked_candidates": per_sample_rankings[retrieved_idx]
-            }
-            for retrieved_idx in retrieved_indices
-        ],
+        "evaluation_contexts": evaluation_contexts,
+        "best_candidates": best_candidates,
+        "telemetry": {
+            "pool_construction_passes": len(retrieved_indices),
+            "scoring_passes": len(retrieved_indices),
+            "total_transformations": len(retrieved_indices) * n_transformations,
+            "selections": telemetry_selections
+        },
         "trace": local_trace
     }
