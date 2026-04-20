@@ -50,6 +50,7 @@ CONFIG = {
     # --- AvalAI (OpenAI-Compatible) API Settings ---
     "AVALAI_API_KEY": "YOUR_AVALAI_API_KEY_HERE",
     # "AVALAI_BASE_URL": "https://api.avalai.ir/v1",
+    
     "AVALAI_BASE_URL": "https://api.avalapis.ir/v1",
     "AVALAI_MODEL_QUOTAS": {
         "default": {"delay_seconds": 2}
@@ -385,3 +386,7 @@ def setup_directories():
         except OSError as e:
             print(f"Error creating directory {dir_path}: {e}")
     print("--- Directory setup complete ---\n")
+
+
+
+
