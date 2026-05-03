@@ -1021,23 +1021,19 @@ Rationale and Answer: [Your step-by-step solution using analogical reasoning fro
 """,
 
 
-    "analogical_adaptation_v2": """You are an expert in analogical reasoning for mathematical problem-solving.
+    "analogical_adaptation_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
 <Instructions>
-1. Carefully analyze each solved sample problem to understand its reasoning pattern, problem-solving strategy, and logical structure.
-2. Identify the core reasoning principles and mathematical techniques that can be transferred to the Main Question.
-3. Apply these analogical insights to solve the Main Question, adapting the reasoning patterns to fit the specific context and requirements of the Main Question.
-4. Present your solution in a clear, step-by-step format that shows how you applied analogical reasoning.
-5. Do NOT simply copy the solutions from the samples—adapt and apply their reasoning patterns intelligently.
+Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
 </Instructions>
 
 <Solved Examples>
 {samples_block}
 </Solved Examples>
 
-<Main Question to Solve>
+<Main Question>
 {main_question_text}
-</Main Question to Solve>
+</Main Question>
 
 <Your Answer/Output Format>
 Rationale:
