@@ -495,7 +495,9 @@ def run_layer1_base_execution(
     # --- Initialization ---
     cache_dir = config.get("LAYER1_CACHE_DIR", "local_data/layer1_cache")
     top_k = config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-    n_candidates = config.get("LAYER1_N_CANDIDATES", top_k)  # Usually equals top_k
+    n_candidates = config.get("LAYER1_N_CANDIDATES")
+    if n_candidates is None:
+        n_candidates = top_k  # Use top_k if LAYER1_N_CANDIDATES not explicitly set
     dataset_name = config.get("LAYER1_DATASET_NAME", "hard_questions")
     
     trace_accumulator = []
