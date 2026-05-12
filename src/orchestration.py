@@ -67,6 +67,7 @@ from src.pipeline_steps import (
 )
 
 from src.multibranch_transformation import multibranch_transformation_experiment
+from src.layer1_base_execution import run_layer1_base_execution
 
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -120,6 +121,9 @@ def run_pipeline_for_single_query(
                     "USE_RETRIEVAL", "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
                     "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3", "APPLY_MERGING",
                     "DEFER_SOLVE_STEP", "TOP_N_CANDIDATES_RETRIEVAL", "N_PASS_ATTEMPTS",
+                    # Layer 1 Flags
+                    "APPLY_LAYER1_BASE_EXECUTION", "LAYER1_ONLY_MODE", "LAYER1_CACHE_DIR",
+                    "LAYER1_N_CANDIDATES", "LAYER1_DATASET_NAME",
                     # New Feature Flags
                     "APPLY_SELF_SAMPLING", "SELF_SAMPLING_N",
                     "APPLY_ANALOGICAL_ADAPTATION", "ANALOGICAL_GROUP_SETS",
@@ -186,6 +190,51 @@ def run_pipeline_for_single_query(
     # NEW: Specific Manager for Simplification
     provider_for_simp = config.get('API_PROVIDER_SIMPLIFICATION', provider_for_adapt)
     manager_for_simp = api_managers[provider_for_simp]
+
+    # --- LAYER 1: BASE EXECUTION PHASE ---
+    if config.get('APPLY_LAYER1_BASE_EXECUTION', False):
+        print("\n[PRE-PROCESSING] LAYER 1: BASE EXECUTION PHASE ENABLED")
+        print("  Mode: API-driven data generation with persistent caching")
+        
+        # Get ground truth for this query
+        # The ground truth is expected to be available in exemplar_data or config
+        ground_truth = None
+        if 'ground_truths' in exemplar_data:
+            ground_truth = exemplar_data['ground_truths'][hard_list_idx]
+        elif 'solutions' in exemplar_data:
+            # Try to find the ground truth from the hard questions dataset
+            ground_truth = exemplar_data['solutions'][hard_list_idx] if hard_list_idx < len(exemplar_data.get('solutions', [])) else None
+        
+        if not ground_truth:
+            logger.warning(f"Layer 1 enabled but no ground truth available for query #{hard_list_idx}. Skipping Layer 1.")
+        else:
+            # Execute Layer 1
+            layer1_state = run_layer1_base_execution(
+                target_query_index=hard_list_idx,
+                target_query=target_query,
+                ground_truth_answer=ground_truth,
+                embedding_model=embedding_model,
+                exemplar_questions=exemplar_data['questions'],
+                exemplar_solutions=exemplar_data.get('solutions', []),
+                embedded_exemplars=exemplar_data['embeddings'],
+                exemplar_data=exemplar_data,
+                api_manager=manager_for_solve,  # Use the solve manager for consistency
+                config=config
+            )
+            
+            # Store Layer 1 state in run_log for reference
+            run_log['layer1_base_execution_state'] = layer1_state
+            
+            # If Layer 1 succeeded and we're ONLY running Layer 1 (not full pipeline)
+            if config.get('LAYER1_ONLY_MODE', False) and layer1_state.get('overall_status') == 'SUCCESS':
+                print("\n[LAYER 1 COMPLETE] Layer 1 Only Mode is active. Pipeline execution halted.")
+                run_log['pipeline_status'] = 'SUCCESS'
+                run_log['execution_mode'] = 'layer1_only'
+                logger.info(f"Layer 1 only mode: Query #{hard_list_idx} execution complete, cache saved.")
+                return run_log
+            
+            # Otherwise, continue with the main pipeline
+            logger.info(f"Layer 1 completed. Status: {layer1_state.get('overall_status')}. Proceeding with main pipeline.")
 
     # --- MULTI-BRANCH TRANSFORMATION EXPERIMENTS ---
     if config.get('APPLY_MULTIBRANCH_TRANSFORMATION', False):
