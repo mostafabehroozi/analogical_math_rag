@@ -277,6 +277,33 @@ CONFIG = {
     "APPLY_FULL_PIPELINE_RETRY": False,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
+    # ============================================================================
+    # LAYER 1: BASE EXECUTION PHASE
+    # ============================================================================
+    # Layer 1 is the foundational data-gathering engine that performs expensive LLM
+    # API operations exactly once, captures complete execution state, and serializes
+    # it to persistent JSON caches. This enables Layer 2's offline analytical
+    # experiments without requiring redundant API calls.
+    #
+    # Cache-First Architecture:
+    # - If cache exists for a query configuration → instant load (ZERO API calls)
+    # - If cache missing → full 5-phase execution → serialize to JSON
+    #
+    # The 5 phases executed by Layer 1:
+    # 1. Retrieval: Fetch top-K exemplars
+    # 2. Candidate Generation: Generate 1-shot candidates (H_i using only R_i)
+    # 3. Intrinsic Baseline: Calculate zero-shot difficulty scores
+    # 4. Cross-Evaluation Matrix: Test each candidate against each evaluator
+    # 5. Ground-Truth Evaluation: Establish True/False labels for all candidates
+    #
+    # Output: Single JSON cache with complete execution state ready for Layer 2
+    
+    "APPLY_LAYER1_BASE_EXECUTION": False,  # Enable/disable Layer 1 system
+    "LAYER1_ONLY_MODE": False,             # If True, halt after Layer 1 (cache generation only)
+    "LAYER1_CACHE_DIR": os.path.join(LOCAL_DATA_BASE, "layer1_cache"),  # Cache storage directory
+    "LAYER1_N_CANDIDATES": None,           # Number of candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
+    "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
+
     # --- Dataset Construction Settings ---
     # When enabled, the system will perform a specialized dataset generation
     # phase.  It randomly selects a query from the exemplar corpus, finds the
