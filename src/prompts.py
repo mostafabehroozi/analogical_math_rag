@@ -456,7 +456,8 @@ Final Answer:
     "final_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
 <Instructions>
-Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers.
+Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
 </Instructions>
 
 <Solved Examples>
@@ -481,6 +482,28 @@ Final Answer:
 <True Solved Example>
 {examples_block}
 </True Solved Example>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+    "final_solver_v4": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Analyze the solved examples to identify key reasoning patterns, structures, and strategies that lead to their answers. Use these insights as guidance—rather than strict templates—and adapt them to the main question while applying your own reasoning to reach a solution.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
 
 <Main Question to Solve>
 {main_question_text}
@@ -1021,19 +1044,23 @@ Rationale and Answer: [Your step-by-step solution using analogical reasoning fro
 """,
 
 
-    "analogical_adaptation_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+    "analogical_adaptation_v2": """You are an expert in analogical reasoning for mathematical problem-solving.
 
 <Instructions>
-Carefully analyze each example: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these examples as supportive guides—treat them as verified, correct rationales to inform your approach, but not as strict templates that must be replicated exactly. Instead, adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
+1. Carefully analyze each solved sample problem to understand its reasoning pattern, problem-solving strategy, and logical structure.
+2. Identify the core reasoning principles and mathematical techniques that can be transferred to the Main Question.
+3. Apply these analogical insights to solve the Main Question, adapting the reasoning patterns to fit the specific context and requirements of the Main Question.
+4. Present your solution in a clear, step-by-step format that shows how you applied analogical reasoning.
+5. Do NOT simply copy the solutions from the samples—adapt and apply their reasoning patterns intelligently.
 </Instructions>
 
 <Solved Examples>
 {samples_block}
 </Solved Examples>
 
-<Main Question>
+<Main Question to Solve>
 {main_question_text}
-</Main Question>
+</Main Question to Solve>
 
 <Your Answer/Output Format>
 Rationale:
@@ -1388,7 +1415,7 @@ Simplified Question:
 </Output Format>
 """,
 
-    "mirror_baseline_zero_shot_v1": """You are an expert mathematician. Solve the following problem step-by-step.
+    "mirror_baseline_zero_shot_v1_old": """You are an expert mathematician. Solve the following problem step-by-step.
 
 <Main Question to Solve>
 {question}
@@ -1403,8 +1430,31 @@ Final Answer:
 </Your Answer/Output Format>
 """,
 
+    "mirror_baseline_zero_shot_v1": """Objective:
+Your task is to solve the Main Question by generating a clear, step-by-step Rationale and the Final Answer.
 
-    "mirror_hypothesis_gen_v1": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
+Your Method & Constraints:
+1.  Construct Your Solution: Develop a logical, step-by-step Rationale for the Main Question.
+2.  Perform calculations accurately and show your work.
+3.  Clearly state the Final Answer at the end.
+
+Required Output Format (Strictly Adhere):
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+
+
+Inputs:
+Main Question:
+{question}
+
+Your Solution:
+""",
+
+
+    "mirror_hypothesis_gen_v1_old": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
 
 <True Solved Example>
 question:
@@ -1413,6 +1463,33 @@ question:
 Solution:
 {exemplar_solution}
 </True Solved Example>
+
+<Main Question to Solve>
+{target_query}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "mirror_hypothesis_gen_v1": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Analyze the solved examples to identify key reasoning patterns, structures, and strategies that lead to their answers. Use these insights as guidance—rather than strict templates—and adapt them to the main question while applying your own reasoning to reach a solution.
+</Instructions>
+
+<Solved Examples>
+question:
+{exemplar_question}
+
+Solution:
+{exemplar_solution}
+</Solved Examples>
 
 <Main Question to Solve>
 {target_query}
@@ -1442,7 +1519,7 @@ Final Answer:
 </Your Answer/Output Format>
 """,
 
-    "mirror_verification_v1": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
+    "mirror_verification_v1_old": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
 
 <True Solved Example>
 question:
@@ -1451,6 +1528,33 @@ question:
 Solution:
 {hypothesis_solution}
 </True Solved Example>
+
+<Main Question to Solve>
+{validation_question}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "mirror_verification_v1": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Analyze the solved examples to identify key reasoning patterns, structures, and strategies that lead to their answers. Use these insights as guidance—rather than strict templates—and adapt them to the main question while applying your own reasoning to reach a solution.
+</Instructions>
+
+<Solved Examples>
+question:
+{hypothesis_question}
+
+Solution:
+{hypothesis_solution}
+</Solved Examples>
 
 <Main Question to Solve>
 {validation_question}
