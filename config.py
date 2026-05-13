@@ -300,7 +300,7 @@ CONFIG = {
     
     "APPLY_LAYER1_BASE_EXECUTION": False,  # Enable/disable Layer 1 system
     "LAYER1_ONLY_MODE": False,             # If True, halt after Layer 1 (cache generation only)
-    "LAYER1_CACHE_DIR": os.path.join(LOCAL_DATA_BASE, "layer1_cache"),  # Cache storage directory
+    "LAYER1_CACHE_DIR": os.path.join(RESULTS_DIR, "layer1_cache"),  # Cache storage directory
     "LAYER1_N_CANDIDATES": None,           # Number of candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
 
@@ -449,13 +449,16 @@ def setup_directories():
         CONFIG.get("LOGS_DIR", LOGS_DIR),
         CONFIG.get("EMBEDDINGS_DIR", EMBEDDINGS_DIR),
         CONFIG.get("RESULTS_DIR", RESULTS_DIR),
+        CONFIG.get("LAYER1_CACHE_DIR",os.path.join(RESULTS_DIR, "layer1_cache")),
     ]
+
     for dir_path in dirs_to_create:
         try:
             os.makedirs(dir_path, exist_ok=True)
             print(f"Directory ensured: {dir_path}")
         except OSError as e:
             print(f"Error creating directory {dir_path}: {e}")
+
     print("--- Directory setup complete ---\n")
 
 
