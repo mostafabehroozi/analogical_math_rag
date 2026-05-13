@@ -159,10 +159,9 @@ def _execute_retrieval(
         retrieved_indices = retrieval_result.get("retrieved_indices", [])
         
         # Collect the actual exemplar data for storage
-        from src.pipeline_steps import exemplar_questions as global_exemplars, exemplar_solutions
         retrieval_data = []
         
-        # Use the exemplar data from the scope where available
+        # Use the exemplar data from the function parameter
         try:
             for idx in retrieved_indices:
                 retrieval_data.append({
