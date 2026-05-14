@@ -511,13 +511,19 @@ class OllamaAPIManager:
             print(f"Model: {model_name}, Temperature: {temperature}")
             print(f"Prompt Sent (truncated): {prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
-
+            
         def _inner_call() -> APIResponse:
             caught_exception = None
             try:
                 options = {}
                 if temperature is not None:
                     options['temperature'] = temperature
+
+                # --- NEW CODE: Add the think parameter here ---
+                think_mode = self.config.get("OLLAMA_THINK_MODE")
+                if think_mode:
+                    options['think'] = think_mode
+                # ----------------------------------------------
 
                 self.logger.info(f"Calling Ollama model '{model_name}'.")
                 
@@ -550,5 +556,6 @@ class OllamaAPIManager:
                 print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
             
             return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
+
 
         return execute_with_retry(self.config, _inner_call)
