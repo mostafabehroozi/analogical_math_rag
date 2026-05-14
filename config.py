@@ -67,6 +67,7 @@ CONFIG = {
 
     # Ollama (Local LLM) Settings
     "OLLAMA_BASE_URL": "http://localhost:11434",
+    "OLLAMA_THINK_MODE" : "low" ,
     "OLLAMA_MODEL_NAME_ADAPTATION": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_FINAL_SOLVER": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_EVALUATOR": "gpt-oss:20b",
@@ -164,17 +165,8 @@ CONFIG = {
 
     "APPLY_GROUP_CONSISTENCY_SELECTION": False,
 
-    # DEFINITION OF STRATEGIES (Slicing of list_2)
-    # Each tuple represents specific indices from the Master List (list_2) to use.
-    # Group 1 (0,): 1-Shot Benchmark -> Uses list_2[0]
-    # Group 2 (0, 1): 2-Shot Benchmark -> Uses list_2[0] and list_2[1]
-    # Group 3 (0, 1, 2): 3-Shot Benchmark -> Uses list_2[0], list_2[1], list_2[2]
     "GROUP_CONSISTENCY_CANDIDATES": [(0,), (0, 1), (0, 1, 2)],
 
-    # N_gen (Evaluation Sampling):
-    # Number of independent generations per slice to calculate Pass@K curves.
-    # This is the "N" in the Benchmark Track (Track A).
-    # Recommended: 10 <= N <= 40 for statistically significant benchmarking.
     "GROUP_CONSISTENCY_SAMPLES_N": 10,
 
     # These legacy scoring flags can be ignored or set to None as we are 
@@ -212,46 +204,18 @@ CONFIG = {
     "REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES": False,
     "REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N": 3,
 
-    # Best-of-Transformation (Enhancement to Reverse Validation)
-    # REFORMED: Per-Retrieved-Sample Best Candidate Selection
-    # 
-    # When APPLY_BEST_OF_TRANSFORMATION is True, the system performs:
-    # 1. RETRIEVE: K examined exemplars
-    # 2. TRANSFORM: For each exemplar, generate N transformed variants
-    # 3. GENERATE: For each transformation, generate M candidate attempts
-    #    Total candidates: K × N × M
-    # 4. VALIDATE: Score all candidates using mirror evaluation
-    # 5. SELECT-PER-SAMPLE: For each retrieved exemplar, select exactly 1 best candidate
-    #    (no cross-sample competition). Result: K best candidates.
-    #
-    # Key improvement: Enforces structural diversity by selecting one best candidate
-    # per retrieved sample, preventing any single sample from occupying multiple slots.
     "APPLY_BEST_OF_TRANSFORMATION": False,
     "BEST_OF_TRANSFORMATION_N_SAMPLES": 3,  # N: transformations per retrieved sample
     "BEST_OF_TRANSFORMATION_ATTEMPTS_PER_TRANSFORMATION": 1,  # M: candidate attempts per transformation
     "BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE": "transformation_shallow-&-moderately-deep",
-    "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL": True,  # Use mirror evaluation to score candidates
+    "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL": False,  # Use mirror evaluation to score candidates
     "BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS": 3,  # Quick validation attempts per candidate
 
-    # ========================================================================
-    # MULTI-BRANCH TRANSFORMATION EXPERIMENTS
-    # ========================================================================
-    # Extends best-of-transformation to support three parallel experimental
-    # scenarios on a centralized candidate pool:
-    # 1. Tx1: Single transformation baseline (intervention rate = 100%)
-    # 2. BoT-N: Best-of-N transformations (exclusive of original)
-    # 3. BoT-N+R: Best-of-N+original (inclusive with tie-breaking)
-    #
-    # ARCHITECTURE:
-    # - Phase 1: Build centralized pool [R_main, T_1, T_2, ..., T_N]
-    # - Phase 2: Score all candidates in single batch
-    # - Phase 3: Apply three selection strategies via array slicing
-    # - Phase 4: Fan out to independent solvers per branch
     
     "APPLY_MULTIBRANCH_TRANSFORMATION": False,  # Master control flag
     
     # Branch Control: Which scenarios to execute
-    "RUN_TX1_BASELINE": True,          # Scenario 1: Single transformation baseline
+    "RUN_TX1_BASELINE": False,          # Scenario 1: Single transformation baseline
     "RUN_BOT_N_ONLY": True,            # Scenario 2: Best-of-N (exclusive)
     "RUN_BOT_N_PLUS_R": True,          # Scenario 3: Best-of-N+R (inclusive)
     
@@ -277,26 +241,7 @@ CONFIG = {
     "APPLY_FULL_PIPELINE_RETRY": False,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
 
-    # ============================================================================
-    # LAYER 1: BASE EXECUTION PHASE
-    # ============================================================================
-    # Layer 1 is the foundational data-gathering engine that performs expensive LLM
-    # API operations exactly once, captures complete execution state, and serializes
-    # it to persistent JSON caches. This enables Layer 2's offline analytical
-    # experiments without requiring redundant API calls.
-    #
-    # Cache-First Architecture:
-    # - If cache exists for a query configuration → instant load (ZERO API calls)
-    # - If cache missing → full 5-phase execution → serialize to JSON
-    #
-    # The 5 phases executed by Layer 1:
-    # 1. Retrieval: Fetch top-K exemplars
-    # 2. Candidate Generation: Generate 1-shot candidates (H_i using only R_i)
-    # 3. Intrinsic Baseline: Calculate zero-shot difficulty scores
-    # 4. Cross-Evaluation Matrix: Test each candidate against each evaluator
-    # 5. Ground-Truth Evaluation: Establish True/False labels for all candidates
-    #
-    # Output: Single JSON cache with complete execution state ready for Layer 2
+
     
     "APPLY_LAYER1_BASE_EXECUTION": False,  # Enable/disable Layer 1 system
     "LAYER1_ONLY_MODE": False,             # If True, halt after Layer 1 (cache generation only)
@@ -304,13 +249,7 @@ CONFIG = {
     "LAYER1_N_CANDIDATES": None,           # Number of candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
 
-    # --- Dataset Construction Settings ---
-    # When enabled, the system will perform a specialized dataset generation
-    # phase.  It randomly selects a query from the exemplar corpus, finds the
-    # two most similar samples (A and B), attempts a two‑shot solve of the query
-    # using those samples, and if the evaluation LLM confirms correctness the
-    # example is added to the constructed dataset.  The resulting JSON contains
-    # both the raw material (question, A, B) and the input/output pairs.
+
     "APPLY_DATASET_CONSTRUCTION": False,
     "DATASET_CONSTRUCTION_MAX_SEARCH": 1000,    # how many random queries to examine
     "DATASET_CONSTRUCTION_MAX_MEMBERS": 100,    # stop when this many valid entries are gathered
@@ -367,20 +306,6 @@ CONFIG = {
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
 
-    # ============================================================================
-    # UNIFIED MIRROR RERANKING STAGE (Integration of Re-Ranking into Pipeline)
-    # ============================================================================
-    # New Integrated Feature: After retrieval and optional transformation,
-    # apply mirror-based re-ranking to optimize demonstration selection based on
-    # analogical consistency (True Consistency Score) rather than just similarity.
-    # 
-    # This stage can be applied in two contexts:
-    # 1. After BEST_OF_TRANSFORMATION: Re-rank the per-sample best candidates
-    # 2. After standard RETRIEVAL: Re-rank the retrieved samples directly
-    # 
-    # When enabled, the re-ranking generates Q_answered candidates for each demo,
-    # evaluates them using mirror consistency scoring against other demos,
-    # and produces a re-ranked list optimized for analogical utility.
     
     "APPLY_MIRROR_RERANKING": False,  # Enable/disable the unified re-ranking stage
     "MIRROR_RERANKING_APPLY_AFTER": "transformation",  # "transformation", "retrieval", or "both"
