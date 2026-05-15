@@ -194,7 +194,10 @@ def run_pipeline_for_single_query(
     # --- LAYER 1: BASE EXECUTION PHASE ---
     if config.get('APPLY_LAYER1_BASE_EXECUTION', False):
         print("\n[PRE-PROCESSING] LAYER 1: BASE EXECUTION PHASE ENABLED")
-        print("  Mode: API-driven data generation with persistent caching")
+        print("  Mode: API-driven data generation with persistent combined caching")
+        
+        # Get experiment name for combined cache file
+        experiment_name = config.get('experiment_name', 'default_experiment')
         
         # Get ground truth for this query
         # The ground truth is expected to be available in exemplar_data or config
@@ -208,7 +211,7 @@ def run_pipeline_for_single_query(
         if not ground_truth:
             logger.warning(f"Layer 1 enabled but no ground truth available for query #{hard_list_idx}. Skipping Layer 1.")
         else:
-            # Execute Layer 1
+            # Execute Layer 1 with experiment_name for combined cache
             layer1_state = run_layer1_base_execution(
                 target_query_index=hard_list_idx,
                 target_query=target_query,
@@ -219,7 +222,8 @@ def run_pipeline_for_single_query(
                 embedded_exemplars=exemplar_data['embeddings'],
                 exemplar_data=exemplar_data,
                 api_manager=manager_for_solve,  # Use the solve manager for consistency
-                config=config
+                config=config,
+                experiment_name=experiment_name  # Pass experiment name for combined cache
             )
             
             # Store Layer 1 state in run_log for reference
@@ -230,7 +234,7 @@ def run_pipeline_for_single_query(
                 print("\n[LAYER 1 COMPLETE] Layer 1 Only Mode is active. Pipeline execution halted.")
                 run_log['pipeline_status'] = 'SUCCESS'
                 run_log['execution_mode'] = 'layer1_only'
-                logger.info(f"Layer 1 only mode: Query #{hard_list_idx} execution complete, cache saved.")
+                logger.info(f"Layer 1 only mode: Query #{hard_list_idx} execution complete, cache merged into experiment '{experiment_name}'.")
                 return run_log
             
             # Otherwise, continue with the main pipeline
