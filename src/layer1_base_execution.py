@@ -109,7 +109,7 @@ def _save_cached_state(cache_path: str, state: Dict[str, Any]) -> bool:
     Returns True if successful, False otherwise.
     """
     try:
-        save_json(cache_path, state)
+        save_json(state, cache_path)
         logging.getLogger(__name__).info(f"Successfully saved Layer 1 cache to {cache_path}")
         return True
     except Exception as e:
