@@ -47,16 +47,19 @@ from src.evaluation import evaluate_single_answer_with_llm
 # ============================================================================
 
 def _get_cache_filename(
-    target_query_index: int,
     top_k: int,
     n_candidates: int,
-    dataset_name: str = "hard_questions"
+    experiment_name: str = "default_experiment"
 ) -> str:
     """
     Generates a deterministic cache filename based on configuration.
-    Format: layer1_cache_idx{idx}_k{k}_n{n}_{dataset}.json
+    Format: layer1_cache_k{k}_n{n}_{experiment_name}.json
+    
+    All queries are stored in a single combined file per experiment.
     """
-    return f"layer1_cache_idx{target_query_index}_k{top_k}_n{n_candidates}_{dataset_name}.json"
+    # Sanitize experiment name for filename
+    safe_experiment_name = experiment_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return f"layer1_cache_k{top_k}_n{n_candidates}_{safe_experiment_name}.json"
 
 
 def _get_cache_path(cache_dir: str, filename: str) -> str:
@@ -66,54 +69,111 @@ def _get_cache_path(cache_dir: str, filename: str) -> str:
 
 
 def _cache_exists(cache_path: str) -> bool:
-    """Checks if a cache file exists and is valid."""
+    """Checks if a combined cache file exists and has valid structure."""
     if not os.path.exists(cache_path):
         return False
     try:
         data = load_json(cache_path)
-        # Validate that it has all required sections
-        required_keys = {
-            "target_query_data",
-            "retrieved_set",
-            "candidate_set",
-            "intrinsic_baselines",
-            "cross_evaluation_matrix",
-            "ground_truth_labels"
-        }
-        return all(key in data for key in required_keys)
+        # Validate that it has the required combined structure
+        return isinstance(data, dict) and "metadata" in data and "queries" in data
     except Exception as e:
         logging.getLogger(__name__).warning(f"Cache validation failed for {cache_path}: {e}")
         return False
 
 
-def _load_cached_state(cache_path: str) -> Optional[Dict[str, Any]]:
+def _load_cached_state(cache_path: str, target_query_index: int) -> Optional[Dict[str, Any]]:
     """
-    Loads a cached Layer 1 state from disk.
-    Returns None if the cache is invalid or doesn't exist.
+    Loads a cached Layer 1 state from the combined cache file for a specific query.
+    
+    Args:
+        cache_path: Path to the combined cache file
+        target_query_index: The query index to extract from the combined file
+    
+    Returns:
+        The Layer 1 state for the specific query, or None if not found/invalid.
     """
     if not _cache_exists(cache_path):
         return None
     
     try:
-        data = load_json(cache_path)
-        logging.getLogger(__name__).info(f"Successfully loaded Layer 1 cache from {cache_path}")
-        return data
+        combined_data = load_json(cache_path)
+        query_key = str(target_query_index)
+        
+        if query_key not in combined_data.get("queries", {}):
+            return None
+        
+        query_state = combined_data["queries"][query_key]
+        logging.getLogger(__name__).info(
+            f"Successfully loaded Layer 1 cache for query #{target_query_index} from {cache_path}"
+        )
+        return query_state
     except Exception as e:
-        logging.getLogger(__name__).error(f"Failed to load Layer 1 cache from {cache_path}: {e}")
+        logging.getLogger(__name__).error(
+            f"Failed to load Layer 1 cache for query #{target_query_index} from {cache_path}: {e}"
+        )
         return None
 
 
-def _save_cached_state(cache_path: str, state: Dict[str, Any]) -> bool:
+def _save_cached_state(
+    cache_path: str,
+    target_query_index: int,
+    state: Dict[str, Any],
+    top_k: int,
+    n_candidates: int,
+    experiment_name: str
+) -> bool:
     """
-    Saves the complete Layer 1 state to a JSON cache file.
-    Returns True if successful, False otherwise.
+    Saves a Layer 1 state to the combined cache file for this query.
+    Merges with existing data if the file already exists.
+    
+    Args:
+        cache_path: Path to the combined cache file
+        target_query_index: The query index to store
+        state: The Layer 1 state for this query
+        top_k: Top-k retrieval setting
+        n_candidates: Number of candidates setting
+        experiment_name: Name of the experiment
+    
+    Returns:
+        True if successful, False otherwise.
     """
     try:
-        save_json(state, cache_path)
-        logging.getLogger(__name__).info(f"Successfully saved Layer 1 cache to {cache_path}")
+        query_key = str(target_query_index)
+        
+        # Load existing combined file if it exists
+        if os.path.exists(cache_path):
+            combined_data = load_json(cache_path)
+        else:
+            # Create new combined structure
+            combined_data = {
+                "metadata": {
+                    "created_at": time.time(),
+                    "experiment_name": experiment_name,
+                    "top_k": top_k,
+                    "n_candidates": n_candidates,
+                    "config_snapshot": {}
+                },
+                "queries": {}
+            }
+        
+        # Add/update this query's data
+        combined_data["queries"][query_key] = state
+        
+        # Update metadata timestamp (latest update)
+        combined_data["metadata"]["updated_at"] = time.time()
+        combined_data["metadata"]["total_queries"] = len(combined_data["queries"])
+        
+        # Save the combined file
+        save_json(combined_data, cache_path)
+        logging.getLogger(__name__).info(
+            f"Successfully saved Layer 1 cache for query #{target_query_index} to {cache_path} "
+            f"(total queries: {len(combined_data['queries'])})"
+        )
         return True
     except Exception as e:
-        logging.getLogger(__name__).error(f"Failed to save Layer 1 cache to {cache_path}: {e}")
+        logging.getLogger(__name__).error(
+            f"Failed to save Layer 1 cache for query #{target_query_index} to {cache_path}: {e}"
+        )
         return False
 
 
@@ -463,15 +523,16 @@ def run_layer1_base_execution(
     embedded_exemplars: np.ndarray,
     exemplar_data: Dict[str, Any],
     api_manager: Any,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    experiment_name: str = "default_experiment"
 ) -> Dict[str, Any]:
     """
     Main entry point for Layer 1: Base Execution Phase.
     
     Orchestrates the complete data-gathering pipeline:
-    1. Check for cached state (Cache-First Rule)
+    1. Check for cached state in combined file (Cache-First Rule)
     2. If cache miss: Execute Steps A-E
-    3. Serialize complete state to JSON cache
+    3. Merge result into combined JSON cache file
     4. Return the cached/computed state
     
     Args:
@@ -485,6 +546,7 @@ def run_layer1_base_execution(
         exemplar_data: Structured exemplar data with questions/solutions
         api_manager: API manager instance
         config: Configuration dictionary
+        experiment_name: Name of the experiment (for combined cache filename)
     
     Returns:
         The complete Layer 1 cached state (dict) with all phases populated
@@ -497,42 +559,42 @@ def run_layer1_base_execution(
     n_candidates = config.get("LAYER1_N_CANDIDATES")
     if n_candidates is None:
         n_candidates = top_k  # Use top_k if LAYER1_N_CANDIDATES not explicitly set
-    dataset_name = config.get("LAYER1_DATASET_NAME", "hard_questions")
     
     trace_accumulator = []
     
     print(f"\n{'='*80}")
     print(f"[LAYER 1 - BASE EXECUTION] Processing Query #{target_query_index}")
     print(f"Query: {target_query[:80]}...")
+    print(f"Experiment: {experiment_name}")
     print(f"{'='*80}")
     
-    logger.info(f"[Layer 1] Starting base execution for Query #{target_query_index}")
+    logger.info(f"[Layer 1] Starting base execution for Query #{target_query_index} (Experiment: {experiment_name})")
     
-    # --- CACHE-FIRST CHECK ---
-    cache_filename = _get_cache_filename(target_query_index, top_k, n_candidates, dataset_name)
+    # --- CACHE-FIRST CHECK (from combined file) ---
+    cache_filename = _get_cache_filename(top_k, n_candidates, experiment_name)
     cache_path = _get_cache_path(cache_dir, cache_filename)
     
-    cached_state = _load_cached_state(cache_path)
+    cached_state = _load_cached_state(cache_path, target_query_index)
     if cached_state:
-        print(f"[LAYER 1 CACHE HIT] Loaded from {cache_path}")
+        print(f"[LAYER 1 CACHE HIT] Loaded query #{target_query_index} from {cache_path}")
         print(f"  Retrieved samples: {len(cached_state.get('retrieved_set', []))}")
         print(f"  Generated candidates: {len(cached_state.get('candidate_set', {}))}")
-        logger.info(f"Cache hit for Layer 1 state at {cache_path}")
+        logger.info(f"Cache hit for Layer 1 state (query #{target_query_index}) at {cache_path}")
         return cached_state
     
-    print(f"[LAYER 1 CACHE MISS] Will execute full pipeline. Cache will be saved to {cache_path}")
+    print(f"[LAYER 1 CACHE MISS] Query #{target_query_index} will execute full pipeline.")
+    print(f"  Results will be merged into: {cache_path}")
     
     # --- INITIALIZE RESULT STRUCTURE ---
     layer1_state = {
         "metadata": {
             "query_index": target_query_index,
-            "cache_version": "1.0",
+            "cache_version": "2.0",
             "timestamp": time.time(),
             "config_snapshot": {
                 "TOP_N_CANDIDATES_RETRIEVAL": config.get("TOP_N_CANDIDATES_RETRIEVAL"),
                 "LAYER1_N_CANDIDATES": config.get("LAYER1_N_CANDIDATES"),
-                "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION"),
-                "LAYER1_DATASET_NAME": dataset_name
+                "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION")
             }
         },
         "target_query_data": {
@@ -682,7 +744,7 @@ def run_layer1_base_execution(
     layer1_state["ground_truth_labels"] = gt_labels
     
     # --- CACHE & FINALIZE ---
-    print(f"\n[Layer 1] All steps completed. Saving cache...")
+    print(f"\n[Layer 1] All steps completed. Saving to combined cache...")
     
     # Determine overall status
     all_statuses = layer1_state["step_statuses"].values()
@@ -696,10 +758,19 @@ def run_layer1_base_execution(
         layer1_state["overall_status"] = "FAILURE"
         print("  ✗ Critical failure; check step_statuses for details")
     
-    # Save cache
-    success = _save_cached_state(cache_path, layer1_state)
+    # Save to combined cache (merges with existing queries)
+    success = _save_cached_state(
+        cache_path=cache_path,
+        target_query_index=target_query_index,
+        state=layer1_state,
+        top_k=top_k,
+        n_candidates=n_candidates,
+        experiment_name=experiment_name
+    )
+    
     if success:
-        print(f"  ✓ Cache saved to {cache_path}")
+        print(f"  ✓ Cache merged into {cache_path}")
+        print(f"    (All queries for this experiment stored in one combined file)")
     else:
         logger.warning(f"Failed to save cache to {cache_path}")
     
