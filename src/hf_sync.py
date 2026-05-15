@@ -112,17 +112,20 @@ def sync_workspace_to_hub(config: dict):
         # 1. Instantiate the API client with the token.
         api = HfApi(token=hf_token)
 
-        # 2. Upload the entire outputs folder.
-        api.upload_folder(
+        # 2. Upload the outputs folder using upload_large_folder to avoid timeouts
+        api.upload_large_folder(
             folder_path=local_outputs_dir,
             repo_id=repo_id,
             repo_type="dataset",
-            commit_message="Automated experiment results sync"
+            commit_message="Automated experiment results sync",
+            # EXTREMELY IMPORTANT: Exclude the massive 3GB embeddings folder from repetitive syncing
+            ignore_patterns=["embeddings/*", "*.npy"] 
         )
         logger.info(f"Successfully synced '{local_outputs_dir}' to {repo_id}.")
     except Exception as e:
         logger.error(f"Failed to sync workspace to Hugging Face Hub: {e}", exc_info=True)
 
+        
 def periodic_sync_check(loop_counter: int, config: dict):
     """
     Checks if a sync is needed based on the counter and sync interval.
