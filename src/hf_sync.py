@@ -111,15 +111,23 @@ def sync_workspace_to_hub(config: dict):
     try:
         # 1. Instantiate the API client with the token.
         api = HfApi(token=hf_token)
+        
+        # Dynamically calculate the exact relative path of the embeddings folder
+        rel_embeddings_dir = os.path.relpath(config["EMBEDDINGS_DIR"], local_outputs_dir)
+        # Ensure forward slashes for Hugging Face pattern matching
+        rel_embeddings_pattern = f"{rel_embeddings_dir.replace(os.sep, '/')}/**"
 
-        # 2. Upload the outputs folder using upload_large_folder to avoid timeouts
-        api.upload_large_folder(
+        # 2. Upload the outputs folder
+        api.upload_folder(
             folder_path=local_outputs_dir,
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="Automated experiment results sync",
-            # EXTREMELY IMPORTANT: Exclude the massive 3GB embeddings folder from repetitive syncing
-            ignore_patterns=["embeddings/*", "*.npy"] 
+            ignore_patterns=[
+                rel_embeddings_pattern,  # Exact dynamic path
+                "**/embeddings/**",      # Global fallback for any embeddings folder
+                "**/*.npy"               # Global fallback for all numpy files
+            ] 
         )
         logger.info(f"Successfully synced '{local_outputs_dir}' to {repo_id}.")
     except Exception as e:
