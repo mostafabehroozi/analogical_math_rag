@@ -125,6 +125,7 @@ def _save_cached_state(
     """
     Saves a Layer 1 state to the combined cache file for this query.
     Merges with existing data if the file already exists.
+    Uses atomic writes (temp file + rename) to prevent corruption.
     
     Args:
         cache_path: Path to the combined cache file
@@ -151,7 +152,9 @@ def _save_cached_state(
                     "experiment_name": experiment_name,
                     "top_k": top_k,
                     "n_candidates": n_candidates,
-                    "config_snapshot": {}
+                    "config_snapshot": {},
+                    "completed_queries": [],
+                    "queries_in_progress": []
                 },
                 "queries": {}
             }
@@ -163,8 +166,11 @@ def _save_cached_state(
         combined_data["metadata"]["updated_at"] = time.time()
         combined_data["metadata"]["total_queries"] = len(combined_data["queries"])
         
-        # Save the combined file
-        save_json(combined_data, cache_path)
+        # Atomic write: write to temp file, then rename
+        temp_path = cache_path + ".tmp"
+        save_json(combined_data, temp_path)
+        os.replace(temp_path, cache_path)  # Atomic rename operation
+        
         logging.getLogger(__name__).info(
             f"Successfully saved Layer 1 cache for query #{target_query_index} to {cache_path} "
             f"(total queries: {len(combined_data['queries'])})"
@@ -174,7 +180,201 @@ def _save_cached_state(
         logging.getLogger(__name__).error(
             f"Failed to save Layer 1 cache for query #{target_query_index} to {cache_path}: {e}"
         )
+        # Clean up temp file if it exists
+        try:
+            if os.path.exists(cache_path + ".tmp"):
+                os.remove(cache_path + ".tmp")
+        except:
+            pass
         return False
+
+
+def _save_step_checkpoint(
+    cache_path: str,
+    target_query_index: int,
+    step_name: str,
+    step_data: Dict[str, Any],
+    top_k: int,
+    n_candidates: int,
+    experiment_name: str
+) -> bool:
+    """
+    Saves a checkpoint for a single completed step atomically.
+    This enables resuming from this exact point if a kernel crash occurs.
+    
+    Args:
+        cache_path: Path to the combined cache file
+        target_query_index: The query index
+        step_name: Name of the step ("retrieval", "candidate_generation", etc.)
+        step_data: Data to checkpoint for this step
+        top_k: Top-k retrieval setting
+        n_candidates: Number of candidates setting
+        experiment_name: Name of the experiment
+    
+    Returns:
+        True if successful, False otherwise.
+    """
+    try:
+        query_key = str(target_query_index)
+        step_order = {
+            "retrieval": 0,
+            "candidate_generation": 1,
+            "baseline_calculation": 2,
+            "cross_evaluation": 3,
+            "ground_truth_evaluation": 4
+        }
+        
+        # Load existing combined file
+        if os.path.exists(cache_path):
+            combined_data = load_json(cache_path)
+        else:
+            combined_data = {
+                "metadata": {
+                    "created_at": time.time(),
+                    "experiment_name": experiment_name,
+                    "top_k": top_k,
+                    "n_candidates": n_candidates,
+                    "completed_queries": [],
+                    "queries_in_progress": []
+                },
+                "queries": {}
+            }
+        
+        # Initialize query if needed
+        if query_key not in combined_data["queries"]:
+            combined_data["queries"][query_key] = {
+                "metadata": {
+                    "query_index": target_query_index,
+                    "cache_version": "3.0",
+                    "last_checkpoint_timestamp": time.time(),
+                    "last_completed_step": -1
+                },
+                "step_checkpoints": {},
+                "step_statuses": {}
+            }
+        
+        # Ensure metadata has the new fields
+        if "last_completed_step" not in combined_data["queries"][query_key]["metadata"]:
+            combined_data["queries"][query_key]["metadata"]["last_completed_step"] = -1
+        if "step_checkpoints" not in combined_data["queries"][query_key]:
+            combined_data["queries"][query_key]["step_checkpoints"] = {}
+        if "step_statuses" not in combined_data["queries"][query_key]:
+            combined_data["queries"][query_key]["step_statuses"] = {}
+        
+        # Save step checkpoint
+        combined_data["queries"][query_key]["step_checkpoints"][step_name] = {
+            "status": "SUCCESS",
+            "data": step_data,
+            "completed_at": time.time()
+        }
+        combined_data["queries"][query_key]["step_statuses"][step_name] = "SUCCESS"
+        combined_data["queries"][query_key]["metadata"]["last_completed_step"] = step_order[step_name]
+        combined_data["queries"][query_key]["metadata"]["last_checkpoint_timestamp"] = time.time()
+        
+        # Update global metadata
+        completed_queries = combined_data["metadata"].get("completed_queries", [])
+        queries_in_progress = combined_data["metadata"].get("queries_in_progress", [])
+        
+        # Remove from in-progress if adding to completed (happens when all 5 steps done)
+        if target_query_index not in queries_in_progress:
+            queries_in_progress.append(target_query_index)
+        
+        combined_data["metadata"]["queries_in_progress"] = queries_in_progress
+        combined_data["metadata"]["updated_at"] = time.time()
+        combined_data["metadata"]["total_queries"] = len(combined_data["queries"])
+        
+        # Atomic write: temp file + rename
+        temp_path = cache_path + ".tmp"
+        save_json(combined_data, temp_path)
+        os.replace(temp_path, cache_path)
+        
+        logging.getLogger(__name__).debug(
+            f"Step checkpoint saved: Query #{target_query_index}, Step {step_name} "
+            f"(completed_step_index: {step_order[step_name]})"
+        )
+        return True
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"Failed to save step checkpoint for {step_name} (query #{target_query_index}): {e}"
+        )
+        try:
+            if os.path.exists(cache_path + ".tmp"):
+                os.remove(cache_path + ".tmp")
+        except:
+            pass
+        return False
+
+
+def _get_last_completed_step(cache_path: str, target_query_index: int) -> int:
+    """
+    Returns the index of the last completed step for a query.
+    
+    Returns:
+        -1 if query not found or no steps completed
+        0-4 corresponding to the last step completed (retrieval=0, candidate_gen=1, etc.)
+    
+    Step order: 0=retrieval, 1=candidate_generation, 2=baseline_calculation, 
+                3=cross_evaluation, 4=ground_truth_evaluation
+    """
+    try:
+        if not _cache_exists(cache_path):
+            return -1
+        
+        combined_data = load_json(cache_path)
+        query_key = str(target_query_index)
+        
+        if query_key not in combined_data.get("queries", {}):
+            return -1
+        
+        query_data = combined_data["queries"][query_key]
+        last_step = query_data.get("metadata", {}).get("last_completed_step", -1)
+        return last_step
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"Could not get last completed step for query #{target_query_index}: {e}"
+        )
+        return -1
+
+
+def _load_step_checkpoint(
+    cache_path: str,
+    target_query_index: int,
+    step_name: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Loads previously saved checkpoint data for a specific step.
+    
+    Args:
+        cache_path: Path to the combined cache file
+        target_query_index: The query index
+        step_name: Name of the step to load
+    
+    Returns:
+        The checkpoint data dict, or None if not found/invalid.
+    """
+    try:
+        if not _cache_exists(cache_path):
+            return None
+        
+        combined_data = load_json(cache_path)
+        query_key = str(target_query_index)
+        
+        if query_key not in combined_data.get("queries", {}):
+            return None
+        
+        query_data = combined_data["queries"][query_key]
+        checkpoints = query_data.get("step_checkpoints", {})
+        
+        if step_name not in checkpoints:
+            return None
+        
+        checkpoint = checkpoints[step_name]
+        return checkpoint.get("data")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"Could not load checkpoint for {step_name} (query #{target_query_index}): {e}"
+        )
+        return None
 
 
 # ============================================================================
@@ -527,13 +727,17 @@ def run_layer1_base_execution(
     experiment_name: str = "default_experiment"
 ) -> Dict[str, Any]:
     """
-    Main entry point for Layer 1: Base Execution Phase.
+    Main entry point for Layer 1: Base Execution Phase with RESUMABLE checkpointing.
     
-    Orchestrates the complete data-gathering pipeline:
+    Orchestrates the complete data-gathering pipeline with step-level recovery:
     1. Check for cached state in combined file (Cache-First Rule)
-    2. If cache miss: Execute Steps A-E
-    3. Merge result into combined JSON cache file
-    4. Return the cached/computed state
+    2. Detect if query is FULLY cached (all 5 steps done) → Return immediately
+    3. Detect if query is PARTIALLY cached → Resume from last step
+    4. If cache miss → Execute Steps A-E with checkpoint saves after each step
+    5. Merge result into combined JSON cache file
+    6. Return the cached/computed state
+    
+    ✅ NEW: Step-level checkpointing enables resumption after kernel crashes
     
     Args:
         target_query_index: Index in the hard questions list
@@ -554,7 +758,7 @@ def run_layer1_base_execution(
     logger = logging.getLogger(__name__)
     
     # --- Initialization ---
-    cache_dir = config.get("LAYER1_CACHE_DIR", "local_data/layer1_cache")
+    cache_dir = config.get("LAYER1_CACHE_DIR", config.get("RESULTS_DIR", "local_data/outputs/results"))
     top_k = config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
     n_candidates = config.get("LAYER1_N_CANDIDATES")
     if n_candidates is None:
@@ -574,177 +778,383 @@ def run_layer1_base_execution(
     cache_filename = _get_cache_filename(top_k, n_candidates, experiment_name)
     cache_path = _get_cache_path(cache_dir, cache_filename)
     
+    # Check for FULLY CACHED query
     cached_state = _load_cached_state(cache_path, target_query_index)
     if cached_state:
-        print(f"[LAYER 1 CACHE HIT] Loaded query #{target_query_index} from {cache_path}")
-        print(f"  Retrieved samples: {len(cached_state.get('retrieved_set', []))}")
-        print(f"  Generated candidates: {len(cached_state.get('candidate_set', {}))}")
-        logger.info(f"Cache hit for Layer 1 state (query #{target_query_index}) at {cache_path}")
-        return cached_state
+        # Verify that ALL steps are complete (last_completed_step == 4)
+        last_step = cached_state.get("metadata", {}).get("last_completed_step", -1)
+        if last_step == 4:  # All 5 steps complete (0-4)
+            print(f"[LAYER 1 CACHE HIT - FULL] Loaded query #{target_query_index} from {cache_path}")
+            print(f"  All 5 steps cached")
+            print(f"  Retrieved samples: {len(cached_state.get('retrieved_set', []))}")
+            print(f"  Generated candidates: {len(cached_state.get('candidate_set', {}))}")
+            logger.info(f"Full cache hit for Layer 1 state (query #{target_query_index}) at {cache_path}")
+            return cached_state
+        else:
+            # PARTIAL CACHE: Resume from last completed step
+            print(f"[LAYER 1 CACHE HIT - PARTIAL] Found incomplete query #{target_query_index}")
+            last_step_names = ["retrieval", "candidate_generation", "baseline_calculation", 
+                               "cross_evaluation", "ground_truth_evaluation"]
+            print(f"  Last completed step: {last_step_names[last_step + 1] if last_step >= 0 else 'none'}")
+            print(f"  Will resume from step {last_step_names[last_step + 2] if last_step + 1 < 5 else 'complete'}")
+    else:
+        print(f"[LAYER 1 CACHE MISS] Query #{target_query_index} will execute full pipeline.")
+        last_step = -1
+        cached_state = None
     
-    print(f"[LAYER 1 CACHE MISS] Query #{target_query_index} will execute full pipeline.")
     print(f"  Results will be merged into: {cache_path}")
     
+    # --- GET LAST COMPLETED STEP (for resumption) ---
+    last_completed_step = _get_last_completed_step(cache_path, target_query_index)
+    
     # --- INITIALIZE RESULT STRUCTURE ---
-    layer1_state = {
-        "metadata": {
-            "query_index": target_query_index,
-            "cache_version": "2.0",
-            "timestamp": time.time(),
-            "config_snapshot": {
-                "TOP_N_CANDIDATES_RETRIEVAL": config.get("TOP_N_CANDIDATES_RETRIEVAL"),
-                "LAYER1_N_CANDIDATES": config.get("LAYER1_N_CANDIDATES"),
-                "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION")
-            }
-        },
-        "target_query_data": {
-            "query_text": target_query,
-            "ground_truth_answer": ground_truth_answer,
-            "query_index": target_query_index
-        },
-        "retrieved_set": [],
-        "candidate_set": {},
-        "intrinsic_baselines": {},
-        "cross_evaluation_matrix": {},
-        "ground_truth_labels": {},
-        "execution_trace": trace_accumulator,
-        "step_statuses": {
-            "retrieval": "PENDING",
-            "candidate_generation": "PENDING",
-            "baseline_calculation": "PENDING",
-            "cross_evaluation": "PENDING",
-            "ground_truth_evaluation": "PENDING"
+    if cached_state:
+        layer1_state = cached_state
+    else:
+        layer1_state = {
+            "metadata": {
+                "query_index": target_query_index,
+                "cache_version": "3.0",  # ← BUMPED VERSION
+                "timestamp": time.time(),
+                "last_checkpoint_timestamp": time.time(),
+                "last_completed_step": -1,
+                "config_snapshot": {
+                    "TOP_N_CANDIDATES_RETRIEVAL": config.get("TOP_N_CANDIDATES_RETRIEVAL"),
+                    "LAYER1_N_CANDIDATES": config.get("LAYER1_N_CANDIDATES"),
+                    "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION")
+                }
+            },
+            "target_query_data": {
+                "query_text": target_query,
+                "ground_truth_answer": ground_truth_answer,
+                "query_index": target_query_index
+            },
+            "retrieved_set": [],
+            "candidate_set": {},
+            "intrinsic_baselines": {},
+            "cross_evaluation_matrix": {},
+            "ground_truth_labels": {},
+            "execution_trace": trace_accumulator,
+            "step_statuses": {
+                "retrieval": "PENDING",
+                "candidate_generation": "PENDING",
+                "baseline_calculation": "PENDING",
+                "cross_evaluation": "PENDING",
+                "ground_truth_evaluation": "PENDING"
+            },
+            "step_checkpoints": {}
         }
-    }
     
     # --- STEP A: RETRIEVAL ---
-    print("\n[Step A] Retrieval...")
-    start_time = time.time()
-    
-    # Create question_to_index_map for O(1) self-match detection
-    question_to_index_map = {q: i for i, q in enumerate(exemplar_questions)}
-    
-    retrieval_result = _execute_retrieval(
-        target_query=target_query,
-        embedding_model=embedding_model,
-        exemplar_questions=exemplar_questions,
-        embedded_exemplars=embedded_exemplars,
-        top_k=top_k,
-        question_to_index_map=question_to_index_map
-    )
-    
-    layer1_state["step_statuses"]["retrieval"] = retrieval_result["status"]
-    
-    if retrieval_result["status"] == "FAILURE":
-        logger.error(f"Retrieval failed: {retrieval_result.get('error')}")
-        layer1_state["step_statuses"]["retrieval"] = "FAILURE"
-        return layer1_state
-    
-    retrieved_indices = retrieval_result.get("retrieved_indices", [])
-    print(f"  ✓ Retrieved {len(retrieved_indices)} exemplars in {time.time() - start_time:.2f}s")
-    
-    # Store retrieval data
-    layer1_state["retrieved_set"] = retrieval_result.get("retrieval_data", [])
-    layer1_state["execution_trace"].extend(retrieval_result.get("trace", []))
+    if last_completed_step < 0:  # Only execute if not already done
+        print("\n[Step A] Retrieval...")
+        start_time = time.time()
+        
+        # Create question_to_index_map for O(1) self-match detection
+        question_to_index_map = {q: i for i, q in enumerate(exemplar_questions)}
+        
+        retrieval_result = _execute_retrieval(
+            target_query=target_query,
+            embedding_model=embedding_model,
+            exemplar_questions=exemplar_questions,
+            embedded_exemplars=embedded_exemplars,
+            top_k=top_k,
+            question_to_index_map=question_to_index_map
+        )
+        
+        layer1_state["step_statuses"]["retrieval"] = retrieval_result["status"]
+        
+        if retrieval_result["status"] == "FAILURE":
+            logger.error(f"Retrieval failed: {retrieval_result.get('error')}")
+            layer1_state["step_statuses"]["retrieval"] = "FAILURE"
+            return layer1_state
+        
+        retrieved_indices = retrieval_result.get("retrieved_indices", [])
+        print(f"  ✓ Retrieved {len(retrieved_indices)} exemplars in {time.time() - start_time:.2f}s")
+        
+        # Store retrieval data
+        layer1_state["retrieved_set"] = retrieval_result.get("retrieval_data", [])
+        layer1_state["execution_trace"].extend(retrieval_result.get("trace", []))
+        
+        # ✅ SAVE CHECKPOINT IMMEDIATELY AFTER STEP A
+        checkpoint_success = _save_step_checkpoint(
+            cache_path=cache_path,
+            target_query_index=target_query_index,
+            step_name="retrieval",
+            step_data={
+                "retrieved_set": layer1_state["retrieved_set"],
+                "retrieved_indices": retrieved_indices,
+                "execution_trace": layer1_state["execution_trace"]
+            },
+            top_k=top_k,
+            n_candidates=n_candidates,
+            experiment_name=experiment_name
+        )
+        print(f"  ✓ Checkpoint saved (resumable from this point)" if checkpoint_success else "  ⚠ Checkpoint save failed")
+    else:
+        # ✅ RESUME: Load from checkpoint
+        print("\n[Step A] RESUMING from checkpoint...")
+        checkpoint_data = _load_step_checkpoint(cache_path, target_query_index, "retrieval")
+        if checkpoint_data:
+            layer1_state["retrieved_set"] = checkpoint_data.get("retrieved_set", [])
+            retrieved_indices = checkpoint_data.get("retrieved_indices", [])
+            layer1_state["execution_trace"] = checkpoint_data.get("execution_trace", [])
+            print(f"  ✓ Loaded retrieval results from checkpoint ({len(retrieved_indices)} exemplars)")
+        else:
+            print(f"  ⚠ Could not load retrieval checkpoint, re-executing")
+            # Fall back to executing
+            question_to_index_map = {q: i for i, q in enumerate(exemplar_questions)}
+            retrieval_result = _execute_retrieval(
+                target_query=target_query,
+                embedding_model=embedding_model,
+                exemplar_questions=exemplar_questions,
+                embedded_exemplars=embedded_exemplars,
+                top_k=top_k,
+                question_to_index_map=question_to_index_map
+            )
+            layer1_state["retrieved_set"] = retrieval_result.get("retrieval_data", [])
+            retrieved_indices = retrieval_result.get("retrieved_indices", [])
     
     # --- STEP B: CANDIDATE GENERATION ---
-    print("\n[Step B] Candidate Generation (1-shot)...")
-    start_time = time.time()
-    
-    candidate_result = _execute_candidate_generation(
-        target_query=target_query,
-        retrieved_indices=retrieved_indices,
-        exemplar_data=exemplar_data,
-        api_manager=api_manager,
-        config=config,
-        trace_accumulator=trace_accumulator
-    )
-    
-    layer1_state["step_statuses"]["candidate_generation"] = candidate_result["status"]
-    
-    if candidate_result["status"] == "FAILURE":
-        logger.error(f"Candidate generation failed: {candidate_result.get('error')}")
-        # Continue anyway to attempt other steps
-    
-    candidates = candidate_result.get("candidates", {})
-    print(f"  ✓ Generated {candidate_result.get('generated_count', 0)} candidates in {time.time() - start_time:.2f}s")
-    
-    # Store candidates
-    layer1_state["candidate_set"] = candidates
+    if last_completed_step < 1:  # Only execute if not already done
+        print("\n[Step B] Candidate Generation (1-shot)...")
+        start_time = time.time()
+        
+        candidate_result = _execute_candidate_generation(
+            target_query=target_query,
+            retrieved_indices=retrieved_indices,
+            exemplar_data=exemplar_data,
+            api_manager=api_manager,
+            config=config,
+            trace_accumulator=trace_accumulator
+        )
+        
+        layer1_state["step_statuses"]["candidate_generation"] = candidate_result["status"]
+        
+        if candidate_result["status"] == "FAILURE":
+            logger.error(f"Candidate generation failed: {candidate_result.get('error')}")
+            # Continue anyway to attempt other steps
+        
+        candidates = candidate_result.get("candidates", {})
+        print(f"  ✓ Generated {candidate_result.get('generated_count', 0)} candidates in {time.time() - start_time:.2f}s")
+        
+        # Store candidates
+        layer1_state["candidate_set"] = candidates
+        
+        # ✅ SAVE CHECKPOINT AFTER STEP B
+        checkpoint_success = _save_step_checkpoint(
+            cache_path=cache_path,
+            target_query_index=target_query_index,
+            step_name="candidate_generation",
+            step_data={
+                "candidate_set": candidates,
+                "generated_count": candidate_result.get('generated_count', 0),
+                "failed_count": candidate_result.get('failed_count', 0)
+            },
+            top_k=top_k,
+            n_candidates=n_candidates,
+            experiment_name=experiment_name
+        )
+        print(f"  ✓ Checkpoint saved" if checkpoint_success else "  ⚠ Checkpoint save failed")
+    else:
+        # ✅ RESUME: Load from checkpoint
+        print("\n[Step B] RESUMING from checkpoint...")
+        checkpoint_data = _load_step_checkpoint(cache_path, target_query_index, "candidate_generation")
+        if checkpoint_data:
+            candidates = checkpoint_data.get("candidate_set", {})
+            print(f"  ✓ Loaded {len(candidates)} candidates from checkpoint")
+        else:
+            print(f"  ⚠ Could not load candidate checkpoint, re-executing")
+            candidate_result = _execute_candidate_generation(
+                target_query=target_query,
+                retrieved_indices=retrieved_indices,
+                exemplar_data=exemplar_data,
+                api_manager=api_manager,
+                config=config,
+                trace_accumulator=trace_accumulator
+            )
+            candidates = candidate_result.get("candidates", {})
     
     # --- STEP C: BASELINE CALCULATION ---
-    print("\n[Step C] Intrinsic Baseline Calculation...")
-    start_time = time.time()
-    
-    baseline_result = _execute_baseline_calculation(
-        retrieved_indices=retrieved_indices,
-        exemplar_data=exemplar_data,
-        api_manager=api_manager,
-        config=config,
-        trace_accumulator=trace_accumulator
-    )
-    
-    layer1_state["step_statuses"]["baseline_calculation"] = baseline_result["status"]
-    
-    if baseline_result["status"] == "FAILURE":
-        logger.error(f"Baseline calculation failed: {baseline_result.get('error')}")
-    
-    baselines = baseline_result.get("intrinsic_baselines", {})
-    print(f"  ✓ Calculated baselines for {len(baselines)} samples in {time.time() - start_time:.2f}s")
-    
-    # Store baselines
-    layer1_state["intrinsic_baselines"] = baselines
+    if last_completed_step < 2:  # Only execute if not already done
+        print("\n[Step C] Intrinsic Baseline Calculation...")
+        start_time = time.time()
+        
+        baseline_result = _execute_baseline_calculation(
+            retrieved_indices=retrieved_indices,
+            exemplar_data=exemplar_data,
+            api_manager=api_manager,
+            config=config,
+            trace_accumulator=trace_accumulator
+        )
+        
+        layer1_state["step_statuses"]["baseline_calculation"] = baseline_result["status"]
+        
+        if baseline_result["status"] == "FAILURE":
+            logger.error(f"Baseline calculation failed: {baseline_result.get('error')}")
+        
+        baselines = baseline_result.get("intrinsic_baselines", {})
+        print(f"  ✓ Calculated baselines for {len(baselines)} samples in {time.time() - start_time:.2f}s")
+        
+        # Store baselines
+        layer1_state["intrinsic_baselines"] = baselines
+        
+        # ✅ SAVE CHECKPOINT AFTER STEP C
+        checkpoint_success = _save_step_checkpoint(
+            cache_path=cache_path,
+            target_query_index=target_query_index,
+            step_name="baseline_calculation",
+            step_data={
+                "intrinsic_baselines": baselines
+            },
+            top_k=top_k,
+            n_candidates=n_candidates,
+            experiment_name=experiment_name
+        )
+        print(f"  ✓ Checkpoint saved" if checkpoint_success else "  ⚠ Checkpoint save failed")
+    else:
+        # ✅ RESUME: Load from checkpoint
+        print("\n[Step C] RESUMING from checkpoint...")
+        checkpoint_data = _load_step_checkpoint(cache_path, target_query_index, "baseline_calculation")
+        if checkpoint_data:
+            baselines = checkpoint_data.get("intrinsic_baselines", {})
+            layer1_state["intrinsic_baselines"] = baselines
+            print(f"  ✓ Loaded baselines for {len(baselines)} samples from checkpoint")
+        else:
+            print(f"  ⚠ Could not load baseline checkpoint, re-executing")
+            baseline_result = _execute_baseline_calculation(
+                retrieved_indices=retrieved_indices,
+                exemplar_data=exemplar_data,
+                api_manager=api_manager,
+                config=config,
+                trace_accumulator=trace_accumulator
+            )
+            baselines = baseline_result.get("intrinsic_baselines", {})
     
     # --- STEP D: CROSS-EVALUATION MATRIX ---
-    print("\n[Step D] Cross-Evaluation Matrix...")
-    start_time = time.time()
-    
-    cross_eval_result = _execute_cross_evaluation(
-        target_query=target_query,
-        candidates=candidates,
-        retrieved_indices=retrieved_indices,
-        exemplar_data=exemplar_data,
-        api_manager=api_manager,
-        config=config,
-        trace_accumulator=trace_accumulator
-    )
-    
-    layer1_state["step_statuses"]["cross_evaluation"] = cross_eval_result["status"]
-    
-    if cross_eval_result["status"] == "FAILURE":
-        logger.error(f"Cross-evaluation failed: {cross_eval_result.get('error')}")
-    
-    cross_matrix = cross_eval_result.get("cross_evaluation_matrix", {})
-    print(f"  ✓ Cross-evaluated matrix in {time.time() - start_time:.2f}s")
-    
-    # Store cross-evaluation matrix
-    layer1_state["cross_evaluation_matrix"] = cross_matrix
+    if last_completed_step < 3:  # Only execute if not already done
+        print("\n[Step D] Cross-Evaluation Matrix...")
+        start_time = time.time()
+        
+        cross_eval_result = _execute_cross_evaluation(
+            target_query=target_query,
+            candidates=candidates,
+            retrieved_indices=retrieved_indices,
+            exemplar_data=exemplar_data,
+            api_manager=api_manager,
+            config=config,
+            trace_accumulator=trace_accumulator
+        )
+        
+        layer1_state["step_statuses"]["cross_evaluation"] = cross_eval_result["status"]
+        
+        if cross_eval_result["status"] == "FAILURE":
+            logger.error(f"Cross-evaluation failed: {cross_eval_result.get('error')}")
+        
+        cross_matrix = cross_eval_result.get("cross_evaluation_matrix", {})
+        print(f"  ✓ Cross-evaluated matrix in {time.time() - start_time:.2f}s")
+        
+        # Store cross-evaluation matrix
+        layer1_state["cross_evaluation_matrix"] = cross_matrix
+        
+        # ✅ SAVE CHECKPOINT AFTER STEP D
+        checkpoint_success = _save_step_checkpoint(
+            cache_path=cache_path,
+            target_query_index=target_query_index,
+            step_name="cross_evaluation",
+            step_data={
+                "cross_evaluation_matrix": cross_matrix,
+                "matrix_dimensions": cross_eval_result.get("matrix_dimensions", {})
+            },
+            top_k=top_k,
+            n_candidates=n_candidates,
+            experiment_name=experiment_name
+        )
+        print(f"  ✓ Checkpoint saved" if checkpoint_success else "  ⚠ Checkpoint save failed")
+    else:
+        # ✅ RESUME: Load from checkpoint
+        print("\n[Step D] RESUMING from checkpoint...")
+        checkpoint_data = _load_step_checkpoint(cache_path, target_query_index, "cross_evaluation")
+        if checkpoint_data:
+            cross_matrix = checkpoint_data.get("cross_evaluation_matrix", {})
+            layer1_state["cross_evaluation_matrix"] = cross_matrix
+            dims = checkpoint_data.get("matrix_dimensions", {})
+            print(f"  ✓ Loaded cross-evaluation matrix from checkpoint "
+                  f"({dims.get('candidates', 0)} x {dims.get('evaluators', 0)})")
+        else:
+            print(f"  ⚠ Could not load cross-evaluation checkpoint, re-executing")
+            cross_eval_result = _execute_cross_evaluation(
+                target_query=target_query,
+                candidates=candidates,
+                retrieved_indices=retrieved_indices,
+                exemplar_data=exemplar_data,
+                api_manager=api_manager,
+                config=config,
+                trace_accumulator=trace_accumulator
+            )
+            cross_matrix = cross_eval_result.get("cross_evaluation_matrix", {})
     
     # --- STEP E: GROUND-TRUTH EVALUATION ---
-    print("\n[Step E] Ground-Truth Correctness Evaluation...")
-    start_time = time.time()
-    
-    gt_result = _execute_ground_truth_evaluation(
-        target_query=target_query,
-        ground_truth_answer=ground_truth_answer,
-        candidates=candidates,
-        api_manager=api_manager,
-        config=config
-    )
-    
-    layer1_state["step_statuses"]["ground_truth_evaluation"] = gt_result["status"]
-    
-    if gt_result["status"] == "FAILURE":
-        logger.error(f"Ground-truth evaluation failed: {gt_result.get('error')}")
-    
-    gt_labels = gt_result.get("ground_truth_labels", {})
-    print(f"  ✓ Evaluated {gt_result.get('successful_evals', 0)} candidates against ground truth in {time.time() - start_time:.2f}s")
-    
-    # Store ground-truth labels
-    layer1_state["ground_truth_labels"] = gt_labels
+    if last_completed_step < 4:  # Only execute if not already done
+        print("\n[Step E] Ground-Truth Correctness Evaluation...")
+        start_time = time.time()
+        
+        gt_result = _execute_ground_truth_evaluation(
+            target_query=target_query,
+            ground_truth_answer=ground_truth_answer,
+            candidates=candidates,
+            api_manager=api_manager,
+            config=config
+        )
+        
+        layer1_state["step_statuses"]["ground_truth_evaluation"] = gt_result["status"]
+        
+        if gt_result["status"] == "FAILURE":
+            logger.error(f"Ground-truth evaluation failed: {gt_result.get('error')}")
+        
+        gt_labels = gt_result.get("ground_truth_labels", {})
+        print(f"  ✓ Evaluated {gt_result.get('successful_evals', 0)} candidates against ground truth in {time.time() - start_time:.2f}s")
+        
+        # Store ground-truth labels
+        layer1_state["ground_truth_labels"] = gt_labels
+        
+        # ✅ SAVE CHECKPOINT AFTER STEP E (FINAL)
+        checkpoint_success = _save_step_checkpoint(
+            cache_path=cache_path,
+            target_query_index=target_query_index,
+            step_name="ground_truth_evaluation",
+            step_data={
+                "ground_truth_labels": gt_labels,
+                "successful_evals": gt_result.get('successful_evals', 0),
+                "failed_evals": gt_result.get('failed_evals', 0)
+            },
+            top_k=top_k,
+            n_candidates=n_candidates,
+            experiment_name=experiment_name
+        )
+        print(f"  ✓ Checkpoint saved (query complete!)" if checkpoint_success else "  ⚠ Checkpoint save failed")
+    else:
+        # ✅ RESUME: Load from checkpoint
+        print("\n[Step E] RESUMING from checkpoint...")
+        checkpoint_data = _load_step_checkpoint(cache_path, target_query_index, "ground_truth_evaluation")
+        if checkpoint_data:
+            gt_labels = checkpoint_data.get("ground_truth_labels", {})
+            layer1_state["ground_truth_labels"] = gt_labels
+            successful = checkpoint_data.get('successful_evals', 0)
+            print(f"  ✓ Loaded {successful} ground-truth evaluations from checkpoint")
+        else:
+            print(f"  ⚠ Could not load ground-truth checkpoint, re-executing")
+            gt_result = _execute_ground_truth_evaluation(
+                target_query=target_query,
+                ground_truth_answer=ground_truth_answer,
+                candidates=candidates,
+                api_manager=api_manager,
+                config=config
+            )
+            gt_labels = gt_result.get("ground_truth_labels", {})
     
     # --- CACHE & FINALIZE ---
-    print(f"\n[Layer 1] All steps completed. Saving to combined cache...")
+    print(f"\n[Layer 1] All steps completed. Saving final state to combined cache...")
     
     # Determine overall status
     all_statuses = layer1_state["step_statuses"].values()
@@ -758,7 +1168,7 @@ def run_layer1_base_execution(
         layer1_state["overall_status"] = "FAILURE"
         print("  ✗ Critical failure; check step_statuses for details")
     
-    # Save to combined cache (merges with existing queries)
+    # Save complete state to cache (merges with existing queries)
     success = _save_cached_state(
         cache_path=cache_path,
         target_query_index=target_query_index,
@@ -769,10 +1179,10 @@ def run_layer1_base_execution(
     )
     
     if success:
-        print(f"  ✓ Cache merged into {cache_path}")
+        print(f"  ✓ Final state merged into {cache_path}")
         print(f"    (All queries for this experiment stored in one combined file)")
     else:
-        logger.warning(f"Failed to save cache to {cache_path}")
+        logger.warning(f"Failed to save final cache to {cache_path}")
     
     print(f"{'='*80}\n")
     
