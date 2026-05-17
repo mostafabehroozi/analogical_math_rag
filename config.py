@@ -66,7 +66,7 @@ CONFIG = {
     "AVALAI_MODEL_NAME_SIMPLIFICATION": "openai.gpt-oss-20b-1:0",
 
     # Ollama (Local LLM) Settings
-    "OLLAMA_BASE_URL": "http://localhost:11434",
+    "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
     "OLLAMA_THINK_MODE" : "low" ,
     "OLLAMA_MODEL_NAME_ADAPTATION": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_FINAL_SOLVER": "gpt-oss:20b",
@@ -245,7 +245,7 @@ CONFIG = {
     
     "APPLY_LAYER1_BASE_EXECUTION": False,  # Enable/disable Layer 1 system
     "LAYER1_ONLY_MODE": False,             # If True, halt after Layer 1 (cache generation only)
-    "LAYER1_CACHE_DIR": os.path.join(RESULTS_DIR, "layer1_cache"),  # Cache storage directory
+    "LAYER1_CACHE_DIR": RESULTS_DIR,
     "LAYER1_N_CANDIDATES": None,           # Number of candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
 
@@ -341,6 +341,7 @@ def _initialize_derived_paths():
     CONFIG["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"] = os.path.join(CONFIG["EMBEDDINGS_DIR"], 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy')
     CONFIG["ADVANCED_RAG_FULL_LOG_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_pipeline_full_log.json")
     CONFIG["ADVANCED_RAG_EVALUATION_RESULTS_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_evaluation_results.pkl")
+    CONFIG["LAYER1_CACHE_DIR"] = CONFIG["RESULTS_DIR"]
 
 _initialize_derived_paths()
 
@@ -360,6 +361,7 @@ def rebuild_derived_paths():
     CONFIG["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"] = os.path.join(CONFIG["EMBEDDINGS_DIR"], 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy')
     CONFIG["ADVANCED_RAG_FULL_LOG_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_pipeline_full_log.json")
     CONFIG["ADVANCED_RAG_EVALUATION_RESULTS_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_evaluation_results.pkl")
+    CONFIG["LAYER1_CACHE_DIR"] = CONFIG["RESULTS_DIR"]
 
 
 def setup_directories():
@@ -374,7 +376,7 @@ def setup_directories():
         CONFIG.get("LOGS_DIR", LOGS_DIR),
         CONFIG.get("EMBEDDINGS_DIR", EMBEDDINGS_DIR),
         CONFIG.get("RESULTS_DIR", RESULTS_DIR),
-        CONFIG.get("LAYER1_CACHE_DIR",os.path.join(RESULTS_DIR, "layer1_cache")),
+        CONFIG.get("LAYER1_CACHE_DIR", RESULTS_DIR),  # Updated
     ]
 
     for dir_path in dirs_to_create:
