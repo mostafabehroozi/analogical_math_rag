@@ -338,10 +338,10 @@ def _evaluate_mirror_consistency(
         formatted_hypothesis_sol = f"{hypothesis_text}"
 
         for val_idx in validation_indices:
-            # Skip self-test (trivial)
-            if cand_id == val_idx:
-                mirror_results[cand_id][val_idx] = 0.0 
-                continue
+            # ALLOW self-test (Reverse Validation logic)
+            # if cand_id == val_idx:
+            #     mirror_results[cand_id][val_idx] = 0.0 
+            #     continue
 
             val_q = exemplar_data['questions'][val_idx]
             val_gt = exemplar_data['solutions'][val_idx]
@@ -1650,7 +1650,8 @@ def optimize_demonstrations_via_mirroring(
             contribs = {}
             
             for val_idx in validation_set_indices:
-                if cand_idx == val_idx: continue
+                # Include self-test in utility calculation
+                # if cand_idx == val_idx: continue
                 
                 mirror_acc = consistency_matrix.get(cand_idx, {}).get(val_idx, 0.0)
                 base_acc = baseline_scores.get(val_idx, 0.0)
@@ -1821,8 +1822,9 @@ def apply_mirror_reranking(
             contribs = {}
             
             for val_idx in validation_indices:
-                if cand_idx == val_idx:
-                    continue
+                # Allow self-evaluation to contribute to utility
+                # if cand_idx == val_idx:
+                #     continue
                 
                 mirror_acc = consistency_matrix.get(cand_idx, {}).get(val_idx, 0.0)
                 base_acc = baseline_scores.get(val_idx, 0.0)
@@ -2275,7 +2277,14 @@ def solve_with_analogical_consistency(
             
         all_indices = retrieval_res['retrieved_indices']
         helper_indices = all_indices[:gen_k]
-        validator_indices = all_indices[gen_k:]
+        
+        # FIX: Ensure validators INCLUDE the helpers so the candidate 
+        # is tested against its own original source exemplar!
+        # You can either use all of them:
+        validator_indices = all_indices 
+        
+        # OR just use the helpers as their own validators:
+        # validator_indices = helper_indices
         
         print(f"\n  [Phase 1] Generating Candidates using RAG Helpers ({len(helper_indices)} helpers)...")
         for h_idx in helper_indices:
