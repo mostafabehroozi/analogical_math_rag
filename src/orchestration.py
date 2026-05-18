@@ -71,6 +71,7 @@ from src.layer1_base_execution import run_layer1_base_execution
 
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
+from src.wandb_sync import periodic_wandb_sync_check  # <-- ADDED THIS
 from src.prompts import EXEMPLAR_FORMAT, create_analogical_adaptation_prompt
 
 def run_pipeline_for_single_query(
@@ -1325,6 +1326,7 @@ def run_experiments(
                     run_logs.append(intermediate_log)
                     save_json(run_logs, log_file_path)
                     periodic_sync_check(loop_idx, current_config)
+                    periodic_wandb_sync_check(loop_idx, current_config) 
             else:
                 logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
 
@@ -1362,6 +1364,7 @@ def run_experiments(
                     completed_logs_map[original_idx] = completed_log
                     save_json(list(completed_logs_map.values()), log_file_path)
                     periodic_sync_check(loop_idx, current_config)
+                    periodic_wandb_sync_check(loop_idx, current_config) 
                 
                 final_logs = list(completed_logs_map.values())
             else:
@@ -1406,6 +1409,7 @@ def run_experiments(
                     run_logs.append(single_run_log)
                     save_json(run_logs, log_file_path)
                     periodic_sync_check(loop_idx, current_config)
+                    periodic_wandb_sync_check(loop_idx, current_config)
             else:
                 # --- Single-Experiment Deferred Mode ---
                 logger.info(f"Running '{exp_name}' in single-experiment deferred solve mode.")
@@ -1426,6 +1430,7 @@ def run_experiments(
                         run_logs.append(intermediate_log)
                         save_json(run_logs, log_file_path)
                         periodic_sync_check(loop_idx, current_config)
+                        periodic_wandb_sync_check(loop_idx, current_config) 
                 else:
                     logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
 
@@ -1449,6 +1454,7 @@ def run_experiments(
                         completed_logs_map[original_idx] = completed_log
                         save_json(list(completed_logs_map.values()), log_file_path)
                         periodic_sync_check(loop_idx, current_config)
+                        periodic_wandb_sync_check(loop_idx, current_config) 
                     
                     run_logs = list(completed_logs_map.values())
                 else:
