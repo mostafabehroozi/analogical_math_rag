@@ -71,8 +71,13 @@ from src.layer1_base_execution import run_layer1_base_execution
 
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
-from src.wandb_sync import periodic_wandb_sync_check  # <-- ADDED THIS
+from src.wandb_sync import periodic_wandb_sync_check, log_experiment_metrics, log_checkpoint  # <-- ADDED THIS
 from src.prompts import EXEMPLAR_FORMAT, create_analogical_adaptation_prompt
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 def run_pipeline_for_single_query(
     hard_list_idx: int,
@@ -1464,5 +1469,26 @@ def run_experiments(
             save_json(run_logs, log_file_path)
             logger.info(f"########## Finished Experiment: {exp_name} ##########")
             all_results[exp_name] = run_logs
-        
+    
+    # --- Log final experiment metrics to W&B ---
+    if global_config.get('WANDB_PERSIST_ONLINE', False) and wandb is not None:
+        try:
+            for exp_name, exp_logs in all_results.items():
+                if isinstance(exp_logs, list) and len(exp_logs) > 0:
+                    # Calculate simple metrics for logging
+                    total_queries = len(exp_logs)
+                    completed_queries = len([log for log in exp_logs if log.get('pipeline_status') == 'SUCCESS'])
+                    failed_queries = total_queries - completed_queries
+                    
+                    metrics = {
+                        "total_queries": total_queries,
+                        "completed_queries": completed_queries,
+                        "failed_queries": failed_queries,
+                        "completion_rate": completed_queries / total_queries if total_queries > 0 else 0
+                    }
+                    log_experiment_metrics(global_config, exp_name, metrics)
+                    logger.info(f"Logged metrics for experiment '{exp_name}' to W&B")
+        except Exception as e:
+            logger.warning(f"Failed to log experiment metrics to W&B: {e}")
+    
     return all_results
