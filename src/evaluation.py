@@ -35,6 +35,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from collections import Counter, defaultdict
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 # Import custom project modules
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -347,7 +352,33 @@ def analyze_experiment_logs(
         analysis_summary.append(exp_summary)
         
     logger.info("Finished analysis of all experiments.")
-    return pd.DataFrame(analysis_summary)
+    
+    analysis_df = pd.DataFrame(analysis_summary)
+    
+    # --- Log evaluation results to W&B ---
+    if config.get('WANDB_PERSIST_ONLINE', False) and wandb is not None:
+        try:
+            from src.wandb_sync import log_experiment_metrics
+            
+            # Log metrics for each experiment from the analysis summary
+            for _, row in analysis_df.iterrows():
+                exp_name = row.get('experiment_name', 'unknown')
+                metrics = {}
+                
+                # Extract metric columns (those starting with 'pass@')
+                for col in analysis_df.columns:
+                    if col.startswith('pass@'):
+                        metrics[col] = row[col]
+                    elif col == 'num_eval_primary':
+                        metrics['evaluations'] = row[col]
+                
+                if metrics:
+                    log_experiment_metrics(config, exp_name, metrics)
+                    logger.debug(f"Logged evaluation metrics for '{exp_name}' to W&B")
+        except Exception as e:
+            logger.debug(f"Failed to log evaluation metrics to W&B: {e}")
+    
+    return analysis_df
 
 
 # --- SHARED HELPERS FOR CONSISTENCY ANALYSIS ---
