@@ -14,11 +14,17 @@ import pandas as pd
 from tqdm import tqdm
 from typing import List, Dict, Any
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 # Import our custom modules
 from src.evaluation import evaluate_single_answer_with_llm
 from src.orchestration import run_pipeline_for_single_query # Used for retrying generation
 from src.utils import load_json, save_json
 from src.hf_sync import periodic_sync_check, sync_workspace_to_hub
+from src.wandb_sync import log_error_batch
 
 # --- NEW: Generation Phase Retry Logic ---
 
@@ -234,5 +240,26 @@ def generate_error_report(
     if not error_records:
         logger.info("No errors were found in any experiment logs.")
         return pd.DataFrame()
-
-    return pd.DataFrame(error_records)
+    
+    error_df = pd.DataFrame(error_records)
+    
+    # --- Log errors to W&B ---
+    if config.get('WANDB_PERSIST_ONLINE', False) and wandb is not None:
+        try:
+            # Convert DataFrame to list of dicts for W&B logging
+            errors_for_logging = []
+            for _, row in error_df.iterrows():
+                errors_for_logging.append({
+                    "query_idx": row.get("query_hard_list_idx"),
+                    "error_type": row.get("error_type"),
+                    "error_message": row.get("error_message", "")[:200],  # Truncate long messages
+                    "timestamp": ""
+                })
+            
+            if errors_for_logging:
+                log_error_batch(config, errors_for_logging)
+                logger.info(f"Logged {len(errors_for_logging)} errors to W&B")
+        except Exception as e:
+            logger.debug(f"Failed to log errors to W&B: {e}")
+    
+    return error_df
