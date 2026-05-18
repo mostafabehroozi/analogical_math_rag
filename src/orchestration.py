@@ -51,7 +51,6 @@ from tqdm import tqdm
 import os
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
-from transformers import logger
 
 from src.pipeline_steps import (
     retrieve, adapt, merge, solve,
@@ -72,13 +71,7 @@ from src.layer1_base_execution import run_layer1_base_execution
 
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
-from src.wandb_sync import periodic_wandb_sync_check, log_experiment_metrics, log_checkpoint  # <-- ADDED THIS
 from src.prompts import EXEMPLAR_FORMAT, create_analogical_adaptation_prompt
-
-try:
-    import wandb
-except ImportError:
-    wandb = None
 
 def run_pipeline_for_single_query(
     hard_list_idx: int,
@@ -1291,15 +1284,6 @@ def run_experiments(
             logger.info(f"--- Dataset experiment '{exp_name}' finished ---")
         # replace list for the remaining pipeline with the normal ones
         experiment_configs = normal_configs
-        
-        # --- TAIL-END SYNC: Dataset Construction ---
-        if global_config.get("PERSIST_RESULTS_ONLINE"):
-            from src.hf_sync import sync_workspace_to_hub
-            sync_workspace_to_hub(global_config)
-        if global_config.get("WANDB_PERSIST_ONLINE"):
-            from src.wandb_sync import sync_workspace_to_wandb
-            sync_workspace_to_wandb(global_config)
-
         if not experiment_configs:
             # nothing else to do
             return all_results
@@ -1341,20 +1325,10 @@ def run_experiments(
                     run_logs.append(intermediate_log)
                     save_json(run_logs, log_file_path)
                     periodic_sync_check(loop_idx, current_config)
-                    periodic_wandb_sync_check(loop_idx, current_config) 
             else:
                 logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
 
         print("\n" + "#"*25 + " PHASE 1 COMPLETE " + "#"*25)
-        
-        # --- TAIL-END SYNC: Phase 1 ---
-        if global_config.get("PERSIST_RESULTS_ONLINE"):
-            from src.hf_sync import sync_workspace_to_hub
-            sync_workspace_to_hub(global_config)
-        if global_config.get("WANDB_PERSIST_ONLINE"):
-            from src.wandb_sync import sync_workspace_to_wandb
-            sync_workspace_to_wandb(global_config)
-
         print("\n" + "#"*25 + " PHASE 2: EXECUTING FINAL SOLVE STEPS FOR ALL EXPERIMENTS " + "#"*25)
 
         # --- PHASE 2: Final Solving Steps for ALL experiments ---
@@ -1388,7 +1362,6 @@ def run_experiments(
                     completed_logs_map[original_idx] = completed_log
                     save_json(list(completed_logs_map.values()), log_file_path)
                     periodic_sync_check(loop_idx, current_config)
-                    periodic_wandb_sync_check(loop_idx, current_config) 
                 
                 final_logs = list(completed_logs_map.values())
             else:
@@ -1400,14 +1373,7 @@ def run_experiments(
             logger.info(f"########## Finished Experiment: {exp_name} ##########")
 
         print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
-        
-        # --- TAIL-END SYNC: Phase 2 ---
-        if global_config.get("PERSIST_RESULTS_ONLINE"):
-            from src.hf_sync import sync_workspace_to_hub
-            sync_workspace_to_hub(global_config)
-        if global_config.get("WANDB_PERSIST_ONLINE"):
-            from src.wandb_sync import sync_workspace_to_wandb
-            sync_workspace_to_wandb(global_config)
+
     else:
         # --- Original Mode: Run each experiment sequentially ---
         logger.info("Deferred mode is DISABLED. Running experiments sequentially.")
@@ -1440,7 +1406,6 @@ def run_experiments(
                     run_logs.append(single_run_log)
                     save_json(run_logs, log_file_path)
                     periodic_sync_check(loop_idx, current_config)
-                    periodic_wandb_sync_check(loop_idx, current_config)
             else:
                 # --- Single-Experiment Deferred Mode ---
                 logger.info(f"Running '{exp_name}' in single-experiment deferred solve mode.")
@@ -1461,20 +1426,9 @@ def run_experiments(
                         run_logs.append(intermediate_log)
                         save_json(run_logs, log_file_path)
                         periodic_sync_check(loop_idx, current_config)
-                        periodic_wandb_sync_check(loop_idx, current_config) 
                 else:
                     logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
 
-                # --- TAIL-END SYNC: Single-Experiment Deferred Phase 1 ---
-                if global_config.get("PERSIST_RESULTS_ONLINE"):
-                    from src.hf_sync import sync_workspace_to_hub
-                    sync_workspace_to_hub(global_config)
-                if global_config.get("WANDB_PERSIST_ONLINE"):
-                    from src.wandb_sync import sync_workspace_to_wandb
-                    sync_workspace_to_wandb(global_config)
-
-                # PHASE 2: Final Solving Step
-                print(f"\n--- {exp_name}: STARTING PHASE 2 of 2 (Final Solving) ---")
                 # PHASE 2: Final Solving Step
                 print(f"\n--- {exp_name}: STARTING PHASE 2 of 2 (Final Solving) ---")
                 intermediate_logs = load_json(log_file_path)
@@ -1495,7 +1449,6 @@ def run_experiments(
                         completed_logs_map[original_idx] = completed_log
                         save_json(list(completed_logs_map.values()), log_file_path)
                         periodic_sync_check(loop_idx, current_config)
-                        periodic_wandb_sync_check(loop_idx, current_config) 
                     
                     run_logs = list(completed_logs_map.values())
                 else:
@@ -1505,34 +1458,5 @@ def run_experiments(
             save_json(run_logs, log_file_path)
             logger.info(f"########## Finished Experiment: {exp_name} ##########")
             all_results[exp_name] = run_logs
-            
-            # --- TAIL-END SYNC: Standard Mode Experiment ---
-            if global_config.get("PERSIST_RESULTS_ONLINE"):
-                from src.hf_sync import sync_workspace_to_hub
-                sync_workspace_to_hub(global_config)
-            if global_config.get("WANDB_PERSIST_ONLINE"):
-                from src.wandb_sync import sync_workspace_to_wandb
-                sync_workspace_to_wandb(global_config)
-    
-    # --- Log final experiment metrics to W&B ---
-    if global_config.get('WANDB_PERSIST_ONLINE', False) and wandb is not None:
-        try:
-            for exp_name, exp_logs in all_results.items():
-                if isinstance(exp_logs, list) and len(exp_logs) > 0:
-                    # Calculate simple metrics for logging
-                    total_queries = len(exp_logs)
-                    completed_queries = len([log for log in exp_logs if log.get('pipeline_status') == 'SUCCESS'])
-                    failed_queries = total_queries - completed_queries
-                    
-                    metrics = {
-                        "total_queries": total_queries,
-                        "completed_queries": completed_queries,
-                        "failed_queries": failed_queries,
-                        "completion_rate": completed_queries / total_queries if total_queries > 0 else 0
-                    }
-                    log_experiment_metrics(global_config, exp_name, metrics)
-                    logger.info(f"Logged metrics for experiment '{exp_name}' to W&B")
-        except Exception as e:
-            logger.warning(f"Failed to log experiment metrics to W&B: {e}")
-    
+        
     return all_results
