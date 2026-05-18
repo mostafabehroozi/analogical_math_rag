@@ -305,13 +305,7 @@ CONFIG = {
     "HF_SYNC_REVISION_ENABLED": False,
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
-    
-    # 2. Weights & Biases (W&B) Settings
-    "WANDB_PERSIST_ONLINE": True,     # Set True to enable Weights & Biases sync
-    "WANDB_API_KEY": "YOUR_WANDB_API_KEY_HERE",  # <-- ADD THIS LINE
-    "WANDB_PROJECT_NAME": "analogical-math-rag", # Name of the project in your W&B dashboard
-    "WANDB_ENTITY": None,             # Your W&B username (Leave as None to use your default account)
-    "WANDB_SYNC_INTERVAL": 10,        # How often to sync artifacts to W&B (can be different from HF)
+
     
     "APPLY_MIRROR_RERANKING": False,  # Enable/disable the unified re-ranking stage
     "MIRROR_RERANKING_APPLY_AFTER": "transformation",  # "transformation", "retrieval", or "both"
