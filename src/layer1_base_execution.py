@@ -41,6 +41,11 @@ from src.pipeline_steps import (
 )
 from src.evaluation import evaluate_single_answer_with_llm
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 # ============================================================================
 # CACHE MANAGEMENT
@@ -1183,6 +1188,25 @@ def run_layer1_base_execution(
         print(f"    (All queries for this experiment stored in one combined file)")
     else:
         logger.warning(f"Failed to save final cache to {cache_path}")
+    
+    # --- Log to W&B (Layer 1 execution metrics) ---
+    if config.get("WANDB_PERSIST_ONLINE", False) and wandb is not None:
+        try:
+            from src.wandb_sync import log_checkpoint
+            
+            cache_stats = {
+                "query_index": target_query_index,
+                "experiment_name": experiment_name,
+                "cache_path": cache_path,
+                "retrieved_samples": len(layer1_state.get("retrieved_set", [])),
+                "generated_candidates": len(layer1_state.get("candidate_set", {})),
+                "baseline_calculated": "baseline_difficulty" in layer1_state,
+                "cross_evaluated": "cross_evaluation_matrix" in layer1_state,
+            }
+            log_checkpoint(config, f"layer1_query_{target_query_index}", cache_stats)
+            logger.debug(f"Logged Layer 1 execution for query #{target_query_index} to W&B")
+        except Exception as e:
+            logger.debug(f"Failed to log Layer 1 metrics to W&B: {e}")
     
     print(f"{'='*80}\n")
     
