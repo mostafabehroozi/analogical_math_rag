@@ -111,23 +111,15 @@ def sync_workspace_to_hub(config: dict):
     try:
         # 1. Instantiate the API client with the token.
         api = HfApi(token=hf_token)
-        
-        # Dynamically calculate the exact relative path of the embeddings folder
-        rel_embeddings_dir = os.path.relpath(config["EMBEDDINGS_DIR"], local_outputs_dir)
-        # Ensure forward slashes for Hugging Face pattern matching
-        rel_embeddings_pattern = f"{rel_embeddings_dir.replace(os.sep, '/')}/**"
 
-        # 2. Upload the outputs folder
-        api.upload_folder(
+        # 2. Upload the outputs folder using upload_large_folder to avoid timeouts
+        api.upload_large_folder(
             folder_path=local_outputs_dir,
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="Automated experiment results sync",
-            ignore_patterns=[
-                rel_embeddings_pattern,  # Exact dynamic path
-                "**/embeddings/**",      # Global fallback for any embeddings folder
-                "**/*.npy"               # Global fallback for all numpy files
-            ] 
+            # EXTREMELY IMPORTANT: Exclude the massive 3GB embeddings folder from repetitive syncing
+            ignore_patterns=["embeddings/*", "*.npy"] 
         )
         logger.info(f"Successfully synced '{local_outputs_dir}' to {repo_id}.")
     except Exception as e:
@@ -148,3 +140,28 @@ def periodic_sync_check(loop_counter: int, config: dict):
         print(f"\n--- Reached sync interval at item #{loop_counter + 1}. Syncing results to Hugging Face Hub. ---")
         sync_workspace_to_hub(config)
         print("--- Sync complete. ---\n")
+
+        
+def log_experiment_metrics(config: dict, experiment_name: str, metrics: dict):
+    """Logs high-level experiment metrics to W&B."""
+    if not config.get("WANDB_PERSIST_ONLINE", False) or wandb is None or wandb.run is None:
+        return
+    
+    # Structure metrics under the experiment name for a clean W&B dashboard
+    wandb_metrics = {f"{experiment_name}/{k}": v for k, v in metrics.items()}
+    try:
+        wandb.log(wandb_metrics)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Failed to log metrics to W&B: {e}")
+
+def log_checkpoint(config: dict, step_name: str, stats: dict):
+    """Logs granular checkpoint/layer1 execution metrics to W&B."""
+    if not config.get("WANDB_PERSIST_ONLINE", False) or wandb is None or wandb.run is None:
+        return
+        
+    wandb_stats = {f"layer1/{k}": v for k, v in stats.items()}
+    wandb_stats["layer1_step"] = step_name
+    try:
+        wandb.log(wandb_stats)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Failed to log checkpoint to W&B: {e}")
