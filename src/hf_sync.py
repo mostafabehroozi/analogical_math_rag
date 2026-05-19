@@ -38,14 +38,18 @@ def initialize_workspace(config: dict):
     HF token directly from the provided configuration dictionary.
     """
     logger = logging.getLogger(__name__)
+    
+    # 1. Check if persistence is enabled
     if not config.get("PERSIST_RESULTS_ONLINE"):
         logger.info("Online persistence is disabled. Skipping workspace initialization.")
         return
 
+    # 2. Extract credentials safely
     hf_token, hf_username, repo_name = _get_hf_config(config)
 
     if not all([hf_token, hf_username, repo_name]):
         logger.warning("HF token, username, or repo name not found in config. Cannot initialize workspace.")
+        print("\n⚠️ WARNING: Missing Hugging Face configuration. Skipping workspace initialization.")
         return
 
     repo_id = f"{hf_username}/{repo_name}"
@@ -53,7 +57,7 @@ def initialize_workspace(config: dict):
 
     logger.info(f"Initializing workspace from Hugging Face Hub repo: {repo_id}")
 
-    # Check for specific revision settings from the config
+    # 3. Handle specific revision settings
     revision = None
     if config.get("HF_SYNC_REVISION_ENABLED", False):
         revision_id = config.get("HF_SYNC_REVISION_ID")
@@ -63,15 +67,16 @@ def initialize_workspace(config: dict):
         else:
             logger.warning("HF_SYNC_REVISION_ENABLED is True, but HF_SYNC_REVISION_ID is not set. Downloading latest.")
     
+    # 4. Attempt API interactions
     try:
-        # 1. Instantiate the API client, passing the token directly.
+        # Instantiate the API client
         api = HfApi(token=hf_token)
 
-        # 2. Ensure the repository exists, creating it if necessary.
+        # Ensure the repository exists, creating it if necessary
         api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
         logger.info(f"Repository {repo_id} exists or was created successfully.")
 
-        # 3. Download the repository's contents, passing the token and revision.
+        # Download the repository's contents
         snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
@@ -81,11 +86,21 @@ def initialize_workspace(config: dict):
         )
 
         logger.info(f"Workspace synchronized. Files from {repo_id} are downloaded to {local_outputs_dir}.")
+        print(f"✅ Hugging Face workspace successfully initialized from {repo_id}")
 
     except HfHubHTTPError as e:
-        logger.error(f"HTTP Error initializing workspace from {repo_id}. Check your HF token permissions. Error: {e}", exc_info=True)
+        # Clear, non-halting warning for HTTP/Authentication issues
+        error_msg = f"HTTP Error initializing workspace from {repo_id}. Check your HF token permissions. Details: {str(e)}"
+        print(f"\n⚠️ WARNING: HF Sync Failed (Download/Init HTTP Error) - {str(e)}")
+        print("Continuing pipeline execution with local files...\n")
+        logger.warning(error_msg)
+        
     except Exception as e:
-        logger.error(f"An unexpected error occurred during workspace initialization: {e}", exc_info=True)
+        # Clear, non-halting warning for any other unexpected errors
+        error_msg = f"An unexpected error occurred during workspace initialization: {str(e)}"
+        print(f"\n⚠️ WARNING: HF Sync Failed (Download/Init Unexpected Error) - {str(e)}")
+        print("Continuing pipeline execution with local files...\n")
+        logger.warning(error_msg)
 
 def sync_workspace_to_hub(config: dict):
     """
@@ -117,15 +132,18 @@ def sync_workspace_to_hub(config: dict):
             folder_path=local_outputs_dir,
             repo_id=repo_id,
             repo_type="dataset",
-            commit_message="Automated experiment results sync",
             # EXTREMELY IMPORTANT: Exclude the massive 3GB embeddings folder from repetitive syncing
             ignore_patterns=["embeddings/*", "*.npy"] 
         )
         logger.info(f"Successfully synced '{local_outputs_dir}' to {repo_id}.")
-    except Exception as e:
-        logger.error(f"Failed to sync workspace to Hugging Face Hub: {e}", exc_info=True)
-
+        print(f"✅ Backup complete: Results synced to Hugging Face ({repo_id})")
         
+    except Exception as e:
+        # Clear, non-halting warning
+        print(f"\n⚠️ WARNING: HF Sync Failed (Upload Error) - {str(e)}")
+        print("Continuing pipeline execution. Results are still saved locally...\n")
+        logger.warning(f"Failed to sync workspace to Hugging Face Hub: {str(e)}")
+
 def periodic_sync_check(loop_counter: int, config: dict):
     """
     Checks if a sync is needed based on the counter and sync interval.
