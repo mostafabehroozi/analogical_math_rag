@@ -171,6 +171,26 @@ class GeminiAPIManager:
         """Returns the current UTC date as a formatted string."""
         return datetime.utcnow().strftime('%Y-%m-%d')
     
+    def _get_quota_for_key(self, model_name: str, api_key: str) -> Dict[str, Any]:
+        """Resolves the quota configuration for a specific model and API key."""
+        model_entry = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
+
+        if isinstance(model_entry, dict):
+            return model_entry
+
+        if isinstance(model_entry, list):
+            default_quota = {}
+            for quota in model_entry:
+                target_key = quota.get("api_key")
+                if target_key == api_key:
+                    return quota
+                if target_key is None:
+                    default_quota = quota
+                elif isinstance(target_key, (list, tuple, set)) and api_key in target_key:
+                    return quota
+            return default_quota
+
+        return {}
 
     def _select_key_and_apply_delay(self, model_name: str) -> Optional[str]:
         """
@@ -190,19 +210,15 @@ class GeminiAPIManager:
 
         self._lock = True
         try:
-            current_time_before_sleep = time.time()
-            time_since_last_global_call = current_time_before_sleep - self.last_global_call_timestamp
+            now = time.time()
+            time_since_last_global_call = now - self.last_global_call_timestamp
             global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global_call)
 
-            num_keys = len(self.api_keys_list)
-            start_index = self.current_key_index
-            model_specific_quotas = self.model_quotas.get(model_name, {})
-            required_per_key_delay = model_specific_quotas.get("delay_seconds", 1)
-            max_rpd = model_specific_quotas.get("rpd", float('inf'))
-
-            for i in range(num_keys):
-                key_idx = (start_index + i) % num_keys
-                current_api_key = self.api_keys_list[key_idx]
+            candidates = []
+            for current_api_key in self.api_keys_list:
+                quota = self._get_quota_for_key(model_name, current_api_key)
+                required_per_key_delay = quota.get("delay_seconds", 1)
+                max_rpd = quota.get("rpd", float('inf'))
 
                 current_date_str = self._get_current_date_str()
                 daily_usage_key = (current_api_key, model_name, current_date_str)
@@ -212,32 +228,38 @@ class GeminiAPIManager:
 
                 last_call_timestamp_key = (current_api_key, model_name)
                 last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
-                time_since_last_call = current_time_before_sleep - last_call_time
+                time_since_last_call = now - last_call_time
                 per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
-
                 final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
 
-                if final_sleep_duration > 0:
-                    self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s.")
-                    print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
-                    time.sleep(final_sleep_duration)
+                candidates.append((
+                    current_api_key,
+                    final_sleep_duration,
+                    current_daily_calls,
+                    last_call_time,
+                ))
 
+            if not candidates:
+                self.logger.warning(f"All {len(self.api_keys_list)} API keys are rate-limited for model '{model_name}'.")
+                return None
 
-                current_call_start_time = time.time()
-                
-                if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-                    elapsed = current_call_start_time - self._last_checkpoint_timestamp
-                    print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-                self._last_checkpoint_timestamp = current_call_start_time
-                
-                self.last_global_call_timestamp = current_call_start_time
-                self.key_usage_timestamps[(current_api_key, model_name)] = current_call_start_time
-                
-                self.current_key_index = (key_idx + 1) % num_keys
-                return current_api_key
+            candidates.sort(key=lambda item: (item[1], item[2], item[3]))
+            selected_key, sleep_duration, _, _ = candidates[0]
 
-            self.logger.warning(f"All {num_keys} API keys are rate-limited for model '{model_name}'.")
-            return None
+            if sleep_duration > 0:
+                self.logger.info(f"Rate limit requires sleeping for {sleep_duration:.2f}s.")
+                print(f"Sleeping for {sleep_duration:.2f} seconds due to rate limiting.")
+                time.sleep(sleep_duration)
+
+            current_call_start_time = time.time()
+            if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
+                elapsed = current_call_start_time - self._last_checkpoint_timestamp
+                print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
+            self._last_checkpoint_timestamp = current_call_start_time
+            self.last_global_call_timestamp = current_call_start_time
+            self.key_usage_timestamps[(selected_key, model_name)] = current_call_start_time
+            self.current_key_index = (self.api_keys_list.index(selected_key) + 1) % len(self.api_keys_list)
+            return selected_key
         finally:
             self._lock = False
 
@@ -398,6 +420,26 @@ class AvalAIAPIManager:
     def _get_current_date_str(self) -> str:
         return datetime.utcnow().strftime('%Y-%m-%d')
 
+    def _get_quota_for_key(self, model_name: str, api_key: str) -> Dict[str, Any]:
+        model_entry = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
+
+        if isinstance(model_entry, dict):
+            return model_entry
+
+        if isinstance(model_entry, list):
+            default_quota = {}
+            for quota in model_entry:
+                target_key = quota.get("api_key")
+                if target_key == api_key:
+                    return quota
+                if target_key is None:
+                    default_quota = quota
+                elif isinstance(target_key, (list, tuple, set)) and api_key in target_key:
+                    return quota
+            return default_quota
+
+        return {}
+
     def _select_key_and_apply_delay(self, model_name: str) -> Optional[str]:
         """
         Selects an available API key, applies per-key and global rate-limit delays,
@@ -413,19 +455,15 @@ class AvalAIAPIManager:
 
         self._lock = True
         try:
-            current_time_before_sleep = time.time()
-            time_since_last_global = current_time_before_sleep - self.last_global_call_timestamp
+            now = time.time()
+            time_since_last_global = now - self.last_global_call_timestamp
             global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
 
-            num_keys = len(self.api_keys_list)
-            start_index = self.current_key_index
-            model_specific_quotas = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
-            required_per_key_delay = model_specific_quotas.get("delay_seconds", 1)
-            max_rpd = model_specific_quotas.get("rpd", float('inf'))
-
-            for i in range(num_keys):
-                key_idx = (start_index + i) % num_keys
-                current_api_key = self.api_keys_list[key_idx]
+            candidates = []
+            for current_api_key in self.api_keys_list:
+                quota = self._get_quota_for_key(model_name, current_api_key)
+                required_per_key_delay = quota.get("delay_seconds", 1)
+                max_rpd = quota.get("rpd", float('inf'))
 
                 current_date_str = self._get_current_date_str()
                 daily_usage_key = (current_api_key, model_name, current_date_str)
@@ -435,31 +473,38 @@ class AvalAIAPIManager:
 
                 last_call_timestamp_key = (current_api_key, model_name)
                 last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
-                time_since_last_call = current_time_before_sleep - last_call_time
+                time_since_last_call = now - last_call_time
                 per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
-
                 final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
 
-                if final_sleep_duration > 0:
-                    self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s.")
-                    print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
-                    time.sleep(final_sleep_duration)
+                candidates.append((
+                    current_api_key,
+                    final_sleep_duration,
+                    current_daily_calls,
+                    last_call_time,
+                ))
 
-                current_call_start_time = time.time()
+            if not candidates:
+                self.logger.warning(f"All {len(self.api_keys_list)} API keys are rate-limited for model '{model_name}'.")
+                return None
 
-                if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-                    elapsed = current_call_start_time - self._last_checkpoint_timestamp
-                    print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-                self._last_checkpoint_timestamp = current_call_start_time
+            candidates.sort(key=lambda item: (item[1], item[2], item[3]))
+            selected_key, sleep_duration, _, _ = candidates[0]
 
-                self.last_global_call_timestamp = current_call_start_time
-                self.key_usage_timestamps[(current_api_key, model_name)] = current_call_start_time
+            if sleep_duration > 0:
+                self.logger.info(f"Rate limit requires sleeping for {sleep_duration:.2f}s.")
+                print(f"Sleeping for {sleep_duration:.2f} seconds due to rate limiting.")
+                time.sleep(sleep_duration)
 
-                self.current_key_index = (key_idx + 1) % num_keys
-                return current_api_key
-
-            self.logger.warning(f"All {num_keys} API keys are rate-limited for model '{model_name}'.")
-            return None
+            current_call_start_time = time.time()
+            if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
+                elapsed = current_call_start_time - self._last_checkpoint_timestamp
+                print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
+            self._last_checkpoint_timestamp = current_call_start_time
+            self.last_global_call_timestamp = current_call_start_time
+            self.key_usage_timestamps[(selected_key, model_name)] = current_call_start_time
+            self.current_key_index = (self.api_keys_list.index(selected_key) + 1) % len(self.api_keys_list)
+            return selected_key
         finally:
             self._lock = False
 

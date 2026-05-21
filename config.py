@@ -41,8 +41,10 @@ CONFIG = {
     # Gemini API Settings
     "GEMINI_API_KEYS": [
     ],
+    # Per-model rate-limit settings. Each entry may be a dict for all keys,
+    # or a list of quota dicts with optional api_key values for key-specific settings.
     "GEMINI_MODEL_QUOTAS": {
-        "models/gemma-3-27b-it": {"delay_seconds": 2, "rpd": 1000},
+        "models/gemma-3-27b-it": [{"api_key": None, "delay_seconds": 2, "rpd": 1000}],
     },
     "GLOBAL_API_CALL_DELAY_SECONDS": 5,
 
@@ -56,6 +58,8 @@ CONFIG = {
     "AVALAI_API_KEY": "YOUR_AVALAI_API_KEY_HERE",
     # "AVALAI_BASE_URL": "https://api.avalai.ir/v1",
     "AVALAI_BASE_URL": "https://api.avalapis.ir/v1",
+    # Per-model rate-limit settings. Use a dict for all keys, or a list of quota dicts
+    # with optional api_key for per-key customization.
     "AVALAI_MODEL_QUOTAS": {
         "default": {"delay_seconds": 2}
     },
