@@ -21,7 +21,7 @@ import sys
 import time
 import logging
 from datetime import datetime
-from typing import List, Tuple, Dict, Optional, Any, TypedDict
+from typing import List, Tuple, Dict, Optional, Any, TypedDict, Union
 
 import openai
 import ollama  # NEW: Import for local LLM support
@@ -338,83 +338,138 @@ class GeminiAPIManager:
 
 class AvalAIAPIManager:
     """
-    Manages API calls to an OpenAI-compatible endpoint like AvalAI with enhanced error handling.
+    Manages API calls to an OpenAI-compatible endpoint like AvalAI with support
+    for multiple API keys, key rotation, per-key rate limiting, and enhanced error handling.
     """
-    def __init__(self, api_key: str, base_url: str, model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, api_key_or_list: Union[str, List[str]], base_url: str, model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
         """
         Initializes the OpenAI-compatible API manager.
 
         Args:
-            api_key (str): The API key for the service.
+            api_key_or_list (str | List[str]): The API key or list of API keys for the service.
             base_url (str): The base URL of the API endpoint.
-            model_quotas (Dict): Configuration for rate limiting (e.g., delay).
+            model_quotas (Dict): Configuration for rate limiting (e.g., delay_seconds, rpd).
             global_delay_seconds (int): A minimum delay between any two API calls.
             config (Optional[Dict]): The main configuration dictionary to read control flags.
         """
         self.logger = logging.getLogger(__name__)
 
-        if not api_key or not base_url:
-            self.logger.critical("AvalAIAPIManager initialized with missing API key or base URL.")
-            raise ValueError("API key and base URL cannot be empty for AvalAIAPIManager.")
-        
-        self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        if not api_key_or_list or not base_url:
+            self.logger.critical("AvalAIAPIManager initialized with missing API key(s) or base URL.")
+            raise ValueError("API key(s) and base URL cannot be empty for AvalAIAPIManager.")
+
+        # Normalize to a list of keys
+        if isinstance(api_key_or_list, str):
+            self.api_keys_list: List[str] = [api_key_or_list]
+        else:
+            self.api_keys_list: List[str] = list(api_key_or_list)
+
+        # Create a client per key so we can rotate easily
+        self.clients: Dict[str, openai.OpenAI] = {}
+        for k in self.api_keys_list:
+            self.clients[k] = openai.OpenAI(api_key=k, base_url=base_url)
+
         self.model_quotas = model_quotas
         self.config = config if config else {}
-        
+
         self.global_delay_seconds = global_delay_seconds
         self.last_global_call_timestamp: float = 0
+
+        # Per-key tracking
+        self.key_usage_timestamps: Dict[Tuple[str, str], float] = {}
+        self.key_daily_counts: Dict[Tuple[str, str, str], int] = {}
+        self.current_key_index: int = 0
+        self._lock = False
+
+        # Per-model last call timestamps for fallback book-keeping
         self.last_model_call_timestamps: Dict[str, float] = {}
-        
+
         # --- Read control flags from config ---
-        self.print_details = config.get("PRINT_API_CALL_DETAILS", False) if config else False
-        self.truncation_length = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50) if config else 50
+        self.print_details = self.config.get("PRINT_API_CALL_DETAILS", False) if config else False
+        self.truncation_length = self.config.get("API_RESPONSE_TRUNCATION_LENGTH", 50) if config else 50
 
         # --- Timing Checkpoint Feature ---
-        self._print_timing_checkpoints = config.get("PRINT_API_TIMING_CHECKPOINTS", False) if config else False
+        self._print_timing_checkpoints = self.config.get("PRINT_API_TIMING_CHECKPOINTS", False) if config else False
         self._last_checkpoint_timestamp: Optional[float] = None
         # --- End of Timing Checkpoint Feature ---
-        
-        self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url}")
 
-    def _apply_rate_limit_and_record(self, model_name: str) -> None:
+        self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url} with {len(self.api_keys_list)} key(s)")
+
+    def _get_current_date_str(self) -> str:
+        return datetime.utcnow().strftime('%Y-%m-%d')
+
+    def _select_key_and_apply_delay(self, model_name: str) -> Optional[str]:
         """
-        Applies rate limiting delays and then immediately records the timestamps
-        for the upcoming API call.
+        Selects an available API key, applies per-key and global rate-limit delays,
+        records timestamps, and returns the selected key. Returns None if all
+        keys are rate-limited.
         """
-        current_time_before_sleep = time.time()
+        if not self.api_keys_list:
+            return None
 
-        time_since_last_global = current_time_before_sleep - self.last_global_call_timestamp
-        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
+        if self._lock:
+            self.logger.warning("Key selection is locked; waiting.")
+            return None
 
-        model_specific_quotas = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
-        model_delay_seconds = model_specific_quotas.get("delay_seconds", 1)
-        
-        last_call_for_model = self.last_model_call_timestamps.get(model_name, 0)
-        time_since_last_model_call = current_time_before_sleep - last_call_for_model
-        model_sleep_needed = max(0, model_delay_seconds - time_since_last_model_call)
-        
-        final_sleep_duration = max(global_sleep_needed, model_sleep_needed)
-        
-        if final_sleep_duration > 0:
-            self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s (Global: {global_sleep_needed:.2f}s, Model: {model_sleep_needed:.2f}s).")
-            print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
-            time.sleep(final_sleep_duration)
+        self._lock = True
+        try:
+            current_time_before_sleep = time.time()
+            time_since_last_global = current_time_before_sleep - self.last_global_call_timestamp
+            global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
 
-        current_call_start_time = time.time()
-        
-        if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-            elapsed = current_call_start_time - self._last_checkpoint_timestamp
-            print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-        
-        self._last_checkpoint_timestamp = current_call_start_time
+            num_keys = len(self.api_keys_list)
+            start_index = self.current_key_index
+            model_specific_quotas = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
+            required_per_key_delay = model_specific_quotas.get("delay_seconds", 1)
+            max_rpd = model_specific_quotas.get("rpd", float('inf'))
 
-        self.last_global_call_timestamp = current_call_start_time
-        self.last_model_call_timestamps[model_name] = current_call_start_time
+            for i in range(num_keys):
+                key_idx = (start_index + i) % num_keys
+                current_api_key = self.api_keys_list[key_idx]
+
+                current_date_str = self._get_current_date_str()
+                daily_usage_key = (current_api_key, model_name, current_date_str)
+                current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
+                if current_daily_calls >= max_rpd:
+                    continue
+
+                last_call_timestamp_key = (current_api_key, model_name)
+                last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
+                time_since_last_call = current_time_before_sleep - last_call_time
+                per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
+
+                final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
+
+                if final_sleep_duration > 0:
+                    self.logger.info(f"Rate limit requires sleeping for {final_sleep_duration:.2f}s.")
+                    print(f"Sleeping for {final_sleep_duration:.2f} seconds due to rate limiting.")
+                    time.sleep(final_sleep_duration)
+
+                current_call_start_time = time.time()
+
+                if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
+                    elapsed = current_call_start_time - self._last_checkpoint_timestamp
+                    print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
+                self._last_checkpoint_timestamp = current_call_start_time
+
+                self.last_global_call_timestamp = current_call_start_time
+                self.key_usage_timestamps[(current_api_key, model_name)] = current_call_start_time
+
+                self.current_key_index = (key_idx + 1) % num_keys
+                return current_api_key
+
+            self.logger.warning(f"All {num_keys} API keys are rate-limited for model '{model_name}'.")
+            return None
+        finally:
+            self._lock = False
+
+    def _increment_daily_usage(self, api_key: str, model_name: str) -> None:
+        current_date_str = self._get_current_date_str()
+        daily_usage_key = (api_key, model_name, current_date_str)
+        self.key_daily_counts[daily_usage_key] = self.key_daily_counts.get(daily_usage_key, 0) + 1
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
-        """Generates content using an OpenAI-compatible API, handling rate limiting and specific errors."""
-        self._apply_rate_limit_and_record(model_name)
-
+        """Generates content using an OpenAI-compatible API, handling key selection, rate limiting and specific errors."""
         if self.print_details:
             print("\n" + "--- [API Call Start: AvalAI] ---")
             print(f"Model: {model_name}, Temperature: {temperature}")
@@ -422,16 +477,28 @@ class AvalAIAPIManager:
             print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
+        selected_key = self._select_key_and_apply_delay(model_name)
+
+        if selected_key is None:
+            error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
+            if self.print_details:
+                print(f"\n!!! [API Call FAILED: AvalAI] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+            return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
+
+        client = self.clients[selected_key]
+
         def _inner_call() -> APIResponse:
             caught_exception = None
             try:
-                self.logger.info(f"Calling OpenAI-compatible model '{model_name}'.")
+                self.logger.info(f"Calling OpenAI-compatible model '{model_name}' with key ending in ...{selected_key[-4:]}")
                 
-                completion = self.client.chat.completions.create(
+                completion = client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temperature
                 )
+
+                self._increment_daily_usage(selected_key, model_name)
 
                 if not completion.choices:
                     error_msg = "Response was empty or blocked (no choices returned)."
@@ -470,6 +537,12 @@ class AvalAIAPIManager:
                 print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
                 print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
             
+            # Record this failed attempt's usage count as well to avoid repeated attempts on the same key
+            try:
+                self._increment_daily_usage(selected_key, model_name)
+            except Exception:
+                pass
+
             return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
 
         return execute_with_retry(self.config, _inner_call)
