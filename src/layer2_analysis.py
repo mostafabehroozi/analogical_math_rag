@@ -152,12 +152,18 @@ class PTUMathEngine:
         self.target_query_text = layer1_state.get('target_query_text')
         self.ground_truth_answer = layer1_state.get('ground_truth_answer')
         
-        # Extract key data structures
-        self.retrieved_set = layer1_state.get('retrieved_set', [])
-        self.candidate_set = layer1_state.get('candidate_set', [])
+        # Extract raw Layer 1 data structures
+        self.raw_retrieved_set = layer1_state.get('retrieved_set', [])
+        self.raw_candidate_set = layer1_state.get('candidate_set', {})
         self.intrinsic_baselines = layer1_state.get('intrinsic_baselines', {})
         self.cross_eval_matrix = layer1_state.get('cross_evaluation_matrix', {})
         self.ground_truth_labels = layer1_state.get('ground_truth_labels', {})
+        
+        # Normalize Layer 1 IDs to contiguous matrix indices
+        self.evaluator_ids, self.retrieved_set = self._normalize_retrieved_set(self.raw_retrieved_set)
+        self.candidate_ids, self.candidate_set = self._normalize_candidate_set(self.raw_candidate_set)
+        self.candidate_id_to_idx = {cid: idx for idx, cid in enumerate(self.candidate_ids)}
+        self.evaluator_id_to_idx = {eid: idx for idx, eid in enumerate(self.evaluator_ids)}
         
         # Derived data
         self.n_candidates = len(self.candidate_set)
@@ -176,6 +182,91 @@ class PTUMathEngine:
             f"{self.n_evaluators} evaluators"
         )
     
+    def _normalize_candidate_set(self, candidate_set: Any) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """Normalize candidate data into an ordered list and ID mapping."""
+        if isinstance(candidate_set, dict):
+            items = list(candidate_set.items())
+            try:
+                items.sort(key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else kv[0])
+            except Exception:
+                pass
+            ids = [str(k) for k, _ in items]
+            candidates = [v for _, v in items]
+            return ids, candidates
+        elif isinstance(candidate_set, list):
+            ids = [str(i) for i in range(len(candidate_set))]
+            return ids, candidate_set
+        else:
+            return [], []
+    
+    def _normalize_retrieved_set(self, retrieved_set: Any) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """Normalize retrieved evaluator data into an ordered list and ID mapping."""
+        if isinstance(retrieved_set, dict):
+            items = list(retrieved_set.items())
+            try:
+                items.sort(key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else kv[0])
+            except Exception:
+                pass
+            ids = [str(k) for k, _ in items]
+            evaluators = [v for _, v in items]
+            return ids, evaluators
+        elif isinstance(retrieved_set, list):
+            ids = []
+            evaluators = []
+            for idx, item in enumerate(retrieved_set):
+                evaluator_id = None
+                if isinstance(item, dict):
+                    evaluator_id = item.get('corpus_index')
+                ids.append(str(evaluator_id) if evaluator_id is not None else str(idx))
+                evaluators.append(item)
+            return ids, evaluators
+        else:
+            return [], []
+    
+    def _normalize_id(self, raw_id: Any) -> Any:
+        """Normalize an ID to its string or integer representation."""
+        if isinstance(raw_id, str):
+            return raw_id
+        if isinstance(raw_id, (int, np.integer)):
+            return str(raw_id)
+        return str(raw_id)
+    
+    def _lookup_value_by_key_variants(self, data: dict, key: Any, default: Any = None) -> Any:
+        """Lookup a value by int/key/string variants to support Layer 1 state shapes."""
+        if data is None:
+            return default
+        if key in data:
+            return data[key]
+        key_str = self._normalize_id(key)
+        if key_str in data:
+            return data[key_str]
+        try:
+            key_int = int(key)
+            if key_int in data:
+                return data[key_int]
+        except Exception:
+            pass
+        return default
+    
+    def _fetch_cross_eval_score(self, candidate_id: Any, evaluator_id: Any) -> float:
+        """Fetch a cross-evaluation score from Layer 1 state in a robust way."""
+        row = self._lookup_value_by_key_variants(self.cross_eval_matrix, candidate_id, {})
+        if isinstance(row, dict):
+            score = self._lookup_value_by_key_variants(row, evaluator_id, 0.0)
+            return float(score) if score is not None else 0.0
+        # Support tuple-keyed cross evaluation matrices
+        tuple_key = (candidate_id, evaluator_id)
+        score = self._lookup_value_by_key_variants(self.cross_eval_matrix, tuple_key, None)
+        if score is not None:
+            return float(score)
+        score = self._lookup_value_by_key_variants(self.cross_eval_matrix, str(tuple_key), 0.0)
+        return float(score) if score is not None else 0.0
+    
+    def _fetch_intrinsic_baseline(self, evaluator_id: Any) -> float:
+        """Fetch intrinsic baseline score from Layer 1 state."""
+        score = self._lookup_value_by_key_variants(self.intrinsic_baselines, evaluator_id, 0.0)
+        return float(score) if score is not None else 0.0
+    
     def _compute_ptu_matrix(self) -> np.ndarray:
         """
         Compute the base PTU matrix without masking.
@@ -186,16 +277,11 @@ class PTUMathEngine:
         ptu = np.zeros((self.n_candidates, self.n_evaluators), dtype=np.float32)
         
         for cand_idx, candidate in enumerate(self.candidate_set):
+            cand_id = self.candidate_ids[cand_idx]
             for eval_idx, evaluator in enumerate(self.retrieved_set):
-                # Get induced CCS (success rate with this candidate on this evaluator)
-                key = (cand_idx, eval_idx)
-                induced_ccs = self.cross_eval_matrix.get(str(key), 0.0)
-                
-                # Get intrinsic CCS (zero-shot baseline for this evaluator)
-                eval_key = str(eval_idx)
-                intrinsic_ccs = self.intrinsic_baselines.get(eval_key, 0.0)
-                
-                # PTU = max(0, induced - intrinsic)
+                eval_id = self.evaluator_ids[eval_idx]
+                induced_ccs = self._fetch_cross_eval_score(cand_id, eval_id)
+                intrinsic_ccs = self._fetch_intrinsic_baseline(eval_id)
                 ptu[cand_idx, eval_idx] = max(0.0, induced_ccs - intrinsic_ccs)
         
         return ptu
@@ -266,16 +352,22 @@ class PTUMathEngine:
         holistic = np.zeros(self.n_candidates, dtype=np.float32)
         
         for cand_idx, candidate in enumerate(self.candidate_set):
-            src_eval_idx = candidate.get('parent_evaluator_idx', cand_idx)
-            
-            make_score = score_make[src_eval_idx] if src_eval_idx < len(score_make) else 0.0
-            
+            src_eval_idx = self._resolve_source_evaluator_index(candidate, cand_idx)
+            make_score = score_make[src_eval_idx] if 0 <= src_eval_idx < len(score_make) else 0.0
             holistic[cand_idx] = (
                 score_take[cand_idx] * weight_taker +
                 make_score * weight_maker
             )
         
         return holistic
+    
+    def _resolve_source_evaluator_index(self, candidate: Dict[str, Any], default_idx: int) -> int:
+        """Resolve the matrix evaluator index for a candidate's source exemplar."""
+        source_id = candidate.get('source_exemplar_idx') if isinstance(candidate, dict) else None
+        if source_id is None:
+            return default_idx
+        source_key = self._normalize_id(source_id)
+        return self.evaluator_id_to_idx.get(source_key, default_idx)
     
     def get_scores_for_strategy(
         self,
@@ -288,17 +380,33 @@ class PTUMathEngine:
         if strategy == 'ScoreTake':
             return self.compute_score_take(ptu_matrix)
         elif strategy == 'ScoreMake':
-            # Return score make for each candidate's source evaluator
             score_make = self.compute_score_make(ptu_matrix)
             result = np.zeros(self.n_candidates, dtype=np.float32)
             for cand_idx, candidate in enumerate(self.candidate_set):
-                src_eval_idx = candidate.get('parent_evaluator_idx', cand_idx)
-                result[cand_idx] = score_make[src_eval_idx] if src_eval_idx < len(score_make) else 0.0
+                src_eval_idx = self._resolve_source_evaluator_index(candidate, cand_idx)
+                result[cand_idx] = score_make[src_eval_idx] if 0 <= src_eval_idx < len(score_make) else 0.0
             return result
         elif strategy == 'Holistic':
             return self.compute_holistic_score(ptu_matrix, weight_taker, weight_maker)
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
+
+
+def _normalize_ground_truth_label(label_obj: Any) -> bool:
+    """Normalize a ground truth label value into a boolean is_correct flag."""
+    if isinstance(label_obj, dict):
+        return bool(label_obj.get('is_correct', False))
+    return bool(label_obj)
+
+
+def _get_ground_truth_label(ground_truth_labels: Dict[Any, Any], cand_idx: int) -> bool:
+    """Fetch and normalize a candidate's ground truth correctness label."""
+    if cand_idx in ground_truth_labels:
+        return _normalize_ground_truth_label(ground_truth_labels[cand_idx])
+    cand_key = str(cand_idx)
+    if cand_key in ground_truth_labels:
+        return _normalize_ground_truth_label(ground_truth_labels[cand_key])
+    return False
 
 
 # ============================================================================
@@ -335,7 +443,7 @@ class ListBasedEvaluator:
         num_true = 0
         
         for rank, cand_idx in enumerate(ordered_candidate_indices):
-            label = ground_truth_labels.get(str(cand_idx), False)
+            label = _get_ground_truth_label(ground_truth_labels, cand_idx)
             if label:
                 num_true += 1
                 precision_at_rank = num_true / (rank + 1)
@@ -381,7 +489,7 @@ class GroupBasedEvaluator:
         # Count true candidates in the group
         num_true = sum(
             1 for idx in candidate_indices
-            if ground_truth_labels.get(str(idx), False)
+            if _get_ground_truth_label(ground_truth_labels, idx)
         )
         
         group_size = len(candidate_indices)
@@ -586,11 +694,11 @@ class BlockB:
             # Calculate encapsulation accuracy (True labels inside, False outside)
             true_inside = sum(
                 1 for idx in cutoff_list
-                if self.ptu_engine.ground_truth_labels.get(str(idx), False)
+                if _get_ground_truth_label(self.ptu_engine.ground_truth_labels, idx)
             )
             false_outside = sum(
                 1 for idx in ranked_list_for_boundary[k_dynamic:]
-                if not self.ptu_engine.ground_truth_labels.get(str(idx), False)
+                if not _get_ground_truth_label(self.ptu_engine.ground_truth_labels, idx)
             )
             total_outside = len(ranked_list_for_boundary) - k_dynamic
             
@@ -840,8 +948,9 @@ class Layer2Orchestrator:
                 if self.config.run_boundary_intersection_test:
                     scores_for_ranking = ptu_engine.get_scores_for_strategy(
                         masked_ptu,
-                        self.config.block_B_weight_taker if self.config.block_B_weight_taker > 0 else 1.0,
-                        self.config.block_B_weight_maker if self.config.block_B_weight_maker > 0 else 1.0
+                        'Holistic',
+                        self.config.block_B_weight_taker,
+                        self.config.block_B_weight_maker
                     )
                     ranked_list = np.argsort(-scores_for_ranking).tolist()
                 else:
