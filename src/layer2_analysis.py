@@ -184,44 +184,73 @@ class PTUMathEngine:
     
     def _normalize_candidate_set(self, candidate_set: Any) -> Tuple[List[str], List[Dict[str, Any]]]:
         """Normalize candidate data into an ordered list and ID mapping."""
+        ids = []
+        candidates = []
+
         if isinstance(candidate_set, dict):
             items = list(candidate_set.items())
             try:
                 items.sort(key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else kv[0])
             except Exception:
                 pass
-            ids = [str(k) for k, _ in items]
-            candidates = [v for _, v in items]
+
+            for key, value in items:
+                candidate_id = None
+                if isinstance(value, dict):
+                    candidate_id = value.get('candidate_id')
+                    if candidate_id is None:
+                        candidate_id = value.get('source_exemplar_idx')
+                if candidate_id is None:
+                    candidate_id = key
+                ids.append(str(candidate_id))
+                candidates.append(value)
+
             return ids, candidates
+
         elif isinstance(candidate_set, list):
-            ids = [str(i) for i in range(len(candidate_set))]
-            return ids, candidate_set
-        else:
-            return [], []
+            for idx, value in enumerate(candidate_set):
+                candidate_id = None
+                if isinstance(value, dict):
+                    candidate_id = value.get('candidate_id') or value.get('source_exemplar_idx')
+                ids.append(str(candidate_id) if candidate_id is not None else str(idx))
+                candidates.append(value)
+            return ids, candidates
+
+        return [], []
     
     def _normalize_retrieved_set(self, retrieved_set: Any) -> Tuple[List[str], List[Dict[str, Any]]]:
         """Normalize retrieved evaluator data into an ordered list and ID mapping."""
+        ids = []
+        evaluators = []
+
         if isinstance(retrieved_set, dict):
             items = list(retrieved_set.items())
             try:
                 items.sort(key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else kv[0])
             except Exception:
                 pass
-            ids = [str(k) for k, _ in items]
-            evaluators = [v for _, v in items]
+
+            for key, value in items:
+                evaluator_id = None
+                if isinstance(value, dict):
+                    evaluator_id = value.get('corpus_index') or value.get('retrieval_index') or value.get('retrieved_idx')
+                if evaluator_id is None:
+                    evaluator_id = key
+                ids.append(str(evaluator_id))
+                evaluators.append(value)
+
             return ids, evaluators
+
         elif isinstance(retrieved_set, list):
-            ids = []
-            evaluators = []
             for idx, item in enumerate(retrieved_set):
                 evaluator_id = None
                 if isinstance(item, dict):
-                    evaluator_id = item.get('corpus_index')
+                    evaluator_id = item.get('corpus_index') or item.get('retrieval_index') or item.get('retrieved_idx')
                 ids.append(str(evaluator_id) if evaluator_id is not None else str(idx))
                 evaluators.append(item)
             return ids, evaluators
-        else:
-            return [], []
+
+        return [], []
     
     def _normalize_id(self, raw_id: Any) -> Any:
         """Normalize an ID to its string or integer representation."""
@@ -393,7 +422,18 @@ class PTUMathEngine:
 
     def candidate_indices_to_ids(self, candidate_indices: List[int]) -> List[str]:
         """Convert a list of internal candidate indices into dataset IDs."""
-        return [self.candidate_ids[idx] for idx in candidate_indices if 0 <= idx < len(self.candidate_ids)]
+        output_ids = []
+        for idx in candidate_indices:
+            if 0 <= idx < len(self.candidate_set):
+                candidate = self.candidate_set[idx]
+                explicit_id = None
+                if isinstance(candidate, dict):
+                    explicit_id = candidate.get('candidate_id') or candidate.get('source_exemplar_idx')
+                if explicit_id is not None:
+                    output_ids.append(str(explicit_id))
+                else:
+                    output_ids.append(self.candidate_ids[idx])
+        return output_ids
 
     def evaluator_indices_to_ids(self, evaluator_indices: List[int]) -> List[str]:
         """Convert a list of internal evaluator indices into dataset IDs."""
