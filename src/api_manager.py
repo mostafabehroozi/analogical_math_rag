@@ -37,6 +37,7 @@ RETRYABLE_ERROR_TYPES = {
     "OllamaConnectionError",
     "UnknownError",
     "APIStatusError",
+    "ModelMismatch",  # Retry if the wrong model was returned (fallback scenario)
 }
 
 
@@ -552,11 +553,26 @@ class AvalAIAPIManager:
                         print(f"\n!!! [API Call BLOCKED: AvalAI] !!!\nReason: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
                     return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": error_msg, "error_details": None}
 
+                # --- NEW: Validate that the returned model matches the requested model ---
+                returned_model = getattr(completion, 'model', None)
+                if returned_model != model_name:
+                    error_msg = f"Model mismatch: Requested '{model_name}' but API returned '{returned_model}'. Stopping to ensure correct model is used."
+                    self.logger.error(error_msg)
+                    print(f"✗ API Call FAILED - Model Mismatch!")
+                    print(f"  Requested: {model_name}")
+                    print(f"  Returned:  {returned_model}")
+                    if self.print_details:
+                        print(f"\n!!! [API Call FAILED: AvalAI] !!!\nReason: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                    return {"status": "ERROR", "text": None, "error_type": "ModelMismatch", "error_message": error_msg, "error_details": {"requested": model_name, "returned": returned_model}}
+
                 response_text = completion.choices[0].message.content
                 if self.print_details:
                     print("--- [API Call SUCCESS: AvalAI] ---")
                     print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
                     print("----------------------------------\n")
+
+                # --- NEW: Always print model information for transparency ---
+                print(f"✓ API Call Completed - Model: {model_name} (Confirmed: {returned_model})")
 
                 return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
 
