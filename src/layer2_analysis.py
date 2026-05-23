@@ -662,8 +662,8 @@ class BlockB:
             # For evaluator-based, find candidates whose source evaluators score > threshold
             positive_indices = []
             for cand_idx, candidate in enumerate(self.ptu_engine.candidate_set):
-                src_eval_idx = candidate.get('parent_evaluator_idx', cand_idx)
-                if src_eval_idx < len(scores) and scores[src_eval_idx] > threshold:
+                src_eval_idx = self.ptu_engine._resolve_source_evaluator_index(candidate, cand_idx)
+                if 0 <= src_eval_idx < len(scores) and scores[src_eval_idx] > threshold:
                     positive_indices.append(cand_idx)
         
         k_dynamic = len(positive_indices)
