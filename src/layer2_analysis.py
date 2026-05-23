@@ -59,7 +59,7 @@ class ExperimentResult:
     # Application Details
     application: str  # 'Block_A_Reranking', 'Block_A_TopK', 'Block_B_Dynamic', etc.
     subset_size: int = 0
-    selected_candidates: List[int] = None  # Indices of selected candidates
+    selected_candidates: List[str] = None  # Dataset IDs of selected candidates
     selected_evaluators: List[int] = None  # Indices of selected evaluators
     
     # Evaluation Metrics
@@ -391,6 +391,14 @@ class PTUMathEngine:
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
+    def candidate_indices_to_ids(self, candidate_indices: List[int]) -> List[str]:
+        """Convert a list of internal candidate indices into dataset IDs."""
+        return [self.candidate_ids[idx] for idx in candidate_indices if 0 <= idx < len(self.candidate_ids)]
+
+    def evaluator_indices_to_ids(self, evaluator_indices: List[int]) -> List[str]:
+        """Convert a list of internal evaluator indices into dataset IDs."""
+        return [self.evaluator_ids[idx] for idx in evaluator_indices if 0 <= idx < len(self.evaluator_ids)]
+
 
 def _normalize_ground_truth_label(label_obj: Any) -> bool:
     """Normalize a ground truth label value into a boolean is_correct flag."""
@@ -545,6 +553,7 @@ class BlockA:
             ranked_indices.tolist(),
             self.ptu_engine.ground_truth_labels
         )
+        ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
         
         result_a1 = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
@@ -556,7 +565,7 @@ class BlockA:
             weight_maker=weight_maker,
             application=f"Block_A_Reranking_{strategy}",
             subset_size=len(ranked_indices),
-            selected_candidates=ranked_indices.tolist(),
+            selected_candidates=ranked_candidate_ids,
             list_ap_score=ap_score,
             group_pass_at_n=None
         )
@@ -573,6 +582,7 @@ class BlockA:
                 continue
             
             top_k_indices = ranked_indices[:k].tolist()
+            top_k_candidate_ids = self.ptu_engine.candidate_indices_to_ids(top_k_indices)
             pass_at_n = GroupBasedEvaluator.calculate_pass_at_n(
                 top_k_indices,
                 self.ptu_engine.ground_truth_labels,
@@ -589,7 +599,7 @@ class BlockA:
                 weight_maker=weight_maker,
                 application=f"Block_A_TopK_{k}_{strategy}",
                 subset_size=k,
-                selected_candidates=top_k_indices,
+                selected_candidates=top_k_candidate_ids,
                 list_ap_score=None,
                 group_pass_at_n=pass_at_n
             )
@@ -665,6 +675,7 @@ class BlockB:
             self.config.global_pass_at_N
         )
         
+        selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(positive_indices)
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -675,7 +686,7 @@ class BlockB:
             weight_maker=weight_maker,
             application=f"Block_B_Dynamic_{method}",
             subset_size=k_dynamic,
-            selected_candidates=positive_indices,
+            selected_candidates=selected_candidate_ids,
             list_ap_score=None,
             group_pass_at_n=pass_at_n
         )
@@ -869,6 +880,7 @@ class BlockC:
             self.config.global_pass_at_N
         )
         
+        selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(selected_candidate_indices)
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -877,7 +889,7 @@ class BlockC:
             scoring_strategy=perspective,
             application=f"Block_C_{perspective}",
             subset_size=subset_size,
-            selected_candidates=selected_candidate_indices,
+            selected_candidates=selected_candidate_ids,
             list_ap_score=None,
             group_pass_at_n=pass_at_n
         )
