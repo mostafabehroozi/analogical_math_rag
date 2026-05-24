@@ -1147,6 +1147,15 @@ class Layer2Orchestrator:
         self.all_results = []
         os.makedirs(output_dir, exist_ok=True)
     
+    def _map_dynamic_method_to_block_a_strategy(self, dynamic_method: str) -> Optional[str]:
+        """Map Block B dynamic-K methods to the corresponding Block A ranking strategy."""
+        mapping = {
+            'K_take': 'ScoreTake',
+            'K_make': 'ScoreMake',
+            'K_both': 'Holistic'
+        }
+        return mapping.get(dynamic_method)
+    
     def run_single_query(self, layer1_state: Dict[str, Any]) -> List[ExperimentResult]:
         """
         Run all configured experiments for a single query.
@@ -1185,22 +1194,25 @@ class Layer2Orchestrator:
                 logger.info("\n[BLOCK B] Dynamic Smart-K Grouping")
                 block_b = BlockB(ptu_engine, self.config)
                 
-                # Get ranked list for boundary test from Block A (use first strategy)
-                # CRITICAL BUG FIX: Use the cached ranked_indices from Block A instead of recalculating
-                # with Block B weights. This ensures the boundary test uses Block A's actual rankings.
-                ranked_list = None
+                # Get ranked list for boundary test from Block A using the matching strategy for each method.
+                ranked_list_cache = {}
                 if self.config.run_boundary_intersection_test and block_a:
-                    # Retrieve the ranked indices from Block A's first strategy
-                    first_strategy = self.config.block_A_strategies[0] if self.config.block_A_strategies else None
-                    if first_strategy:
-                        ranked_list = block_a.get_ranked_indices_for_strategy(mask_type, first_strategy)
-                        if ranked_list is None:
-                            logger.warning(
-                                f"Could not retrieve cached ranked indices for boundary test. "
-                                f"Ensure Block A is enabled and completed first."
-                            )
+                    for method in self.config.dynamic_k_methods:
+                        matching_strategy = self._map_dynamic_method_to_block_a_strategy(method)
+                        if matching_strategy:
+                            ranked_indices = block_a.get_ranked_indices_for_strategy(mask_type, matching_strategy)
+                            if ranked_indices is None:
+                                logger.warning(
+                                    f"Could not retrieve cached ranked indices for Block A strategy '{matching_strategy}' "
+                                    f"needed by Block B boundary test for method '{method}'. "
+                                    f"Ensure Block A is enabled and includes that strategy."
+                                )
+                            ranked_list_cache[method] = ranked_indices
+                        else:
+                            ranked_list_cache[method] = None
                 
                 for method in self.config.dynamic_k_methods:
+                    ranked_list = ranked_list_cache.get(method) if self.config.run_boundary_intersection_test else None
                     results = block_b.run_for_mask_and_method(
                         masked_ptu, mask_type, method,
                         ranked_list,
