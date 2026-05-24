@@ -641,7 +641,7 @@ class ListBasedEvaluator:
     
     @staticmethod
     def calculate_average_precision(
-        ordered_candidate_indices: List[int],
+        ordered_candidate_ids: List[str],
         ground_truth_labels: Dict[str, bool]
     ) -> float:
         """
@@ -650,20 +650,20 @@ class ListBasedEvaluator:
         AP = mean of precision at each position where a True label appears.
         
         Args:
-            ordered_candidate_indices: List of candidate indices in ranked order
-            ground_truth_labels: Dict mapping candidate index to True/False
+            ordered_candidate_ids: List of candidate IDs in ranked order
+            ground_truth_labels: Dict mapping candidate ID to True/False
         
         Returns:
             AP score between 0.0 and 1.0
         """
-        if not ordered_candidate_indices:
+        if not ordered_candidate_ids:
             return 0.0
         
         precisions = []
         num_true = 0
         
-        for rank, cand_idx in enumerate(ordered_candidate_indices):
-            label = _get_ground_truth_label(ground_truth_labels, cand_idx)
+        for rank, cand_id in enumerate(ordered_candidate_ids):
+            label = _get_ground_truth_label(ground_truth_labels, cand_id)
             if label:
                 num_true += 1
                 precision_at_rank = num_true / (rank + 1)
@@ -683,7 +683,7 @@ class GroupBasedEvaluator:
     
     @staticmethod
     def calculate_pass_at_n(
-        candidate_indices: List[int],
+        candidate_ids: List[str],
         ground_truth_labels: Dict[str, bool],
         n: int = 1
     ) -> float:
@@ -696,23 +696,23 @@ class GroupBasedEvaluator:
         For larger N, it's the probability of drawing at least one True in N draws.
         
         Args:
-            candidate_indices: List of candidate indices
-            ground_truth_labels: Dict mapping candidate index to True/False
+            candidate_ids: List of candidate IDs
+            ground_truth_labels: Dict mapping candidate ID to True/False
             n: Number of sampling attempts
         
         Returns:
             Pass@N score between 0.0 and 1.0
         """
-        if not candidate_indices:
+        if not candidate_ids:
             return 0.0
         
         # Count true candidates in the group
         num_true = sum(
-            1 for idx in candidate_indices
-            if _get_ground_truth_label(ground_truth_labels, idx)
+            1 for cand_id in candidate_ids
+            if _get_ground_truth_label(ground_truth_labels, cand_id)
         )
         
-        group_size = len(candidate_indices)
+        group_size = len(candidate_ids)
         
         if num_true == 0:
             return 0.0
@@ -768,11 +768,11 @@ class BlockA:
         cache_key = (mask_type, strategy)
         self.ranked_indices_cache[cache_key] = ranked_indices.tolist()
         
+        ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
         ap_score = ListBasedEvaluator.calculate_average_precision(
-            ranked_indices.tolist(),
+            ranked_candidate_ids,
             self.ptu_engine.ground_truth_labels
         )
-        ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
         
         result_a1 = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
@@ -803,7 +803,7 @@ class BlockA:
             top_k_indices = ranked_indices[:k].tolist()
             top_k_candidate_ids = self.ptu_engine.candidate_indices_to_ids(top_k_indices)
             pass_at_n = GroupBasedEvaluator.calculate_pass_at_n(
-                top_k_indices,
+                top_k_candidate_ids,
                 self.ptu_engine.ground_truth_labels,
                 self.config.global_pass_at_N
             )
@@ -896,13 +896,12 @@ class BlockB:
         k_dynamic = len(positive_indices)
         
         # Evaluate the dynamic group
+        selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(positive_indices)
         pass_at_n = GroupBasedEvaluator.calculate_pass_at_n(
-            positive_indices,
+            selected_candidate_ids,
             self.ptu_engine.ground_truth_labels,
             self.config.global_pass_at_N
         )
-        
-        selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(positive_indices)
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -930,13 +929,15 @@ class BlockB:
             cutoff_list = ranked_list_for_boundary[:k_dynamic]
             
             # Calculate encapsulation accuracy (True labels inside, False outside)
+            cutoff_candidate_ids = self.ptu_engine.candidate_indices_to_ids(cutoff_list)
+            outside_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_list_for_boundary[k_dynamic:])
             true_inside = sum(
-                1 for idx in cutoff_list
-                if _get_ground_truth_label(self.ptu_engine.ground_truth_labels, idx)
+                1 for cand_id in cutoff_candidate_ids
+                if _get_ground_truth_label(self.ptu_engine.ground_truth_labels, cand_id)
             )
             false_outside = sum(
-                1 for idx in ranked_list_for_boundary[k_dynamic:]
-                if not _get_ground_truth_label(self.ptu_engine.ground_truth_labels, idx)
+                1 for cand_id in outside_candidate_ids
+                if not _get_ground_truth_label(self.ptu_engine.ground_truth_labels, cand_id)
             )
             total_outside = len(ranked_list_for_boundary) - k_dynamic
             
@@ -1101,13 +1102,12 @@ class BlockC:
             subset_size = len(set(selected_candidate_indices))
         
         # Evaluate
+        selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(selected_candidate_indices)
         pass_at_n = GroupBasedEvaluator.calculate_pass_at_n(
-            selected_candidate_indices,
+            selected_candidate_ids,
             self.ptu_engine.ground_truth_labels,
             self.config.global_pass_at_N
         )
-        
-        selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(selected_candidate_indices)
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
