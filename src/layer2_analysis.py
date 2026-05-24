@@ -568,6 +568,8 @@ class BlockA:
         self.ptu_engine = ptu_engine
         self.config = config
         self.results = []
+        # Store ranked indices for each (mask_type, strategy) combination for Block B boundary test
+        self.ranked_indices_cache = {}
     
     def run_for_mask_and_strategy(
         self,
@@ -589,6 +591,11 @@ class BlockA:
         
         # Experiment A.1: Reranking & Average Precision
         ranked_indices = np.argsort(-scores)  # Sort descending
+        
+        # Cache the ranked indices for Block B boundary test (Experiment B.2.3)
+        cache_key = (mask_type, strategy)
+        self.ranked_indices_cache[cache_key] = ranked_indices.tolist()
+        
         ap_score = ListBasedEvaluator.calculate_average_precision(
             ranked_indices.tolist(),
             self.ptu_engine.ground_truth_labels
@@ -652,6 +659,14 @@ class BlockA:
         
         self.results.extend(results)
         return results
+    
+    def get_ranked_indices_for_strategy(self, mask_type: str, strategy: str) -> Optional[List[int]]:
+        """
+        Retrieve the cached ranked indices for a specific mask_type and strategy.
+        Used by Block B boundary test to use Block A's ranking instead of recalculating.
+        """
+        cache_key = (mask_type, strategy)
+        return self.ranked_indices_cache.get(cache_key, None)
 
 
 # ============================================================================
@@ -990,23 +1005,28 @@ class Layer2Orchestrator:
                         self.config.block_A_weight_maker
                     )
                     query_results.extend(results)
+            else:
+                block_a = None
             
             # ===== BLOCK B =====
             if self.config.run_block_B:
                 logger.info("\n[BLOCK B] Dynamic Smart-K Grouping")
                 block_b = BlockB(ptu_engine, self.config)
                 
-                # Get ranked list for boundary test (from Block A reranking)
-                if self.config.run_boundary_intersection_test:
-                    scores_for_ranking = ptu_engine.get_scores_for_strategy(
-                        masked_ptu,
-                        'Holistic',
-                        self.config.block_B_weight_taker,
-                        self.config.block_B_weight_maker
-                    )
-                    ranked_list = np.argsort(-scores_for_ranking).tolist()
-                else:
-                    ranked_list = None
+                # Get ranked list for boundary test from Block A (use first strategy)
+                # CRITICAL BUG FIX: Use the cached ranked_indices from Block A instead of recalculating
+                # with Block B weights. This ensures the boundary test uses Block A's actual rankings.
+                ranked_list = None
+                if self.config.run_boundary_intersection_test and block_a:
+                    # Retrieve the ranked indices from Block A's first strategy
+                    first_strategy = self.config.block_A_strategies[0] if self.config.block_A_strategies else None
+                    if first_strategy:
+                        ranked_list = block_a.get_ranked_indices_for_strategy(mask_type, first_strategy)
+                        if ranked_list is None:
+                            logger.warning(
+                                f"Could not retrieve cached ranked indices for boundary test. "
+                                f"Ensure Block A is enabled and completed first."
+                            )
                 
                 for method in self.config.dynamic_k_methods:
                     results = block_b.run_for_mask_and_method(
