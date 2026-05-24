@@ -1055,8 +1055,7 @@ class BlockC:
         
         if perspective == 'Candidate_Centric':
             # Find max PTU for each evaluator (column maxima)
-            selected_candidate_indices = []
-            source_samples = set()
+            winning_source_evals = set()
             
             for eval_idx in range(self.ptu_engine.n_evaluators):
                 col = ptu_matrix[:, eval_idx]
@@ -1071,16 +1070,23 @@ class BlockC:
                         tied_candidates, ptu_matrix, eval_idx, score_take,
                         target_query_embedding_similarity
                     )
+                    already_selected_cands.add(selected_idx)
                     
-                    selected_candidate_indices.append(selected_idx)
-                    source_samples.add(selected_idx)
+                    src_eval = self.ptu_engine._resolve_source_evaluator_index(
+                        self.ptu_engine.candidate_set[selected_idx], selected_idx
+                    )
+                    winning_source_evals.add(src_eval)
             
-            subset_size = len(set(selected_candidate_indices))
+            # Collect ALL candidates associated with the winning source samples
+            selected_candidate_indices = [
+                idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
+                if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_source_evals
+            ]
+            subset_size = len(winning_source_evals)
             
         else:  # Evaluator_Centric
             # Find max PTU for each candidate (row maxima)
-            selected_evaluator_indices = []
-            selected_candidate_indices = []
+            winning_evals = set()
             
             for cand_idx in range(self.ptu_engine.n_candidates):
                 row = ptu_matrix[cand_idx, :]
@@ -1095,11 +1101,15 @@ class BlockC:
                         tied_evaluators, ptu_matrix, cand_idx, score_make,
                         target_query_embedding_similarity
                     )
-                    
-                    selected_evaluator_indices.append(selected_idx)
-                    selected_candidate_indices.append(cand_idx)
+                    already_selected_evals.add(selected_idx)
+                    winning_evals.add(selected_idx)
             
-            subset_size = len(set(selected_candidate_indices))
+            # Collect ALL candidates associated with the optimal subset of evaluators
+            selected_candidate_indices = [
+                idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
+                if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_evals
+            ]
+            subset_size = len(winning_evals)
         
         # Evaluate
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(selected_candidate_indices)
