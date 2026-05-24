@@ -146,7 +146,24 @@ class PTUMathEngine:
                 - intrinsic_baselines: Dict of baseline success rates per evaluator
                 - cross_evaluation_matrix: Raw binary success data
                 - ground_truth_labels: True/False labels for candidates
+        
+        Raises:
+            ValueError: If layer1_state is invalid or contains required empty structures
+            RuntimeError: If PTU matrix dimensions do not match expected sizes
         """
+        # === BUG FIX 3: STRICT LAYER 1 STATE VALIDATION ===
+        # Validate that layer1_state is provided and is a dictionary
+        if layer1_state is None:
+            raise ValueError(
+                "PTUMathEngine initialization failed: layer1_state is None. "
+                "Layer 1 cache must be loaded before initializing the math engine."
+            )
+        if not isinstance(layer1_state, dict):
+            raise ValueError(
+                f"PTUMathEngine initialization failed: layer1_state must be a dictionary. "
+                f"Got type: {type(layer1_state)}"
+            )
+        
         self.layer1_state = layer1_state
         self.target_query_idx = layer1_state.get('target_query_idx')
         self.target_query_text = layer1_state.get('target_query_text')
@@ -162,12 +179,43 @@ class PTUMathEngine:
         # Normalize Layer 1 IDs to contiguous matrix indices
         self.evaluator_ids, self.retrieved_set = self._normalize_retrieved_set(self.raw_retrieved_set)
         self.candidate_ids, self.candidate_set = self._normalize_candidate_set(self.raw_candidate_set)
+        
+        # === BUG FIX 3: STRICT DIMENSIONAL VALIDATION AFTER NORMALIZATION ===
+        # Validate that normalization produced non-empty structures
+        if not self.evaluator_ids or len(self.evaluator_ids) == 0:
+            raise ValueError(
+                "PTUMathEngine initialization failed: Retrieved exemplar set is empty after normalization. "
+                "Layer 1 cache must contain non-empty 'retrieved_set' with at least one evaluator."
+            )
+        
+        if not self.candidate_ids or len(self.candidate_ids) == 0:
+            raise ValueError(
+                "PTUMathEngine initialization failed: Candidate set is empty after normalization. "
+                "Layer 1 cache must contain non-empty 'candidate_set' with at least one candidate."
+            )
+        
         self.candidate_id_to_idx = {cid: idx for idx, cid in enumerate(self.candidate_ids)}
         self.evaluator_id_to_idx = {eid: idx for idx, eid in enumerate(self.evaluator_ids)}
         
         # Derived data
         self.n_candidates = len(self.candidate_set)
         self.n_evaluators = len(self.retrieved_set)
+        
+        # === BUG FIX 3: VALIDATE DIMENSIONS BEFORE PTU COMPUTATION ===
+        # Ensure consistency between normalized IDs and data structures
+        if self.n_candidates != len(self.candidate_ids):
+            raise RuntimeError(
+                f"PTUMathEngine initialization failed: Dimension mismatch. "
+                f"n_candidates={self.n_candidates} but len(candidate_ids)={len(self.candidate_ids)}. "
+                f"This indicates a critical inconsistency in candidate normalization."
+            )
+        
+        if self.n_evaluators != len(self.evaluator_ids):
+            raise RuntimeError(
+                f"PTUMathEngine initialization failed: Dimension mismatch. "
+                f"n_evaluators={self.n_evaluators} but len(evaluator_ids)={len(self.evaluator_ids)}. "
+                f"This indicates a critical inconsistency in evaluator normalization."
+            )
         
         # Compute core PTU matrix
         self.ptu_matrix = self._compute_ptu_matrix()
@@ -302,16 +350,106 @@ class PTUMathEngine:
         
         Returns:
             Matrix of shape (n_candidates, n_evaluators) with PTU values.
+        
+        Raises:
+            RuntimeError: If dimensional validation fails
         """
+        # === BUG FIX 3: STRICT DIMENSIONAL VALIDATION BEFORE COMPUTATION ===
+        # Validate that n_candidates and n_evaluators are properly set and consistent
+        if self.n_candidates <= 0:
+            raise RuntimeError(
+                f"PTU matrix computation failed: Invalid n_candidates={self.n_candidates}. "
+                f"The candidate set must contain at least 1 element."
+            )
+        
+        if self.n_evaluators <= 0:
+            raise RuntimeError(
+                f"PTU matrix computation failed: Invalid n_evaluators={self.n_evaluators}. "
+                f"The retrieved evaluator set must contain at least 1 element."
+            )
+        
+        # Validate internal data structure consistency
+        if len(self.candidate_set) != self.n_candidates:
+            raise RuntimeError(
+                f"PTU matrix computation failed: Candidate set size mismatch. "
+                f"len(candidate_set)={len(self.candidate_set)} but n_candidates={self.n_candidates}. "
+                f"This indicates a critical data structure inconsistency."
+            )
+        
+        if len(self.retrieved_set) != self.n_evaluators:
+            raise RuntimeError(
+                f"PTU matrix computation failed: Evaluator set size mismatch. "
+                f"len(retrieved_set)={len(self.retrieved_set)} but n_evaluators={self.n_evaluators}. "
+                f"This indicates a critical data structure inconsistency."
+            )
+        
+        # Validate ID mapping consistency
+        if len(self.candidate_ids) != self.n_candidates:
+            raise RuntimeError(
+                f"PTU matrix computation failed: Candidate ID mapping size mismatch. "
+                f"len(candidate_ids)={len(self.candidate_ids)} but n_candidates={self.n_candidates}."
+            )
+        
+        if len(self.evaluator_ids) != self.n_evaluators:
+            raise RuntimeError(
+                f"PTU matrix computation failed: Evaluator ID mapping size mismatch. "
+                f"len(evaluator_ids)={len(self.evaluator_ids)} but n_evaluators={self.n_evaluators}."
+            )
+        
+        # === COMPUTE PTU MATRIX ===
+        # Initialize the PTU matrix with dimensions (n_candidates, n_evaluators)
         ptu = np.zeros((self.n_candidates, self.n_evaluators), dtype=np.float32)
         
+        # === BUG FIX 3: VALIDATE MATRIX DIMENSIONS AFTER CREATION ===
+        if ptu.shape != (self.n_candidates, self.n_evaluators):
+            raise RuntimeError(
+                f"PTU matrix computation failed: Created matrix has invalid shape. "
+                f"Expected ({self.n_candidates}, {self.n_evaluators}) but got {ptu.shape}."
+            )
+        
+        # Populate the matrix
         for cand_idx, candidate in enumerate(self.candidate_set):
+            if cand_idx >= self.n_candidates:
+                raise RuntimeError(
+                    f"PTU matrix computation failed: Candidate index {cand_idx} exceeds "
+                    f"expected size {self.n_candidates}."
+                )
+            
             cand_id = self.candidate_ids[cand_idx]
             for eval_idx, evaluator in enumerate(self.retrieved_set):
+                if eval_idx >= self.n_evaluators:
+                    raise RuntimeError(
+                        f"PTU matrix computation failed: Evaluator index {eval_idx} exceeds "
+                        f"expected size {self.n_evaluators}."
+                    )
+                
                 eval_id = self.evaluator_ids[eval_idx]
                 induced_ccs = self._fetch_cross_eval_score(cand_id, eval_id)
                 intrinsic_ccs = self._fetch_intrinsic_baseline(eval_id)
+                
+                # Validate fetched scores are numeric
+                if not isinstance(induced_ccs, (int, float)) or np.isnan(induced_ccs):
+                    logger.warning(
+                        f"PTU computation: Invalid induced_ccs for candidate {cand_id} "
+                        f"and evaluator {eval_id}. Using 0.0."
+                    )
+                    induced_ccs = 0.0
+                
+                if not isinstance(intrinsic_ccs, (int, float)) or np.isnan(intrinsic_ccs):
+                    logger.warning(
+                        f"PTU computation: Invalid intrinsic_ccs for evaluator {eval_id}. "
+                        f"Using 0.0."
+                    )
+                    intrinsic_ccs = 0.0
+                
                 ptu[cand_idx, eval_idx] = max(0.0, induced_ccs - intrinsic_ccs)
+        
+        # Final validation: Ensure matrix is fully populated
+        if np.all(ptu == 0.0):
+            logger.warning(
+                "PTU matrix computation completed, but all values are zero. "
+                "This may indicate empty or mismatched cross-evaluation data in Layer 1 cache."
+            )
         
         return ptu
     
@@ -324,20 +462,61 @@ class PTUMathEngine:
         
         Returns:
             Masked PTU matrix
+        
+        Raises:
+            ValueError: If mask_type is invalid
+            RuntimeError: If matrix dimensions are inconsistent
         """
+        # === BUG FIX 3: VALIDATE MASK APPLICATION ===
+        # Validate mask_type
+        valid_masks = ['Self', 'Others', 'All']
+        if mask_type not in valid_masks:
+            raise ValueError(
+                f"apply_evaluator_mask failed: Invalid mask_type '{mask_type}'. "
+                f"Must be one of {valid_masks}."
+            )
+        
+        # Validate PTU matrix state before masking
+        if self.ptu_matrix is None:
+            raise RuntimeError(
+                "apply_evaluator_mask failed: PTU matrix is None. "
+                "The math engine must be properly initialized before applying masks."
+            )
+        
+        if self.ptu_matrix.shape != (self.n_candidates, self.n_evaluators):
+            raise RuntimeError(
+                f"apply_evaluator_mask failed: PTU matrix shape mismatch. "
+                f"Expected ({self.n_candidates}, {self.n_evaluators}) "
+                f"but got {self.ptu_matrix.shape}."
+            )
+        
+        # Create a copy to avoid modifying the original
         masked_ptu = self.ptu_matrix.copy()
         
         if mask_type == 'Self':
             # Keep only diagonal elements (candidate i vs evaluator i)
+            # Validate that we have enough elements for diagonal masking
+            min_dim = min(self.n_candidates, self.n_evaluators)
+            
             for i in range(self.n_candidates):
                 for j in range(self.n_evaluators):
                     if i != j:
                         masked_ptu[i, j] = 0.0
+            
+            # Log warning if dimensions are significantly mismatched
+            if self.n_candidates != self.n_evaluators:
+                logger.warning(
+                    f"apply_evaluator_mask: 'Self' masking applied with mismatched dimensions. "
+                    f"n_candidates={self.n_candidates}, n_evaluators={self.n_evaluators}. "
+                    f"Only {min_dim} diagonal elements will be retained."
+                )
+        
         elif mask_type == 'Others':
-            # Keep only off-diagonal elements
+            # Keep only off-diagonal elements (exclude self-pairing)
             for i in range(self.n_candidates):
                 if i < self.n_evaluators:
                     masked_ptu[i, i] = 0.0
+        
         # 'All' leaves the matrix unchanged
         
         return masked_ptu
