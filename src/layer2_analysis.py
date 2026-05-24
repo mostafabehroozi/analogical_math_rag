@@ -494,28 +494,21 @@ class PTUMathEngine:
         masked_ptu = self.ptu_matrix.copy()
         
         if mask_type == 'Self':
-            # Keep only diagonal elements (candidate i vs evaluator i)
-            # Validate that we have enough elements for diagonal masking
-            min_dim = min(self.n_candidates, self.n_evaluators)
-            
+            # Keep only the true parent-child evaluator relationships for each candidate.
             for i in range(self.n_candidates):
+                candidate = self.candidate_set[i]
+                true_j = self._resolve_source_evaluator_index(candidate, i)
                 for j in range(self.n_evaluators):
-                    if i != j:
+                    if j != true_j:
                         masked_ptu[i, j] = 0.0
-            
-            # Log warning if dimensions are significantly mismatched
-            if self.n_candidates != self.n_evaluators:
-                logger.warning(
-                    f"apply_evaluator_mask: 'Self' masking applied with mismatched dimensions. "
-                    f"n_candidates={self.n_candidates}, n_evaluators={self.n_evaluators}. "
-                    f"Only {min_dim} diagonal elements will be retained."
-                )
         
         elif mask_type == 'Others':
-            # Keep only off-diagonal elements (exclude self-pairing)
+            # Keep everything except the true parent-child relationships.
             for i in range(self.n_candidates):
-                if i < self.n_evaluators:
-                    masked_ptu[i, i] = 0.0
+                candidate = self.candidate_set[i]
+                true_j = self._resolve_source_evaluator_index(candidate, i)
+                if 0 <= true_j < self.n_evaluators:
+                    masked_ptu[i, true_j] = 0.0
         
         # 'All' leaves the matrix unchanged
         
