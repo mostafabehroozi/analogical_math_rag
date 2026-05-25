@@ -979,12 +979,17 @@ class BlockC:
         eval_idx: int,
         score_take: np.ndarray,
         target_query_embedding_similarity: Dict[int, float],
-        already_selected_candidates: Set[int]
+        already_selected_candidates: Set[int],
+        holistic_scores: Optional[np.ndarray] = None
     ) -> int:
         """
         Apply hierarchical tie-breaking for candidate-centric view.
         Levels: 1) Coverage overlap, 2) Highest ScoreTake, 3) Highest Holistic,
                 4) Highest embedding similarity
+        
+        Args:
+            holistic_scores: Pre-computed holistic scores array (shape: n_candidates,).
+                            If None, will be computed on-demand (inefficient if called multiple times).
         """
         # Level 1: Maximize coverage overlap (prefer candidates already selected elsewhere)
         overlap = [c for c in tied_candidates if c in already_selected_candidates]
@@ -998,11 +1003,13 @@ class BlockC:
             
             if len(tied_by_score) > 1:
                 # Level 3: Highest Holistic Score
-                holistic_scores = self.ptu_engine.compute_holistic_score(
-                    ptu_matrix,
-                    self.config.block_C_tiebreaker_weight_taker,
-                    self.config.block_C_tiebreaker_weight_maker
-                )
+                if holistic_scores is None:
+                    # Fallback: compute if not provided (should rarely happen in optimized path)
+                    holistic_scores = self.ptu_engine.compute_holistic_score(
+                        ptu_matrix,
+                        self.config.block_C_tiebreaker_weight_taker,
+                        self.config.block_C_tiebreaker_weight_maker
+                    )
                 best_idx = max(tied_by_score, key=lambda i: holistic_scores[i])
                 
                 # Level 4: Highest embedding similarity
@@ -1096,6 +1103,13 @@ class BlockC:
         score_make = self.ptu_engine.compute_score_make(ptu_matrix)
         
         if perspective == 'Candidate_Centric':
+            # OPTIMIZATION: Pre-compute holistic scores once for all tie-breaker calls
+            holistic_scores_candidate_centric = self.ptu_engine.compute_holistic_score(
+                ptu_matrix,
+                self.config.block_C_tiebreaker_weight_taker,
+                self.config.block_C_tiebreaker_weight_maker
+            )
+            
             # Find max PTU for each evaluator (column maxima)
             winning_source_evals = set()
             
@@ -1108,14 +1122,15 @@ class BlockC:
                     # Find all candidates with this max value
                     tied_candidates = np.where(col == max_ptu)[0].tolist()
                     
-                    # Apply tie-breaking
+                    # Apply tie-breaking with pre-computed holistic scores
                     selected_idx = self._apply_hierarchical_tiebreaker_candidate_centric(
                         tied_candidates,
                         ptu_matrix,
                         eval_idx,
                         score_take,
                         target_query_embedding_similarity,
-                        already_selected_cands
+                        already_selected_cands,
+                        holistic_scores_candidate_centric
                     )
                     already_selected_cands.add(selected_idx)
                     
