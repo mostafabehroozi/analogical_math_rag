@@ -994,7 +994,7 @@ class BlockC:
 
         # Level 2: Highest total ScoreTake
         best_idx = max(current_pool, key=lambda i: score_take[i])
-        if len(tied_candidates) > 1:
+        if len(current_pool) > 1:
             max_score_take = score_take[best_idx]
             tied_by_score = [i for i in current_pool if score_take[i] == max_score_take]
             
@@ -1008,16 +1008,15 @@ class BlockC:
                 best_idx = max(tied_by_score, key=lambda i: holistic_scores[i])
                 
                 # Level 4: Highest embedding similarity
-                if len(tied_by_score) > 1:
-                    tied_by_holistic = [
-                        i for i in tied_by_score
-                        if holistic_scores[i] == holistic_scores[best_idx]
-                    ]
-                    if tied_by_holistic:
-                        best_idx = max(
-                            tied_by_holistic,
-                            key=lambda i: target_query_embedding_similarity.get(i, 0.0)
-                        )
+                tied_by_holistic = [
+                    i for i in tied_by_score
+                    if holistic_scores[i] == holistic_scores[best_idx]
+                ]
+                if len(tied_by_holistic) > 1:
+                    best_idx = max(
+                        tied_by_holistic,
+                        key=lambda i: target_query_embedding_similarity.get(i, 0.0)
+                    )
         
         return best_idx
     
@@ -1041,7 +1040,7 @@ class BlockC:
         # Level 2: Highest total ScoreMake
         best_idx = max(current_pool, key=lambda i: score_make[i])
         
-        if len(tied_evaluators) > 1:
+        if len(current_pool) > 1:
             max_score_make = score_make[best_idx]
             tied_by_score = [i for i in current_pool if score_make[i] == max_score_make]
             
