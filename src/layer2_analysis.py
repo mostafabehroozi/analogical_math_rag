@@ -1018,9 +1018,16 @@ class BlockC:
                     if holistic_scores[i] == holistic_scores[best_idx]
                 ]
                 if len(tied_by_holistic) > 1:
+                    # FIX: Resolve candidate index to source evaluator index for correct domain lookup
                     best_idx = max(
                         tied_by_holistic,
-                        key=lambda i: target_query_embedding_similarity.get(i, 0.0)
+                        key=lambda cand_idx: target_query_embedding_similarity.get(
+                            self.ptu_engine._resolve_source_evaluator_index(
+                                self.ptu_engine.candidate_set[cand_idx],
+                                cand_idx
+                            ),
+                            0.0
+                        )
                     )
         
         return best_idx
