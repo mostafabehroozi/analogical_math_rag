@@ -53,11 +53,9 @@ class ExperimentResult:
     # Base Conditions
     evaluator_setting: str  # 'Self', 'Others', 'All'
     scoring_strategy: str   # 'ScoreTake', 'ScoreMake', 'Holistic'
+    application: str = ""  # 'Block_A_Reranking', 'Block_A_TopK', 'Block_B_Dynamic', etc.
     weight_taker: float = 1.0
     weight_maker: float = 1.0
-    
-    # Application Details
-    application: str  # 'Block_A_Reranking', 'Block_A_TopK', 'Block_B_Dynamic', etc.
     subset_size: int = 0
     selected_candidates: List[str] = None  # Dataset IDs of selected candidates
     selected_evaluators: List[int] = None  # Indices of selected evaluators
@@ -1027,15 +1025,27 @@ class BlockC:
         cand_idx: int,
         score_make: np.ndarray,
         target_query_embedding_similarity: Dict[int, float],
-        already_selected_evaluators: Set[int]
+        evaluator_max_counts: Dict[int, int]
     ) -> int:
         """
         Apply hierarchical tie-breaking for evaluator-centric view.
-        Levels: 1) Coverage overlap, 2) Highest ScoreMake, 3) Embedding similarity
+        Levels: 1) Coverage overlap by global frequency, 2) Highest ScoreMake, 3) Embedding similarity
         """
-        # Level 1: Maximize coverage overlap (prefer evaluators already selected elsewhere)
-        overlap = [e for e in tied_evaluators if e in already_selected_evaluators]
-        current_pool = overlap if overlap else tied_evaluators
+        # Level 1: Choose the evaluator that appears most often as a row-max across all candidates.
+        # This is a global frequency-based tie-breaker, not an order-dependent greedy selection.
+        row = ptu_matrix[cand_idx, :]
+        max_ptu = np.max(row)
+        current_pool = tied_evaluators
+        threshold = getattr(self.config, 'activation_threshold', 0.0)
+        if max_ptu > threshold:
+            counts_excluding_current = {
+                e: evaluator_max_counts.get(e, 0) - (1 if e in tied_evaluators else 0)
+                for e in tied_evaluators
+            }
+            best_count = max(counts_excluding_current.values())
+            frequent_evaluators = [e for e, count in counts_excluding_current.items() if count == best_count]
+            if frequent_evaluators:
+                current_pool = frequent_evaluators
 
         # Level 2: Highest total ScoreMake
         best_idx = max(current_pool, key=lambda i: score_make[i])
@@ -1052,7 +1062,23 @@ class BlockC:
                 )
         
         return best_idx
-    
+
+    def _compute_evaluator_maximum_counts(
+        self,
+        ptu_matrix: np.ndarray,
+        threshold: float
+    ) -> Dict[int, int]:
+        """Compute how many times each evaluator is a row-max across the candidate set."""
+        counts: Dict[int, int] = defaultdict(int)
+        for cand_idx in range(self.ptu_engine.n_candidates):
+            row = ptu_matrix[cand_idx, :]
+            max_ptu = np.max(row)
+            if max_ptu > threshold:
+                tied_evaluators = np.where(row == max_ptu)[0].tolist()
+                for evaluator_idx in tied_evaluators:
+                    counts[evaluator_idx] += 1
+        return counts
+
     def run_for_mask_and_perspective(
         self,
         ptu_matrix: np.ndarray,
@@ -1109,7 +1135,7 @@ class BlockC:
             # Find max PTU for each candidate (row maxima)
             winning_evals = set()
             
-            already_selected_evals: Set[int] = set()
+            evaluator_max_counts = self._compute_evaluator_maximum_counts(ptu_matrix, threshold)
             for cand_idx in range(self.ptu_engine.n_candidates):
                 row = ptu_matrix[cand_idx, :]
                 max_ptu = np.max(row)
@@ -1125,9 +1151,8 @@ class BlockC:
                         cand_idx,
                         score_make,
                         target_query_embedding_similarity,
-                        already_selected_evals
+                        evaluator_max_counts
                     )
-                    already_selected_evals.add(selected_idx)
                     winning_evals.add(selected_idx)
             
             # Collect ALL candidates associated with the optimal subset of evaluators
