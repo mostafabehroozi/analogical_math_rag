@@ -417,17 +417,21 @@ def _execute_retrieval(
             return {"status": "FAILURE", "error": "Retrieval failed"}
         
         retrieved_indices = retrieval_result.get("retrieved_indices", [])
+        retrieved_scores = retrieval_result.get("retrieved_similarity_scores", [])
         
         # Collect the actual exemplar data for storage
         retrieval_data = []
         
         # Use the exemplar data from the function parameter
         try:
-            for idx in retrieved_indices:
+            for idx_position, idx in enumerate(retrieved_indices):
+                similarity_score = None
+                if idx_position < len(retrieved_scores):
+                    similarity_score = float(retrieved_scores[idx_position])
                 retrieval_data.append({
                     "corpus_index": int(idx),
                     "question": exemplar_questions[idx] if idx < len(exemplar_questions) else "",
-                    "similarity_score": None  # Can be populated if needed from retrieval_result
+                    "similarity_score": similarity_score
                 })
         except Exception as e:
             logger.warning(f"Could not fully populate retrieval data: {e}")

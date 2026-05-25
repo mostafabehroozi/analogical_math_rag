@@ -562,6 +562,16 @@ class PTUMathEngine:
         
         return holistic
     
+    def get_target_query_embedding_similarity(self) -> Dict[int, float]:
+        """Return the cached target query similarity score for each retrieval/evaluator."""
+        similarity_map: Dict[int, float] = {}
+        for evaluator_idx, evaluator in enumerate(self.retrieved_set):
+            similarity_score = 0.0
+            if isinstance(evaluator, dict):
+                similarity_score = float(evaluator.get('similarity_score', 0.0) or 0.0)
+            similarity_map[evaluator_idx] = similarity_score
+        return similarity_map
+
     def _resolve_source_evaluator_index(self, candidate: Dict[str, Any], default_idx: int) -> int:
         """Resolve the matrix evaluator index for a candidate's source exemplar."""
         source_id = candidate.get('source_exemplar_idx') if isinstance(candidate, dict) else None
@@ -1253,11 +1263,7 @@ class Layer2Orchestrator:
                 logger.info("\n[BLOCK C] Optimal Subset (Coverage) Grouping")
                 block_c = BlockC(ptu_engine, self.config)
                 
-                # Dummy embedding similarity (can be enhanced with actual embeddings)
-                target_query_embedding_sim = {
-                    i: float(i) / max(1, ptu_engine.n_evaluators)
-                    for i in range(ptu_engine.n_evaluators)
-                }
+                target_query_embedding_sim = ptu_engine.get_target_query_embedding_similarity()
                 
                 for perspective in self.config.coverage_perspectives:
                     results = block_c.run_for_mask_and_perspective(
