@@ -970,21 +970,23 @@ class BlockC:
         ptu_matrix: np.ndarray,
         eval_idx: int,
         score_take: np.ndarray,
-        target_query_embedding_similarity: Dict[int, float]
+        target_query_embedding_similarity: Dict[int, float],
+        already_selected_candidates: Set[int]
     ) -> int:
         """
         Apply hierarchical tie-breaking for candidate-centric view.
         Levels: 1) Coverage overlap, 2) Highest ScoreTake, 3) Highest Holistic,
                 4) Highest embedding similarity
         """
-        # Level 1: Maximize coverage (already winning elsewhere)
-        # TODO: Would require tracking of already-selected winners
-        
+        # Level 1: Maximize coverage overlap (prefer candidates already selected elsewhere)
+        overlap = [c for c in tied_candidates if c in already_selected_candidates]
+        current_pool = overlap if overlap else tied_candidates
+
         # Level 2: Highest total ScoreTake
-        best_idx = max(tied_candidates, key=lambda i: score_take[i])
+        best_idx = max(current_pool, key=lambda i: score_take[i])
         if len(tied_candidates) > 1:
             max_score_take = score_take[best_idx]
-            tied_by_score = [i for i in tied_candidates if score_take[i] == max_score_take]
+            tied_by_score = [i for i in current_pool if score_take[i] == max_score_take]
             
             if len(tied_by_score) > 1:
                 # Level 3: Highest Holistic Score
@@ -1015,20 +1017,25 @@ class BlockC:
         ptu_matrix: np.ndarray,
         cand_idx: int,
         score_make: np.ndarray,
-        target_query_embedding_similarity: Dict[int, float]
+        target_query_embedding_similarity: Dict[int, float],
+        already_selected_evaluators: Set[int]
     ) -> int:
         """
         Apply hierarchical tie-breaking for evaluator-centric view.
         Levels: 1) Coverage overlap, 2) Highest ScoreMake, 3) Embedding similarity
         """
+        # Level 1: Maximize coverage overlap (prefer evaluators already selected elsewhere)
+        overlap = [e for e in tied_evaluators if e in already_selected_evaluators]
+        current_pool = overlap if overlap else tied_evaluators
+
         # Level 2: Highest total ScoreMake
-        best_idx = max(tied_evaluators, key=lambda i: score_make[i])
+        best_idx = max(current_pool, key=lambda i: score_make[i])
         
         if len(tied_evaluators) > 1:
             max_score_make = score_make[best_idx]
-            tied_by_score = [i for i in tied_evaluators if score_make[i] == max_score_make]
+            tied_by_score = [i for i in current_pool if score_make[i] == max_score_make]
             
-            if tied_by_score:
+            if len(tied_by_score) > 1:
                 # Level 3: Highest embedding similarity
                 best_idx = max(
                     tied_by_score,
@@ -1057,6 +1064,7 @@ class BlockC:
             # Find max PTU for each evaluator (column maxima)
             winning_source_evals = set()
             
+            already_selected_cands: Set[int] = set()
             for eval_idx in range(self.ptu_engine.n_evaluators):
                 col = ptu_matrix[:, eval_idx]
                 max_ptu = np.max(col)
@@ -1067,8 +1075,12 @@ class BlockC:
                     
                     # Apply tie-breaking
                     selected_idx = self._apply_hierarchical_tiebreaker_candidate_centric(
-                        tied_candidates, ptu_matrix, eval_idx, score_take,
-                        target_query_embedding_similarity
+                        tied_candidates,
+                        ptu_matrix,
+                        eval_idx,
+                        score_take,
+                        target_query_embedding_similarity,
+                        already_selected_cands
                     )
                     already_selected_cands.add(selected_idx)
                     
@@ -1088,6 +1100,7 @@ class BlockC:
             # Find max PTU for each candidate (row maxima)
             winning_evals = set()
             
+            already_selected_evals: Set[int] = set()
             for cand_idx in range(self.ptu_engine.n_candidates):
                 row = ptu_matrix[cand_idx, :]
                 max_ptu = np.max(row)
@@ -1098,8 +1111,12 @@ class BlockC:
                     
                     # Apply tie-breaking
                     selected_idx = self._apply_hierarchical_tiebreaker_evaluator_centric(
-                        tied_evaluators, ptu_matrix, cand_idx, score_make,
-                        target_query_embedding_similarity
+                        tied_evaluators,
+                        ptu_matrix,
+                        cand_idx,
+                        score_make,
+                        target_query_embedding_similarity,
+                        already_selected_evals
                     )
                     already_selected_evals.add(selected_idx)
                     winning_evals.add(selected_idx)
