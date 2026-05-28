@@ -47,6 +47,7 @@ ARCHITECTURAL REFACTOR: "Acquire-Optimize-Fork".
 """
 
 import logging
+from fastapi import logger
 from tqdm import tqdm
 import os
 from typing import List, Dict, Any, Optional
@@ -68,6 +69,7 @@ from src.pipeline_steps import (
 
 from src.multibranch_transformation import multibranch_transformation_experiment
 from src.layer1_base_execution import run_layer1_base_execution
+from src.layer2_integration import run_layer2_complete_pipeline
 
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
@@ -1372,6 +1374,23 @@ def run_experiments(
             all_results[exp_name] = final_logs
             logger.info(f"########## Finished Experiment: {exp_name} ##########")
 
+            # --- AUTOMATIC LAYER 2 EXECUTION ---
+            if current_config.get('APPLY_LAYER2_ANALYSIS', False):
+                print("\n" + "#"*25 + f" STARTING LAYER 2 ANALYSIS FOR: {exp_name} " + "#"*25)
+                layer2_cfg = current_config.get('LAYER2_CONFIG', {})
+                l2_out_dir = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_layer2_analytics")
+                
+                run_layer2_complete_pipeline(
+                    layer1_cache_dir=global_config.get('LAYER1_CACHE_DIR', global_config['RESULTS_DIR']),
+                    layer2_output_dir=l2_out_dir,
+                    experiment_name=exp_name,
+                    layer2_config_dict=layer2_cfg,
+                    top_k=current_config.get('TOP_N_CANDIDATES_RETRIEVAL', 3),
+                    n_candidates=current_config.get('LAYER1_N_CANDIDATES', None)
+                )
+                print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
+            # -----------------------------------
+
         print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
 
     else:
@@ -1455,8 +1474,31 @@ def run_experiments(
                      logger.info(f"All solve steps for '{exp_name}' are already complete.")
                      run_logs = intermediate_logs
             
-            save_json(run_logs, log_file_path)
+            save_json(final_logs, log_file_path)
+            all_results[exp_name] = final_logs
             logger.info(f"########## Finished Experiment: {exp_name} ##########")
-            all_results[exp_name] = run_logs
+
+            # --- AUTOMATIC LAYER 2 EXECUTION ---
+            if current_config.get('APPLY_LAYER2_ANALYSIS', False):
+                print("\n" + "#"*25 + f" STARTING LAYER 2 ANALYSIS FOR: {exp_name} " + "#"*25)
+                
+                layer2_cfg = current_config.get('LAYER2_CONFIG', {})
+                l2_out_dir = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_layer2_analytics")
+                
+                top_k_val = current_config.get('TOP_N_CANDIDATES_RETRIEVAL', 3)
+                n_cand_val = current_config.get('LAYER1_N_CANDIDATES') or top_k_val
+                
+                run_layer2_complete_pipeline(
+                    layer1_cache_dir=global_config.get('LAYER1_CACHE_DIR', global_config['RESULTS_DIR']),
+                    layer2_output_dir=l2_out_dir,
+                    experiment_name=exp_name,
+                    layer2_config_dict=layer2_cfg,
+                    top_k=top_k_val,
+                    n_candidates=n_cand_val
+                )
+                print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
+            # --- END OF AUTOMATIC LAYER 2 EXECUTION ---
+
+        print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
         
     return all_results

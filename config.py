@@ -252,7 +252,11 @@ CONFIG = {
     "LAYER1_CACHE_DIR": RESULTS_DIR,
     "LAYER1_N_CANDIDATES": None,           # Number of candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
+    
+    "APPLY_LAYER2_ANALYSIS": False,
+    "LAYER2_CONFIG": {},
 
+    "APPLY_DATASET_CONSTRUCTION": False,
 
     "APPLY_DATASET_CONSTRUCTION": False,
     "DATASET_CONSTRUCTION_MAX_SEARCH": 1000,    # how many random queries to examine
