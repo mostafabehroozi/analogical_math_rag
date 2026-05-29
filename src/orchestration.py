@@ -1412,19 +1412,22 @@ def run_experiments(
                 queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_indices]
                 
                 if not queries_to_process:
-                    logger.info(f"All queries for '{exp_name}' are already processed. Skipping.")
-                    all_results[exp_name] = run_logs
-                    continue
+                    logger.info(f"All queries for '{exp_name}' are already processed. Skipping LLM execution.")
+                else:
+                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
+                        single_run_log = run_pipeline_for_single_query(
+                            hard_list_idx=original_idx, target_query=query_text, config=current_config,
+                            embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
+                            run_mode='full'
+                        )
+                        run_logs.append(single_run_log)
+                        save_json(run_logs, log_file_path)
+                        periodic_sync_check(loop_idx, current_config)
+                
+                # FIXED: Ensure the logs variable is named correctly so it doesn't crash 
+                # and flows properly into Layer 2
+                final_logs = run_logs
 
-                for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
-                    single_run_log = run_pipeline_for_single_query(
-                        hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                        run_mode='full'
-                    )
-                    run_logs.append(single_run_log)
-                    save_json(run_logs, log_file_path)
-                    periodic_sync_check(loop_idx, current_config)
             else:
                 # --- Single-Experiment Deferred Mode ---
                 logger.info(f"Running '{exp_name}' in single-experiment deferred solve mode.")
@@ -1469,10 +1472,10 @@ def run_experiments(
                         save_json(list(completed_logs_map.values()), log_file_path)
                         periodic_sync_check(loop_idx, current_config)
                     
-                    run_logs = list(completed_logs_map.values())
+                    final_logs = list(completed_logs_map.values())
                 else:
                      logger.info(f"All solve steps for '{exp_name}' are already complete.")
-                     run_logs = intermediate_logs
+                     final_logs = intermediate_logs
             
             save_json(final_logs, log_file_path)
             all_results[exp_name] = final_logs
