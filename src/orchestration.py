@@ -231,15 +231,20 @@ def run_pipeline_for_single_query(
             # Store Layer 1 state in run_log for reference
             run_log['layer1_base_execution_state'] = layer1_state
             
-            # If Layer 1 succeeded and we're ONLY running Layer 1 (not full pipeline)
-            if config.get('LAYER1_ONLY_MODE', False) and layer1_state.get('overall_status') == 'SUCCESS':
-                print("\n[LAYER 1 COMPLETE] Layer 1 Only Mode is active. Pipeline execution halted.")
-                run_log['pipeline_status'] = 'SUCCESS'
+            # --- FIXED: Handle LAYER1_ONLY_MODE correctly regardless of success/failure ---
+            if config.get('LAYER1_ONLY_MODE', False):
+                overall_status = layer1_state.get('overall_status', 'FAILURE')
+                
+                print(f"\n[LAYER 1 COMPLETE] Layer 1 Only Mode is active. Status: {overall_status}. Pipeline execution halted.")
+                
+                # Assign the status from Layer 1 directly to the pipeline log
+                run_log['pipeline_status'] = overall_status 
                 run_log['execution_mode'] = 'layer1_only'
-                logger.info(f"Layer 1 only mode: Query #{hard_list_idx} execution complete, cache merged into experiment '{experiment_name}'.")
+                
+                logger.info(f"Layer 1 only mode: Query #{hard_list_idx} halted with status '{overall_status}'.")
                 return run_log
             
-            # Otherwise, continue with the main pipeline
+            # Otherwise, continue with the main pipeline (if LAYER1_ONLY_MODE is False)
             logger.info(f"Layer 1 completed. Status: {layer1_state.get('overall_status')}. Proceeding with main pipeline.")
 
     # --- MULTI-BRANCH TRANSFORMATION EXPERIMENTS ---

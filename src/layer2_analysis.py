@@ -1245,8 +1245,13 @@ class Layer2Orchestrator:
         """
         query_results = []
         
-        # Initialize PTU engine
-        ptu_engine = PTUMathEngine(layer1_state)
+        try:
+            ptu_engine = PTUMathEngine(layer1_state)
+        except (ValueError, RuntimeError) as e:
+            target_idx = layer1_state.get('target_query_idx', 'Unknown')
+            logger.error(f"Skipping Layer 2 Analysis for Query #{target_idx}: {e}")
+            print(f"  [!] Skipping Query #{target_idx} due to empty/invalid Layer 1 data.")
+            return [] # Skip this query and move to the next one
         
         # Grid search: For each mask type
         for mask_type in self.config.evaluator_masking:

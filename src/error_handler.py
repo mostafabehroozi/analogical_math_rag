@@ -20,7 +20,14 @@ from src.orchestration import run_pipeline_for_single_query # Used for retrying 
 from src.utils import load_json, save_json
 from src.hf_sync import periodic_sync_check, sync_workspace_to_hub
 
-# --- NEW: Generation Phase Retry Logic ---
+import os
+import logging
+from tqdm import tqdm
+from typing import List, Dict, Any
+from src.orchestration import run_pipeline_for_single_query
+from src.utils import load_json, save_json
+from src.hf_sync import periodic_sync_check
+from src.layer1_base_execution import _get_cache_filename, _get_cache_path
 
 def retry_failed_generation_pipelines(
     all_experiments_logs: Dict[str, List[Dict]],
@@ -30,15 +37,9 @@ def retry_failed_generation_pipelines(
     exemplar_data: Dict[str, Any],
     api_managers: Dict[str, Any]
 ) -> Dict[str, List[Dict]]:
-    """
-    Identifies and retries generation pipelines that failed partway through.
-
-    It loads the run log for each experiment, finds entries with a 'FAILURE' status,
-    and re-runs the `run_pipeline_for_single_query` function for them. The original
-    log entry is then replaced with the new result.
-    """
+    
     logger = logging.getLogger(__name__)
-    logger.info("Starting the process to retry failed generation pipelines.")
+    logger.info("Starting SMART retry process for failed/partial generation pipelines.")
     
     for exp_name, original_logs in all_experiments_logs.items():
         exp_config_overrides = original_logs[0].get("config_flags_used", {})
@@ -46,54 +47,73 @@ def retry_failed_generation_pipelines(
         current_config.update(exp_config_overrides)
         
         log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
-        
-        # We work directly with the list of logs for this experiment
         logs_to_process = original_logs
         
-        # Find indices of logs that need retrying
-        indices_to_retry = [
-            i for i, log in enumerate(logs_to_process)
-            if "FAILURE" in log.get("pipeline_status", "")
-        ]
+        indices_to_retry = []
+        
+        # 1. Identify Bad Logs
+        for i, log in enumerate(logs_to_process):
+            status = log.get("pipeline_status", "")
+            needs_retry = False
+            
+            if "FAILURE" in status or "PARTIAL" in status:
+                needs_retry = True
+            
+            if "layer1_base_execution_state" in log:
+                l1_state = log["layer1_base_execution_state"]
+                if not l1_state.get("candidate_set") or not l1_state.get("cross_evaluation_matrix"):
+                    needs_retry = True
+            
+            if needs_retry:
+                indices_to_retry.append(i)
 
         if not indices_to_retry:
-            logger.info(f"No failed generation pipelines found for experiment '{exp_name}'. Skipping.")
             continue
 
-        logger.info(f"--- Retrying {len(indices_to_retry)} failed pipelines for Experiment: {exp_name} ---")
+        # 2. Load Layer 1 Cache
+        cache_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
+        top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+        n_candidates = current_config.get("LAYER1_N_CANDIDATES") or top_k
+        cache_filename = _get_cache_filename(top_k, n_candidates, exp_name)
+        cache_path = _get_cache_path(cache_dir, cache_filename)
+        
+        l1_cache = load_json(cache_path) if os.path.exists(cache_path) else None
 
-        for loop_idx, log_idx in enumerate(tqdm(indices_to_retry, desc=f"Retrying generation for {exp_name}")):
+        for loop_idx, log_idx in enumerate(tqdm(indices_to_retry, desc=f"Retrying {exp_name}")):
             failed_log = logs_to_process[log_idx]
             original_hard_list_idx = failed_log["target_query_original_hard_list_idx"]
             target_query = failed_log["target_query_text"]
             
-            print(f"\nRetrying pipeline for Query #{original_hard_list_idx}...")
+            # WIPE BAD CACHE
+            if l1_cache and "queries" in l1_cache:
+                query_key = str(original_hard_list_idx)
+                if query_key in l1_cache["queries"]:
+                    del l1_cache["queries"][query_key]
+                    save_json(l1_cache, cache_path)
             
-            # Re-run the entire pipeline logic for this single query
+            # --- NEW: CRITICAL OVERRIDE ---
+            # Force the pipeline to run all the way through, even if the experiment
+            # originally deferred the solving step to phase 2.
+            retry_config = current_config.copy()
+            retry_config["DEFER_SOLVE_STEP"] = False
+            
+            # 3. Re-run Pipeline
             new_run_log = run_pipeline_for_single_query(
                 hard_list_idx=original_hard_list_idx,
                 target_query=target_query,
-                config=current_config,
+                config=retry_config,  # <-- Using the forced config
                 embedding_model=embedding_model,
                 exemplar_data=exemplar_data,
                 api_managers=api_managers
             )
             
-            # Replace the old failed log with the new one
             logs_to_process[log_idx] = new_run_log
-            
-            # Save progress incrementally
             save_json(logs_to_process, log_file_path)
             periodic_sync_check(loop_idx, current_config)
 
-        # Final save and sync for the experiment
         save_json(logs_to_process, log_file_path)
-        sync_workspace_to_hub(current_config)
 
-    logger.info("Finished retrying all failed generation pipelines.")
     return all_experiments_logs
-
-
 # --- UPGRADED: Evaluation Phase Retry Logic ---
 
 def retry_failed_evaluations(
