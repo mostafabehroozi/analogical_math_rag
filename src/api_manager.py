@@ -67,6 +67,7 @@ def execute_with_retry(config: dict, api_call_func) -> APIResponse:
     enable_retry = config.get("ENABLE_API_RETRY", False)
     max_retries = config.get("MAX_API_RETRIES", 3)
     retry_delay = config.get("API_RETRY_DELAY_SECONDS", 5)
+    retry_all_errors = config.get("RETRY_ALL_API_ERRORS", True)  # NEW: Feature flag for retrying all error types
 
     if not enable_retry:
         return api_call_func()
@@ -89,7 +90,8 @@ def execute_with_retry(config: dict, api_call_func) -> APIResponse:
 
         # status == "ERROR" — check if the error type is retryable
         error_type = response.get("error_type", "")
-        if error_type not in RETRYABLE_ERROR_TYPES:
+        # NEW: If RETRY_ALL_API_ERRORS is False, use selective retrying; otherwise retry all error types
+        if not retry_all_errors and error_type not in RETRYABLE_ERROR_TYPES:
             logger.warning(
                 f"API call failed with non-retryable error type '{error_type}'. Not retrying."
             )

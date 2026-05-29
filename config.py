@@ -22,7 +22,8 @@ CONFIG = {
     "PRINT_API_TIMING_CHECKPOINTS": True,
     "ENABLE_API_RETRY": True,          
     "MAX_API_RETRIES": 200,              
-    "API_RETRY_DELAY_SECONDS": 20.0,    
+    "API_RETRY_DELAY_SECONDS": 20.0,
+    "RETRY_ALL_API_ERRORS": True,  # If True, retry all API error types; if False, only retry RETRYABLE_ERROR_TYPES
     "API_RESPONSE_TRUNCATION_LENGTH": 50,
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "DATA_DIR": DATA_DIR,
