@@ -77,25 +77,34 @@ def execute_with_retry(config: dict, api_call_func) -> APIResponse:
     for attempt in range(1, max_retries + 1):
         response = api_call_func()
 
-        # Success or non-retryable statuses — return immediately
+        # Success — return immediately
         if response["status"] == "SUCCESS":
             return response
 
+        # Handle BLOCKED / RATE_LIMITED: by default they were non-retryable,
+        # but if `RETRY_ALL_API_ERRORS` is enabled we should treat them as retryable.
         if response["status"] in ("BLOCKED", "RATE_LIMITED"):
+            if not retry_all_errors:
+                logger.warning(
+                    f"API call returned non-retryable status '{response['status']}' "
+                    f"(type: {response['error_type']}). Not retrying."
+                )
+                return response
+            # When retry_all_errors is True, fall through and treat like an ERROR for retry purposes.
+            error_type = response.get("error_type", response["status"]) or response["status"]
             logger.warning(
-                f"API call returned non-retryable status '{response['status']}' "
-                f"(type: {response['error_type']}). Not retrying."
+                f"API call returned status '{response['status']}' (type: {error_type}). "
+                f"RETRY_ALL_API_ERRORS enabled — will attempt retries."
             )
-            return response
-
-        # status == "ERROR" — check if the error type is retryable
-        error_type = response.get("error_type", "")
-        # NEW: If RETRY_ALL_API_ERRORS is False, use selective retrying; otherwise retry all error types
-        if not retry_all_errors and error_type not in RETRYABLE_ERROR_TYPES:
-            logger.warning(
-                f"API call failed with non-retryable error type '{error_type}'. Not retrying."
-            )
-            return response
+        else:
+            # status == "ERROR" — check if the error type is retryable
+            error_type = response.get("error_type", "")
+            # If RETRY_ALL_API_ERRORS is False, use selective retrying; otherwise retry all error types
+            if not retry_all_errors and error_type not in RETRYABLE_ERROR_TYPES:
+                logger.warning(
+                    f"API call failed with non-retryable error type '{error_type}'. Not retrying."
+                )
+                return response
 
         last_response = response
 
