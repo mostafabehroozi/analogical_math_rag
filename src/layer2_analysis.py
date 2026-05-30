@@ -79,6 +79,16 @@ class ExperimentResult:
     executions: List[Dict[str, Any]] = None  
     pass_at_k_metrics: Dict[int, float] = None
     
+    # === NEW: RANKING METRICS (BLOCK A ONLY) ===
+    ap_score_reranked: Optional[float] = None  # AP on reranked list
+    ap_score_original: Optional[float] = None  # AP on original retrieved list
+    ap_improvement: Optional[float] = None  # Delta: reranked - original
+    recall_at_k: Optional[Dict[int, float]] = None  # {k: recall@k}
+    ndcg_at_k: Optional[Dict[int, float]] = None  # {k: ndcg@k}
+    candidate_coverage_rate: Optional[float] = None  # Fraction of candidate set used
+    avg_rerank_position_shift: Optional[float] = None  # Avg rank movement (Block A only)
+    confidence_variance: Optional[float] = None  # Std dev of selected candidate scores
+    
     # Meta
     timestamp: str = None
     notes: str = ""
@@ -98,6 +108,10 @@ class ExperimentResult:
             self.executions = []
         if self.pass_at_k_metrics is None:
             self.pass_at_k_metrics = {}
+        if self.recall_at_k is None:
+            self.recall_at_k = {}
+        if self.ndcg_at_k is None:
+            self.ndcg_at_k = {}
 
 
 @dataclass
@@ -131,6 +145,9 @@ class Layer2Config:
     block_C_tiebreaker_weight_taker: float = 1.0
     block_C_tiebreaker_weight_maker: float = 1.0
     
+    # === NEW: Ranking Metrics Configuration ===
+    ranking_k_values: List[int] = None  # [1, 3, 5, 10] for Recall@K and NDCG@K
+    
     def __post_init__(self):
         if self.evaluator_masking is None:
             self.evaluator_masking = ['Self', 'Others', 'All']
@@ -144,6 +161,194 @@ class Layer2Config:
             self.dynamic_k_methods = ['K_take', 'K_make', 'K_both']
         if self.coverage_perspectives is None:
             self.coverage_perspectives = ['Candidate_Centric', 'Evaluator_Centric']
+        if self.ranking_k_values is None:
+            self.ranking_k_values = [1, 3, 5, 10]
+
+
+# ============================================================================
+# RANKING METRICS CALCULATOR (NEW)
+# ============================================================================
+
+class RankingMetricsCalculator:
+    """
+    Computes ranking-based metrics for evaluating retrieved and reranked lists.
+    Metrics include: Average Precision (AP), Recall@K, and NDCG@K.
+    """
+    
+    @staticmethod
+    def calculate_ap(ranked_candidates: List[str], ground_truth_labels: Dict[str, bool]) -> float:
+        """
+        Calculate Average Precision (AP) for a ranked list.
+        
+        Args:
+            ranked_candidates: List of candidate IDs in ranked order
+            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
+        
+        Returns:
+            AP score in [0.0, 1.0]
+        """
+        if not ranked_candidates or not ground_truth_labels:
+            return 0.0
+        
+        # Count total relevant items
+        num_relevant = sum(1 for label in ground_truth_labels.values() if label)
+        if num_relevant == 0:
+            return 0.0
+        
+        # Calculate precision at each relevant position
+        ap_sum = 0.0
+        num_relevant_found = 0
+        
+        for position, candidate_id in enumerate(ranked_candidates, start=1):
+            is_relevant = ground_truth_labels.get(candidate_id, False)
+            if is_relevant:
+                num_relevant_found += 1
+                precision_at_k = num_relevant_found / position
+                ap_sum += precision_at_k
+        
+        # AP = sum of precisions / total relevant items
+        ap = ap_sum / num_relevant if num_relevant > 0 else 0.0
+        return min(ap, 1.0)  # Ensure bounded to [0, 1]
+    
+    @staticmethod
+    def calculate_recall_at_k(ranked_candidates: List[str], ground_truth_labels: Dict[str, bool], k: int) -> float:
+        """
+        Calculate Recall@K: fraction of relevant items in top-K.
+        
+        Args:
+            ranked_candidates: List of candidate IDs in ranked order
+            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
+            k: Cutoff position
+        
+        Returns:
+            Recall@K in [0.0, 1.0]
+        """
+        if not ranked_candidates or not ground_truth_labels:
+            return 0.0
+        
+        total_relevant = sum(1 for label in ground_truth_labels.values() if label)
+        if total_relevant == 0:
+            return 0.0
+        
+        # Count relevant items in top-K
+        top_k = ranked_candidates[:k]
+        relevant_in_k = sum(1 for cand in top_k if ground_truth_labels.get(cand, False))
+        
+        recall_k = relevant_in_k / total_relevant
+        return min(recall_k, 1.0)
+    
+    @staticmethod
+    def calculate_dcg_at_k(ranked_candidates: List[str], ground_truth_labels: Dict[str, bool], k: int) -> float:
+        """
+        Calculate Discounted Cumulative Gain at K.
+        
+        Args:
+            ranked_candidates: List of candidate IDs in ranked order
+            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
+            k: Cutoff position
+        
+        Returns:
+            DCG@K value (unbounded)
+        """
+        if not ranked_candidates:
+            return 0.0
+        
+        dcg = 0.0
+        top_k = ranked_candidates[:k]
+        
+        for position, candidate_id in enumerate(top_k, start=1):
+            is_relevant = ground_truth_labels.get(candidate_id, False)
+            if is_relevant:
+                # DCG formula: rel / log2(position + 1)
+                dcg += 1.0 / np.log2(position + 1)
+        
+        return dcg
+    
+    @staticmethod
+    def calculate_idcg_at_k(ground_truth_labels: Dict[str, bool], k: int) -> float:
+        """
+        Calculate Ideal Discounted Cumulative Gain at K (perfect ranking).
+        
+        Args:
+            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
+            k: Cutoff position
+        
+        Returns:
+            IDCG@K value
+        """
+        # Ideal ranking: all relevant items first
+        total_relevant = sum(1 for label in ground_truth_labels.values() if label)
+        if total_relevant == 0:
+            return 0.0
+        
+        idcg = 0.0
+        for position in range(1, min(total_relevant, k) + 1):
+            idcg += 1.0 / np.log2(position + 1)
+        
+        return idcg
+    
+    @staticmethod
+    def calculate_ndcg_at_k(ranked_candidates: List[str], ground_truth_labels: Dict[str, bool], k: int) -> float:
+        """
+        Calculate Normalized Discounted Cumulative Gain at K.
+        
+        Args:
+            ranked_candidates: List of candidate IDs in ranked order
+            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
+            k: Cutoff position
+        
+        Returns:
+            NDCG@K in [0.0, 1.0]
+        """
+        dcg = RankingMetricsCalculator.calculate_dcg_at_k(ranked_candidates, ground_truth_labels, k)
+        idcg = RankingMetricsCalculator.calculate_idcg_at_k(ground_truth_labels, k)
+        
+        if idcg == 0.0:
+            return 0.0
+        
+        ndcg = dcg / idcg
+        return min(ndcg, 1.0)  # Ensure bounded to [0, 1]
+    
+    @staticmethod
+    def compute_all_metrics(
+        ranked_candidates_reranked: List[str],
+        ranked_candidates_original: List[str],
+        ground_truth_labels: Dict[str, bool],
+        k_values: List[int]
+    ) -> Dict[str, Any]:
+        """
+        Compute all ranking metrics for both reranked and original lists.
+        
+        Args:
+            ranked_candidates_reranked: Reranked candidate list
+            ranked_candidates_original: Original (pre-reranking) candidate list
+            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
+            k_values: List of K values for Recall@K and NDCG@K
+        
+        Returns:
+            Dict with all computed metrics
+        """
+        metrics = {
+            'ap_reranked': RankingMetricsCalculator.calculate_ap(ranked_candidates_reranked, ground_truth_labels),
+            'ap_original': RankingMetricsCalculator.calculate_ap(ranked_candidates_original, ground_truth_labels),
+            'recall_at_k': {},
+            'ndcg_at_k': {}
+        }
+        
+        # Calculate Recall@K and NDCG@K for reranked list only (Block A specific)
+        for k in k_values:
+            if k > 0:
+                metrics['recall_at_k'][k] = RankingMetricsCalculator.calculate_recall_at_k(
+                    ranked_candidates_reranked, ground_truth_labels, k
+                )
+                metrics['ndcg_at_k'][k] = RankingMetricsCalculator.calculate_ndcg_at_k(
+                    ranked_candidates_reranked, ground_truth_labels, k
+                )
+        
+        # Calculate AP improvement
+        metrics['ap_improvement'] = metrics['ap_reranked'] - metrics['ap_original']
+        
+        return metrics
 
 
 # ============================================================================
@@ -651,6 +856,47 @@ class PTUMathEngine:
                 if isinstance(cand, dict) and cand.get('candidate_text'):
                     texts.append(cand['candidate_text'])
         return texts
+    
+    def get_original_retrieved_ranking(self) -> List[str]:
+        """
+        Get the original (pre-reranking) candidate ranking from Layer 1 retrieved set.
+        Candidates are ordered by their retrieval index (as they appear in the retrieved set).
+        
+        Returns:
+            List of candidate IDs in original retrieval order
+        """
+        # The original ranking is determined by the order of candidates in the retrieved set
+        # (i.e., the order they were retrieved by the embedding model)
+        # For now, we use the order of candidate_ids (which reflects the candidate_set order)
+        # In Layer 1, candidates are typically ordered by their appearance/importance in retrievals
+        return self.candidate_ids.copy()
+    
+    def compute_position_shift(self, original_indices: List[int], reranked_indices: List[int]) -> float:
+        """
+        Calculate average position shift from original to reranked ranking.
+        
+        Args:
+            original_indices: Original candidate indices in order
+            reranked_indices: Reranked candidate indices in order
+        
+        Returns:
+            Average absolute position shift
+        """
+        if not reranked_indices:
+            return 0.0
+        
+        # Map original candidates to their original positions
+        original_positions = {cand_idx: pos for pos, cand_idx in enumerate(original_indices)}
+        
+        # Calculate position shift for reranked candidates
+        total_shift = 0.0
+        for new_pos, cand_idx in enumerate(reranked_indices):
+            original_pos = original_positions.get(cand_idx, len(original_indices))
+            shift = abs(original_pos - new_pos)
+            total_shift += shift
+        
+        avg_shift = total_shift / len(reranked_indices) if reranked_indices else 0.0
+        return avg_shift
 
 
 def _normalize_ground_truth_label(label_obj: Any) -> bool:
@@ -823,7 +1069,32 @@ class BlockA:
         self.ranked_indices_cache[cache_key] = ranked_indices.tolist()
         
         ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
-        ap_score = None
+        
+        # === NEW: Compute AP and ranking metrics for Block A ===
+        original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
+        ground_truth_labels_dict = {
+            self.ptu_engine.candidate_ids[i]: _normalize_ground_truth_label(self.ptu_engine.ground_truth_labels.get(i))
+            for i in range(len(self.ptu_engine.candidate_ids))
+        }
+        
+        # Compute all ranking metrics
+        ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
+            ranked_candidate_ids,
+            original_ranking_ids,
+            ground_truth_labels_dict,
+            self.config.ranking_k_values
+        )
+        
+        # Calculate position shift from original to reranked
+        original_indices = [i for i in range(len(self.ptu_engine.candidate_ids))]
+        avg_position_shift = self.ptu_engine.compute_position_shift(original_indices, ranked_indices.tolist())
+        
+        # Calculate confidence variance (std dev of selected candidate scores)
+        confidence_variance = float(np.std(scores[ranked_indices])) if len(ranked_indices) > 0 else 0.0
+        
+        # Calculate candidate coverage rate
+        total_candidates = len(self.ptu_engine.candidate_ids)
+        coverage_rate = len(ranked_indices) / total_candidates if total_candidates > 0 else 0.0
         
         cand_texts_a1 = self.ptu_engine.get_candidate_texts(ranked_indices.tolist())
         result_a1 = ExperimentResult(
@@ -837,17 +1108,28 @@ class BlockA:
             application=f"Block_A_Reranking_{strategy}",
             subset_size=len(ranked_indices),
             selected_candidates=ranked_candidate_ids,
-            selected_scores=[float(scores[idx]) for idx in ranked_indices],  # NEW: Added scores for A.1
+            selected_scores=[float(scores[idx]) for idx in ranked_indices],
             selected_candidate_texts=cand_texts_a1,
             zero_score_fallback_triggered=(len(cand_texts_a1) == 0),
-            list_ap_score=ap_score,
-            group_pass_at_n=None
+            list_ap_score=None,
+            group_pass_at_n=None,
+            # === NEW: Block A specific metrics ===
+            ap_score_reranked=ranking_metrics['ap_reranked'],
+            ap_score_original=ranking_metrics['ap_original'],
+            ap_improvement=ranking_metrics['ap_improvement'],
+            recall_at_k=ranking_metrics['recall_at_k'],
+            ndcg_at_k=ranking_metrics['ndcg_at_k'],
+            candidate_coverage_rate=coverage_rate,
+            avg_rerank_position_shift=avg_position_shift,
+            confidence_variance=confidence_variance
         )
         results.append(result_a1)
         
         logger.info(
             f"Block A A.1 - {mask_type} {strategy}: "
-            f"AP = {ap_score:.4f}"
+            f"AP_Reranked = {ranking_metrics['ap_reranked']:.4f}, "
+            f"AP_Original = {ranking_metrics['ap_original']:.4f}, "
+            f"AP_Improvement = {ranking_metrics['ap_improvement']:.4f}"
         )
         
         # Experiment A.2: Static Top-K Grouping
@@ -858,6 +1140,23 @@ class BlockA:
             top_k_indices = ranked_indices[:k].tolist()
             top_k_candidate_ids = self.ptu_engine.candidate_indices_to_ids(top_k_indices)
             pass_at_n = None
+            
+            # Compute ranking metrics for top-K list
+            top_k_ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
+                top_k_candidate_ids,
+                original_ranking_ids,
+                ground_truth_labels_dict,
+                self.config.ranking_k_values
+            )
+            
+            # Calculate position shift for top-K
+            top_k_position_shift = self.ptu_engine.compute_position_shift(original_indices, top_k_indices)
+            
+            # Calculate confidence variance for top-K
+            top_k_variance = float(np.std(scores[top_k_indices])) if len(top_k_indices) > 0 else 0.0
+            
+            # Coverage rate for top-K
+            top_k_coverage = k / total_candidates if total_candidates > 0 else 0.0
             
             cand_texts_a2 = self.ptu_engine.get_candidate_texts(top_k_indices)
             result_a2 = ExperimentResult(
@@ -871,16 +1170,26 @@ class BlockA:
                 application=f"Block_A_TopK_{k}_{strategy}",
                 subset_size=k,
                 selected_candidates=top_k_candidate_ids,
-                selected_scores=[float(scores[idx]) for idx in top_k_indices],  # NEW: Grab the scores
+                selected_scores=[float(scores[idx]) for idx in top_k_indices],
                 selected_candidate_texts=cand_texts_a2,
                 zero_score_fallback_triggered=(len(cand_texts_a2) == 0),
                 list_ap_score=None,
-                group_pass_at_n=pass_at_n
+                group_pass_at_n=pass_at_n,
+                # === NEW: Block A TopK metrics ===
+                ap_score_reranked=top_k_ranking_metrics['ap_reranked'],
+                ap_score_original=top_k_ranking_metrics['ap_original'],
+                ap_improvement=top_k_ranking_metrics['ap_improvement'],
+                recall_at_k=top_k_ranking_metrics['recall_at_k'],
+                ndcg_at_k=top_k_ranking_metrics['ndcg_at_k'],
+                candidate_coverage_rate=top_k_coverage,
+                avg_rerank_position_shift=top_k_position_shift,
+                confidence_variance=top_k_variance
             )
             results.append(result_a2)
             
             logger.info(
                 f"Block A A.2 - {mask_type} {strategy} Top-{k}: "
+                f"AP_Reranked = {top_k_ranking_metrics['ap_reranked']:.4f}, "
                 f"Pass@{self.config.global_pass_at_N} = {pass_at_n:.4f}"
             )
         
@@ -1266,6 +1575,164 @@ class BlockC:
 
 
 # ============================================================================
+# THREAD AGGREGATOR (NEW)
+# ============================================================================
+
+class ThreadAggregator:
+    """
+    Aggregates ExperimentResult objects into per-configuration-thread statistics.
+    Prepares data for comprehensive CSV report generation.
+    """
+    
+    @staticmethod
+    def aggregate_results(all_results: List[ExperimentResult], config: Layer2Config) -> Dict[str, Dict[str, Any]]:
+        """
+        Aggregate results by configuration thread.
+        
+        Args:
+            all_results: List of all ExperimentResult objects from orchestration
+            config: Layer2Config containing global settings
+        
+        Returns:
+            Dict mapping configuration_thread_name -> aggregated metrics dict
+        """
+        agg_data = defaultdict(lambda: {
+            "mask": None,
+            "block": None,
+            "strategy": None,
+            "top_k": None,
+            "threshold": None,
+            "coverage_target": None,
+            "total_queries": 0,
+            "total_context_tokens": 0,
+            "pass_at_metrics": defaultdict(float),  # {k: sum_of_passes}
+            "ap_scores_reranked": [],
+            "ap_scores_original": [],
+            "ap_improvements": [],
+            "recall_at_k_lists": defaultdict(list),  # {k: [recall@k values]}
+            "ndcg_at_k_lists": defaultdict(list),  # {k: [ndcg@k values]}
+            "coverage_rates": [],
+            "position_shifts": [],
+            "confidence_variances": []
+        })
+        
+        # Aggregate results by configuration thread
+        for result in all_results:
+            # Create unique thread identifier
+            thread_key = f"{result.evaluator_setting}_{result.application}_{result.scoring_strategy}"
+            
+            # Parse block and application details
+            if "Block_A" in result.application:
+                block = "Block_A"
+                if "Reranking" in result.application:
+                    top_k = None
+                else:
+                    # Extract K from Block_A_TopK_K_strategy
+                    parts = result.application.split("_")
+                    top_k = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+            elif "Block_B" in result.application:
+                block = "Block_B"
+                top_k = None  # Dynamic K
+            elif "Block_C" in result.application:
+                block = "Block_C"
+                top_k = None
+            else:
+                block = None
+                top_k = None
+            
+            # Store metadata
+            agg_data[thread_key]["mask"] = result.evaluator_setting
+            agg_data[thread_key]["block"] = block
+            agg_data[thread_key]["strategy"] = result.scoring_strategy
+            agg_data[thread_key]["top_k"] = top_k
+            
+            # Aggregate counts
+            agg_data[thread_key]["total_queries"] += 1
+            agg_data[thread_key]["total_context_tokens"] += result.context_token_estimate
+            
+            # Aggregate Pass@K metrics
+            for k, val in result.pass_at_k_metrics.items():
+                agg_data[thread_key]["pass_at_metrics"][k] += val
+            
+            # Aggregate Block A specific metrics
+            if result.ap_score_reranked is not None:
+                agg_data[thread_key]["ap_scores_reranked"].append(result.ap_score_reranked)
+            if result.ap_score_original is not None:
+                agg_data[thread_key]["ap_scores_original"].append(result.ap_score_original)
+            if result.ap_improvement is not None:
+                agg_data[thread_key]["ap_improvements"].append(result.ap_improvement)
+            
+            # Aggregate Recall@K and NDCG@K
+            for k, recall_val in (result.recall_at_k or {}).items():
+                agg_data[thread_key]["recall_at_k_lists"][k].append(recall_val)
+            for k, ndcg_val in (result.ndcg_at_k or {}).items():
+                agg_data[thread_key]["ndcg_at_k_lists"][k].append(ndcg_val)
+            
+            # Aggregate additional analysis metrics
+            if result.candidate_coverage_rate is not None:
+                agg_data[thread_key]["coverage_rates"].append(result.candidate_coverage_rate)
+            if result.avg_rerank_position_shift is not None:
+                agg_data[thread_key]["position_shifts"].append(result.avg_rerank_position_shift)
+            if result.confidence_variance is not None:
+                agg_data[thread_key]["confidence_variances"].append(result.confidence_variance)
+        
+        # Convert aggregated lists to averages
+        for thread_key, data in agg_data.items():
+            total_q = data["total_queries"]
+            
+            # Averages
+            data["avg_context_tokens"] = data["total_context_tokens"] / total_q if total_q > 0 else 0.0
+            data["avg_ap_reranked"] = np.mean(data["ap_scores_reranked"]) if data["ap_scores_reranked"] else None
+            data["avg_ap_original"] = np.mean(data["ap_scores_original"]) if data["ap_scores_original"] else None
+            data["avg_ap_improvement"] = np.mean(data["ap_improvements"]) if data["ap_improvements"] else None
+            
+            # Average Recall@K and NDCG@K
+            data["avg_recall_at_k"] = {
+                k: np.mean(vals) if vals else None
+                for k, vals in data["recall_at_k_lists"].items()
+            }
+            data["avg_ndcg_at_k"] = {
+                k: np.mean(vals) if vals else None
+                for k, vals in data["ndcg_at_k_lists"].items()
+            }
+            
+            # Average additional metrics
+            data["avg_coverage_rate"] = np.mean(data["coverage_rates"]) if data["coverage_rates"] else None
+            data["avg_position_shift"] = np.mean(data["position_shifts"]) if data["position_shifts"] else None
+            data["avg_confidence_variance"] = np.mean(data["confidence_variances"]) if data["confidence_variances"] else None
+            
+            # Convert Pass@K sum to average
+            for k in data["pass_at_metrics"]:
+                data["pass_at_metrics"][k] /= total_q
+        
+        return dict(agg_data)
+    
+    @staticmethod
+    def sort_threads_hierarchically(threads: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+        """
+        Sort threads hierarchically: Evaluator_Mask -> Experimental_Block -> Strategy_Name
+        
+        Args:
+            threads: Dict of aggregated thread data
+        
+        Returns:
+            List of (thread_name, thread_data) tuples sorted hierarchically
+        """
+        mask_order = {"Self": 0, "Others": 1, "All": 2}
+        block_order = {"Block_A": 0, "Block_B": 1, "Block_C": 2}
+        
+        def sort_key(item):
+            thread_name, data = item
+            mask_idx = mask_order.get(data["mask"], 3)
+            block_idx = block_order.get(data["block"], 3)
+            strategy = data["strategy"] or ""
+            top_k = data["top_k"] or 0
+            return (mask_idx, block_idx, strategy, top_k)
+        
+        return sorted(threads.items(), key=sort_key)
+
+
+# ============================================================================
 # LAYER 2 ORCHESTRATOR
 # ============================================================================
 
@@ -1436,6 +1903,25 @@ class Layer2Orchestrator:
         
         return report
     
+    def generate_comprehensive_report(self) -> Dict[str, Any]:
+        """
+        Generate comprehensive analysis report with AP metrics, ranking metrics, and all aggregations.
+        Returns data structure ready for CSV conversion.
+        
+        Returns:
+            Dict mapping thread_name -> comprehensive metrics
+        """
+        # Aggregate results by configuration thread
+        aggregated = ThreadAggregator.aggregate_results(self.all_results, self.config)
+        
+        # Sort threads hierarchically
+        sorted_threads = ThreadAggregator.sort_threads_hierarchically(aggregated)
+        
+        comprehensive_report = {}
+        for thread_name, thread_data in sorted_threads:
+            comprehensive_report[thread_name] = thread_data
+        
+        return comprehensive_report
     
     def _make_serializable(self, obj: Any) -> Any:
         """Convert numpy and other non-serializable types for JSON."""
@@ -1453,13 +1939,13 @@ class Layer2Orchestrator:
             return obj
     
     def save_reports(self, report: Dict[str, Any], json_filename: str = "layer2_detailed_logs.json", csv_filename: str = "layer2_master_report.csv"):
-        """Save both the detailed JSON logs and the aggregated CSV report to disk."""
+        """Save the detailed JSON logs and generate both the existing and comprehensive CSV reports."""
         # 1. Save JSON
         json_filepath = os.path.join(self.output_dir, json_filename)
         save_json(report, json_filepath)
         logger.info(f"Detailed JSON logs saved to: {json_filepath}")
 
-        # 2. Generate and Save CSV
+        # 2. Generate and Save EXISTING CSV (for backward compatibility)
         csv_filepath = os.path.join(self.output_dir, csv_filename)
         
         # Aggregate data by Configuration Thread
@@ -1481,11 +1967,11 @@ class Layer2Orchestrator:
                 agg_data[thread_name]["Pass_At_Metrics"][k] += val
                 if k > max_k: max_k = k
 
-        # Write to CSV
+        # Write existing CSV
         with open(csv_filepath, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             
-            expected_n = self.config.global_pass_at_N  # NEW: Force exact column count
+            expected_n = self.config.global_pass_at_N  # Force exact column count
             
             # Create Headers
             headers = ["Configuration_Thread", "Total_Questions_Evaluated", "Average_Context_Tokens"]
@@ -1506,7 +1992,121 @@ class Layer2Orchestrator:
                 writer.writerow(row)
 
         logger.info(f"Master CSV report saved to: {csv_filepath}")
+        
+        # 3. Generate and Save NEW COMPREHENSIVE CSV
+        self._save_comprehensive_report()
+        
         return json_filepath, csv_filepath
+    
+    def _save_comprehensive_report(self, csv_filename: str = "layer2_comprehensive_analysis.csv"):
+        """
+        Generate and save the comprehensive analysis CSV with AP metrics, ranking metrics, and hierarchical organization.
+        """
+        comprehensive_data = self.generate_comprehensive_report()
+        csv_filepath = os.path.join(self.output_dir, csv_filename)
+        
+        # Prepare headers
+        expected_n = self.config.global_pass_at_N
+        k_values = self.config.ranking_k_values
+        
+        headers = [
+            # Group 1: Configuration Identity
+            "Evaluator_Mask", "Experimental_Block", "Strategy_Name",
+            # Group 2: Block-Specific Hyperparameters
+            "Top_K", "Threshold", "Coverage_Target",
+            # Group 3: Global Execution Settings
+            "Global_Pass_at_N", "Model_Temperature",
+            # Group 4: Execution Scope
+            "Total_Queries_Evaluated",
+            # Group 5: Context Efficiency
+            "Avg_Context_Tokens",
+        ]
+        
+        # Group 6: Pass@N Metrics
+        for k in range(1, expected_n + 1):
+            headers.append(f"Pass_At_{k}")
+        
+        # Group 7: AP Analysis (Block A only)
+        headers.extend(["AP_Score_Reranked", "AP_Score_Original", "AP_Improvement"])
+        
+        # Group 8: Ranking Metrics (Block A only)
+        for k in k_values:
+            headers.append(f"Recall_At_{k}")
+        for k in k_values:
+            headers.append(f"NDCG_At_{k}")
+        
+        # Group 9: Additional Analysis
+        headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Confidence_Variance"])
+        
+        # Write to CSV
+        with open(csv_filepath, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow(headers)
+            
+            # Data rows (already sorted hierarchically)
+            for thread_name, thread_data in comprehensive_data.items():
+                row = [
+                    # Group 1: Configuration Identity
+                    thread_data.get("mask", ""),
+                    thread_data.get("block", ""),
+                    thread_data.get("strategy", ""),
+                    # Group 2: Block-Specific Hyperparameters
+                    thread_data.get("top_k") if thread_data.get("top_k") is not None else "-",
+                    "-",  # Threshold (not used in current config; set to N/A)\n                    "-",  # Coverage_Target (not used in current config; set to N/A)
+                    # Group 3: Global Execution Settings
+                    self.config.global_pass_at_N,
+                    self.global_config.get("DEFAULT_PASS_N_SOLVER_TEMPERATURE", 1.0),
+                    # Group 4: Execution Scope
+                    thread_data.get("total_queries", 0),
+                    # Group 5: Context Efficiency
+                    round(thread_data.get("avg_context_tokens", 0.0), 2),
+                ]
+                
+                # Group 6: Pass@N Metrics
+                for k in range(1, expected_n + 1):
+                    pass_k_val = thread_data.get("pass_at_metrics", {}).get(k, 0.0)
+                    row.append(round(pass_k_val, 4))
+                
+                # Group 7: AP Analysis (Block A only; "-" for others)
+                ap_reranked = thread_data.get("avg_ap_reranked")
+                ap_original = thread_data.get("avg_ap_original")
+                ap_improvement = thread_data.get("avg_ap_improvement")
+                row.extend([
+                    round(ap_reranked, 4) if ap_reranked is not None else "-",
+                    round(ap_original, 4) if ap_original is not None else "-",
+                    round(ap_improvement, 4) if ap_improvement is not None else "-",
+                ])
+                
+                # Group 8: Ranking Metrics (Block A only)
+                avg_recall = thread_data.get("avg_recall_at_k", {})
+                for k in k_values:
+                    recall_val = avg_recall.get(k)
+                    row.append(round(recall_val, 4) if recall_val is not None else "-")
+                
+                avg_ndcg = thread_data.get("avg_ndcg_at_k", {})
+                for k in k_values:
+                    ndcg_val = avg_ndcg.get(k)
+                    row.append(round(ndcg_val, 4) if ndcg_val is not None else "-")
+                
+                # Group 9: Additional Analysis
+                coverage = thread_data.get("avg_coverage_rate")
+                position_shift = thread_data.get("avg_position_shift")
+                confidence_var = thread_data.get("avg_confidence_variance")
+                row.extend([
+                    round(coverage, 4) if coverage is not None else "-",
+                    round(position_shift, 4) if position_shift is not None else "-",
+                    round(confidence_var, 4) if confidence_var is not None else "-",
+                ])
+                
+                writer.writerow(row)
+        
+        logger.info(f"Comprehensive analysis CSV report saved to: {csv_filepath}")
+        print(f"✓ Comprehensive CSV report generated: {csv_filename}")
+
+
+# ============================================================================
+# PUBLIC API
+# ============================================================================
 
 
 # ============================================================================
