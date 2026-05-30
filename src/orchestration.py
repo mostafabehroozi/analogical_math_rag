@@ -1382,17 +1382,27 @@ def run_experiments(
             # --- AUTOMATIC LAYER 2 EXECUTION ---
             if current_config.get('APPLY_LAYER2_ANALYSIS', False):
                 print("\n" + "#"*25 + f" STARTING LAYER 2 ANALYSIS FOR: {exp_name} " + "#"*25)
+                
                 layer2_cfg = current_config.get('LAYER2_CONFIG', {})
                 l2_out_dir = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_layer2_analytics")
+                
+                top_k_val = current_config.get('TOP_N_CANDIDATES_RETRIEVAL', 3)
+                n_cand_val = current_config.get('LAYER1_N_CANDIDATES') or top_k_val
+                
+                solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
+                eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", "gemini"))
                 
                 run_layer2_complete_pipeline(
                     layer1_cache_dir=global_config.get('LAYER1_CACHE_DIR', global_config['RESULTS_DIR']),
                     layer2_output_dir=l2_out_dir,
                     experiment_name=exp_name,
+                    api_manager_solve=solver_mgr,
+                    api_manager_eval=eval_mgr,
                     layer2_config_dict=layer2_cfg,
-                    top_k=current_config.get('TOP_N_CANDIDATES_RETRIEVAL', 3),
-                    n_candidates=current_config.get('LAYER1_N_CANDIDATES', None)
+                    top_k=top_k_val,
+                    n_candidates=n_cand_val
                 )
+                
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
             # -----------------------------------
 

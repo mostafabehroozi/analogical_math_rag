@@ -27,14 +27,19 @@ Key Design Principles:
 import logging
 import os
 import json
+import csv
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from collections import defaultdict
+import concurrent.futures
 
 from src.utils import save_json, load_json, convert_numpy_for_json
-
+from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.evaluation import evaluate_single_answer_with_llm
+from src.prompts import create_final_reasoning_prompt, create_final_reasoning_prompt_simple, EXEMPLAR_FORMAT
+from config import CONFIG as GLOBAL_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +65,16 @@ class ExperimentResult:
     selected_candidates: List[str] = None  # Dataset IDs of selected candidates
     selected_evaluators: List[int] = None  # Indices of selected evaluators
     
-    # Evaluation Metrics
-    list_ap_score: Optional[float] = None  # Block A Reranking only
-    group_pass_at_n: Optional[float] = None  # Pass@N metric
+    # Evaluation Metrics (Legacy)
+    list_ap_score: Optional[float] = None  
+    group_pass_at_n: Optional[float] = None  
+    
+# --- ACTIVE INFERENCE PAYLOADS (NEW) ---
+    selected_candidate_texts: List[str] = None
+    final_prompt_text: Optional[str] = None
+    zero_score_fallback_triggered: bool = False
+    executions: List[Dict[str, Any]] = None  
+    pass_at_k_metrics: Dict[int, float] = None
     
     # Meta
     timestamp: str = None
@@ -75,6 +87,12 @@ class ExperimentResult:
             self.selected_candidates = []
         if self.selected_evaluators is None:
             self.selected_evaluators = []
+        if self.selected_candidate_texts is None:
+            self.selected_candidate_texts = []
+        if self.executions is None:
+            self.executions = []
+        if self.pass_at_k_metrics is None:
+            self.pass_at_k_metrics = {}
 
 
 @dataclass
@@ -619,6 +637,16 @@ class PTUMathEngine:
         """Convert a list of internal evaluator indices into dataset IDs."""
         return [self.evaluator_ids[idx] for idx in evaluator_indices if 0 <= idx < len(self.evaluator_ids)]
 
+    def get_candidate_texts(self, candidate_indices: List[int]) -> List[str]:
+        """Extract the actual text strings for the selected candidates."""
+        texts = []
+        for idx in candidate_indices:
+            if 0 <= idx < len(self.candidate_set):
+                cand = self.candidate_set[idx]
+                if isinstance(cand, dict) and cand.get('candidate_text'):
+                    texts.append(cand['candidate_text'])
+        return texts
+
 
 def _normalize_ground_truth_label(label_obj: Any) -> bool:
     """Normalize a ground truth label value into a boolean is_correct flag."""
@@ -638,101 +666,81 @@ def _get_ground_truth_label(ground_truth_labels: Dict[Any, Any], cand_idx: int) 
 
 
 # ============================================================================
-# STANDARDIZED EVALUATION HARNESSES
+# ACTIVE INFERENCE ENGINE (LIVE LLM EVALUATION)
 # ============================================================================
 
-class ListBasedEvaluator:
+class ActiveInferenceEngine:
     """
-    Evaluates a fully ordered list of candidates using Average Precision (AP).
-    Used exclusively for Block A Reranking experiments.
+    Executes live API calls to the LLM using the contexts chosen by Layer 2 Blocks.
     """
-    
-    @staticmethod
-    def calculate_average_precision(
-        ordered_candidate_ids: List[str],
-        ground_truth_labels: Dict[str, bool]
-    ) -> float:
-        """
-        Calculate Average Precision for an ordered list.
+    def __init__(self, api_manager_solve: Any, api_manager_eval: Any):
+        self.api_manager_solve = api_manager_solve
+        self.api_manager_eval = api_manager_eval
+        self.global_config = GLOBAL_CONFIG
         
-        AP = mean of precision at each position where a True label appears.
-        
-        Args:
-            ordered_candidate_ids: List of candidate IDs in ranked order
-            ground_truth_labels: Dict mapping candidate ID to True/False
-        
-        Returns:
-            AP score between 0.0 and 1.0
-        """
-        if not ordered_candidate_ids:
-            return 0.0
-        
-        precisions = []
-        num_true = 0
-        
-        for rank, cand_id in enumerate(ordered_candidate_ids):
-            label = _get_ground_truth_label(ground_truth_labels, cand_id)
-            if label:
-                num_true += 1
-                precision_at_rank = num_true / (rank + 1)
-                precisions.append(precision_at_rank)
-        
-        if not precisions:
-            return 0.0
-        
-        return np.mean(precisions)
+        # Determine which model to use based on the API Manager type
+        if isinstance(self.api_manager_solve, GeminiAPIManager):
+            self.model_name = self.global_config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
+        elif isinstance(self.api_manager_solve, AvalAIAPIManager):
+            self.model_name = self.global_config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
+        else:
+            self.model_name = self.global_config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
 
+def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int):
+        # 1. Prompt Assembly
+        if not context_texts:
+            # Naked prompt (Zero-Score Fallback or no context)
+            prompt = create_final_reasoning_prompt_simple(target_query, self.global_config)
+        else:
+            # Format the raw candidate answers so the LLM understands what they are
+            formatted_contexts = []
+            for text in context_texts:
+                # If it's already formatted, leave it alone, otherwise wrap it
+                if "Question:" in text and "Rationale and Answer:" in text:
+                    formatted_contexts.append(text)
+                else:
+                    formatted_contexts.append(f"Question: {target_query}\nRationale and Answer: {text}")
+                    
+            # Context-Aware prompt
+            prompt = create_final_reasoning_prompt(target_query, formatted_contexts, self.global_config)
 
-class GroupBasedEvaluator:
-    """
-    Evaluates a subset (group) of candidates using Pass@N metric.
-    Used for any application that outputs a subset rather than full ordering.
-    """
-    
-    @staticmethod
-    def calculate_pass_at_n(
-        candidate_ids: List[str],
-        ground_truth_labels: Dict[str, bool],
-        n: int = 1
-    ) -> float:
-        """
-        Calculate Pass@N: probability that at least one of N random samples from
-        the candidate group contains a correct (True) answer.
+        executions = []
+        temp = self.global_config.get("DEFAULT_PASS_N_SOLVER_TEMPERATURE", 1.0)
+
+        # 2. Worker function for concurrent execution
+        def run_attempt(i):
+            resp = self.api_manager_solve.generate_content(prompt, self.model_name, temp)
+            is_correct = False
+            raw_text = resp.get('text', '')
+            error_msg = resp.get('error_message', '')
+            
+            if resp['status'] == 'SUCCESS':
+                eval_res = evaluate_single_answer_with_llm(raw_text, ground_truth, self.api_manager_eval, self.global_config)
+                is_correct = eval_res.get('is_correct', False)
+                
+            return {
+                "attempt_index": i + 1,
+                "raw_llm_generation": raw_text,
+                "error": error_msg,
+                "is_correct": is_correct
+            }
+
+        # 3. Execute N Independent Inferences Concurrently
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_attempts, 10)) as executor:
+            futures = [executor.submit(run_attempt, i) for i in range(n_attempts)]
+            for future in concurrent.futures.as_completed(futures):
+                executions.append(future.result())
         
-        For small groups, this is approximated as:
-        Pass@N = 1.0 if any candidate in the group is True, else 0.0 (for N=1)
-        For larger N, it's the probability of drawing at least one True in N draws.
-        
-        Args:
-            candidate_ids: List of candidate IDs
-            ground_truth_labels: Dict mapping candidate ID to True/False
-            n: Number of sampling attempts
-        
-        Returns:
-            Pass@N score between 0.0 and 1.0
-        """
-        if not candidate_ids:
-            return 0.0
-        
-        # Count true candidates in the group
-        num_true = sum(
-            1 for cand_id in candidate_ids
-            if _get_ground_truth_label(ground_truth_labels, cand_id)
-        )
-        
-        group_size = len(candidate_ids)
-        
-        if num_true == 0:
-            return 0.0
-        
-        # Pass@N = 1 - P(all N samples are wrong)
-        # P(drawing a wrong one) = (group_size - num_true) / group_size
-        prob_wrong = 1.0
-        for _ in range(n):
-            prob_wrong *= (group_size - num_true) / group_size
-        
-        pass_at_n = 1.0 - prob_wrong
-        return pass_at_n
+        # Sort executions sequentially
+        executions.sort(key=lambda x: x["attempt_index"])
+
+        # 4. Calculate empirical Pass@k metrics
+        pass_at_k = {}
+        is_correct_array = [ex["is_correct"] for ex in executions]
+        for k in range(1, n_attempts + 1):
+            pass_at_k[k] = 1.0 if any(is_correct_array[:k]) else 0.0
+
+        return prompt, executions, pass_at_k
 
 
 # ============================================================================
@@ -777,11 +785,9 @@ class BlockA:
         self.ranked_indices_cache[cache_key] = ranked_indices.tolist()
         
         ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
-        ap_score = ListBasedEvaluator.calculate_average_precision(
-            ranked_candidate_ids,
-            self.ptu_engine.ground_truth_labels
-        )
+        ap_score = None
         
+        cand_texts_a1 = self.ptu_engine.get_candidate_texts(ranked_indices.tolist())
         result_a1 = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -793,6 +799,8 @@ class BlockA:
             application=f"Block_A_Reranking_{strategy}",
             subset_size=len(ranked_indices),
             selected_candidates=ranked_candidate_ids,
+            selected_candidate_texts=cand_texts_a1,
+            zero_score_fallback_triggered=(len(cand_texts_a1) == 0),
             list_ap_score=ap_score,
             group_pass_at_n=None
         )
@@ -810,12 +818,9 @@ class BlockA:
             
             top_k_indices = ranked_indices[:k].tolist()
             top_k_candidate_ids = self.ptu_engine.candidate_indices_to_ids(top_k_indices)
-            pass_at_n = GroupBasedEvaluator.calculate_pass_at_n(
-                top_k_candidate_ids,
-                self.ptu_engine.ground_truth_labels,
-                self.config.global_pass_at_N
-            )
+            pass_at_n = None
             
+            cand_texts_a2 = self.ptu_engine.get_candidate_texts(top_k_indices)
             result_a2 = ExperimentResult(
                 target_query_idx=self.ptu_engine.target_query_idx,
                 target_query_text=self.ptu_engine.target_query_text,
@@ -827,6 +832,8 @@ class BlockA:
                 application=f"Block_A_TopK_{k}_{strategy}",
                 subset_size=k,
                 selected_candidates=top_k_candidate_ids,
+                selected_candidate_texts=cand_texts_a2,
+                zero_score_fallback_triggered=(len(cand_texts_a2) == 0),
                 list_ap_score=None,
                 group_pass_at_n=pass_at_n
             )
@@ -902,14 +909,11 @@ class BlockB:
                     positive_indices.append(cand_idx)
         
         k_dynamic = len(positive_indices)
+        zero_score_fallback_triggered = (k_dynamic == 0)
         
         # Evaluate the dynamic group
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(positive_indices)
-        pass_at_n = GroupBasedEvaluator.calculate_pass_at_n(
-            selected_candidate_ids,
-            self.ptu_engine.ground_truth_labels,
-            self.config.global_pass_at_N
-        )
+        pass_at_n = None
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -921,6 +925,8 @@ class BlockB:
             application=f"Block_B_Dynamic_{method}",
             subset_size=k_dynamic,
             selected_candidates=selected_candidate_ids,
+            selected_candidate_texts=self.ptu_engine.get_candidate_texts(positive_indices),
+            zero_score_fallback_triggered=zero_score_fallback_triggered,
             list_ap_score=None,
             group_pass_at_n=pass_at_n
         )
@@ -1186,11 +1192,8 @@ class BlockC:
         
         # Evaluate
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(selected_candidate_indices)
-        pass_at_n = GroupBasedEvaluator.calculate_pass_at_n(
-            selected_candidate_ids,
-            self.ptu_engine.ground_truth_labels,
-            self.config.global_pass_at_N
-        )
+        pass_at_n = None
+        cand_texts_c = self.ptu_engine.get_candidate_texts(selected_candidate_indices)
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -1200,6 +1203,8 @@ class BlockC:
             application=f"Block_C_{perspective}",
             subset_size=subset_size,
             selected_candidates=selected_candidate_ids,
+            selected_candidate_texts=cand_texts_c,
+            zero_score_fallback_triggered=(len(cand_texts_c) == 0),
             list_ap_score=None,
             group_pass_at_n=pass_at_n
         )
@@ -1224,9 +1229,12 @@ class Layer2Orchestrator:
     Manages the grid search across all base conditions and blocks.
     """
     
-    def __init__(self, config: Layer2Config, output_dir: str):
+    def __init__(self, config: Layer2Config, output_dir: str, api_manager_solve: Any, api_manager_eval: Any):
         self.config = config
         self.output_dir = output_dir
+        self.api_manager_solve = api_manager_solve
+        self.api_manager_eval = api_manager_eval
+        self.inference_engine = ActiveInferenceEngine(api_manager_solve, api_manager_eval)
         self.all_results = []
         os.makedirs(output_dir, exist_ok=True)
     
@@ -1322,21 +1330,49 @@ class Layer2Orchestrator:
                     )
                     query_results.extend(results)
         
+        # ===== ACTIVE INFERENCE EXECUTION =====
+        logger.info(f"\n[ACTIVE INFERENCE] Executing LLM for {len(query_results)} configurations...")
+        for result in query_results:
+            logger.info(f"  -> Running LLM for: {result.application} (Pass@{self.config.global_pass_at_N})")
+            
+            prompt, executions, pass_at_k = self.inference_engine.execute_and_evaluate(
+                target_query=result.target_query_text,
+                ground_truth=result.ground_truth_answer,
+                context_texts=result.selected_candidate_texts,
+                n_attempts=self.config.global_pass_at_N
+            )
+            
+            # Attach live payloads to the result object
+            result.final_prompt_text = prompt
+            result.executions = executions
+            result.pass_at_k_metrics = pass_at_k
+            
+            # For backward compatibility with the legacy summary function
+            result.group_pass_at_n = pass_at_k.get(self.config.global_pass_at_N, 0.0)
+
         self.all_results.extend(query_results)
         return query_results
     
     def generate_master_report(self) -> Dict[str, Any]:
         """
-        Generate comprehensive master report from all experimental results.
+        Generate detailed JSON report matching the strict schema requirements.
         """
-        # Convert results to serializable format
         results_data = []
-        for result in self.all_results:
-            result_dict = asdict(result)
-            result_dict = self._make_serializable(result_dict)
-            results_data.append(result_dict)
+        for r in self.all_results:
+            # Map strictly to the required schema
+            record = {
+                "main_question_id": r.target_query_idx,
+                "configuration_thread": f"{r.application}_{r.scoring_strategy}",
+                "context_selection_metadata": {
+                    "selected_samples": r.selected_candidates,
+                    "subset_size": r.subset_size,
+                    "zero_score_fallback_triggered": r.zero_score_fallback_triggered
+                },
+                "final_prompt_text": r.final_prompt_text,
+                "executions": r.executions
+            }
+            results_data.append(self._make_serializable(record))
         
-        # Create aggregated statistics
         report = {
             "metadata": {
                 "generation_timestamp": datetime.now().isoformat(),
@@ -1344,59 +1380,11 @@ class Layer2Orchestrator:
                 "total_queries": len(set(r.target_query_idx for r in self.all_results)),
                 "config": self._make_serializable(asdict(self.config))
             },
-            "experiments": results_data,
-            "summary_statistics": self._calculate_summary_stats()
+            "experiments": results_data
         }
         
         return report
     
-    def _calculate_summary_stats(self) -> Dict[str, Any]:
-        """Calculate aggregate statistics."""
-        stats = {
-            "by_application": defaultdict(lambda: {"count": 0, "avg_pass_at_n": 0.0, "avg_ap": 0.0}),
-            "by_evaluator_setting": defaultdict(lambda: {"count": 0, "avg_pass_at_n": 0.0}),
-            "by_strategy": defaultdict(lambda: {"count": 0, "avg_pass_at_n": 0.0})
-        }
-        
-        for result in self.all_results:
-            # By application
-            app_key = result.application
-            stats["by_application"][app_key]["count"] += 1
-            if result.group_pass_at_n is not None:
-                stats["by_application"][app_key]["avg_pass_at_n"] += result.group_pass_at_n
-            if result.list_ap_score is not None:
-                stats["by_application"][app_key]["avg_ap"] += result.list_ap_score
-            
-            # By evaluator setting
-            eval_key = result.evaluator_setting
-            stats["by_evaluator_setting"][eval_key]["count"] += 1
-            if result.group_pass_at_n is not None:
-                stats["by_evaluator_setting"][eval_key]["avg_pass_at_n"] += result.group_pass_at_n
-            
-            # By strategy
-            strat_key = result.scoring_strategy
-            stats["by_strategy"][strat_key]["count"] += 1
-            if result.group_pass_at_n is not None:
-                stats["by_strategy"][strat_key]["avg_pass_at_n"] += result.group_pass_at_n
-        
-        # Calculate averages
-        for key in stats["by_application"]:
-            count = stats["by_application"][key]["count"]
-            if count > 0:
-                stats["by_application"][key]["avg_pass_at_n"] /= count
-                stats["by_application"][key]["avg_ap"] /= count
-        
-        for key in stats["by_evaluator_setting"]:
-            count = stats["by_evaluator_setting"][key]["count"]
-            if count > 0:
-                stats["by_evaluator_setting"][key]["avg_pass_at_n"] /= count
-        
-        for key in stats["by_strategy"]:
-            count = stats["by_strategy"][key]["count"]
-            if count > 0:
-                stats["by_strategy"][key]["avg_pass_at_n"] /= count
-        
-        return {k: dict(v) for k, v in stats.items()}
     
     def _make_serializable(self, obj: Any) -> Any:
         """Convert numpy and other non-serializable types for JSON."""
@@ -1413,12 +1401,57 @@ class Layer2Orchestrator:
         else:
             return obj
     
-    def save_report(self, report: Dict[str, Any], filename: str = "layer2_master_report.json"):
-        """Save master report to disk."""
-        filepath = os.path.join(self.output_dir, filename)
-        save_json(report, filepath)
-        logger.info(f"Master report saved to: {filepath}")
-        return filepath
+    def save_reports(self, report: Dict[str, Any], json_filename: str = "layer2_detailed_logs.json", csv_filename: str = "layer2_master_report.csv"):
+        """Save both the detailed JSON logs and the aggregated CSV report to disk."""
+        # 1. Save JSON
+        json_filepath = os.path.join(self.output_dir, json_filename)
+        save_json(report, json_filepath)
+        logger.info(f"Detailed JSON logs saved to: {json_filepath}")
+
+        # 2. Generate and Save CSV
+        csv_filepath = os.path.join(self.output_dir, csv_filename)
+        
+        # Aggregate data by Configuration Thread
+        agg_data = defaultdict(lambda: {
+            "Total_Questions": 0, 
+            "Total_Context_Size": 0, 
+            "Pass_At_Metrics": defaultdict(float)
+        })
+        
+        max_k = 0
+        for r in self.all_results:
+            thread_name = f"{r.application}_{r.scoring_strategy}"
+            agg_data[thread_name]["Total_Questions"] += 1
+            agg_data[thread_name]["Total_Context_Size"] += r.subset_size
+            
+            for k, val in r.pass_at_k_metrics.items():
+                agg_data[thread_name]["Pass_At_Metrics"][k] += val
+                if k > max_k: max_k = k
+
+        # Write to CSV
+        with open(csv_filepath, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            
+            # Create Headers
+            headers = ["Configuration_Thread", "Total_Questions_Evaluated", "Average_Context_Samples"]
+            for k in range(1, max_k + 1):
+                headers.append(f"Pass@{k}_Accuracy")
+            writer.writerow(headers)
+            
+            # Write Rows
+            for thread_name, stats in agg_data.items():
+                total_q = stats["Total_Questions"]
+                avg_context = stats["Total_Context_Size"] / total_q if total_q > 0 else 0
+                
+                row = [thread_name, total_q, round(avg_context, 2)]
+                for k in range(1, max_k + 1):
+                    avg_pass_k = stats["Pass_At_Metrics"][k] / total_q if total_q > 0 else 0
+                    row.append(round(avg_pass_k, 4))
+                    
+                writer.writerow(row)
+
+        logger.info(f"Master CSV report saved to: {csv_filepath}")
+        return json_filepath, csv_filepath
 
 
 # ============================================================================
@@ -1428,7 +1461,9 @@ class Layer2Orchestrator:
 def run_layer2_experiments(
     layer1_states: List[Dict[str, Any]],
     config: Layer2Config,
-    output_dir: str
+    output_dir: str,
+    api_manager_solve: Any,
+    api_manager_eval: Any
 ) -> Tuple[List[ExperimentResult], Dict[str, Any]]:
     """
     Run complete Layer 2 analysis on Layer 1 cached states.
@@ -1437,11 +1472,13 @@ def run_layer2_experiments(
         layer1_states: List of Layer 1 cached states (one per query)
         config: Layer2Config instance
         output_dir: Directory to save results
+        api_manager_solve: The API manager for generating solutions
+        api_manager_eval: The API manager for checking answers
     
     Returns:
         Tuple of (all_results, master_report)
     """
-    orchestrator = Layer2Orchestrator(config, output_dir)
+    orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval)
     
     logger.info(f"Starting Layer 2 Analysis on {len(layer1_states)} queries")
     logger.info(f"Config: {asdict(config)}")
@@ -1449,9 +1486,9 @@ def run_layer2_experiments(
     for layer1_state in layer1_states:
         orchestrator.run_single_query(layer1_state)
     
-    # Generate and save report
+    # Generate and save reports (JSON and CSV)
     report = orchestrator.generate_master_report()
-    orchestrator.save_report(report)
+    orchestrator.save_reports(report)
     
     logger.info(f"Layer 2 Analysis Complete: {len(orchestrator.all_results)} total experiments")
     

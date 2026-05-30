@@ -167,6 +167,8 @@ def run_layer2_complete_pipeline(
     layer1_cache_dir: str,
     layer2_output_dir: str,
     experiment_name: str,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
     layer2_config_dict: Optional[Dict[str, Any]] = None,
     query_indices: Optional[List[int]] = None,
     top_k: int = 3,
@@ -223,49 +225,18 @@ def run_layer2_complete_pipeline(
     # Step 4: Run Layer 2 experiments
     logger.info(f"\nStep 4: Running Layer 2 experiments")
     all_results, master_report = run_layer2_experiments(
-        layer1_states, layer2_config, layer2_output_dir
+        layer1_states, layer2_config, layer2_output_dir, api_manager_solve, api_manager_eval
     )
     
-    # Step 5: Save report and results
-    logger.info(f"\nStep 5: Saving results")
-    results_filepath = os.path.join(layer2_output_dir, "layer2_experiments_detailed.json")
-    report_filepath = os.path.join(layer2_output_dir, "layer2_master_report.json")
-    
-    # Serialize results
-    results_data = [
-        {
-            'target_query_idx': r.target_query_idx,
-            'target_query_text': r.target_query_text,
-            'ground_truth_answer': r.ground_truth_answer,
-            'evaluator_setting': r.evaluator_setting,
-            'scoring_strategy': r.scoring_strategy,
-            'weight_taker': r.weight_taker,
-            'weight_maker': r.weight_maker,
-            'application': r.application,
-            'subset_size': r.subset_size,
-            'selected_candidates': r.selected_candidates,
-            'list_ap_score': r.list_ap_score,
-            'group_pass_at_n': r.group_pass_at_n,
-            'timestamp': r.timestamp,
-            'notes': r.notes
-        }
-        for r in all_results
-    ]
-    
-    save_json(results_data, results_filepath)
-    save_json(master_report, report_filepath)
-    
+    # Step 5: Wrap up logging (Files are already saved by the Orchestrator)
     logger.info(f"\n{'='*80}")
     logger.info("LAYER 2 EXECUTION COMPLETE")
     logger.info(f"{'='*80}")
-    logger.info(f"Results saved to:")
-    logger.info(f"  - Detailed Results: {results_filepath}")
-    logger.info(f"  - Master Report: {report_filepath}")
-    logger.info(f"  - Total Experiments: {len(all_results)}")
-    logger.info(f"  - Total Queries: {len(set(r.target_query_idx for r in all_results))}")
+    logger.info(f"  - Output Directory: {layer2_output_dir}")
+    logger.info(f"  - Total Configurations Tested: {len(all_results)}")
+    logger.info(f"  - Total Target Queries: {len(set(r.target_query_idx for r in all_results))}")
     
     return all_results, master_report
-
 
 def validate_layer1_cache_structure(cache_data: Dict[str, Any]) -> bool:
     """
