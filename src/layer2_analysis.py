@@ -31,6 +31,7 @@ import csv
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
+import time
 from datetime import datetime
 from collections import defaultdict
 import concurrent.futures
@@ -62,8 +63,10 @@ class ExperimentResult:
     weight_taker: float = 1.0
     weight_maker: float = 1.0
     subset_size: int = 0
-    selected_candidates: List[str] = None  # Dataset IDs of selected candidates
-    selected_evaluators: List[int] = None  # Indices of selected evaluators
+    context_token_estimate: int = 0  
+    selected_candidates: List[str] = None  
+    selected_evaluators: List[int] = None  
+    selected_scores: List[float] = None  # NEW: Store the scores of chosen samples
     
     # Evaluation Metrics (Legacy)
     list_ap_score: Optional[float] = None  
@@ -87,6 +90,8 @@ class ExperimentResult:
             self.selected_candidates = []
         if self.selected_evaluators is None:
             self.selected_evaluators = []
+        if self.selected_scores is None:
+            self.selected_scores = []  # NEW
         if self.selected_candidate_texts is None:
             self.selected_candidate_texts = []
         if self.executions is None:
@@ -687,42 +692,66 @@ class ActiveInferenceEngine:
             self.model_name = self.global_config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
 
 def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int):
+        # NEW: Deduplicate text strings to save tokens and prevent redundant context
+        unique_contexts = []
+        if context_texts:
+            for text in context_texts:
+                if text not in unique_contexts:
+                    unique_contexts.append(text)
+            context_texts = unique_contexts
+
         # 1. Prompt Assembly
         if not context_texts:
-            # Naked prompt (Zero-Score Fallback or no context)
             prompt = create_final_reasoning_prompt_simple(target_query, self.global_config)
         else:
-            # Format the raw candidate answers so the LLM understands what they are
             formatted_contexts = []
             for text in context_texts:
-                # If it's already formatted, leave it alone, otherwise wrap it
                 if "Question:" in text and "Rationale and Answer:" in text:
                     formatted_contexts.append(text)
                 else:
                     formatted_contexts.append(f"Question: {target_query}\nRationale and Answer: {text}")
-                    
-            # Context-Aware prompt
             prompt = create_final_reasoning_prompt(target_query, formatted_contexts, self.global_config)
 
         executions = []
         temp = self.global_config.get("DEFAULT_PASS_N_SOLVER_TEMPERATURE", 1.0)
 
-        # 2. Worker function for concurrent execution
+        # 2. Worker function with RETRY LOGIC (Exponential Backoff)
         def run_attempt(i):
-            resp = self.api_manager_solve.generate_content(prompt, self.model_name, temp)
-            is_correct = False
-            raw_text = resp.get('text', '')
-            error_msg = resp.get('error_message', '')
+            max_retries = 3
+            backoff = 2.0
             
-            if resp['status'] == 'SUCCESS':
-                eval_res = evaluate_single_answer_with_llm(raw_text, ground_truth, self.api_manager_eval, self.global_config)
-                is_correct = eval_res.get('is_correct', False)
+            for attempt in range(max_retries):
+                resp = self.api_manager_solve.generate_content(prompt, self.model_name, temp)
+                raw_text = resp.get('text', '')
+                error_msg = resp.get('error_message', '')
                 
+                if resp['status'] == 'SUCCESS':
+                    eval_res = evaluate_single_answer_with_llm(raw_text, ground_truth, self.api_manager_eval, self.global_config)
+                    
+                    # NEW: Did the evaluator API fail? If yes, trigger a retry!
+                    if eval_res.get('status') != 'SUCCESS':
+                        time.sleep(backoff)
+                        backoff *= 2
+                        continue 
+                        
+                    return {
+                        "attempt_index": i + 1,
+                        "raw_llm_generation": raw_text,
+                        "error": "",
+                        "is_correct": eval_res.get('is_correct', False),
+                        "api_success": True
+                    }
+                else:
+                    time.sleep(backoff)
+                    backoff *= 2  # Double the wait time
+            
+            # If all retries fail
             return {
                 "attempt_index": i + 1,
-                "raw_llm_generation": raw_text,
+                "raw_llm_generation": "",
                 "error": error_msg,
-                "is_correct": is_correct
+                "is_correct": False,
+                "api_success": False  # Mark as API failure so we don't count it in the math
             }
 
         # 3. Execute N Independent Inferences Concurrently
@@ -731,14 +760,21 @@ def execute_and_evaluate(self, target_query: str, ground_truth: str, context_tex
             for future in concurrent.futures.as_completed(futures):
                 executions.append(future.result())
         
-        # Sort executions sequentially
         executions.sort(key=lambda x: x["attempt_index"])
 
-        # 4. Calculate empirical Pass@k metrics
+        # 4. Calculate empirical Pass@k metrics (Excluding API Failures)
         pass_at_k = {}
-        is_correct_array = [ex["is_correct"] for ex in executions]
+        # Only count successful API calls for our math
+        valid_executions = [ex for ex in executions if ex["api_success"]]
+        is_correct_array = [ex["is_correct"] for ex in valid_executions]
+        
+        # If all API calls failed, return 0.0 for everything
+        actual_n = len(valid_executions)
         for k in range(1, n_attempts + 1):
-            pass_at_k[k] = 1.0 if any(is_correct_array[:k]) else 0.0
+            if k <= actual_n:
+                pass_at_k[k] = 1.0 if any(is_correct_array[:k]) else 0.0
+            else:
+                pass_at_k[k] = pass_at_k.get(actual_n, 0.0) # Carry forward the last valid score
 
         return prompt, executions, pass_at_k
 
@@ -778,7 +814,9 @@ class BlockA:
         )
         
         # Experiment A.1: Reranking & Average Precision
-        ranked_indices = np.argsort(-scores)  # Sort descending
+        # FIX: Only keep candidates that have a strictly positive score (> 0)
+        valid_indices = np.where(scores > 0)[0]
+        ranked_indices = valid_indices[np.argsort(-scores[valid_indices])]
         
         # Cache the ranked indices for Block B boundary test (Experiment B.2.3)
         cache_key = (mask_type, strategy)
@@ -799,6 +837,7 @@ class BlockA:
             application=f"Block_A_Reranking_{strategy}",
             subset_size=len(ranked_indices),
             selected_candidates=ranked_candidate_ids,
+            selected_scores=[float(scores[idx]) for idx in ranked_indices],  # NEW: Added scores for A.1
             selected_candidate_texts=cand_texts_a1,
             zero_score_fallback_triggered=(len(cand_texts_a1) == 0),
             list_ap_score=ap_score,
@@ -832,6 +871,7 @@ class BlockA:
                 application=f"Block_A_TopK_{k}_{strategy}",
                 subset_size=k,
                 selected_candidates=top_k_candidate_ids,
+                selected_scores=[float(scores[idx]) for idx in top_k_indices],  # NEW: Grab the scores
                 selected_candidate_texts=cand_texts_a2,
                 zero_score_fallback_triggered=(len(cand_texts_a2) == 0),
                 list_ap_score=None,
@@ -925,6 +965,7 @@ class BlockB:
             application=f"Block_B_Dynamic_{method}",
             subset_size=k_dynamic,
             selected_candidates=selected_candidate_ids,
+            selected_scores=[float(scores[idx]) for idx in positive_indices],  # NEW: Grab the scores
             selected_candidate_texts=self.ptu_engine.get_candidate_texts(positive_indices),
             zero_score_fallback_triggered=zero_score_fallback_triggered,
             list_ap_score=None,
@@ -1194,6 +1235,10 @@ class BlockC:
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(selected_candidate_indices)
         pass_at_n = None
         cand_texts_c = self.ptu_engine.get_candidate_texts(selected_candidate_indices)
+        
+        # NEW: Pick the right scores depending on the strategy!
+        log_scores = score_take if perspective == 'Candidate_Centric' else score_make
+        
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -1203,6 +1248,7 @@ class BlockC:
             application=f"Block_C_{perspective}",
             subset_size=subset_size,
             selected_candidates=selected_candidate_ids,
+            selected_scores=[float(log_scores[idx]) for idx in selected_candidate_indices], # FIXED
             selected_candidate_texts=cand_texts_c,
             zero_score_fallback_triggered=(len(cand_texts_c) == 0),
             list_ap_score=None,
@@ -1347,6 +1393,9 @@ class Layer2Orchestrator:
             result.executions = executions
             result.pass_at_k_metrics = pass_at_k
             
+            # NEW: Calculate tokens based on the EXACT final prompt sent to the LLM (chars / 4)
+            result.context_token_estimate = len(prompt) // 4
+            
             # For backward compatibility with the legacy summary function
             result.group_pass_at_n = pass_at_k.get(self.config.global_pass_at_N, 0.0)
 
@@ -1365,7 +1414,9 @@ class Layer2Orchestrator:
                 "configuration_thread": f"{r.application}_{r.scoring_strategy}",
                 "context_selection_metadata": {
                     "selected_samples": r.selected_candidates,
+                    "selected_scores": r.selected_scores,
                     "subset_size": r.subset_size,
+                    "context_token_estimate": r.context_token_estimate,
                     "zero_score_fallback_triggered": r.zero_score_fallback_triggered
                 },
                 "final_prompt_text": r.final_prompt_text,
@@ -1422,7 +1473,9 @@ class Layer2Orchestrator:
         for r in self.all_results:
             thread_name = f"{r.application}_{r.scoring_strategy}"
             agg_data[thread_name]["Total_Questions"] += 1
-            agg_data[thread_name]["Total_Context_Size"] += r.subset_size
+            
+            # Use the token estimate we calculated accurately during inference
+            agg_data[thread_name]["Total_Context_Size"] += r.context_token_estimate
             
             for k, val in r.pass_at_k_metrics.items():
                 agg_data[thread_name]["Pass_At_Metrics"][k] += val
@@ -1432,9 +1485,11 @@ class Layer2Orchestrator:
         with open(csv_filepath, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             
+            expected_n = self.config.global_pass_at_N  # NEW: Force exact column count
+            
             # Create Headers
-            headers = ["Configuration_Thread", "Total_Questions_Evaluated", "Average_Context_Samples"]
-            for k in range(1, max_k + 1):
+            headers = ["Configuration_Thread", "Total_Questions_Evaluated", "Average_Context_Tokens"]
+            for k in range(1, expected_n + 1):
                 headers.append(f"Pass@{k}_Accuracy")
             writer.writerow(headers)
             
@@ -1444,7 +1499,7 @@ class Layer2Orchestrator:
                 avg_context = stats["Total_Context_Size"] / total_q if total_q > 0 else 0
                 
                 row = [thread_name, total_q, round(avg_context, 2)]
-                for k in range(1, max_k + 1):
+                for k in range(1, expected_n + 1):
                     avg_pass_k = stats["Pass_At_Metrics"][k] / total_q if total_q > 0 else 0
                     row.append(round(avg_pass_k, 4))
                     
