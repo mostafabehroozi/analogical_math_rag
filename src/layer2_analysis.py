@@ -1190,7 +1190,7 @@ class BlockA:
             logger.info(
                 f"Block A A.2 - {mask_type} {strategy} Top-{k}: "
                 f"AP_Reranked = {top_k_ranking_metrics['ap_reranked']:.4f}, "
-                f"Pass@{self.config.global_pass_at_N} = {pass_at_n:.4f}"
+                f"Pass@{self.config.global_pass_at_N} = PENDING"
             )
         
         self.results.extend(results)
@@ -1284,7 +1284,7 @@ class BlockB:
         
         logger.info(
             f"Block B - {mask_type} {method}: "
-            f"K_dynamic = {k_dynamic}, Pass@{self.config.global_pass_at_N} = {pass_at_n:.4f}"
+            f"K_dynamic = {k_dynamic}, Pass@{self.config.global_pass_at_N} = PENDING"
         )
         
         # Experiment B.2.3: Boundary Intersection Test (if enabled)
@@ -1567,7 +1567,7 @@ class BlockC:
         
         logger.info(
             f"Block C - {mask_type} {perspective}: "
-            f"K_optimal = {subset_size}, Pass@{self.config.global_pass_at_N} = {pass_at_n:.4f}"
+            f"K_optimal = {subset_size}, Pass@{self.config.global_pass_at_N} = PENDING"
         )
         
         self.results.append(result)
