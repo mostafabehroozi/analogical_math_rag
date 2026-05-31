@@ -1000,11 +1000,14 @@ class ActiveInferenceEngine:
                 "api_success": False  # Mark as API failure so we don't count it in the math
             }
 
-        # 3. Execute N Independent Inferences Concurrently
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_attempts, 10)) as executor:
-            futures = [executor.submit(run_attempt, i) for i in range(n_attempts)]
-            for future in concurrent.futures.as_completed(futures):
-                executions.append(future.result())
+        # 3. Execute N Independent Inferences Sequentially (One by one)
+        for i in range(n_attempts):
+            # Print a tiny log so you know it's working sequentially
+            print(f"      -> Running LLM inference attempt {i+1} of {n_attempts}...")
+            
+            # Run the attempt and wait for it to finish before moving to the next
+            result = run_attempt(i)
+            executions.append(result)
         
         executions.sort(key=lambda x: x["attempt_index"])
 

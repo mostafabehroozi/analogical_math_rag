@@ -163,7 +163,6 @@ class GeminiAPIManager:
         self.last_global_call_timestamp: float = 0
         
         self.current_key_index: int = 0
-        self._lock = False
 
         self.print_details = self.config.get("PRINT_API_CALL_DETAILS", False)
         self.truncation_length = self.config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
@@ -207,73 +206,61 @@ class GeminiAPIManager:
     def _select_key_and_apply_delay(self, model_name: str) -> Optional[str]:
         """
         Finds an available API key, applies the necessary rate-limiting delay,
-        and records the call's start timestamp. This method centralizes the
-        entire pre-call process to ensure correct timing.
-
-        Returns:
-            Optional[str]: The selected API key, or None if all keys are rate-limited.
+        and records the call's start timestamp.
         """
         if not self.api_keys_list:
             return None
 
-        if self._lock:
-            self.logger.warning("Key selection is locked; waiting.")
-            return None 
+        now = time.time()
+        time_since_last_global_call = now - self.last_global_call_timestamp
+        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global_call)
 
-        self._lock = True
-        try:
-            now = time.time()
-            time_since_last_global_call = now - self.last_global_call_timestamp
-            global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global_call)
+        candidates = []
+        for current_api_key in self.api_keys_list:
+            quota = self._get_quota_for_key(model_name, current_api_key)
+            required_per_key_delay = quota.get("delay_seconds", 1)
+            max_rpd = quota.get("rpd", float('inf'))
 
-            candidates = []
-            for current_api_key in self.api_keys_list:
-                quota = self._get_quota_for_key(model_name, current_api_key)
-                required_per_key_delay = quota.get("delay_seconds", 1)
-                max_rpd = quota.get("rpd", float('inf'))
+            current_date_str = self._get_current_date_str()
+            daily_usage_key = (current_api_key, model_name, current_date_str)
+            current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
+            if current_daily_calls >= max_rpd:
+                continue
 
-                current_date_str = self._get_current_date_str()
-                daily_usage_key = (current_api_key, model_name, current_date_str)
-                current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
-                if current_daily_calls >= max_rpd:
-                    continue
+            last_call_timestamp_key = (current_api_key, model_name)
+            last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
+            time_since_last_call = now - last_call_time
+            per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
+            final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
 
-                last_call_timestamp_key = (current_api_key, model_name)
-                last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
-                time_since_last_call = now - last_call_time
-                per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
-                final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
+            candidates.append((
+                current_api_key,
+                final_sleep_duration,
+                current_daily_calls,
+                last_call_time,
+            ))
 
-                candidates.append((
-                    current_api_key,
-                    final_sleep_duration,
-                    current_daily_calls,
-                    last_call_time,
-                ))
+        if not candidates:
+            self.logger.warning(f"All {len(self.api_keys_list)} API keys are rate-limited for model '{model_name}'.")
+            return None
 
-            if not candidates:
-                self.logger.warning(f"All {len(self.api_keys_list)} API keys are rate-limited for model '{model_name}'.")
-                return None
+        candidates.sort(key=lambda item: (item[1], item[2], item[3]))
+        selected_key, sleep_duration, _, _ = candidates[0]
 
-            candidates.sort(key=lambda item: (item[1], item[2], item[3]))
-            selected_key, sleep_duration, _, _ = candidates[0]
+        if sleep_duration > 0:
+            self.logger.info(f"Rate limit requires sleeping for {sleep_duration:.2f}s.")
+            print(f"Sleeping for {sleep_duration:.2f} seconds due to rate limiting.")
+            time.sleep(sleep_duration)
 
-            if sleep_duration > 0:
-                self.logger.info(f"Rate limit requires sleeping for {sleep_duration:.2f}s.")
-                print(f"Sleeping for {sleep_duration:.2f} seconds due to rate limiting.")
-                time.sleep(sleep_duration)
-
-            current_call_start_time = time.time()
-            if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-                elapsed = current_call_start_time - self._last_checkpoint_timestamp
-                print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-            self._last_checkpoint_timestamp = current_call_start_time
-            self.last_global_call_timestamp = current_call_start_time
-            self.key_usage_timestamps[(selected_key, model_name)] = current_call_start_time
-            self.current_key_index = (self.api_keys_list.index(selected_key) + 1) % len(self.api_keys_list)
-            return selected_key
-        finally:
-            self._lock = False
+        current_call_start_time = time.time()
+        if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
+            elapsed = current_call_start_time - self._last_checkpoint_timestamp
+            print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
+        self._last_checkpoint_timestamp = current_call_start_time
+        self.last_global_call_timestamp = current_call_start_time
+        self.key_usage_timestamps[(selected_key, model_name)] = current_call_start_time
+        self.current_key_index = (self.api_keys_list.index(selected_key) + 1) % len(self.api_keys_list)
+        return selected_key
 
     def _increment_daily_usage(self, api_key: str, model_name: str) -> None:
         """Increments the daily call count for a given key and model."""
@@ -292,15 +279,16 @@ class GeminiAPIManager:
             print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
-        api_key = self._select_key_and_apply_delay(model_name)
-
-        if api_key is None:
-            error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
-            if self.print_details:
-                print(f"\n!!! [API Call FAILED: Gemini] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-            return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
-
         def _inner_call() -> APIResponse:
+            # MOVED INSIDE: Re-check keys on every retry attempt
+            api_key = self._select_key_and_apply_delay(model_name)
+
+            if api_key is None:
+                error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
+                if self.print_details:
+                    print(f"\n!!! [API Call FAILED: Gemini] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
+
             caught_exception = None
             try:
                 max_tokens = None
@@ -413,7 +401,6 @@ class AvalAIAPIManager:
         self.key_usage_timestamps: Dict[Tuple[str, str], float] = {}
         self.key_daily_counts: Dict[Tuple[str, str, str], int] = {}
         self.current_key_index: int = 0
-        self._lock = False
 
         # Per-model last call timestamps for fallback book-keeping
         self.last_model_call_timestamps: Dict[str, float] = {}
@@ -461,64 +448,56 @@ class AvalAIAPIManager:
         if not self.api_keys_list:
             return None
 
-        if self._lock:
-            self.logger.warning("Key selection is locked; waiting.")
+        now = time.time()
+        time_since_last_global = now - self.last_global_call_timestamp
+        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
+
+        candidates = []
+        for current_api_key in self.api_keys_list:
+            quota = self._get_quota_for_key(model_name, current_api_key)
+            required_per_key_delay = quota.get("delay_seconds", 1)
+            max_rpd = quota.get("rpd", float('inf'))
+
+            current_date_str = self._get_current_date_str()
+            daily_usage_key = (current_api_key, model_name, current_date_str)
+            current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
+            if current_daily_calls >= max_rpd:
+                continue
+
+            last_call_timestamp_key = (current_api_key, model_name)
+            last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
+            time_since_last_call = now - last_call_time
+            per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
+            final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
+
+            candidates.append((
+                current_api_key,
+                final_sleep_duration,
+                current_daily_calls,
+                last_call_time,
+            ))
+
+        if not candidates:
+            self.logger.warning(f"All {len(self.api_keys_list)} API keys are rate-limited for model '{model_name}'.")
             return None
 
-        self._lock = True
-        try:
-            now = time.time()
-            time_since_last_global = now - self.last_global_call_timestamp
-            global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
+        candidates.sort(key=lambda item: (item[1], item[2], item[3]))
+        selected_key, sleep_duration, _, _ = candidates[0]
 
-            candidates = []
-            for current_api_key in self.api_keys_list:
-                quota = self._get_quota_for_key(model_name, current_api_key)
-                required_per_key_delay = quota.get("delay_seconds", 1)
-                max_rpd = quota.get("rpd", float('inf'))
+        if sleep_duration > 0:
+            self.logger.info(f"Rate limit requires sleeping for {sleep_duration:.2f}s.")
+            print(f"Sleeping for {sleep_duration:.2f} seconds due to rate limiting.")
+            time.sleep(sleep_duration)
 
-                current_date_str = self._get_current_date_str()
-                daily_usage_key = (current_api_key, model_name, current_date_str)
-                current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
-                if current_daily_calls >= max_rpd:
-                    continue
-
-                last_call_timestamp_key = (current_api_key, model_name)
-                last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
-                time_since_last_call = now - last_call_time
-                per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
-                final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
-
-                candidates.append((
-                    current_api_key,
-                    final_sleep_duration,
-                    current_daily_calls,
-                    last_call_time,
-                ))
-
-            if not candidates:
-                self.logger.warning(f"All {len(self.api_keys_list)} API keys are rate-limited for model '{model_name}'.")
-                return None
-
-            candidates.sort(key=lambda item: (item[1], item[2], item[3]))
-            selected_key, sleep_duration, _, _ = candidates[0]
-
-            if sleep_duration > 0:
-                self.logger.info(f"Rate limit requires sleeping for {sleep_duration:.2f}s.")
-                print(f"Sleeping for {sleep_duration:.2f} seconds due to rate limiting.")
-                time.sleep(sleep_duration)
-
-            current_call_start_time = time.time()
-            if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-                elapsed = current_call_start_time - self._last_checkpoint_timestamp
-                print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-            self._last_checkpoint_timestamp = current_call_start_time
-            self.last_global_call_timestamp = current_call_start_time
-            self.key_usage_timestamps[(selected_key, model_name)] = current_call_start_time
-            self.current_key_index = (self.api_keys_list.index(selected_key) + 1) % len(self.api_keys_list)
-            return selected_key
-        finally:
-            self._lock = False
+        current_call_start_time = time.time()
+        if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
+            elapsed = current_call_start_time - self._last_checkpoint_timestamp
+            print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
+        self._last_checkpoint_timestamp = current_call_start_time
+        self.last_global_call_timestamp = current_call_start_time
+        self.key_usage_timestamps[(selected_key, model_name)] = current_call_start_time
+        self.current_key_index = (self.api_keys_list.index(selected_key) + 1) % len(self.api_keys_list)
+        return selected_key
 
     def _increment_daily_usage(self, api_key: str, model_name: str) -> None:
         current_date_str = self._get_current_date_str()
@@ -534,17 +513,18 @@ class AvalAIAPIManager:
             print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
             print("----------------------------------")
 
-        selected_key = self._select_key_and_apply_delay(model_name)
-
-        if selected_key is None:
-            error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
-            if self.print_details:
-                print(f"\n!!! [API Call FAILED: AvalAI] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-            return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
-
-        client = self.clients[selected_key]
-
         def _inner_call() -> APIResponse:
+            # MOVED INSIDE: Now if keys are rate-limited, the retry loop catches it!
+            selected_key = self._select_key_and_apply_delay(model_name)
+
+            if selected_key is None:
+                error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
+                if self.print_details:
+                    print(f"\n!!! [API Call FAILED: AvalAI] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
+
+            client = self.clients[selected_key]
+            
             caught_exception = None
             try:
                 self.logger.info(f"Calling OpenAI-compatible model '{model_name}' with key ending in ...{selected_key[-4:]}")
