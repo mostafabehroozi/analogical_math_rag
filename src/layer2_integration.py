@@ -123,6 +123,8 @@ def create_layer2_config_from_dict(config_dict: Dict[str, Any]) -> Layer2Config:
         config.run_block_C = config_dict['run_block_C']
     
     # Global settings
+    if 'utility_calibration_modes' in config_dict:
+        config.utility_calibration_modes = config_dict['utility_calibration_modes']
     if 'evaluator_masking' in config_dict:
         config.evaluator_masking = config_dict['evaluator_masking']
     if 'base_scoring_strategies' in config_dict:

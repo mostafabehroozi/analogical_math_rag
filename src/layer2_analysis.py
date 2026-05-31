@@ -57,6 +57,7 @@ class ExperimentResult:
     ground_truth_answer: str
     
     # Base Conditions
+    utility_calibration: str = "Marginal"  # NEW: 'Marginal' or 'Absolute'
     evaluator_setting: str  # 'Self', 'Others', 'All'
     scoring_strategy: str   # 'ScoreTake', 'ScoreMake', 'Holistic'
     application: str = ""  # 'Block_A_Reranking', 'Block_A_TopK', 'Block_B_Dynamic', etc.
@@ -123,6 +124,7 @@ class Layer2Config:
     run_block_C: bool = True
     
     # Global Base Conditions
+    utility_calibration_modes: List[str] = None  # NEW: ['Marginal', 'Absolute']
     evaluator_masking: List[str] = None  # ['Self', 'Others', 'All']
     base_scoring_strategies: List[str] = None  # ['ScoreTake', 'ScoreMake', 'Holistic']
     global_pass_at_N: int = 3
@@ -149,6 +151,8 @@ class Layer2Config:
     ranking_k_values: List[int] = None  # [1, 3, 5, 10] for Recall@K and NDCG@K
     
     def __post_init__(self):
+        if self.utility_calibration_modes is None:
+            self.utility_calibration_modes = ['Marginal', 'Absolute']
         if self.evaluator_masking is None:
             self.evaluator_masking = ['Self', 'Others', 'All']
         if self.base_scoring_strategies is None:
@@ -443,8 +447,8 @@ class PTUMathEngine:
                 f"This indicates a critical inconsistency in evaluator normalization."
             )
         
-        # Compute core PTU matrix
-        self.ptu_matrix = self._compute_ptu_matrix()
+        # Compute core PTU matrix (defaults to Marginal for fallback)
+        self.ptu_matrix = self.get_calibrated_ptu_matrix('Marginal')
         
         # Cache for computed scores
         self._score_cache = {}
@@ -570,9 +574,9 @@ class PTUMathEngine:
         score = self._lookup_value_by_key_variants(self.intrinsic_baselines, evaluator_id, 0.0)
         return float(score) if score is not None else 0.0
     
-    def _compute_ptu_matrix(self) -> np.ndarray:
+    def get_calibrated_ptu_matrix(self, calibration_mode: str = 'Marginal') -> np.ndarray:
         """
-        Compute the base PTU matrix without masking.
+        Compute the base PTU matrix without masking, applying the requested mathematical calibration.
         
         Returns:
             Matrix of shape (n_candidates, n_evaluators) with PTU values.
@@ -668,7 +672,11 @@ class PTUMathEngine:
                     )
                     intrinsic_ccs = 0.0
                 
-                ptu[cand_idx, eval_idx] = max(0.0, induced_ccs - intrinsic_ccs)
+                # NEW: Apply the mathematical toggle
+                if calibration_mode == 'Absolute':
+                    ptu[cand_idx, eval_idx] = float(induced_ccs)
+                else:  # 'Marginal'
+                    ptu[cand_idx, eval_idx] = max(0.0, induced_ccs - intrinsic_ccs)
         
         # Final validation: Ensure matrix is fully populated
         if np.all(ptu == 0.0):
@@ -679,19 +687,16 @@ class PTUMathEngine:
         
         return ptu
     
-    def apply_evaluator_mask(self, mask_type: str) -> np.ndarray:
+    def apply_evaluator_mask(self, mask_type: str, base_matrix: np.ndarray) -> np.ndarray:
         """
-        Apply evaluator masking to the PTU matrix.
+        Apply evaluator masking to the provided PTU matrix.
         
         Args:
             mask_type: 'Self' (diagonal only), 'Others' (off-diagonal), or 'All' (no mask)
+            base_matrix: The mathematically calibrated base PTU matrix
         
         Returns:
             Masked PTU matrix
-        
-        Raises:
-            ValueError: If mask_type is invalid
-            RuntimeError: If matrix dimensions are inconsistent
         """
         # === BUG FIX 3: VALIDATE MASK APPLICATION ===
         # Validate mask_type
@@ -703,21 +708,20 @@ class PTUMathEngine:
             )
         
         # Validate PTU matrix state before masking
-        if self.ptu_matrix is None:
+        if base_matrix is None:
             raise RuntimeError(
-                "apply_evaluator_mask failed: PTU matrix is None. "
-                "The math engine must be properly initialized before applying masks."
+                "apply_evaluator_mask failed: base_matrix is None. "
             )
         
-        if self.ptu_matrix.shape != (self.n_candidates, self.n_evaluators):
+        if base_matrix.shape != (self.n_candidates, self.n_evaluators):
             raise RuntimeError(
                 f"apply_evaluator_mask failed: PTU matrix shape mismatch. "
                 f"Expected ({self.n_candidates}, {self.n_evaluators}) "
-                f"but got {self.ptu_matrix.shape}."
+                f"but got {base_matrix.shape}."
             )
         
         # Create a copy to avoid modifying the original
-        masked_ptu = self.ptu_matrix.copy()
+        masked_ptu = base_matrix.copy()
         
         if mask_type == 'Self':
             # Keep only the true parent-child evaluator relationships for each candidate.
@@ -1047,6 +1051,7 @@ class BlockA:
     def run_for_mask_and_strategy(
         self,
         ptu_matrix: np.ndarray,
+        utility_calibration: str,
         mask_type: str,
         strategy: str,
         weight_taker: float = 1.0,
@@ -1104,6 +1109,7 @@ class BlockA:
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
             ground_truth_answer=self.ptu_engine.ground_truth_answer,
+            utility_calibration=utility_calibration,
             evaluator_setting=mask_type,
             scoring_strategy=strategy,
             weight_taker=weight_taker,
@@ -1225,6 +1231,7 @@ class BlockB:
     def run_for_mask_and_method(
         self,
         ptu_matrix: np.ndarray,
+        utility_calibration: str,
         mask_type: str,
         method: str,
         ranked_list_for_boundary: Optional[List[int]] = None,
@@ -1270,6 +1277,7 @@ class BlockB:
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
             ground_truth_answer=self.ptu_engine.ground_truth_answer,
+            utility_calibration=utility_calibration,
             evaluator_setting=mask_type,
             scoring_strategy=method,
             weight_taker=weight_taker,
@@ -1455,6 +1463,7 @@ class BlockC:
     def run_for_mask_and_perspective(
         self,
         ptu_matrix: np.ndarray,
+        utility_calibration: str,
         mask_type: str,
         perspective: str,
         target_query_embedding_similarity: Dict[int, float]
@@ -1555,6 +1564,7 @@ class BlockC:
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
             ground_truth_answer=self.ptu_engine.ground_truth_answer,
+            utility_calibration=utility_calibration,
             evaluator_setting=mask_type,
             scoring_strategy=perspective,
             application=f"Block_C_{perspective}",
@@ -1600,6 +1610,7 @@ class ThreadAggregator:
             Dict mapping configuration_thread_name -> aggregated metrics dict
         """
         agg_data = defaultdict(lambda: {
+            "calibration": None,
             "mask": None,
             "block": None,
             "strategy": None,
@@ -1622,7 +1633,7 @@ class ThreadAggregator:
         # Aggregate results by configuration thread
         for result in all_results:
             # Create unique thread identifier
-            thread_key = f"{result.evaluator_setting}_{result.application}_{result.scoring_strategy}"
+            thread_key = f"{result.utility_calibration}_{result.evaluator_setting}_{result.application}_{result.scoring_strategy}"
             
             # Parse block and application details
             if "Block_A" in result.application:
@@ -1644,6 +1655,7 @@ class ThreadAggregator:
                 top_k = None
             
             # Store metadata
+            agg_data[thread_key]["calibration"] = result.utility_calibration
             agg_data[thread_key]["mask"] = result.evaluator_setting
             agg_data[thread_key]["block"] = block
             agg_data[thread_key]["strategy"] = result.scoring_strategy
@@ -1713,7 +1725,7 @@ class ThreadAggregator:
     @staticmethod
     def sort_threads_hierarchically(threads: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
         """
-        Sort threads hierarchically: Evaluator_Mask -> Experimental_Block -> Strategy_Name
+        Sort threads hierarchically: Calibration -> Evaluator_Mask -> Experimental_Block -> Strategy_Name
         
         Args:
             threads: Dict of aggregated thread data
@@ -1721,16 +1733,18 @@ class ThreadAggregator:
         Returns:
             List of (thread_name, thread_data) tuples sorted hierarchically
         """
+        calib_order = {"Marginal": 0, "Absolute": 1}
         mask_order = {"Self": 0, "Others": 1, "All": 2}
         block_order = {"Block_A": 0, "Block_B": 1, "Block_C": 2}
         
         def sort_key(item):
             thread_name, data = item
+            calib_idx = calib_order.get(data.get("calibration"), 2)
             mask_idx = mask_order.get(data["mask"], 3)
             block_idx = block_order.get(data["block"], 3)
             strategy = data["strategy"] or ""
             top_k = data["top_k"] or 0
-            return (mask_idx, block_idx, strategy, top_k)
+            return (calib_idx, mask_idx, block_idx, strategy, top_k)
         
         return sorted(threads.items(), key=sort_key)
 
@@ -1777,74 +1791,78 @@ class Layer2Orchestrator:
             print(f"  [!] Skipping Query #{target_idx} due to empty/invalid Layer 1 data.")
             return [] # Skip this query and move to the next one
         
-        # Grid search: For each mask type
-        for mask_type in self.config.evaluator_masking:
-            # Apply mask to PTU matrix
-            masked_ptu = ptu_engine.apply_evaluator_mask(mask_type)
+        # Grid search: For each calibration mode, then for each mask type
+        for calib_mode in self.config.utility_calibration_modes:
+            # 1. Fetch mathematically calibrated base PTU
+            calibrated_ptu = ptu_engine.get_calibrated_ptu_matrix(calib_mode)
             
-            logger.info(f"\n{'='*70}")
-            logger.info(f"Processing Query #{ptu_engine.target_query_idx}: {mask_type} Evaluation")
-            logger.info(f"{'='*70}")
-            
-            # ===== BLOCK A =====
-            if self.config.run_block_A:
-                logger.info("\n[BLOCK A] Baseline Reranking & Static Grouping")
-                block_a = BlockA(ptu_engine, self.config)
+            for mask_type in self.config.evaluator_masking:
+                # 2. Apply Masking to the calibrated PTU
+                masked_ptu = ptu_engine.apply_evaluator_mask(mask_type, calibrated_ptu)
                 
-                for strategy in self.config.block_A_strategies:
-                    results = block_a.run_for_mask_and_strategy(
-                        masked_ptu, mask_type, strategy,
-                        self.config.block_A_weight_taker,
-                        self.config.block_A_weight_maker
-                    )
-                    query_results.extend(results)
-            else:
-                block_a = None
-            
-            # ===== BLOCK B =====
-            if self.config.run_block_B:
-                logger.info("\n[BLOCK B] Dynamic Smart-K Grouping")
-                block_b = BlockB(ptu_engine, self.config)
+                logger.info(f"\n{'='*70}")
+                logger.info(f"Processing Query #{ptu_engine.target_query_idx}: {calib_mode} | {mask_type} Evaluation")
+                logger.info(f"{'='*70}")
                 
-                # Get ranked list for boundary test from Block A using the matching strategy for each method.
-                ranked_list_cache = {}
-                if self.config.run_boundary_intersection_test and block_a:
+                # ===== BLOCK A =====
+                if self.config.run_block_A:
+                    logger.info("\n[BLOCK A] Baseline Reranking & Static Grouping")
+                    block_a = BlockA(ptu_engine, self.config)
+                    
+                    for strategy in self.config.block_A_strategies:
+                        results = block_a.run_for_mask_and_strategy(
+                            masked_ptu, calib_mode, mask_type, strategy,
+                            self.config.block_A_weight_taker,
+                            self.config.block_A_weight_maker
+                        )
+                        query_results.extend(results)
+                else:
+                    block_a = None
+                
+                # ===== BLOCK B =====
+                if self.config.run_block_B:
+                    logger.info("\n[BLOCK B] Dynamic Smart-K Grouping")
+                    block_b = BlockB(ptu_engine, self.config)
+                    
+                    # Get ranked list for boundary test from Block A using the matching strategy for each method.
+                    ranked_list_cache = {}
+                    if self.config.run_boundary_intersection_test and block_a:
+                        for method in self.config.dynamic_k_methods:
+                            matching_strategy = self._map_dynamic_method_to_block_a_strategy(method)
+                            if matching_strategy:
+                                ranked_indices = block_a.get_ranked_indices_for_strategy(mask_type, matching_strategy)
+                                if ranked_indices is None:
+                                    logger.warning(
+                                        f"Could not retrieve cached ranked indices for Block A strategy '{matching_strategy}' "
+                                        f"needed by Block B boundary test for method '{method}'. "
+                                        f"Ensure Block A is enabled and includes that strategy."
+                                    )
+                                ranked_list_cache[method] = ranked_indices
+                            else:
+                                ranked_list_cache[method] = None
+                    
                     for method in self.config.dynamic_k_methods:
-                        matching_strategy = self._map_dynamic_method_to_block_a_strategy(method)
-                        if matching_strategy:
-                            ranked_indices = block_a.get_ranked_indices_for_strategy(mask_type, matching_strategy)
-                            if ranked_indices is None:
-                                logger.warning(
-                                    f"Could not retrieve cached ranked indices for Block A strategy '{matching_strategy}' "
-                                    f"needed by Block B boundary test for method '{method}'. "
-                                    f"Ensure Block A is enabled and includes that strategy."
-                                )
-                            ranked_list_cache[method] = ranked_indices
-                        else:
-                            ranked_list_cache[method] = None
+                        ranked_list = ranked_list_cache.get(method) if self.config.run_boundary_intersection_test else None
+                        results = block_b.run_for_mask_and_method(
+                            masked_ptu, calib_mode, mask_type, method,
+                            ranked_list,
+                            self.config.block_B_weight_taker,
+                            self.config.block_B_weight_maker
+                        )
+                        query_results.extend(results)
                 
-                for method in self.config.dynamic_k_methods:
-                    ranked_list = ranked_list_cache.get(method) if self.config.run_boundary_intersection_test else None
-                    results = block_b.run_for_mask_and_method(
-                        masked_ptu, mask_type, method,
-                        ranked_list,
-                        self.config.block_B_weight_taker,
-                        self.config.block_B_weight_maker
-                    )
-                    query_results.extend(results)
-            
-            # ===== BLOCK C =====
-            if self.config.run_block_C:
-                logger.info("\n[BLOCK C] Optimal Subset (Coverage) Grouping")
-                block_c = BlockC(ptu_engine, self.config)
-                
-                target_query_embedding_sim = ptu_engine.get_target_query_embedding_similarity()
-                
-                for perspective in self.config.coverage_perspectives:
-                    results = block_c.run_for_mask_and_perspective(
-                        masked_ptu, mask_type, perspective, target_query_embedding_sim
-                    )
-                    query_results.extend(results)
+                # ===== BLOCK C =====
+                if self.config.run_block_C:
+                    logger.info("\n[BLOCK C] Optimal Subset (Coverage) Grouping")
+                    block_c = BlockC(ptu_engine, self.config)
+                    
+                    target_query_embedding_sim = ptu_engine.get_target_query_embedding_similarity()
+                    
+                    for perspective in self.config.coverage_perspectives:
+                        results = block_c.run_for_mask_and_perspective(
+                            masked_ptu, calib_mode, mask_type, perspective, target_query_embedding_sim
+                        )
+                        query_results.extend(results)
         
         # ===== ACTIVE INFERENCE EXECUTION =====
         logger.info(f"\n[ACTIVE INFERENCE] Executing LLM for {len(query_results)} configurations...")
@@ -1881,7 +1899,8 @@ class Layer2Orchestrator:
             # Map strictly to the required schema
             record = {
                 "main_question_id": r.target_query_idx,
-                "configuration_thread": f"{r.application}_{r.scoring_strategy}",
+                "configuration_thread": f"{r.utility_calibration}_{r.evaluator_setting}_{r.application}_{r.scoring_strategy}",
+                "utility_calibration_mode": r.utility_calibration,
                 "context_selection_metadata": {
                     "selected_samples": r.selected_candidates,
                     "selected_scores": r.selected_scores,
@@ -2014,7 +2033,7 @@ class Layer2Orchestrator:
         
         headers = [
             # Group 1: Configuration Identity
-            "Evaluator_Mask", "Experimental_Block", "Strategy_Name",
+            "Utility_Calibration", "Evaluator_Mask", "Experimental_Block", "Strategy_Name",
             # Group 2: Block-Specific Hyperparameters
             "Top_K", "Threshold", "Coverage_Target",
             # Group 3: Global Execution Settings
@@ -2050,6 +2069,7 @@ class Layer2Orchestrator:
             for thread_name, thread_data in comprehensive_data.items():
                 row = [
                     # Group 1: Configuration Identity
+                    thread_data.get("calibration", ""),
                     thread_data.get("mask", ""),
                     thread_data.get("block", ""),
                     thread_data.get("strategy", ""),

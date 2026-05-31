@@ -255,7 +255,12 @@ CONFIG = {
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
     
     "APPLY_LAYER2_ANALYSIS": False,
-    "LAYER2_CONFIG": {},
+    "LAYER2_CONFIG": {
+        "utility_calibration_modes": ["Marginal", "Absolute"],
+        "evaluator_masking": ["Self", "Others", "All"],
+        "experimental_blocks": ["Block_A", "Block_B", "Block_C"],
+        "scoring_strategies": ["Candidate_Centric", "Evaluator_Centric"]
+    },
 
     "APPLY_DATASET_CONSTRUCTION": False,
 
