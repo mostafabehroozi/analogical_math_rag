@@ -937,7 +937,7 @@ class ActiveInferenceEngine:
         else:
             self.model_name = self.global_config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
 
-def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int):
+    def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int):
         # NEW: Deduplicate text strings to save tokens and prevent redundant context
         unique_contexts = []
         if context_texts:
