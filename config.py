@@ -256,6 +256,7 @@ CONFIG = {
     
     "APPLY_LAYER2_ANALYSIS": False,
     "LAYER2_CONFIG": {
+        "layer2_config_name": "my_custom_run",  # <--- ADD THIS LINE
         "utility_calibration_modes": ["Marginal", "Absolute"],
         "evaluator_masking": ["Self", "Others", "All"],
         "experimental_blocks": ["Block_A", "Block_B", "Block_C"],

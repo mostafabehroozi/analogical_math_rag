@@ -118,6 +118,8 @@ class ExperimentResult:
 @dataclass
 class Layer2Config:
     """Configuration for Layer 2 experiments."""
+    layer2_config_name: str = "default_run"  # <--- ADD THIS LINE
+    
     # Block Execution Toggles
     run_block_A: bool = True
     run_block_B: bool = True
@@ -1960,8 +1962,14 @@ class Layer2Orchestrator:
         else:
             return obj
     
-    def save_reports(self, report: Dict[str, Any], json_filename: str = "layer2_detailed_logs.json", csv_filename: str = "layer2_master_report.csv"):
+    def save_reports(self, report: Dict[str, Any], json_filename: str = None, csv_filename: str = None):
         """Save the detailed JSON logs and generate both the existing and comprehensive CSV reports."""
+        
+        # --- ADD THESE TWO LINES TO MAKE NAMES DYNAMIC ---
+        json_filename = f"layer2_detailed_logs_{self.config.layer2_config_name}.json"
+        csv_filename = f"layer2_master_report_{self.config.layer2_config_name}.csv"
+        # -------------------------------------------------
+
         # 1. Save JSON
         json_filepath = os.path.join(self.output_dir, json_filename)
         save_json(report, json_filepath)
@@ -2020,10 +2028,14 @@ class Layer2Orchestrator:
         
         return json_filepath, csv_filepath
     
-    def _save_comprehensive_report(self, csv_filename: str = "layer2_comprehensive_analysis.csv"):
+    def _save_comprehensive_report(self, csv_filename: str = None):
         """
         Generate and save the comprehensive analysis CSV with AP metrics, ranking metrics, and hierarchical organization.
         """
+        # --- ADD THIS LINE TO MAKE THE NAME DYNAMIC ---
+        csv_filename = f"layer2_comprehensive_analysis_{self.config.layer2_config_name}.csv"
+        # ----------------------------------------------
+
         comprehensive_data = self.generate_comprehensive_report()
         csv_filepath = os.path.join(self.output_dir, csv_filename)
         
