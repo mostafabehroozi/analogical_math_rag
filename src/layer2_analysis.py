@@ -40,6 +40,7 @@ from src.utils import save_json, load_json, convert_numpy_for_json
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.evaluation import evaluate_single_answer_with_llm
 from src.hf_sync import periodic_sync_check
+from tqdm import tqdm
 from src.prompts import create_final_reasoning_prompt, create_final_reasoning_prompt_simple, EXEMPLAR_FORMAT
 from config import CONFIG as GLOBAL_CONFIG
 
@@ -2168,15 +2169,11 @@ def run_layer2_experiments(
     print(f"🚀 STARTING LAYER 2 ANALYSIS ({total_queries} queries to process)")
     print("="*60)
     
-    for loop_idx, layer1_state in enumerate(layer1_states):
-        q_idx = layer1_state.get('target_query_idx', 'Unknown')
-        
-        print(f"\n▶ Processing Query #{q_idx} (Question {loop_idx + 1} of {total_queries}) in Layer 2...")
+    # Notice the tqdm() here! This creates the beautiful progress bar.
+    for loop_idx, layer1_state in enumerate(tqdm(layer1_states, desc="Layer 2 Progress")):
         
         # Run the actual question
         orchestrator.run_single_query(layer1_state)
-        
-        print(f"✓ Finished Query #{q_idx} for Layer 2.")
         
         # Trigger HuggingFace Sync if it's time!
         periodic_sync_check(loop_idx, GLOBAL_CONFIG)
