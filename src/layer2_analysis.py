@@ -1174,6 +1174,7 @@ class BlockA:
                 target_query_idx=self.ptu_engine.target_query_idx,
                 target_query_text=self.ptu_engine.target_query_text,
                 ground_truth_answer=self.ptu_engine.ground_truth_answer,
+                utility_calibration=utility_calibration,  # <--- ADD THIS LINE HERE
                 evaluator_setting=mask_type,
                 scoring_strategy=strategy,
                 weight_taker=weight_taker,
