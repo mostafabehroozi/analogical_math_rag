@@ -39,6 +39,7 @@ import concurrent.futures
 from src.utils import save_json, load_json, convert_numpy_for_json
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.evaluation import evaluate_single_answer_with_llm
+from src.hf_sync import periodic_sync_check
 from src.prompts import create_final_reasoning_prompt, create_final_reasoning_prompt_simple, EXEMPLAR_FORMAT
 from config import CONFIG as GLOBAL_CONFIG
 
@@ -2158,29 +2159,37 @@ def run_layer2_experiments(
 ) -> Tuple[List[ExperimentResult], Dict[str, Any]]:
     """
     Run complete Layer 2 analysis on Layer 1 cached states.
-    
-    Args:
-        layer1_states: List of Layer 1 cached states (one per query)
-        config: Layer2Config instance
-        output_dir: Directory to save results
-        api_manager_solve: The API manager for generating solutions
-        api_manager_eval: The API manager for checking answers
-    
-    Returns:
-        Tuple of (all_results, master_report)
     """
     orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval)
     
-    logger.info(f"Starting Layer 2 Analysis on {len(layer1_states)} queries")
-    logger.info(f"Config: {asdict(config)}")
+    total_queries = len(layer1_states)
     
-    for layer1_state in layer1_states:
+    print("\n" + "="*60)
+    print(f"🚀 STARTING LAYER 2 ANALYSIS ({total_queries} queries to process)")
+    print("="*60)
+    
+    for loop_idx, layer1_state in enumerate(layer1_states):
+        q_idx = layer1_state.get('target_query_idx', 'Unknown')
+        
+        print(f"\n▶ Processing Query #{q_idx} (Question {loop_idx + 1} of {total_queries}) in Layer 2...")
+        
+        # Run the actual question
         orchestrator.run_single_query(layer1_state)
+        
+        print(f"✓ Finished Query #{q_idx} for Layer 2.")
+        
+        # Trigger HuggingFace Sync if it's time!
+        periodic_sync_check(loop_idx, GLOBAL_CONFIG)
+    
+    print("\n" + "="*60)
+    print("✅ LAYER 2 ANALYSIS COMPLETELY FINISHED!")
+    print("="*60)
     
     # Generate and save reports (JSON and CSV)
     report = orchestrator.generate_master_report()
     orchestrator.save_reports(report)
     
-    logger.info(f"Layer 2 Analysis Complete: {len(orchestrator.all_results)} total experiments")
+    # Final sync at the very end to make sure the final CSVs get uploaded
+    periodic_sync_check(total_queries, GLOBAL_CONFIG)
     
     return orchestrator.all_results, report
