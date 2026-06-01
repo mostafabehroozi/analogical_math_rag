@@ -2093,7 +2093,7 @@ class Layer2Orchestrator:
                     "-",  # Threshold (not used in current config; set to N/A)\n                    "-",  # Coverage_Target (not used in current config; set to N/A)
                     # Group 3: Global Execution Settings
                     self.config.global_pass_at_N,
-                    self.global_config.get("DEFAULT_PASS_N_SOLVER_TEMPERATURE", 1.0),
+                    GLOBAL_CONFIG.get("DEFAULT_PASS_N_SOLVER_TEMPERATURE", 1.0),
                     # Group 4: Execution Scope
                     thread_data.get("total_queries", 0),
                     # Group 5: Context Efficiency
