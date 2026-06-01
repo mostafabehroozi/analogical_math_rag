@@ -57,7 +57,7 @@ class ExperimentResult:
     ground_truth_answer: str
     
     # Base Conditions
-    utility_calibration: str = "Marginal"  # NEW: 'Marginal' or 'Absolute'
+    utility_calibration: str  # <-- I REMOVED the default value here
     evaluator_setting: str  # 'Self', 'Others', 'All'
     scoring_strategy: str   # 'ScoreTake', 'ScoreMake', 'Holistic'
     application: str = ""  # 'Block_A_Reranking', 'Block_A_TopK', 'Block_B_Dynamic', etc.
