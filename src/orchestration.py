@@ -1400,7 +1400,8 @@ def run_experiments(
                     api_manager_eval=eval_mgr,
                     layer2_config_dict=layer2_cfg,
                     top_k=top_k_val,
-                    n_candidates=n_cand_val
+                    n_candidates=n_cand_val,
+                    global_config=current_config
                 )
                 
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
@@ -1518,7 +1519,8 @@ def run_experiments(
                     api_manager_eval=eval_mgr,          # <-- Added missing argument
                     layer2_config_dict=layer2_cfg,
                     top_k=top_k_val,
-                    n_candidates=n_cand_val
+                    n_candidates=n_cand_val,
+                    global_config=current_config
                 )
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
             # --- END OF AUTOMATIC LAYER 2 EXECUTION ---

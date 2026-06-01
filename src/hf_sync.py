@@ -47,9 +47,10 @@ def initialize_workspace(config: dict):
     # 2. Extract credentials safely
     hf_token, hf_username, repo_name = _get_hf_config(config)
 
-    if not all([hf_token, hf_username, repo_name]):
+    # Check for empty credentials or default placeholders
+    if not all([hf_token, hf_username, repo_name]) or "YOUR_HUGGING_FACE" in str(hf_token):
         logger.warning("HF token, username, or repo name not found in config. Cannot initialize workspace.")
-        print("\n⚠️ WARNING: Missing Hugging Face configuration. Skipping workspace initialization.")
+        print("\n⚠️ WARNING: Missing or default Hugging Face configuration. Skipping workspace initialization.")
         return
 
     repo_id = f"{hf_username}/{repo_name}"
@@ -114,8 +115,10 @@ def sync_workspace_to_hub(config: dict):
 
     hf_token, hf_username, repo_name = _get_hf_config(config)
 
-    if not all([hf_token, hf_username, repo_name]):
-        logger.warning("HF token, username, or repo name not found in config. Cannot sync workspace.")
+    # Check for empty credentials or default placeholders
+    if not all([hf_token, hf_username, repo_name]) or "YOUR_HUGGING_FACE" in str(hf_token):
+        logger.warning("HF token, username, or repo name not found or contains placeholders. Cannot sync workspace.")
+        print("\n⚠️ WARNING: Hugging Face sync configuration is incomplete or contains placeholder values. Sync skipped.")
         return
 
     repo_id = f"{hf_username}/{repo_name}"

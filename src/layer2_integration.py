@@ -176,23 +176,12 @@ def run_layer2_complete_pipeline(
     layer2_config_dict: Optional[Dict[str, Any]] = None,
     query_indices: Optional[List[int]] = None,
     top_k: int = 3,
-    n_candidates: int = None
+    n_candidates: int = None,
+    global_config: Optional[Dict[str, Any]] = None
 ) -> Tuple[List[Any], Dict[str, Any]]:
     """
     Complete end-to-end Layer 2 execution:
     Load Layer 1 cache -> Extract states -> Run Layer 2 grid search -> Generate report
-    
-    Args:
-        layer1_cache_dir: Directory containing Layer 1 cache files
-        layer2_output_dir: Directory to save Layer 2 results
-        experiment_name: Name of the experiment
-        layer2_config_dict: Dictionary with Layer 2 configuration (or None for defaults)
-        query_indices: Specific query indices to process (or None for all)
-        top_k: Number of retrieved samples (for cache filename)
-        n_candidates: Number of candidates (for cache filename)
-    
-    Returns:
-        Tuple of (all_results, master_report)
     """
     os.makedirs(layer2_output_dir, exist_ok=True)
     
@@ -229,7 +218,8 @@ def run_layer2_complete_pipeline(
     # Step 4: Run Layer 2 experiments
     logger.info(f"\nStep 4: Running Layer 2 experiments")
     all_results, master_report = run_layer2_experiments(
-        layer1_states, layer2_config, layer2_output_dir, api_manager_solve, api_manager_eval
+        layer1_states, layer2_config, layer2_output_dir, api_manager_solve, api_manager_eval,
+        global_config=global_config
     )
     
     # Step 5: Wrap up logging (Files are already saved by the Orchestrator)

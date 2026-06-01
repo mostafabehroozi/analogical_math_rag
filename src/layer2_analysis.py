@@ -932,10 +932,10 @@ class ActiveInferenceEngine:
     """
     Executes live API calls to the LLM using the contexts chosen by Layer 2 Blocks.
     """
-    def __init__(self, api_manager_solve: Any, api_manager_eval: Any):
+    def __init__(self, api_manager_solve: Any, api_manager_eval: Any, global_config: Optional[Dict[str, Any]] = None):
         self.api_manager_solve = api_manager_solve
         self.api_manager_eval = api_manager_eval
-        self.global_config = GLOBAL_CONFIG
+        self.global_config = global_config if global_config is not None else GLOBAL_CONFIG
         
         # Determine which model to use based on the API Manager type
         if isinstance(self.api_manager_solve, GeminiAPIManager):
@@ -1764,12 +1764,13 @@ class Layer2Orchestrator:
     Manages the grid search across all base conditions and blocks.
     """
     
-    def __init__(self, config: Layer2Config, output_dir: str, api_manager_solve: Any, api_manager_eval: Any):
+    def __init__(self, config: Layer2Config, output_dir: str, api_manager_solve: Any, api_manager_eval: Any, global_config: Optional[Dict[str, Any]] = None):
         self.config = config
         self.output_dir = output_dir
         self.api_manager_solve = api_manager_solve
         self.api_manager_eval = api_manager_eval
-        self.inference_engine = ActiveInferenceEngine(api_manager_solve, api_manager_eval)
+        self.global_config = global_config if global_config is not None else GLOBAL_CONFIG
+        self.inference_engine = ActiveInferenceEngine(api_manager_solve, api_manager_eval, self.global_config)
         self.all_results = []
         os.makedirs(output_dir, exist_ok=True)
     
@@ -2156,12 +2157,14 @@ def run_layer2_experiments(
     config: Layer2Config,
     output_dir: str,
     api_manager_solve: Any,
-    api_manager_eval: Any
+    api_manager_eval: Any,
+    global_config: Optional[Dict[str, Any]] = None
 ) -> Tuple[List[ExperimentResult], Dict[str, Any]]:
     """
     Run complete Layer 2 analysis on Layer 1 cached states.
     """
-    orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval)
+    run_config = global_config if global_config is not None else GLOBAL_CONFIG
+    orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval, run_config)
     
     total_queries = len(layer1_states)
     
@@ -2169,14 +2172,14 @@ def run_layer2_experiments(
     print(f"🚀 STARTING LAYER 2 ANALYSIS ({total_queries} queries to process)")
     print("="*60)
     
-    # Notice the tqdm() here! This creates the beautiful progress bar.
+    # Notice the tqdm() here! This creates the progress bar.
     for loop_idx, layer1_state in enumerate(tqdm(layer1_states, desc="Layer 2 Progress")):
         
         # Run the actual question
         orchestrator.run_single_query(layer1_state)
         
         # Trigger HuggingFace Sync if it's time!
-        periodic_sync_check(loop_idx, GLOBAL_CONFIG)
+        periodic_sync_check(loop_idx, run_config)
     
     print("\n" + "="*60)
     print("✅ LAYER 2 ANALYSIS COMPLETELY FINISHED!")
@@ -2187,6 +2190,8 @@ def run_layer2_experiments(
     orchestrator.save_reports(report)
     
     # Final sync at the very end to make sure the final CSVs get uploaded
-    periodic_sync_check(total_queries, GLOBAL_CONFIG)
+    if run_config.get("PERSIST_RESULTS_ONLINE"):
+        print("\n--- Final Sync: Forcing workspace backup to Hugging Face Hub ---")
+        sync_workspace_to_hub(run_config)
     
     return orchestrator.all_results, report
