@@ -54,7 +54,9 @@ def initialize_workspace(config: dict):
         return
 
     repo_id = f"{hf_username}/{repo_name}"
-    local_outputs_dir = config["OUTPUTS_DIR"]
+    # Changed: Download to BASE_OUTPUT_DIR instead of OUTPUTS_DIR for consistency
+    # This allows all subdirectories (outputs, results, logs) to be downloaded and available
+    local_outputs_dir = config["BASE_OUTPUT_DIR"]
 
     logger.info(f"Initializing workspace from Hugging Face Hub repo: {repo_id}")
 
@@ -122,7 +124,9 @@ def sync_workspace_to_hub(config: dict):
         return
 
     repo_id = f"{hf_username}/{repo_name}"
-    local_outputs_dir = config["OUTPUTS_DIR"]
+    # Changed: Upload BASE_OUTPUT_DIR instead of OUTPUTS_DIR to include both /outputs/ and /results/ directories
+    # This ensures Layer-2 analytics output (saved to RESULTS_DIR) gets synced to HF Hub
+    local_outputs_dir = config["BASE_OUTPUT_DIR"]
 
     logger.info(f"Starting synchronization of '{local_outputs_dir}' to HF Hub repo: {repo_id}")
 
