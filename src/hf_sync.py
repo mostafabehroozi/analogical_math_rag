@@ -131,8 +131,20 @@ def sync_workspace_to_hub(config: dict):
     logger.info(f"Starting synchronization of '{local_outputs_dir}' to HF Hub repo: {repo_id}")
 
     try:
+        import shutil  # <--- Added import to handle deleting folders safely
+        
         # 1. Instantiate the API client with the token.
         api = HfApi(token=hf_token)
+
+        # --- NEW CODE TO FIX LAYER-2 SYNCING ---
+        # Find the hidden Hugging Face cache folder inside your outputs directory
+        cache_dir = os.path.join(local_outputs_dir, ".cache", "huggingface")
+        
+        # If the cache exists, delete it! This forces Hugging Face to scan the 
+        # folder from scratch and discover your brand new Layer-2 directories.
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir)
+        # ---------------------------------------
 
         # 2. Upload the outputs folder using upload_large_folder to avoid timeouts
         api.upload_large_folder(
