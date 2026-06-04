@@ -146,13 +146,18 @@ def sync_workspace_to_hub(config: dict):
             shutil.rmtree(cache_dir)
         # ---------------------------------------
 
-        # 2. Upload the outputs folder using upload_large_folder to avoid timeouts
+        # 2. Upload only the specific folders using an allowlist to prevent leaks
         api.upload_large_folder(
             folder_path=local_outputs_dir,
             repo_id=repo_id,
             repo_type="dataset",
-            # EXTREMELY IMPORTANT: Exclude the massive 3GB embeddings folder from repetitive syncing
-            ignore_patterns=["embeddings/*", "*.npy"] 
+            # ONLY upload files inside these specific directories
+            allow_patterns=[
+                "outputs/logs/**",     # Logs folder in Kaggle mode
+                "outputs/results/**",  # Results folder in Kaggle mode
+                "logs/**",             # Logs folder in Offline mode
+                "results/**"           # Results folder in Offline mode
+            ]
         )
         logger.info(f"Successfully synced '{local_outputs_dir}' to {repo_id}.")
         print(f"✅ Backup complete: Results synced to Hugging Face ({repo_id})")
