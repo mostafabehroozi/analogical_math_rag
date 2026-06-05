@@ -407,25 +407,16 @@ def setup_directories():
 def setup_kaggle_mode(outputs_base_dir="/kaggle/working"):
     """
     Configure CONFIG for Kaggle/online execution.
-    
-    This function sets all directory paths to Kaggle-appropriate locations
-    and rebuilds all derived paths accordingly.
-    
-    Args:
-        outputs_base_dir (str): Base directory for outputs on Kaggle (default: "/kaggle/working")
-    
-    Example:
-        setup_kaggle_mode()  # Uses default /kaggle/working
-        # or
-        setup_kaggle_mode("/path/to/custom/base")
     """
     CONFIG["OFFLINE_MODE"] = False
     CONFIG["BASE_OUTPUT_DIR"] = outputs_base_dir
     CONFIG["DATA_DIR"] = os.path.join(outputs_base_dir, "data")
     CONFIG["OUTPUTS_DIR"] = os.path.join(outputs_base_dir, "outputs")
-    CONFIG["LOGS_DIR"] = os.path.join(outputs_base_dir, "outputs", "logs")
-    CONFIG["EMBEDDINGS_DIR"] = os.path.join(outputs_base_dir, "outputs", "embeddings")
-    CONFIG["RESULTS_DIR"] = os.path.join(outputs_base_dir, "outputs", "results")
+    
+    # FIX: Removed the extra "outputs" subfolder so it matches Hugging Face downloads
+    CONFIG["LOGS_DIR"] = os.path.join(outputs_base_dir, "logs")
+    CONFIG["EMBEDDINGS_DIR"] = os.path.join(outputs_base_dir, "embeddings")
+    CONFIG["RESULTS_DIR"] = os.path.join(outputs_base_dir, "results")
     
     # Rebuild all derived paths with the new base directories
     rebuild_derived_paths()
