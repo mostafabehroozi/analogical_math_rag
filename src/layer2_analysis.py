@@ -1063,18 +1063,38 @@ class BlockA:
     ) -> List[ExperimentResult]:
         """
         Run Block A experiments for a specific mask and strategy combination.
+        
+        Implements two-tier sorting system for Graceful Similarity Fallback:
+        - Tier 1: Candidates with score > threshold (sorted descending by score)
+        - Tier 2: Candidates with score <= threshold (sorted by original retrieval index)
         """
         results = []
+        threshold = self.config.activation_threshold
         
         # Get scores for this strategy
         scores = self.ptu_engine.get_scores_for_strategy(
             ptu_matrix, strategy, weight_taker, weight_maker
         )
         
-        # Experiment A.1: Reranking & Average Precision
-        # FIX: Only keep candidates that have a strictly positive score (> 0)
-        valid_indices = np.where(scores > 0)[0]
-        ranked_indices = valid_indices[np.argsort(-scores[valid_indices])]
+        # Experiment A.1: Reranking & Average Precision with Two-Tier Sorting
+        # ===== TWO-TIER SORTING SYSTEM =====
+        # Tier 1: Candidates with score > threshold (sorted descending)
+        tier1_mask = scores > threshold
+        tier1_indices = np.where(tier1_mask)[0]
+        tier1_sorted = tier1_indices[np.argsort(-scores[tier1_indices])]
+        
+        # Tier 2: Candidates with score <= threshold (sorted by original index - ascending)
+        tier2_mask = scores <= threshold
+        tier2_indices = np.where(tier2_mask)[0]
+        tier2_sorted = np.sort(tier2_indices)  # Already in original order
+        
+        # Merge: Concatenate Tier 1 and Tier 2 to form complete ranked list
+        ranked_indices = np.concatenate([tier1_sorted, tier2_sorted])
+        
+        # Verify list length equals total number of candidates
+        assert len(ranked_indices) == len(scores), (
+            f"Ranked list length mismatch: {len(ranked_indices)} != {len(scores)}"
+        )
         
         # Cache the ranked indices for Block B boundary test (Experiment B.2.3)
         cache_key = (mask_type, strategy)
@@ -1245,6 +1265,10 @@ class BlockB:
     ) -> List[ExperimentResult]:
         """
         Run Block B experiments for a specific mask and dynamic-K method.
+        
+        Implements Smart Fallback:
+        - If positive_indices found: K_dynamic = len(positive_indices)
+        - If all candidates <= threshold: K_dynamic = max(config.top_ks_group)
         """
         results = []
         threshold = self.config.activation_threshold
@@ -1272,8 +1296,26 @@ class BlockB:
                 if 0 <= src_eval_idx < len(scores) and scores[src_eval_idx] > threshold:
                     positive_indices.append(cand_idx)
         
-        k_dynamic = len(positive_indices)
-        zero_score_fallback_triggered = (k_dynamic == 0)
+        # ===== SMART FALLBACK LOGIC =====
+        zero_score_fallback_triggered = False
+        if len(positive_indices) > 0:
+            # Normal case: K_dynamic = count of positive indices
+            k_dynamic = len(positive_indices)
+        else:
+            # Fallback: All candidates scored <= threshold
+            # Use the maximum K from top_ks_group as fallback
+            k_dynamic = max(self.config.top_ks_group) if self.config.top_ks_group else 1
+            # Cap to not exceed total number of candidates
+            k_dynamic = min(k_dynamic, len(self.ptu_engine.candidate_set))
+            zero_score_fallback_triggered = True
+            
+            # Use first K_dynamic candidates from the reranked Block A list
+            # (which naturally puts original retrieval order if all PTU scores are 0)
+            if ranked_list_for_boundary:
+                positive_indices = ranked_list_for_boundary[:k_dynamic]
+            else:
+                # Fallback to first K candidates in original order
+                positive_indices = list(range(k_dynamic))
         
         # Evaluate the dynamic group
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(positive_indices)
@@ -1300,7 +1342,9 @@ class BlockB:
         
         logger.info(
             f"Block B - {mask_type} {method}: "
-            f"K_dynamic = {k_dynamic}, Pass@{self.config.global_pass_at_N} = PENDING"
+            f"K_dynamic = {k_dynamic}, "
+            f"Fallback_Triggered = {zero_score_fallback_triggered}, "
+            f"Pass@{self.config.global_pass_at_N} = PENDING"
         )
         
         # Experiment B.2.3: Boundary Intersection Test (if enabled)
@@ -1475,95 +1519,129 @@ class BlockC:
     ) -> List[ExperimentResult]:
         """
         Run Block C experiments for a specific mask and perspective.
+        
+        Implements Bypass & Fallback:
+        - If np.max(ptu_matrix) <= threshold: bypass complex coverage logic
+        - Fallback to first K_fallback candidates in original order
         """
         results = []
         threshold = self.config.activation_threshold
         
-        score_take = self.ptu_engine.compute_score_take(ptu_matrix)
-        score_make = self.ptu_engine.compute_score_make(ptu_matrix)
+        # ===== CHECK FOR ZERO-SCORE FALLBACK CONDITION =====
+        max_ptu_value = np.max(ptu_matrix) if ptu_matrix.size > 0 else 0.0
+        zero_score_fallback_triggered = (max_ptu_value <= threshold)
         
-        if perspective == 'Candidate_Centric':
-            # OPTIMIZATION: Pre-compute holistic scores once for all tie-breaker calls
-            holistic_scores_candidate_centric = self.ptu_engine.compute_holistic_score(
-                ptu_matrix,
-                self.config.block_C_tiebreaker_weight_taker,
-                self.config.block_C_tiebreaker_weight_maker
+        if zero_score_fallback_triggered:
+            # ===== FALLBACK PATH: Bypass complex coverage logic =====
+            # Determine fallback size
+            k_fallback = max(self.config.top_ks_group) if self.config.top_ks_group else 1
+            # Cap to not exceed total number of available candidates
+            k_fallback = min(k_fallback, len(self.ptu_engine.candidate_set))
+            
+            # Use first K_fallback indices (original retrieval order)
+            selected_candidate_indices = list(range(k_fallback))
+            subset_size = k_fallback
+            
+            logger.info(
+                f"Block C - {mask_type} {perspective} (ZERO-SCORE FALLBACK): "
+                f"Max PTU = {max_ptu_value:.4f} <= {threshold:.4f}, "
+                f"Using first {k_fallback} candidates in original order"
             )
+        else:
+            # ===== NORMAL PATH: Execute coverage logic =====
+            score_take = self.ptu_engine.compute_score_take(ptu_matrix)
+            score_make = self.ptu_engine.compute_score_make(ptu_matrix)
             
-            # Find max PTU for each evaluator (column maxima)
-            winning_source_evals = set()
-            
-            already_selected_cands: Set[int] = set()
-            for eval_idx in range(self.ptu_engine.n_evaluators):
-                col = ptu_matrix[:, eval_idx]
-                max_ptu = np.max(col)
+            if perspective == 'Candidate_Centric':
+                # OPTIMIZATION: Pre-compute holistic scores once for all tie-breaker calls
+                holistic_scores_candidate_centric = self.ptu_engine.compute_holistic_score(
+                    ptu_matrix,
+                    self.config.block_C_tiebreaker_weight_taker,
+                    self.config.block_C_tiebreaker_weight_maker
+                )
                 
-                if max_ptu > threshold:
-                    # Find all candidates with this max value
-                    tied_candidates = np.where(col == max_ptu)[0].tolist()
-                    
-                    # Apply tie-breaking with pre-computed holistic scores
-                    selected_idx = self._apply_hierarchical_tiebreaker_candidate_centric(
-                        tied_candidates,
-                        ptu_matrix,
-                        eval_idx,
-                        score_take,
-                        target_query_embedding_similarity,
-                        already_selected_cands,
-                        holistic_scores_candidate_centric
-                    )
-                    already_selected_cands.add(selected_idx)
-                    
-                    src_eval = self.ptu_engine._resolve_source_evaluator_index(
-                        self.ptu_engine.candidate_set[selected_idx], selected_idx
-                    )
-                    winning_source_evals.add(src_eval)
-            
-            # Collect ALL candidates associated with the winning source samples
-            selected_candidate_indices = [
-                idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
-                if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_source_evals
-            ]
-            subset_size = len(winning_source_evals)
-            
-        else:  # Evaluator_Centric
-            # Find max PTU for each candidate (row maxima)
-            winning_evals = set()
-            
-            evaluator_max_counts = self._compute_evaluator_maximum_counts(ptu_matrix, threshold)
-            for cand_idx in range(self.ptu_engine.n_candidates):
-                row = ptu_matrix[cand_idx, :]
-                max_ptu = np.max(row)
+                # Find max PTU for each evaluator (column maxima)
+                winning_source_evals = set()
                 
-                if max_ptu > threshold:
-                    # Find all evaluators with this max value
-                    tied_evaluators = np.where(row == max_ptu)[0].tolist()
+                already_selected_cands: Set[int] = set()
+                for eval_idx in range(self.ptu_engine.n_evaluators):
+                    col = ptu_matrix[:, eval_idx]
+                    max_ptu = np.max(col)
                     
-                    # Apply tie-breaking
-                    selected_idx = self._apply_hierarchical_tiebreaker_evaluator_centric(
-                        tied_evaluators,
-                        ptu_matrix,
-                        cand_idx,
-                        score_make,
-                        target_query_embedding_similarity,
-                        evaluator_max_counts
-                    )
-                    winning_evals.add(selected_idx)
-            
-            # Collect ALL candidates associated with the optimal subset of evaluators
-            selected_candidate_indices = [
-                idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
-                if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_evals
-            ]
-            subset_size = len(winning_evals)
+                    if max_ptu > threshold:
+                        # Find all candidates with this max value
+                        tied_candidates = np.where(col == max_ptu)[0].tolist()
+                        
+                        # Apply tie-breaking with pre-computed holistic scores
+                        selected_idx = self._apply_hierarchical_tiebreaker_candidate_centric(
+                            tied_candidates,
+                            ptu_matrix,
+                            eval_idx,
+                            score_take,
+                            target_query_embedding_similarity,
+                            already_selected_cands,
+                            holistic_scores_candidate_centric
+                        )
+                        already_selected_cands.add(selected_idx)
+                        
+                        src_eval = self.ptu_engine._resolve_source_evaluator_index(
+                            self.ptu_engine.candidate_set[selected_idx], selected_idx
+                        )
+                        winning_source_evals.add(src_eval)
+                
+                # Collect ALL candidates associated with the winning source samples
+                selected_candidate_indices = [
+                    idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
+                    if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_source_evals
+                ]
+                subset_size = len(winning_source_evals)
+                
+            else:  # Evaluator_Centric
+                # Find max PTU for each candidate (row maxima)
+                winning_evals = set()
+                
+                evaluator_max_counts = self._compute_evaluator_maximum_counts(ptu_matrix, threshold)
+                for cand_idx in range(self.ptu_engine.n_candidates):
+                    row = ptu_matrix[cand_idx, :]
+                    max_ptu = np.max(row)
+                    
+                    if max_ptu > threshold:
+                        # Find all evaluators with this max value
+                        tied_evaluators = np.where(row == max_ptu)[0].tolist()
+                        
+                        # Apply tie-breaking
+                        selected_idx = self._apply_hierarchical_tiebreaker_evaluator_centric(
+                            tied_evaluators,
+                            ptu_matrix,
+                            cand_idx,
+                            score_make,
+                            target_query_embedding_similarity,
+                            evaluator_max_counts
+                        )
+                        winning_evals.add(selected_idx)
+                
+                # Collect ALL candidates associated with the optimal subset of evaluators
+                selected_candidate_indices = [
+                    idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
+                    if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_evals
+                ]
+                subset_size = len(winning_evals)
         
         # Evaluate
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(selected_candidate_indices)
         pass_at_n = None
         cand_texts_c = self.ptu_engine.get_candidate_texts(selected_candidate_indices)
         
-        # NEW: Pick the right scores depending on the strategy!
-        log_scores = score_take if perspective == 'Candidate_Centric' else score_make
+        # Determine which scores to use based on perspective and fallback condition
+        if zero_score_fallback_triggered:
+            # In fallback mode, use score_take (all zeros anyway)
+            score_take = self.ptu_engine.compute_score_take(ptu_matrix)
+            log_scores = score_take
+        else:
+            # Normal mode: Pick the right scores depending on the strategy
+            score_take = self.ptu_engine.compute_score_take(ptu_matrix)
+            score_make = self.ptu_engine.compute_score_make(ptu_matrix)
+            log_scores = score_take if perspective == 'Candidate_Centric' else score_make
         
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
@@ -1575,9 +1653,9 @@ class BlockC:
             application=f"Block_C_{perspective}",
             subset_size=subset_size,
             selected_candidates=selected_candidate_ids,
-            selected_scores=[float(log_scores[idx]) for idx in selected_candidate_indices], # FIXED
+            selected_scores=[float(log_scores[idx]) for idx in selected_candidate_indices],
             selected_candidate_texts=cand_texts_c,
-            zero_score_fallback_triggered=(len(cand_texts_c) == 0),
+            zero_score_fallback_triggered=zero_score_fallback_triggered,
             list_ap_score=None,
             group_pass_at_n=pass_at_n
         )
@@ -1585,7 +1663,9 @@ class BlockC:
         
         logger.info(
             f"Block C - {mask_type} {perspective}: "
-            f"K_optimal = {subset_size}, Pass@{self.config.global_pass_at_N} = PENDING"
+            f"K_optimal = {subset_size}, "
+            f"Fallback_Triggered = {zero_score_fallback_triggered}, "
+            f"Pass@{self.config.global_pass_at_N} = PENDING"
         )
         
         self.results.append(result)
