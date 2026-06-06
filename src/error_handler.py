@@ -10,24 +10,242 @@ This module provides functions to:
 
 import logging
 import os
+import time
+from typing import Any, Dict, List, Optional, Set
+
 import pandas as pd
 from tqdm import tqdm
-from typing import List, Dict, Any
 
-# Import our custom modules
 from src.evaluation import evaluate_single_answer_with_llm
-from src.orchestration import run_pipeline_for_single_query # Used for retrying generation
-from src.utils import load_json, save_json
-from src.hf_sync import periodic_sync_check, sync_workspace_to_hub
-
-import os
-import logging
-from tqdm import tqdm
-from typing import List, Dict, Any
 from src.orchestration import run_pipeline_for_single_query
 from src.utils import load_json, save_json
-from src.hf_sync import periodic_sync_check
+from src.hf_sync import periodic_sync_check, sync_workspace_to_hub
 from src.layer1_base_execution import _get_cache_filename, _get_cache_path
+
+
+_LAYER1_REQUIRED_LAYER2_FIELDS = (
+    "retrieved_set",
+    "candidate_set",
+    "intrinsic_baselines",
+    "cross_evaluation_matrix",
+    "ground_truth_labels",
+)
+
+
+def _coerce_query_index(value: Any) -> Optional[int]:
+    """Return a hard-question index as int, or None when it cannot be trusted."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_log_query_index(log: Dict[str, Any]) -> Optional[int]:
+    if not isinstance(log, dict):
+        return None
+    return _coerce_query_index(log.get("target_query_original_hard_list_idx"))
+
+
+def _has_non_empty_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (dict, list, tuple, set, str)):
+        return len(value) > 0
+    return True
+
+
+def _is_incomplete_layer1_state(layer1_state: Any) -> bool:
+    """
+    True when a Layer-1 state is missing data that Layer 2 requires.
+
+    A checkpoint skeleton may exist in the combined cache before the final
+    state is saved. Layer 2 needs the final data fields, not just the query key.
+    """
+    if not isinstance(layer1_state, dict):
+        return True
+
+    status = str(layer1_state.get("overall_status", "")).upper()
+    if status and status != "SUCCESS":
+        return True
+
+    last_completed_step = _coerce_query_index(
+        layer1_state.get("metadata", {}).get("last_completed_step")
+    )
+    if last_completed_step is None or last_completed_step < 4:
+        return True
+
+    step_statuses = layer1_state.get("step_statuses", {})
+    if isinstance(step_statuses, dict) and step_statuses:
+        if any(str(step_status).upper() != "SUCCESS" for step_status in step_statuses.values()):
+            return True
+
+    return any(
+        not _has_non_empty_value(layer1_state.get(field))
+        for field in _LAYER1_REQUIRED_LAYER2_FIELDS
+    )
+
+
+def _log_needs_generation_retry(log: Dict[str, Any]) -> bool:
+    if not isinstance(log, dict):
+        return False
+
+    status = str(log.get("pipeline_status", "")).upper()
+    if "FAILURE" in status or "PARTIAL" in status:
+        return True
+
+    if "layer1_base_execution_state" in log:
+        return _is_incomplete_layer1_state(log["layer1_base_execution_state"])
+
+    return False
+
+
+def _validate_manual_retry_indices(
+    manual_retry_query_indices: Optional[List[int]],
+    hard_questions: List[str],
+    logger: logging.Logger
+) -> Set[int]:
+    if not manual_retry_query_indices:
+        return set()
+
+    valid_indices = set()
+    for raw_idx in manual_retry_query_indices:
+        idx = _coerce_query_index(raw_idx)
+        if idx is None:
+            logger.warning(f"Skipping invalid manual retry index: {raw_idx!r}")
+            continue
+        if idx < 0 or idx >= len(hard_questions):
+            logger.warning(
+                f"Skipping out-of-range manual retry index #{idx}. "
+                f"Expected 0 <= index < {len(hard_questions)}."
+            )
+            continue
+        valid_indices.add(idx)
+
+    return valid_indices
+
+
+def _remove_index_from_metadata_list(
+    metadata: Dict[str, Any],
+    field_name: str,
+    query_index: int
+) -> bool:
+    values = metadata.get(field_name)
+    if not isinstance(values, list):
+        return False
+
+    filtered_values = [
+        value for value in values
+        if _coerce_query_index(value) != query_index
+    ]
+    if len(filtered_values) == len(values):
+        return False
+
+    metadata[field_name] = filtered_values
+    return True
+
+
+def _remove_layer1_cache_entry(
+    cache_path: str,
+    query_index: int,
+    logger: logging.Logger
+) -> bool:
+    """
+    Remove a query's stale Layer-1 state so retry starts from the root.
+
+    This also cleans metadata lists that may otherwise mark the query complete
+    or in-progress even after the query payload is deleted.
+    """
+    if not os.path.exists(cache_path):
+        return False
+
+    cache_data = load_json(cache_path)
+    if not isinstance(cache_data, dict):
+        logger.warning(f"Could not load Layer-1 cache for repair: {cache_path}")
+        return False
+
+    changed = False
+    query_key = str(query_index)
+    queries = cache_data.get("queries")
+    if isinstance(queries, dict) and query_key in queries:
+        del queries[query_key]
+        changed = True
+
+    metadata = cache_data.get("metadata")
+    if isinstance(metadata, dict):
+        changed = _remove_index_from_metadata_list(metadata, "completed_queries", query_index) or changed
+        changed = _remove_index_from_metadata_list(metadata, "queries_in_progress", query_index) or changed
+        if isinstance(queries, dict):
+            metadata["total_queries"] = len(queries)
+        metadata["updated_at"] = time.time()
+
+    if changed:
+        if save_json(cache_data, cache_path):
+            logger.info(f"Removed stale Layer-1 cache entry for query #{query_index}: {cache_path}")
+        else:
+            logger.error(f"Failed to save repaired Layer-1 cache metadata: {cache_path}")
+
+    return changed
+
+
+def _collect_retry_targets_from_logs(
+    logs: List[Dict[str, Any]],
+    layer1_cache: Optional[Dict[str, Any]],
+    layer1_enabled: bool,
+    logger: logging.Logger,
+    exp_name: str
+) -> Set[int]:
+    retry_targets = set()
+    cache_queries = {}
+    if isinstance(layer1_cache, dict):
+        cache_queries = layer1_cache.get("queries", {}) or {}
+
+    for log in logs:
+        query_index = _get_log_query_index(log)
+        if query_index is None:
+            if _log_needs_generation_retry(log):
+                logger.warning(
+                    f"Skipping bad log without a usable query index in experiment '{exp_name}'."
+                )
+            continue
+
+        if _log_needs_generation_retry(log):
+            retry_targets.add(query_index)
+            continue
+
+        if layer1_enabled and str(query_index) in cache_queries:
+            if _is_incomplete_layer1_state(cache_queries[str(query_index)]):
+                logger.info(
+                    f"Query #{query_index} in '{exp_name}' has an incomplete Layer-1 cache entry."
+                )
+                retry_targets.add(query_index)
+
+    return retry_targets
+
+
+def _upsert_run_log(
+    logs: List[Dict[str, Any]],
+    new_run_log: Dict[str, Any],
+    query_index: int
+) -> List[Dict[str, Any]]:
+    """Replace the first log for query_index, remove duplicates, or append if missing."""
+    updated_logs = []
+    inserted = False
+
+    for log in logs:
+        if _get_log_query_index(log) == query_index:
+            if not inserted:
+                updated_logs.append(new_run_log)
+                inserted = True
+            continue
+        updated_logs.append(log)
+
+    if not inserted:
+        updated_logs.append(new_run_log)
+
+    return updated_logs
+
 
 def retry_failed_generation_pipelines(
     all_experiments_logs: Dict[str, List[Dict]],
@@ -35,83 +253,112 @@ def retry_failed_generation_pipelines(
     hard_questions: List[str],
     embedding_model: Any,
     exemplar_data: Dict[str, Any],
-    api_managers: Dict[str, Any]
+    api_managers: Dict[str, Any],
+    manual_retry_query_indices: Optional[List[int]] = None
 ) -> Dict[str, List[Dict]]:
+    """
+    Retry failed generation logs and explicitly requested hard-question indices.
+
+    Manual indices are hard-question indices, not positions in the loaded run-log
+    list. They are retried even if absent from both the run log and Layer-1 cache.
+    """
     
     logger = logging.getLogger(__name__)
     logger.info("Starting SMART retry process for failed/partial generation pipelines.")
+    manual_retry_targets = _validate_manual_retry_indices(
+        manual_retry_query_indices,
+        hard_questions,
+        logger
+    )
     
     for exp_name, original_logs in all_experiments_logs.items():
-        exp_config_overrides = original_logs[0].get("config_flags_used", {})
+        log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
+        disk_logs = load_json(log_file_path)
+        if isinstance(disk_logs, list):
+            logs_to_process = disk_logs
+        elif isinstance(original_logs, list):
+            logs_to_process = original_logs
+        elif original_logs:
+            logger.warning(
+                f"Skipping generation retry for '{exp_name}' because its logs are not a list."
+            )
+            continue
+        else:
+            logs_to_process = []
+
+        exp_config_overrides = logs_to_process[0].get("config_flags_used", {}) if logs_to_process else {}
         current_config = global_config.copy()
         current_config.update(exp_config_overrides)
-        
-        log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
-        logs_to_process = original_logs
-        
-        indices_to_retry = []
-        
-        # 1. Identify Bad Logs
-        for i, log in enumerate(logs_to_process):
-            status = log.get("pipeline_status", "")
-            needs_retry = False
-            
-            if "FAILURE" in status or "PARTIAL" in status:
-                needs_retry = True
-            
-            if "layer1_base_execution_state" in log:
-                l1_state = log["layer1_base_execution_state"]
-                if not l1_state.get("candidate_set") or not l1_state.get("cross_evaluation_matrix"):
-                    needs_retry = True
-            
-            if needs_retry:
-                indices_to_retry.append(i)
+        current_config["experiment_name"] = exp_name
 
-        if not indices_to_retry:
-            continue
-
-        # 2. Load Layer 1 Cache
-        cache_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
+        cache_dir = (
+            current_config.get("LAYER1_CACHE_DIR")
+            or current_config.get("RESULTS_DIR")
+            or global_config["RESULTS_DIR"]
+        )
         top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
         n_candidates = current_config.get("LAYER1_N_CANDIDATES") or top_k
         cache_filename = _get_cache_filename(top_k, n_candidates, exp_name)
         cache_path = _get_cache_path(cache_dir, cache_filename)
-        
-        l1_cache = load_json(cache_path) if os.path.exists(cache_path) else None
 
-        for loop_idx, log_idx in enumerate(tqdm(indices_to_retry, desc=f"Retrying {exp_name}")):
-            failed_log = logs_to_process[log_idx]
-            original_hard_list_idx = failed_log["target_query_original_hard_list_idx"]
-            target_query = failed_log["target_query_text"]
-            
-            # WIPE BAD CACHE
-            if l1_cache and "queries" in l1_cache:
-                query_key = str(original_hard_list_idx)
-                if query_key in l1_cache["queries"]:
-                    del l1_cache["queries"][query_key]
-                    save_json(l1_cache, cache_path)
-            
-            # --- NEW: CRITICAL OVERRIDE ---
+        l1_cache = load_json(cache_path) if os.path.exists(cache_path) else None
+        retry_targets = _collect_retry_targets_from_logs(
+            logs=logs_to_process,
+            layer1_cache=l1_cache,
+            layer1_enabled=bool(current_config.get("APPLY_LAYER1_BASE_EXECUTION", False)),
+            logger=logger,
+            exp_name=exp_name
+        )
+        retry_targets.update(manual_retry_targets)
+
+        valid_retry_targets = set()
+        for query_index in retry_targets:
+            if 0 <= query_index < len(hard_questions):
+                valid_retry_targets.add(query_index)
+            else:
+                logger.warning(
+                    f"Skipping out-of-range retry target #{query_index} for '{exp_name}'."
+                )
+
+        if not valid_retry_targets:
+            logger.info(f"No generation retry targets found for '{exp_name}'.")
+            all_experiments_logs[exp_name] = logs_to_process
+            continue
+
+        logger.info(
+            f"Retrying {len(valid_retry_targets)} generation pipeline(s) for '{exp_name}': "
+            f"{sorted(valid_retry_targets)}"
+        )
+
+        for loop_idx, original_hard_list_idx in enumerate(
+            tqdm(sorted(valid_retry_targets), desc=f"Retrying {exp_name}")
+        ):
+            target_query = hard_questions[original_hard_list_idx]
+
+            _remove_layer1_cache_entry(cache_path, original_hard_list_idx, logger)
+
             # Force the pipeline to run all the way through, even if the experiment
             # originally deferred the solving step to phase 2.
             retry_config = current_config.copy()
             retry_config["DEFER_SOLVE_STEP"] = False
-            
-            # 3. Re-run Pipeline
+            retry_config["experiment_name"] = exp_name
+
             new_run_log = run_pipeline_for_single_query(
                 hard_list_idx=original_hard_list_idx,
                 target_query=target_query,
-                config=retry_config,  # <-- Using the forced config
+                config=retry_config,
                 embedding_model=embedding_model,
                 exemplar_data=exemplar_data,
                 api_managers=api_managers
             )
-            
-            logs_to_process[log_idx] = new_run_log
+
+            logs_to_process = _upsert_run_log(logs_to_process, new_run_log, original_hard_list_idx)
+            all_experiments_logs[exp_name] = logs_to_process
             save_json(logs_to_process, log_file_path)
             periodic_sync_check(loop_idx, current_config)
 
         save_json(logs_to_process, log_file_path)
+        all_experiments_logs[exp_name] = logs_to_process
 
     return all_experiments_logs
 # --- UPGRADED: Evaluation Phase Retry Logic ---
