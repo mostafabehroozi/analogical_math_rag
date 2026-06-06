@@ -1172,6 +1172,24 @@ def run_layer1_base_execution(
         layer1_state["overall_status"] = "FAILURE"
         print("  ✗ Critical failure; check step_statuses for details")
     
+    step_order = [
+        "retrieval",
+        "candidate_generation",
+        "baseline_calculation",
+        "cross_evaluation",
+        "ground_truth_evaluation"
+    ]
+    last_contiguous_completed_step = -1
+    for step_idx, step_name in enumerate(step_order):
+        if layer1_state["step_statuses"].get(step_name) == "SUCCESS":
+            last_contiguous_completed_step = step_idx
+        else:
+            break
+
+    layer1_state.setdefault("metadata", {})
+    layer1_state["metadata"]["last_completed_step"] = last_contiguous_completed_step
+    layer1_state["metadata"]["last_checkpoint_timestamp"] = time.time()
+
     # Save complete state to cache (merges with existing queries)
     success = _save_cached_state(
         cache_path=cache_path,

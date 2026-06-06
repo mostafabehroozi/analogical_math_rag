@@ -66,25 +66,34 @@ def _is_incomplete_layer1_state(layer1_state: Any) -> bool:
     if not isinstance(layer1_state, dict):
         return True
 
+    step_statuses = layer1_state.get("step_statuses", {})
+    steps_all_success = False
+    if isinstance(step_statuses, dict) and step_statuses:
+        if any(str(step_status).upper() != "SUCCESS" for step_status in step_statuses.values()):
+            return True
+        steps_all_success = True
+
+    missing_layer2_fields = any(
+        not _has_non_empty_value(layer1_state.get(field))
+        for field in _LAYER1_REQUIRED_LAYER2_FIELDS
+    )
+    if missing_layer2_fields:
+        return True
+
     status = str(layer1_state.get("overall_status", "")).upper()
     if status and status != "SUCCESS":
         return True
 
+    # Legacy Layer-1 final states can contain complete data while metadata still
+    # says last_completed_step=-1 because checkpoints update the file, not the
+    # in-memory state later written by _save_cached_state().
+    if status == "SUCCESS" or steps_all_success:
+        return False
+
     last_completed_step = _coerce_query_index(
         layer1_state.get("metadata", {}).get("last_completed_step")
     )
-    if last_completed_step is None or last_completed_step < 4:
-        return True
-
-    step_statuses = layer1_state.get("step_statuses", {})
-    if isinstance(step_statuses, dict) and step_statuses:
-        if any(str(step_status).upper() != "SUCCESS" for step_status in step_statuses.values()):
-            return True
-
-    return any(
-        not _has_non_empty_value(layer1_state.get(field))
-        for field in _LAYER1_REQUIRED_LAYER2_FIELDS
-    )
+    return last_completed_step is None or last_completed_step < 4
 
 
 def _log_needs_generation_retry(log: Dict[str, Any]) -> bool:
