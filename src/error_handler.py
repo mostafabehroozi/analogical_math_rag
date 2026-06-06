@@ -256,6 +256,89 @@ def _upsert_run_log(
     return updated_logs
 
 
+def _upsert_layer1_cache_state(
+    cache_path: str,
+    query_index: int,
+    layer1_state: Dict[str, Any],
+    top_k: int,
+    n_candidates: int,
+    experiment_name: str,
+    logger: logging.Logger
+) -> bool:
+    """Persist the retried Layer-1 state into the combined cache file."""
+    if not isinstance(layer1_state, dict):
+        logger.warning(
+            f"Cannot update Layer-1 cache for query #{query_index}: "
+            "run log does not contain a dictionary Layer-1 state."
+        )
+        return False
+
+    cache_data = load_json(cache_path) if os.path.exists(cache_path) else None
+    if not isinstance(cache_data, dict):
+        cache_data = {
+            "metadata": {
+                "created_at": time.time(),
+                "experiment_name": experiment_name,
+                "top_k": top_k,
+                "n_candidates": n_candidates,
+                "completed_queries": [],
+                "queries_in_progress": []
+            },
+            "queries": {}
+        }
+
+    if not isinstance(cache_data.get("queries"), dict):
+        cache_data["queries"] = {}
+
+    target_query_data = layer1_state.get("target_query_data", {})
+    layer1_state.setdefault("target_query_idx", query_index)
+    if isinstance(target_query_data, dict):
+        layer1_state.setdefault("target_query_text", target_query_data.get("query_text"))
+        layer1_state.setdefault("ground_truth_answer", target_query_data.get("ground_truth_answer"))
+
+    query_key = str(query_index)
+    cache_data["queries"][query_key] = layer1_state
+
+    metadata = cache_data.setdefault("metadata", {})
+    metadata["experiment_name"] = experiment_name
+    metadata["top_k"] = top_k
+    metadata["n_candidates"] = n_candidates
+    metadata["updated_at"] = time.time()
+    metadata["total_queries"] = len(cache_data["queries"])
+
+    completed_queries = metadata.get("completed_queries")
+    if not isinstance(completed_queries, list):
+        completed_queries = []
+
+    queries_in_progress = metadata.get("queries_in_progress")
+    if not isinstance(queries_in_progress, list):
+        queries_in_progress = []
+
+    completed_set = {
+        idx for idx in (_coerce_query_index(value) for value in completed_queries)
+        if idx is not None and idx != query_index
+    }
+    in_progress_set = {
+        idx for idx in (_coerce_query_index(value) for value in queries_in_progress)
+        if idx is not None and idx != query_index
+    }
+
+    if _is_incomplete_layer1_state(layer1_state):
+        in_progress_set.add(query_index)
+    else:
+        completed_set.add(query_index)
+
+    metadata["completed_queries"] = sorted(completed_set)
+    metadata["queries_in_progress"] = sorted(in_progress_set)
+
+    if save_json(cache_data, cache_path):
+        logger.info(f"Upserted Layer-1 cache state for query #{query_index}: {cache_path}")
+        return True
+
+    logger.error(f"Failed to upsert Layer-1 cache state for query #{query_index}: {cache_path}")
+    return False
+
+
 def retry_failed_generation_pipelines(
     all_experiments_logs: Dict[str, List[Dict]],
     global_config: Dict[str, Any],
@@ -360,6 +443,17 @@ def retry_failed_generation_pipelines(
                 exemplar_data=exemplar_data,
                 api_managers=api_managers
             )
+
+            if current_config.get("APPLY_LAYER1_BASE_EXECUTION", False):
+                _upsert_layer1_cache_state(
+                    cache_path=cache_path,
+                    query_index=original_hard_list_idx,
+                    layer1_state=new_run_log.get("layer1_base_execution_state"),
+                    top_k=top_k,
+                    n_candidates=n_candidates,
+                    experiment_name=exp_name,
+                    logger=logger
+                )
 
             logs_to_process = _upsert_run_log(logs_to_process, new_run_log, original_hard_list_idx)
             all_experiments_logs[exp_name] = logs_to_process
