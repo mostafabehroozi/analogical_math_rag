@@ -83,7 +83,8 @@ def run_pipeline_for_single_query(
     exemplar_data: Dict[str, Any],
     api_managers: Dict[str, Any],
     run_mode: str = 'full',
-    existing_log: Optional[Dict[str, Any]] = None
+    existing_log: Optional[Dict[str, Any]] = None,
+    force_layer1_reexecution: bool = False
 ) -> Dict[str, Any]:
     """
     Executes the RAG pipeline for a single query, supporting different execution modes
@@ -96,6 +97,9 @@ def run_pipeline_for_single_query(
             - 'solve_only': Runs only the solve step, using pre-computed intermediate results.
         existing_log (Optional[Dict]): A pre-existing log from the intermediate phase,
                                        required for 'solve_only' mode.
+        force_layer1_reexecution (bool): If True, forces Layer 1 to bypass cache and re-execute.
+                                        Useful for surgical/manual retries where you want fresh Layer 1 data.
+                                        Can also be set via CONFIG['FORCE_LAYER1_REEXECUTION'].
     """
     logger = logging.getLogger(__name__)
     
@@ -201,6 +205,13 @@ def run_pipeline_for_single_query(
         # Get experiment name for combined cache file
         experiment_name = config.get('experiment_name', 'default_experiment')
         
+        # Determine if Layer 1 should be force re-executed (bypass cache)
+        # Can be set via parameter OR via config flag
+        do_force_layer1_reexecution = force_layer1_reexecution or config.get('FORCE_LAYER1_REEXECUTION', False)
+        
+        if do_force_layer1_reexecution:
+            logger.info(f"🔄 Layer 1 force reexecution enabled for query #{hard_list_idx} (ignoring cache)")
+        
         # Get ground truth for this query
         # The ground truth is expected to be available in exemplar_data or config
         ground_truth = None
@@ -225,7 +236,8 @@ def run_pipeline_for_single_query(
                 exemplar_data=exemplar_data,
                 api_manager=manager_for_solve,  # Use the solve manager for consistency
                 config=config,
-                experiment_name=experiment_name  # Pass experiment name for combined cache
+                experiment_name=experiment_name,  # Pass experiment name for combined cache
+                force_reexecution=do_force_layer1_reexecution  # Force re-execution if retry
             )
             
             # Store Layer 1 state in run_log for reference

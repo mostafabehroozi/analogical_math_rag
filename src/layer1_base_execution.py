@@ -728,13 +728,15 @@ def run_layer1_base_execution(
     exemplar_data: Dict[str, Any],
     api_manager: Any,
     config: Dict[str, Any],
-    experiment_name: str = "default_experiment"
+    experiment_name: str = "default_experiment",
+    force_reexecution: bool = False
 ) -> Dict[str, Any]:
     """
     Main entry point for Layer 1: Base Execution Phase with RESUMABLE checkpointing.
     
     Orchestrates the complete data-gathering pipeline with step-level recovery:
     1. Check for cached state in combined file (Cache-First Rule)
+       - If force_reexecution=True, BYPASS cache and re-execute
     2. Detect if query is FULLY cached (all 5 steps done) → Return immediately
     3. Detect if query is PARTIALLY cached → Resume from last step
     4. If cache miss → Execute Steps A-E with checkpoint saves after each step
@@ -742,6 +744,7 @@ def run_layer1_base_execution(
     6. Return the cached/computed state
     
     ✅ NEW: Step-level checkpointing enables resumption after kernel crashes
+    ✅ NEW: force_reexecution parameter allows bypassing cache for retry operations
     
     Args:
         target_query_index: Index in the hard questions list
@@ -755,6 +758,8 @@ def run_layer1_base_execution(
         api_manager: API manager instance
         config: Configuration dictionary
         experiment_name: Name of the experiment (for combined cache filename)
+        force_reexecution: If True, bypass cache check and re-execute Layer 1.
+                          Used during surgical/full pipeline retries to regenerate data.
     
     Returns:
         The complete Layer 1 cached state (dict) with all phases populated
@@ -774,42 +779,56 @@ def run_layer1_base_execution(
     print(f"[LAYER 1 - BASE EXECUTION] Processing Query #{target_query_index}")
     print(f"Query: {target_query[:80]}...")
     print(f"Experiment: {experiment_name}")
+    if force_reexecution:
+        print(f"🔄 FORCE REEXECUTION MODE - Bypassing cache")
     print(f"{'='*80}")
     
     logger.info(f"[Layer 1] Starting base execution for Query #{target_query_index} (Experiment: {experiment_name})")
+    if force_reexecution:
+        logger.info(f"Force reexecution mode enabled - bypassing cache for query #{target_query_index}")
     
     # --- CACHE-FIRST CHECK (from combined file) ---
     cache_filename = _get_cache_filename(top_k, n_candidates, experiment_name)
     cache_path = _get_cache_path(cache_dir, cache_filename)
     
-    # Check for FULLY CACHED query
-    cached_state = _load_cached_state(cache_path, target_query_index)
-    if cached_state:
-        # Verify that ALL steps are complete (last_completed_step == 4)
-        last_step = cached_state.get("metadata", {}).get("last_completed_step", -1)
-        if last_step == 4:  # All 5 steps complete (0-4)
-            print(f"[LAYER 1 CACHE HIT - FULL] Loaded query #{target_query_index} from {cache_path}")
-            print(f"  All 5 steps cached")
-            print(f"  Retrieved samples: {len(cached_state.get('retrieved_set', []))}")
-            print(f"  Generated candidates: {len(cached_state.get('candidate_set', {}))}")
-            logger.info(f"Full cache hit for Layer 1 state (query #{target_query_index}) at {cache_path}")
-            return cached_state
+    # Check for FULLY CACHED query (unless force_reexecution is True)
+    cached_state = None
+    if not force_reexecution:
+        cached_state = _load_cached_state(cache_path, target_query_index)
+        if cached_state:
+            # Verify that ALL steps are complete (last_completed_step == 4)
+            last_step = cached_state.get("metadata", {}).get("last_completed_step", -1)
+            if last_step == 4:  # All 5 steps complete (0-4)
+                print(f"[LAYER 1 CACHE HIT - FULL] Loaded query #{target_query_index} from {cache_path}")
+                print(f"  All 5 steps cached")
+                print(f"  Retrieved samples: {len(cached_state.get('retrieved_set', []))}")
+                print(f"  Generated candidates: {len(cached_state.get('candidate_set', {}))}")
+                logger.info(f"Full cache hit for Layer 1 state (query #{target_query_index}) at {cache_path}")
+                return cached_state
+            else:
+                # PARTIAL CACHE: Resume from last completed step
+                print(f"[LAYER 1 CACHE HIT - PARTIAL] Found incomplete query #{target_query_index}")
+                last_step_names = ["retrieval", "candidate_generation", "baseline_calculation", 
+                                   "cross_evaluation", "ground_truth_evaluation"]
+                print(f"  Last completed step: {last_step_names[last_step + 1] if last_step >= 0 else 'none'}")
+                print(f"  Will resume from step {last_step_names[last_step + 2] if last_step + 1 < 5 else 'complete'}")
         else:
-            # PARTIAL CACHE: Resume from last completed step
-            print(f"[LAYER 1 CACHE HIT - PARTIAL] Found incomplete query #{target_query_index}")
-            last_step_names = ["retrieval", "candidate_generation", "baseline_calculation", 
-                               "cross_evaluation", "ground_truth_evaluation"]
-            print(f"  Last completed step: {last_step_names[last_step + 1] if last_step >= 0 else 'none'}")
-            print(f"  Will resume from step {last_step_names[last_step + 2] if last_step + 1 < 5 else 'complete'}")
+            print(f"[LAYER 1 CACHE MISS] Query #{target_query_index} will execute full pipeline.")
+            last_step = -1
+            cached_state = None
     else:
-        print(f"[LAYER 1 CACHE MISS] Query #{target_query_index} will execute full pipeline.")
+        print(f"[LAYER 1 FORCE REEXECUTION] Ignoring cache for query #{target_query_index}. Full re-execution.")
         last_step = -1
         cached_state = None
     
     print(f"  Results will be merged into: {cache_path}")
     
     # --- GET LAST COMPLETED STEP (for resumption) ---
-    last_completed_step = _get_last_completed_step(cache_path, target_query_index)
+    # Only use checkpoint resumption if NOT in force_reexecution mode
+    if force_reexecution:
+        last_completed_step = -1
+    else:
+        last_completed_step = _get_last_completed_step(cache_path, target_query_index)
     
     # --- INITIALIZE RESULT STRUCTURE ---
     if cached_state:
