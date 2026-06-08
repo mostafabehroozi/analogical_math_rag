@@ -68,7 +68,12 @@ from src.pipeline_steps import (
 )
 
 from src.multibranch_transformation import multibranch_transformation_experiment
-from src.layer1_base_execution import run_layer1_base_execution
+from src.layer1_base_execution import (
+    run_layer1_base_execution, 
+    _save_cached_state, 
+    _get_cache_filename, 
+    _get_cache_path
+)
 from src.layer2_integration import run_layer2_complete_pipeline
 
 from src.utils import save_json, load_json
@@ -1343,6 +1348,17 @@ def run_experiments(
                     )
                     run_logs.append(intermediate_log)
                     save_json(run_logs, log_file_path)
+                    
+                    # --- NEW: Save Layer 1 Cache Synchronously ---
+                    if 'layer1_base_execution_state' in intermediate_log:
+                        l1_state = intermediate_log['layer1_base_execution_state']
+                        t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+                        n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
+                        c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
+                        c_file = _get_cache_filename(t_k, n_cands, exp_name)
+                        _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
+                    # ---------------------------------------------
+                    
                     periodic_sync_check(loop_idx, current_config)
             else:
                 logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
@@ -1450,6 +1466,17 @@ def run_experiments(
                         )
                         run_logs.append(single_run_log)
                         save_json(run_logs, log_file_path)
+                        
+                        # --- NEW: Save Layer 1 Cache Synchronously ---
+                        if 'layer1_base_execution_state' in single_run_log:
+                            l1_state = single_run_log['layer1_base_execution_state']
+                            t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+                            n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
+                            c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
+                            c_file = _get_cache_filename(t_k, n_cands, exp_name)
+                            _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
+                        # ---------------------------------------------
+                        
                         periodic_sync_check(loop_idx, current_config)
                 
                 # FIXED: Ensure the logs variable is named correctly so it doesn't crash 
@@ -1475,6 +1502,17 @@ def run_experiments(
                         )
                         run_logs.append(intermediate_log)
                         save_json(run_logs, log_file_path)
+                        
+                        # --- NEW: Save Layer 1 Cache Synchronously ---
+                        if 'layer1_base_execution_state' in intermediate_log and intermediate_log['layer1_base_execution_state'].get('_needs_saving'):
+                            l1_state = intermediate_log['layer1_base_execution_state']
+                            t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+                            n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
+                            c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
+                            c_file = _get_cache_filename(t_k, n_cands, exp_name)
+                            _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
+                        # ---------------------------------------------
+                        
                         periodic_sync_check(loop_idx, current_config)
                 else:
                     logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
