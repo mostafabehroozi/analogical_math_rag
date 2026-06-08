@@ -70,6 +70,8 @@ class ExperimentResult:
     selected_candidates: List[str] = None  
     selected_evaluators: List[int] = None  
     selected_scores: List[float] = None  # NEW: Store the scores of chosen samples
+    selected_exemplar_ids: List[str] = None    # NEW: Store the Parent Source IDs
+    selected_exemplar_texts: List[str] = None  # NEW: Store the Parent Source Texts
     
     # Evaluation Metrics (Legacy)
     list_ap_score: Optional[float] = None  
@@ -105,6 +107,10 @@ class ExperimentResult:
             self.selected_evaluators = []
         if self.selected_scores is None:
             self.selected_scores = []  # NEW
+        if self.selected_exemplar_ids is None:
+            self.selected_exemplar_ids = []
+        if self.selected_exemplar_texts is None:
+            self.selected_exemplar_texts = []
         if self.selected_candidate_texts is None:
             self.selected_candidate_texts = []
         if self.executions is None:
@@ -456,6 +462,9 @@ class PTUMathEngine:
         
         # Cache for computed scores
         self._score_cache = {}
+        
+        # NEW: Build source exemplar cache directly from the Layer 1 execution trace
+        self._build_exemplar_cache_from_trace()
         
         logger.info(
             f"PTU Math Engine initialized: "
@@ -864,6 +873,59 @@ class PTUMathEngine:
                 if isinstance(cand, dict) and cand.get('candidate_text'):
                     texts.append(cand['candidate_text'])
         return texts
+
+    def _build_exemplar_cache_from_trace(self):
+        """Reconstruct source exemplars (Q & A) resiliently from the execution trace."""
+        self.exemplar_cache = {}
+        import re
+        for entry in self.layer1_state.get('execution_trace', []):
+            if entry.get('step_name') == 'mirror_phase_0':
+                sub_step = entry.get('sub_step', '')
+                match = re.search(r'baseline_idx_(-?\d+)_attempt', sub_step)
+                if match:
+                    idx = str(match.group(1))
+                    ctx = entry.get('input_context', {})
+                    q = ctx.get('question', '')
+                    gt = ctx.get('ground_truth', '')
+                    if idx not in self.exemplar_cache and q and gt:
+                        self.exemplar_cache[idx] = {'question': q, 'solution': gt}
+
+    def get_source_exemplars(self, candidate_indices: List[int]) -> Tuple[List[str], List[str]]:
+        """
+        Map candidate indices to their parent Source Exemplar IDs and Texts (Q+A).
+        Deduplicates results and ignores Zero-Shot candidates (-1).
+        """
+        seen_ids = set()
+        ids = []
+        texts = []
+        
+        for cand_idx in candidate_indices:
+            if 0 <= cand_idx < len(self.candidate_set):
+                cand = self.candidate_set[cand_idx]
+                src_eval_idx = self._resolve_source_evaluator_index(cand, cand_idx)
+                
+                if 0 <= src_eval_idx < len(self.evaluator_ids):
+                    eval_id = self.evaluator_ids[src_eval_idx]
+                    
+                    # Ignore Zero-Shot and duplicates
+                    if eval_id == "-1" or eval_id in seen_ids:
+                        continue
+                        
+                    seen_ids.add(eval_id)
+                    ids.append(eval_id)
+                    
+                    # Fetch from trace cache or use raw fallback
+                    if eval_id in self.exemplar_cache:
+                        q = self.exemplar_cache[eval_id]['question']
+                        a = self.exemplar_cache[eval_id]['solution']
+                        texts.append(f"Question: {q}\nRationale and Answer: {a}")
+                    else:
+                        eval_data = self.retrieved_set[src_eval_idx]
+                        q = eval_data.get('question', 'Unknown Question')
+                        a = eval_data.get('solution', 'Unknown Solution')
+                        texts.append(f"Question: {q}\nRationale and Answer: {a}")
+                        
+        return ids, texts
     
     def get_original_retrieved_ranking(self) -> List[str]:
         """
@@ -1129,6 +1191,8 @@ class BlockA:
         coverage_rate = len(ranked_indices) / total_candidates if total_candidates > 0 else 0.0
         
         cand_texts_a1 = self.ptu_engine.get_candidate_texts(ranked_indices.tolist())
+        exemplar_ids_a1, exemplar_texts_a1 = self.ptu_engine.get_source_exemplars(ranked_indices.tolist())
+        
         result_a1 = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -1142,6 +1206,8 @@ class BlockA:
             subset_size=len(ranked_indices),
             selected_candidates=ranked_candidate_ids,
             selected_scores=[float(scores[idx]) for idx in ranked_indices],
+            selected_exemplar_ids=exemplar_ids_a1,
+            selected_exemplar_texts=exemplar_texts_a1,
             selected_candidate_texts=cand_texts_a1,
             zero_score_fallback_triggered=(len(cand_texts_a1) == 0),
             list_ap_score=None,
@@ -1192,11 +1258,13 @@ class BlockA:
             top_k_coverage = k / total_candidates if total_candidates > 0 else 0.0
             
             cand_texts_a2 = self.ptu_engine.get_candidate_texts(top_k_indices)
+            exemplar_ids_a2, exemplar_texts_a2 = self.ptu_engine.get_source_exemplars(top_k_indices)
+            
             result_a2 = ExperimentResult(
                 target_query_idx=self.ptu_engine.target_query_idx,
                 target_query_text=self.ptu_engine.target_query_text,
                 ground_truth_answer=self.ptu_engine.ground_truth_answer,
-                utility_calibration=utility_calibration,  # <--- ADD THIS LINE HERE
+                utility_calibration=utility_calibration,
                 evaluator_setting=mask_type,
                 scoring_strategy=strategy,
                 weight_taker=weight_taker,
@@ -1205,6 +1273,8 @@ class BlockA:
                 subset_size=k,
                 selected_candidates=top_k_candidate_ids,
                 selected_scores=[float(scores[idx]) for idx in top_k_indices],
+                selected_exemplar_ids=exemplar_ids_a2,
+                selected_exemplar_texts=exemplar_texts_a2,
                 selected_candidate_texts=cand_texts_a2,
                 zero_score_fallback_triggered=(len(cand_texts_a2) == 0),
                 list_ap_score=None,
@@ -1319,7 +1389,9 @@ class BlockB:
         
         # Evaluate the dynamic group
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(positive_indices)
+        exemplar_ids_b, exemplar_texts_b = self.ptu_engine.get_source_exemplars(positive_indices)
         pass_at_n = None
+        
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
             target_query_text=self.ptu_engine.target_query_text,
@@ -1333,6 +1405,8 @@ class BlockB:
             subset_size=k_dynamic,
             selected_candidates=selected_candidate_ids,
             selected_scores=[float(scores[idx]) for idx in positive_indices],  # NEW: Grab the scores
+            selected_exemplar_ids=exemplar_ids_b,
+            selected_exemplar_texts=exemplar_texts_b,
             selected_candidate_texts=self.ptu_engine.get_candidate_texts(positive_indices),
             zero_score_fallback_triggered=zero_score_fallback_triggered,
             list_ap_score=None,
@@ -1629,6 +1703,7 @@ class BlockC:
         
         # Evaluate
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(selected_candidate_indices)
+        exemplar_ids_c, exemplar_texts_c = self.ptu_engine.get_source_exemplars(selected_candidate_indices)
         pass_at_n = None
         cand_texts_c = self.ptu_engine.get_candidate_texts(selected_candidate_indices)
         
@@ -1654,6 +1729,8 @@ class BlockC:
             subset_size=subset_size,
             selected_candidates=selected_candidate_ids,
             selected_scores=[float(log_scores[idx]) for idx in selected_candidate_indices],
+            selected_exemplar_ids=exemplar_ids_c,
+            selected_exemplar_texts=exemplar_texts_c,
             selected_candidate_texts=cand_texts_c,
             zero_score_fallback_triggered=zero_score_fallback_triggered,
             list_ap_score=None,
@@ -1955,10 +2032,11 @@ class Layer2Orchestrator:
         for result in query_results:
             logger.info(f"  -> Running LLM for: {result.application} (Pass@{self.config.global_pass_at_N})")
             
+            # THE PROXY PRINCIPLE FIX: Pass the Source Exemplars to the Solver, NOT the drafted Candidates!
             prompt, executions, pass_at_k = self.inference_engine.execute_and_evaluate(
                 target_query=result.target_query_text,
                 ground_truth=result.ground_truth_answer,
-                context_texts=result.selected_candidate_texts,
+                context_texts=result.selected_exemplar_texts, 
                 n_attempts=self.config.global_pass_at_N
             )
             
@@ -1988,12 +2066,14 @@ class Layer2Orchestrator:
                 "configuration_thread": f"{r.utility_calibration}_{r.evaluator_setting}_{r.application}_{r.scoring_strategy}",
                 "utility_calibration_mode": r.utility_calibration,
                 "context_selection_metadata": {
-                    "selected_samples": r.selected_candidates,
+                    "selected_candidate_proxies": r.selected_candidates,
+                    "selected_exemplar_ids": r.selected_exemplar_ids,
                     "selected_scores": r.selected_scores,
                     "subset_size": r.subset_size,
                     "context_token_estimate": r.context_token_estimate,
                     "zero_score_fallback_triggered": r.zero_score_fallback_triggered
                 },
+                "context_payload_texts": r.selected_exemplar_texts,
                 "final_prompt_text": r.final_prompt_text,
                 "executions": r.executions
             }
