@@ -89,8 +89,6 @@ class ExperimentResult:
     ap_score_reranked: Optional[float] = None  # AP on reranked list
     ap_score_original: Optional[float] = None  # AP on original retrieved list
     ap_improvement: Optional[float] = None  # Delta: reranked - original
-    recall_at_k: Optional[Dict[int, float]] = None  # {k: recall@k}
-    ndcg_at_k: Optional[Dict[int, float]] = None  # {k: ndcg@k}
     candidate_coverage_rate: Optional[float] = None  # Fraction of candidate set used
     avg_rerank_position_shift: Optional[float] = None  # Avg rank movement (Block A only)
     confidence_variance: Optional[float] = None  # Std dev of selected candidate scores
@@ -118,10 +116,6 @@ class ExperimentResult:
             self.executions = []
         if self.pass_at_k_metrics is None:
             self.pass_at_k_metrics = {}
-        if self.recall_at_k is None:
-            self.recall_at_k = {}
-        if self.ndcg_at_k is None:
-            self.ndcg_at_k = {}
 
 
 @dataclass
@@ -158,9 +152,6 @@ class Layer2Config:
     block_C_tiebreaker_weight_taker: float = 1.0
     block_C_tiebreaker_weight_maker: float = 1.0
     
-    # === NEW: Ranking Metrics Configuration ===
-    ranking_k_values: List[int] = None  # [1, 3, 5, 10] for Recall@K and NDCG@K
-    
     def __post_init__(self):
         if self.utility_calibration_modes is None:
             self.utility_calibration_modes = ['Marginal', 'Absolute']
@@ -176,8 +167,6 @@ class Layer2Config:
             self.dynamic_k_methods = ['K_take', 'K_make', 'K_both']
         if self.coverage_perspectives is None:
             self.coverage_perspectives = ['Candidate_Centric', 'Evaluator_Centric']
-        if self.ranking_k_values is None:
-            self.ranking_k_values = [1, 3, 5, 10]
 
 
 # ============================================================================
@@ -187,7 +176,7 @@ class Layer2Config:
 class RankingMetricsCalculator:
     """
     Computes ranking-based metrics for evaluating retrieved and reranked lists.
-    Metrics include: Average Precision (AP), Recall@K, and NDCG@K.
+    Metrics include: Average Precision (AP).
     """
     
     @staticmethod
@@ -226,110 +215,10 @@ class RankingMetricsCalculator:
         return min(ap, 1.0)  # Ensure bounded to [0, 1]
     
     @staticmethod
-    def calculate_recall_at_k(ranked_candidates: List[str], ground_truth_labels: Dict[str, bool], k: int) -> float:
-        """
-        Calculate Recall@K: fraction of relevant items in top-K.
-        
-        Args:
-            ranked_candidates: List of candidate IDs in ranked order
-            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
-            k: Cutoff position
-        
-        Returns:
-            Recall@K in [0.0, 1.0]
-        """
-        if not ranked_candidates or not ground_truth_labels:
-            return 0.0
-        
-        total_relevant = sum(1 for label in ground_truth_labels.values() if label)
-        if total_relevant == 0:
-            return 0.0
-        
-        # Count relevant items in top-K
-        top_k = ranked_candidates[:k]
-        relevant_in_k = sum(1 for cand in top_k if ground_truth_labels.get(cand, False))
-        
-        recall_k = relevant_in_k / total_relevant
-        return min(recall_k, 1.0)
-    
-    @staticmethod
-    def calculate_dcg_at_k(ranked_candidates: List[str], ground_truth_labels: Dict[str, bool], k: int) -> float:
-        """
-        Calculate Discounted Cumulative Gain at K.
-        
-        Args:
-            ranked_candidates: List of candidate IDs in ranked order
-            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
-            k: Cutoff position
-        
-        Returns:
-            DCG@K value (unbounded)
-        """
-        if not ranked_candidates:
-            return 0.0
-        
-        dcg = 0.0
-        top_k = ranked_candidates[:k]
-        
-        for position, candidate_id in enumerate(top_k, start=1):
-            is_relevant = ground_truth_labels.get(candidate_id, False)
-            if is_relevant:
-                # DCG formula: rel / log2(position + 1)
-                dcg += 1.0 / np.log2(position + 1)
-        
-        return dcg
-    
-    @staticmethod
-    def calculate_idcg_at_k(ground_truth_labels: Dict[str, bool], k: int) -> float:
-        """
-        Calculate Ideal Discounted Cumulative Gain at K (perfect ranking).
-        
-        Args:
-            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
-            k: Cutoff position
-        
-        Returns:
-            IDCG@K value
-        """
-        # Ideal ranking: all relevant items first
-        total_relevant = sum(1 for label in ground_truth_labels.values() if label)
-        if total_relevant == 0:
-            return 0.0
-        
-        idcg = 0.0
-        for position in range(1, min(total_relevant, k) + 1):
-            idcg += 1.0 / np.log2(position + 1)
-        
-        return idcg
-    
-    @staticmethod
-    def calculate_ndcg_at_k(ranked_candidates: List[str], ground_truth_labels: Dict[str, bool], k: int) -> float:
-        """
-        Calculate Normalized Discounted Cumulative Gain at K.
-        
-        Args:
-            ranked_candidates: List of candidate IDs in ranked order
-            ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
-            k: Cutoff position
-        
-        Returns:
-            NDCG@K in [0.0, 1.0]
-        """
-        dcg = RankingMetricsCalculator.calculate_dcg_at_k(ranked_candidates, ground_truth_labels, k)
-        idcg = RankingMetricsCalculator.calculate_idcg_at_k(ground_truth_labels, k)
-        
-        if idcg == 0.0:
-            return 0.0
-        
-        ndcg = dcg / idcg
-        return min(ndcg, 1.0)  # Ensure bounded to [0, 1]
-    
-    @staticmethod
     def compute_all_metrics(
         ranked_candidates_reranked: List[str],
         ranked_candidates_original: List[str],
-        ground_truth_labels: Dict[str, bool],
-        k_values: List[int]
+        ground_truth_labels: Dict[str, bool]
     ) -> Dict[str, Any]:
         """
         Compute all ranking metrics for both reranked and original lists.
@@ -338,27 +227,14 @@ class RankingMetricsCalculator:
             ranked_candidates_reranked: Reranked candidate list
             ranked_candidates_original: Original (pre-reranking) candidate list
             ground_truth_labels: Dict mapping candidate_id -> is_relevant (bool)
-            k_values: List of K values for Recall@K and NDCG@K
         
         Returns:
             Dict with all computed metrics
         """
         metrics = {
             'ap_reranked': RankingMetricsCalculator.calculate_ap(ranked_candidates_reranked, ground_truth_labels),
-            'ap_original': RankingMetricsCalculator.calculate_ap(ranked_candidates_original, ground_truth_labels),
-            'recall_at_k': {},
-            'ndcg_at_k': {}
+            'ap_original': RankingMetricsCalculator.calculate_ap(ranked_candidates_original, ground_truth_labels)
         }
-        
-        # Calculate Recall@K and NDCG@K for reranked list only (Block A specific)
-        for k in k_values:
-            if k > 0:
-                metrics['recall_at_k'][k] = RankingMetricsCalculator.calculate_recall_at_k(
-                    ranked_candidates_reranked, ground_truth_labels, k
-                )
-                metrics['ndcg_at_k'][k] = RankingMetricsCalculator.calculate_ndcg_at_k(
-                    ranked_candidates_reranked, ground_truth_labels, k
-                )
         
         # Calculate AP improvement
         metrics['ap_improvement'] = metrics['ap_reranked'] - metrics['ap_original']
@@ -1176,8 +1052,7 @@ class BlockA:
         ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
             ranked_candidate_ids,
             original_ranking_ids,
-            ground_truth_labels_dict,
-            self.config.ranking_k_values
+            ground_truth_labels_dict
         )
         
         # Calculate position shift from original to reranked
@@ -1217,8 +1092,6 @@ class BlockA:
             ap_score_reranked=ranking_metrics['ap_reranked'],
             ap_score_original=ranking_metrics['ap_original'],
             ap_improvement=ranking_metrics['ap_improvement'],
-            recall_at_k=ranking_metrics['recall_at_k'],
-            ndcg_at_k=ranking_metrics['ndcg_at_k'],
             candidate_coverage_rate=coverage_rate,
             avg_rerank_position_shift=avg_position_shift,
             confidence_variance=confidence_variance
@@ -1245,8 +1118,7 @@ class BlockA:
             top_k_ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
                 top_k_candidate_ids,
                 original_ranking_ids,
-                ground_truth_labels_dict,
-                self.config.ranking_k_values
+                ground_truth_labels_dict
             )
             
             # Calculate position shift for top-K
@@ -1284,8 +1156,6 @@ class BlockA:
                 ap_score_reranked=top_k_ranking_metrics['ap_reranked'],
                 ap_score_original=top_k_ranking_metrics['ap_original'],
                 ap_improvement=top_k_ranking_metrics['ap_improvement'],
-                recall_at_k=top_k_ranking_metrics['recall_at_k'],
-                ndcg_at_k=top_k_ranking_metrics['ndcg_at_k'],
                 candidate_coverage_rate=top_k_coverage,
                 avg_rerank_position_shift=top_k_position_shift,
                 confidence_variance=top_k_variance
@@ -1779,8 +1649,6 @@ class ThreadAggregator:
             "ap_scores_reranked": [],
             "ap_scores_original": [],
             "ap_improvements": [],
-            "recall_at_k_lists": defaultdict(list),  # {k: [recall@k values]}
-            "ndcg_at_k_lists": defaultdict(list),  # {k: [ndcg@k values]}
             "coverage_rates": [],
             "position_shifts": [],
             "confidence_variances": []
@@ -1833,12 +1701,6 @@ class ThreadAggregator:
             if result.ap_improvement is not None:
                 agg_data[thread_key]["ap_improvements"].append(result.ap_improvement)
             
-            # Aggregate Recall@K and NDCG@K
-            for k, recall_val in (result.recall_at_k or {}).items():
-                agg_data[thread_key]["recall_at_k_lists"][k].append(recall_val)
-            for k, ndcg_val in (result.ndcg_at_k or {}).items():
-                agg_data[thread_key]["ndcg_at_k_lists"][k].append(ndcg_val)
-            
             # Aggregate additional analysis metrics
             if result.candidate_coverage_rate is not None:
                 agg_data[thread_key]["coverage_rates"].append(result.candidate_coverage_rate)
@@ -1856,16 +1718,6 @@ class ThreadAggregator:
             data["avg_ap_reranked"] = np.mean(data["ap_scores_reranked"]) if data["ap_scores_reranked"] else None
             data["avg_ap_original"] = np.mean(data["ap_scores_original"]) if data["ap_scores_original"] else None
             data["avg_ap_improvement"] = np.mean(data["ap_improvements"]) if data["ap_improvements"] else None
-            
-            # Average Recall@K and NDCG@K
-            data["avg_recall_at_k"] = {
-                k: np.mean(vals) if vals else None
-                for k, vals in data["recall_at_k_lists"].items()
-            }
-            data["avg_ndcg_at_k"] = {
-                k: np.mean(vals) if vals else None
-                for k, vals in data["ndcg_at_k_lists"].items()
-            }
             
             # Average additional metrics
             data["avg_coverage_rate"] = np.mean(data["coverage_rates"]) if data["coverage_rates"] else None
@@ -2190,7 +2042,6 @@ class Layer2Orchestrator:
         
         # Prepare headers
         expected_n = self.config.global_pass_at_N
-        k_values = self.config.ranking_k_values
         
         headers = [
             # Group 1: Configuration Identity
@@ -2211,12 +2062,6 @@ class Layer2Orchestrator:
         
         # Group 7: AP Analysis (Block A only)
         headers.extend(["AP_Score_Reranked", "AP_Score_Original", "AP_Improvement"])
-        
-        # Group 8: Ranking Metrics (Block A only)
-        for k in k_values:
-            headers.append(f"Recall_At_{k}")
-        for k in k_values:
-            headers.append(f"NDCG_At_{k}")
         
         # Group 9: Additional Analysis
         headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Confidence_Variance"])
@@ -2261,17 +2106,6 @@ class Layer2Orchestrator:
                     round(ap_original, 4) if ap_original is not None else "-",
                     round(ap_improvement, 4) if ap_improvement is not None else "-",
                 ])
-                
-                # Group 8: Ranking Metrics (Block A only)
-                avg_recall = thread_data.get("avg_recall_at_k", {})
-                for k in k_values:
-                    recall_val = avg_recall.get(k)
-                    row.append(round(recall_val, 4) if recall_val is not None else "-")
-                
-                avg_ndcg = thread_data.get("avg_ndcg_at_k", {})
-                for k in k_values:
-                    ndcg_val = avg_ndcg.get(k)
-                    row.append(round(ndcg_val, 4) if ndcg_val is not None else "-")
                 
                 # Group 9: Additional Analysis
                 coverage = thread_data.get("avg_coverage_rate")
