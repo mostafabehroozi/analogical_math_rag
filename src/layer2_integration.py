@@ -117,6 +117,8 @@ def create_layer2_config_from_dict(config_dict: Dict[str, Any]) -> Layer2Config:
         config.layer2_config_name = config_dict['layer2_config_name']
     
     # Block toggles
+    if 'run_block_A_baseline' in config_dict:
+        config.run_block_A_baseline = config_dict['run_block_A_baseline'] 
     if 'run_block_A' in config_dict:
         config.run_block_A = config_dict['run_block_A']
     if 'run_block_B' in config_dict:

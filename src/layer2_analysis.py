@@ -124,6 +124,7 @@ class Layer2Config:
     layer2_config_name: str = "default_run"  # <--- ADD THIS LINE
     
     # Block Execution Toggles
+    run_block_A_baseline: bool = True  # <--- ADD THIS NEW LINE
     run_block_A: bool = True
     run_block_B: bool = True
     run_block_C: bool = True
@@ -991,6 +992,76 @@ class BlockA:
         # Store ranked indices for each (mask_type, strategy) combination for Block B boundary test
         self.ranked_indices_cache = {}
     
+
+    def run_original_baseline(self) -> List[ExperimentResult]:
+        """
+        Runs the Active Baseline for the Original (Un-reranked) Retrieval List.
+        Creates ExperimentResult objects for Top-K slicing of the original list.
+        """
+        results = []
+        # Get the original sequence (0, 1, 2, 3...)
+        original_indices = list(range(len(self.ptu_engine.candidate_ids)))
+        original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
+        
+        ground_truth_labels_dict = {
+            self.ptu_engine.candidate_ids[i]: _normalize_ground_truth_label(self.ptu_engine.ground_truth_labels.get(i))
+            for i in range(len(self.ptu_engine.candidate_ids))
+        }
+
+        for k in self.config.top_ks_group:
+            if k > len(original_indices):
+                continue
+                
+            top_k_indices = original_indices[:k]
+            top_k_candidate_ids = self.ptu_engine.candidate_indices_to_ids(top_k_indices)
+            
+            # Since this IS the original list, reranked metrics equal original metrics
+            top_k_ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
+                top_k_candidate_ids,
+                original_ranking_ids,
+                ground_truth_labels_dict
+            )
+            
+            cand_texts = self.ptu_engine.get_candidate_texts(top_k_indices)
+            exemplar_ids, exemplar_texts = self.ptu_engine.get_source_exemplars(top_k_indices)
+            
+            result = ExperimentResult(
+                target_query_idx=self.ptu_engine.target_query_idx,
+                target_query_text=self.ptu_engine.target_query_text,
+                ground_truth_answer=self.ptu_engine.ground_truth_answer,
+                utility_calibration="Baseline",
+                evaluator_setting="Baseline",
+                scoring_strategy="Original_Retrieval",
+                weight_taker=1.0,
+                weight_maker=1.0,
+                application=f"Block_A_Baseline_TopK_{k}",
+                subset_size=k,
+                selected_candidates=top_k_candidate_ids,
+                selected_scores=[0.0 for _ in top_k_indices], # No PTU scores for baseline
+                selected_exemplar_ids=exemplar_ids,
+                selected_exemplar_texts=exemplar_texts,
+                selected_candidate_texts=cand_texts,
+                zero_score_fallback_triggered=(len(cand_texts) == 0),
+                list_ap_score=None,
+                group_pass_at_n=None,
+                ap_score_reranked=top_k_ranking_metrics['ap_original'],
+                ap_score_original=top_k_ranking_metrics['ap_original'],
+                ap_improvement=0.0, # Baseline cannot improve upon itself
+                candidate_coverage_rate=k / len(original_indices) if original_indices else 0.0,
+                avg_rerank_position_shift=0.0,
+                confidence_variance=0.0
+            )
+            results.append(result)
+            
+            logger.info(
+                f"Block A BASELINE - Original_Retrieval Top-{k}: "
+                f"AP_Original = {top_k_ranking_metrics['ap_original']:.4f}, "
+                f"Pass@{self.config.global_pass_at_N} = PENDING"
+            )
+            
+        self.results.extend(results)
+        return results
+
     def run_for_mask_and_strategy(
         self,
         ptu_matrix: np.ndarray,
@@ -1665,9 +1736,13 @@ class ThreadAggregator:
                 if "Reranking" in result.application:
                     top_k = None
                 else:
-                    # Extract K from Block_A_TopK_K_strategy
+                    # Look for the number dynamically
                     parts = result.application.split("_")
-                    top_k = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+                    top_k = None
+                    for part in parts:
+                        if part.isdigit():
+                            top_k = int(part)
+                            break
             elif "Block_B" in result.application:
                 block = "Block_B"
                 top_k = None  # Dynamic K
@@ -1741,8 +1816,8 @@ class ThreadAggregator:
         Returns:
             List of (thread_name, thread_data) tuples sorted hierarchically
         """
-        calib_order = {"Marginal": 0, "Absolute": 1}
-        mask_order = {"Self": 0, "Others": 1, "All": 2}
+        calib_order = {"Baseline": -1, "Marginal": 0, "Absolute": 1} 
+        mask_order = {"Baseline": -1, "Self": 0, "Others": 1, "All": 2} 
         block_order = {"Block_A": 0, "Block_B": 1, "Block_C": 2}
         
         def sort_key(item):
@@ -1800,6 +1875,14 @@ class Layer2Orchestrator:
             print(f"  [!] Skipping Query #{target_idx} due to empty/invalid Layer 1 data.")
             return [] # Skip this query and move to the next one
         
+        # === NEW: RUN ORIGINAL BASELINE EXACTLY ONCE PER QUESTION ===
+        if self.config.run_block_A and getattr(self.config, 'run_block_A_baseline', False):
+            logger.info(f"\n[BLOCK A BASELINE] Executing Original Retrieval Baseline")
+            block_a_baseline = BlockA(ptu_engine, self.config)
+            baseline_results = block_a_baseline.run_original_baseline()
+            query_results.extend(baseline_results)
+        # ============================================================
+
         # Grid search: For each calibration mode, then for each mask type
         for calib_mode in self.config.utility_calibration_modes:
             # 1. Fetch mathematically calibrated base PTU
