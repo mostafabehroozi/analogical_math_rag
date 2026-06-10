@@ -28,6 +28,7 @@ import logging
 import os
 import json
 import csv
+import pickle
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
@@ -1309,10 +1310,7 @@ class BlockA:
         return self.ranked_indices_cache.get(cache_key, None)
 
 
-# ============================================================================
 # BLOCK B: DYNAMIC SMART-K GROUPING
-# ============================================================================
-
 class BlockB:
     """
     Advanced application: Dynamic K sizing based on score thresholds.
@@ -1366,7 +1364,7 @@ class BlockB:
                 if 0 <= src_eval_idx < len(scores) and scores[src_eval_idx] > threshold:
                     positive_indices.append(cand_idx)
         
-        # ===== SMART FALLBACK LOGIC =====
+        # SMART FALLBACK LOGIC 
         zero_score_fallback_triggered = False
         if len(positive_indices) > 0:
             # Normal case: K_dynamic = count of positive indices
@@ -1448,10 +1446,7 @@ class BlockB:
         return results
 
 
-# ============================================================================
 # BLOCK C: OPTIMAL SUBSET (COVERAGE) GROUPING
-# ============================================================================
-
 class BlockC:
     """
     Advanced application: Optimal subset using coverage-based peak finding.
@@ -1749,9 +1744,8 @@ class BlockC:
         return results
 
 
-# ============================================================================
+
 # THREAD AGGREGATOR (NEW)
-# ============================================================================
 
 class ThreadAggregator:
     """
@@ -1911,9 +1905,9 @@ class ThreadAggregator:
         return sorted(threads.items(), key=sort_key)
 
 
-# ============================================================================
+
 # LAYER 2 ORCHESTRATOR
-# ============================================================================
+
 
 class Layer2Orchestrator:
     """
@@ -1982,7 +1976,7 @@ class Layer2Orchestrator:
                 else:
                     block_a = None
                 
-                # ===== BLOCK B =====
+                # BLOCK B 
                 if self.config.run_block_B:
                     logger.info("\n[BLOCK B] Dynamic Smart-K Grouping")
                     block_b = BlockB(ptu_engine, self.config)
@@ -2014,7 +2008,7 @@ class Layer2Orchestrator:
                         )
                         query_results.extend(results)
                 
-                # ===== BLOCK C =====
+                # BLOCK C 
                 if self.config.run_block_C:
                     logger.info("\n[BLOCK C] Optimal Subset (Coverage) Grouping")
                     block_c = BlockC(ptu_engine, self.config)
@@ -2127,22 +2121,22 @@ class Layer2Orchestrator:
             return obj
     
     def save_reports(self, report: Dict[str, Any], json_filename: str = None, csv_filename: str = None):
-        """Save the detailed JSON logs and generate both the existing and comprehensive CSV reports."""
+        """Save the detailed JSON logs and generate both the existing and comprehensive CSV reports safely."""
         
-        # --- ADD THESE TWO LINES TO MAKE NAMES DYNAMIC ---
         json_filename = f"layer2_detailed_logs_{self.config.layer2_config_name}.json"
         csv_filename = f"layer2_master_report_{self.config.layer2_config_name}.csv"
-        # -------------------------------------------------
 
-        # 1. Save JSON
+        # 1. Save JSON (Atomically)
         json_filepath = os.path.join(self.output_dir, json_filename)
-        save_json(report, json_filepath)
-        logger.info(f"Detailed JSON logs saved to: {json_filepath}")
+        temp_json_filepath = json_filepath + ".tmp"
+        save_json(report, temp_json_filepath)
+        os.replace(temp_json_filepath, json_filepath)
+        logger.debug(f"Detailed JSON logs updated: {json_filepath}")
 
-        # 2. Generate and Save EXISTING CSV (for backward compatibility)
+        # 2. Generate and Save EXISTING CSV (Atomically)
         csv_filepath = os.path.join(self.output_dir, csv_filename)
+        temp_csv_filepath = csv_filepath + ".tmp"
         
-        # Aggregate data by Configuration Thread
         agg_data = defaultdict(lambda: {
             "Total_Questions": 0, 
             "Total_Context_Size": 0, 
@@ -2153,40 +2147,31 @@ class Layer2Orchestrator:
         for r in self.all_results:
             thread_name = f"{r.application}_{r.scoring_strategy}"
             agg_data[thread_name]["Total_Questions"] += 1
-            
-            # Use the token estimate we calculated accurately during inference
             agg_data[thread_name]["Total_Context_Size"] += r.context_token_estimate
-            
             for k, val in r.pass_at_k_metrics.items():
                 agg_data[thread_name]["Pass_At_Metrics"][k] += val
                 if k > max_k: max_k = k
 
-        # Write existing CSV
-        with open(csv_filepath, mode='w', newline='', encoding='utf-8') as file:
+        with open(temp_csv_filepath, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
-            
-            expected_n = self.config.global_pass_at_N  # Force exact column count
-            
-            # Create Headers
+            expected_n = self.config.global_pass_at_N
             headers = ["Configuration_Thread", "Total_Questions_Evaluated", "Average_Context_Tokens"]
             for k in range(1, expected_n + 1):
                 headers.append(f"Pass@{k}_Accuracy")
             writer.writerow(headers)
             
-            # Write Rows
             for thread_name, stats in agg_data.items():
                 total_q = stats["Total_Questions"]
                 avg_context = stats["Total_Context_Size"] / total_q if total_q > 0 else 0
-                
                 row = [thread_name, total_q, round(avg_context, 2)]
                 for k in range(1, expected_n + 1):
                     avg_pass_k = stats["Pass_At_Metrics"][k] / total_q if total_q > 0 else 0
                     row.append(round(avg_pass_k, 4))
-                    
                 writer.writerow(row)
+                
+        # Instantly overwrite the old file with the new one
+        os.replace(temp_csv_filepath, csv_filepath)
 
-        logger.info(f"Master CSV report saved to: {csv_filepath}")
-        
         # 3. Generate and Save NEW COMPREHENSIVE CSV
         self._save_comprehensive_report()
         
@@ -2236,8 +2221,9 @@ class Layer2Orchestrator:
         # Group 9: Additional Analysis
         headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Confidence_Variance"])
         
-        # Write to CSV
-        with open(csv_filepath, mode='w', newline='', encoding='utf-8') as file:
+        # Write to CSV (Atomically)
+        temp_csv_filepath = csv_filepath + ".tmp"
+        with open(temp_csv_filepath, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow(headers)
             
@@ -2299,14 +2285,36 @@ class Layer2Orchestrator:
                 
                 writer.writerow(row)
         
-        logger.info(f"Comprehensive analysis CSV report saved to: {csv_filepath}")
-        print(f"✓ Comprehensive CSV report generated: {csv_filename}")
+        # Instantly overwrite the old file with the new one
+        os.replace(temp_csv_filepath, csv_filepath)
+        logger.debug(f"Comprehensive analysis CSV report updated: {csv_filepath}")
 
 
-# ============================================================================
-# PUBLIC API
-# ============================================================================
 
+def get_checkpoint_path(self) -> str:
+        """Returns the file path for the internal memory checkpoint."""
+        return os.path.join(self.output_dir, f"layer2_internal_checkpoint_{self.config.layer2_config_name}.pkl")
+
+def save_checkpoint(self):
+    """Saves the current memory state to a file atomically."""
+    path = self.get_checkpoint_path()
+    temp_path = path + ".tmp"
+    with open(temp_path, 'wb') as f:
+        pickle.dump(self.all_results, f)
+    os.replace(temp_path, path)
+
+def load_checkpoint(self) -> bool:
+    """Loads memory state from a previous run if the kernel crashed."""
+    path = self.get_checkpoint_path()
+    if os.path.exists(path):
+        try:
+            with open(path, 'rb') as f:
+                self.all_results = pickle.load(f)
+            print(f"🔄 Checkpoint loaded! Recovered {len(self.all_results)} experiment configs from previous run.")
+            return True
+        except Exception as e:
+            print(f"⚠️ Failed to load checkpoint: {e}. Starting fresh.")
+    return False
 
 # ============================================================================
 # PUBLIC API
@@ -2321,37 +2329,55 @@ def run_layer2_experiments(
     global_config: Optional[Dict[str, Any]] = None
 ) -> Tuple[List[ExperimentResult], Dict[str, Any]]:
     """
-    Run complete Layer 2 analysis on Layer 1 cached states.
+    Run complete Layer 2 analysis on Layer 1 cached states with Iterative Saving.
     """
     run_config = global_config if global_config is not None else GLOBAL_CONFIG
     orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval, run_config)
     
+    # 1. Attempt to load previous progress if kernel crashed
+    orchestrator.load_checkpoint()
+    
+    # 2. Filter out questions we have already completely finished
+    completed_query_ids = {res.target_query_idx for res in orchestrator.all_results}
+    pending_states = [state for state in layer1_states if state.get('target_query_idx') not in completed_query_ids]
+    
     total_queries = len(layer1_states)
+    pending_count = len(pending_states)
     
     print("\n" + "="*60)
-    print(f"🚀 STARTING LAYER 2 ANALYSIS ({total_queries} queries to process)")
+    print(f"🚀 STARTING LAYER 2 ANALYSIS")
+    print(f"Total questions: {total_queries} | Already done: {total_queries - pending_count} | Remaining: {pending_count}")
     print("="*60)
     
-    # Notice the tqdm() here! This creates the progress bar.
-    for loop_idx, layer1_state in enumerate(tqdm(layer1_states, desc="Layer 2 Progress")):
-        
-        # Run the actual question
-        orchestrator.run_single_query(layer1_state)
-        
-        # Trigger HuggingFace Sync if it's time!
-        periodic_sync_check(loop_idx, run_config)
+    if pending_count > 0:
+        for loop_idx, layer1_state in enumerate(tqdm(pending_states, desc="Layer 2 Progress")):
+            
+            # Run the actual question
+            orchestrator.run_single_query(layer1_state)
+            
+            # --- ITERATIVE SAVING (Happens after EVERY question) ---
+            # 1. Save memory checkpoint (.pkl)
+            orchestrator.save_checkpoint()
+            
+            # 2. Overwrite JSON and CSV files on disk so you can watch them update live
+            report = orchestrator.generate_master_report()
+            orchestrator.save_reports(report)
+            
+            # Trigger HuggingFace Sync if it's time!
+            periodic_sync_check(loop_idx, run_config)
     
     print("\n" + "="*60)
     print("✅ LAYER 2 ANALYSIS COMPLETELY FINISHED!")
     print("="*60)
     
-    # Generate and save reports (JSON and CSV)
+    # Final generation just to be safe and return the final report variable
     report = orchestrator.generate_master_report()
     orchestrator.save_reports(report)
     
     # Final sync at the very end to make sure the final CSVs get uploaded
     if run_config.get("PERSIST_RESULTS_ONLINE"):
         print("\n--- Final Sync: Forcing workspace backup to Hugging Face Hub ---")
+        from src.hf_sync import sync_workspace_to_hub
         sync_workspace_to_hub(run_config)
     
     return orchestrator.all_results, report
