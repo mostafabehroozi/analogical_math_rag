@@ -2291,30 +2291,30 @@ class Layer2Orchestrator:
 
 
 
-def get_checkpoint_path(self) -> str:
-        """Returns the file path for the internal memory checkpoint."""
-        return os.path.join(self.output_dir, f"layer2_internal_checkpoint_{self.config.layer2_config_name}.pkl")
+    def get_checkpoint_path(self) -> str:
+            """Returns the file path for the internal memory checkpoint."""
+            return os.path.join(self.output_dir, f"layer2_internal_checkpoint_{self.config.layer2_config_name}.pkl")
 
-def save_checkpoint(self):
-    """Saves the current memory state to a file atomically."""
-    path = self.get_checkpoint_path()
-    temp_path = path + ".tmp"
-    with open(temp_path, 'wb') as f:
-        pickle.dump(self.all_results, f)
-    os.replace(temp_path, path)
+    def save_checkpoint(self):
+        """Saves the current memory state to a file atomically."""
+        path = self.get_checkpoint_path()
+        temp_path = path + ".tmp"
+        with open(temp_path, 'wb') as f:
+            pickle.dump(self.all_results, f)
+        os.replace(temp_path, path)
 
-def load_checkpoint(self) -> bool:
-    """Loads memory state from a previous run if the kernel crashed."""
-    path = self.get_checkpoint_path()
-    if os.path.exists(path):
-        try:
-            with open(path, 'rb') as f:
-                self.all_results = pickle.load(f)
-            print(f"🔄 Checkpoint loaded! Recovered {len(self.all_results)} experiment configs from previous run.")
-            return True
-        except Exception as e:
-            print(f"⚠️ Failed to load checkpoint: {e}. Starting fresh.")
-    return False
+    def load_checkpoint(self) -> bool:
+        """Loads memory state from a previous run if the kernel crashed."""
+        path = self.get_checkpoint_path()
+        if os.path.exists(path):
+            try:
+                with open(path, 'rb') as f:
+                    self.all_results = pickle.load(f)
+                print(f"🔄 Checkpoint loaded! Recovered {len(self.all_results)} experiment configs from previous run.")
+                return True
+            except Exception as e:
+                print(f"⚠️ Failed to load checkpoint: {e}. Starting fresh.")
+        return False
 
 # ============================================================================
 # PUBLIC API
