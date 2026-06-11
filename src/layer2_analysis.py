@@ -67,8 +67,7 @@ class ExperimentResult:
     weight_taker: float = 1.0
     weight_maker: float = 1.0
     subset_size: int = 0
-    context_token_estimate: int = 0  
-    selected_candidates: List[str] = None  
+    selected_candidates: List[str] = None 
     selected_evaluators: List[int] = None  
     selected_scores: List[float] = None  # NEW: Store the scores of chosen samples
     selected_exemplar_ids: List[str] = None    # NEW: Store the Parent Source IDs
@@ -91,7 +90,6 @@ class ExperimentResult:
     ap_improvement: Optional[float] = None  # Delta: reranked - original
     candidate_coverage_rate: Optional[float] = None  # Fraction of candidate set used
     avg_rerank_position_shift: Optional[float] = None  # Avg rank movement (Block A only)
-    confidence_variance: Optional[float] = None  # Std dev of selected candidate scores
     
     # Meta
     timestamp: str = None
@@ -1063,8 +1061,7 @@ class BlockA:
                 ap_score_original=top_k_ranking_metrics['ap_original'],
                 ap_improvement=0.0, # Baseline cannot improve upon itself
                 candidate_coverage_rate=k / len(original_indices) if original_indices else 0.0,
-                avg_rerank_position_shift=0.0,
-                confidence_variance=0.0
+                avg_rerank_position_shift=0.0
             )
             results.append(result)
             
@@ -1146,9 +1143,6 @@ class BlockA:
         original_indices = [i for i in range(len(self.ptu_engine.candidate_ids))]
         avg_position_shift = self.ptu_engine.compute_position_shift(original_indices, ranked_indices.tolist())
         
-        # Calculate confidence variance (std dev of selected candidate scores)
-        confidence_variance = float(np.std(scores[ranked_indices])) if len(ranked_indices) > 0 else 0.0
-        
         # Calculate candidate coverage rate
         total_candidates = len(self.ptu_engine.candidate_ids)
         coverage_rate = len(ranked_indices) / total_candidates if total_candidates > 0 else 0.0
@@ -1180,8 +1174,7 @@ class BlockA:
             ap_score_original=ranking_metrics['ap_original'],
             ap_improvement=ranking_metrics['ap_improvement'],
             candidate_coverage_rate=coverage_rate,
-            avg_rerank_position_shift=avg_position_shift,
-            confidence_variance=confidence_variance
+            avg_rerank_position_shift=avg_position_shift
         )
         results.append(result_a1)
         
@@ -1210,9 +1203,6 @@ class BlockA:
             
             # Calculate position shift for top-K
             top_k_position_shift = self.ptu_engine.compute_position_shift(original_indices, top_k_indices)
-            
-            # Calculate confidence variance for top-K
-            top_k_variance = float(np.std(scores[top_k_indices])) if len(top_k_indices) > 0 else 0.0
             
             # Coverage rate for top-K
             top_k_coverage = k / total_candidates if total_candidates > 0 else 0.0
@@ -1245,7 +1235,6 @@ class BlockA:
                 ap_improvement=top_k_ranking_metrics['ap_improvement'],
                 candidate_coverage_rate=top_k_coverage,
                 avg_rerank_position_shift=top_k_position_shift,
-                confidence_variance=top_k_variance
             )
             results.append(result_a2)
             
@@ -1727,16 +1716,13 @@ class ThreadAggregator:
             "strategy": None,
             "top_k": None,
             "threshold": None,
-            "coverage_target": None,
             "total_queries": 0,
-            "total_context_tokens": 0,
             "pass_at_metrics": defaultdict(float),  # {k: sum_of_passes}
             "ap_scores_reranked": [],
             "ap_scores_original": [],
             "ap_improvements": [],
             "coverage_rates": [],
-            "position_shifts": [],
-            "confidence_variances": []
+            "position_shifts": []
         })
         
         # Aggregate results by configuration thread
@@ -1776,7 +1762,6 @@ class ThreadAggregator:
             
             # Aggregate counts
             agg_data[thread_key]["total_queries"] += 1
-            agg_data[thread_key]["total_context_tokens"] += result.context_token_estimate
             
             # Aggregate Pass@K metrics
             for k, val in result.pass_at_k_metrics.items():
@@ -1795,15 +1780,12 @@ class ThreadAggregator:
                 agg_data[thread_key]["coverage_rates"].append(result.candidate_coverage_rate)
             if result.avg_rerank_position_shift is not None:
                 agg_data[thread_key]["position_shifts"].append(result.avg_rerank_position_shift)
-            if result.confidence_variance is not None:
-                agg_data[thread_key]["confidence_variances"].append(result.confidence_variance)
         
         # Convert aggregated lists to averages
         for thread_key, data in agg_data.items():
             total_q = data["total_queries"]
             
             # Averages
-            data["avg_context_tokens"] = data["total_context_tokens"] / total_q if total_q > 0 else 0.0
             data["avg_ap_reranked"] = np.mean(data["ap_scores_reranked"]) if data["ap_scores_reranked"] else None
             data["avg_ap_original"] = np.mean(data["ap_scores_original"]) if data["ap_scores_original"] else None
             data["avg_ap_improvement"] = np.mean(data["ap_improvements"]) if data["ap_improvements"] else None
@@ -1811,7 +1793,6 @@ class ThreadAggregator:
             # Average additional metrics
             data["avg_coverage_rate"] = np.mean(data["coverage_rates"]) if data["coverage_rates"] else None
             data["avg_position_shift"] = np.mean(data["position_shifts"]) if data["position_shifts"] else None
-            data["avg_confidence_variance"] = np.mean(data["confidence_variances"]) if data["confidence_variances"] else None
             
             # Convert Pass@K sum to average
             for k in data["pass_at_metrics"]:
@@ -1983,9 +1964,6 @@ class Layer2Orchestrator:
             result.executions = executions
             result.pass_at_k_metrics = pass_at_k
             
-            # NEW: Calculate tokens based on the EXACT final prompt sent to the LLM (chars / 4)
-            result.context_token_estimate = len(prompt) // 4
-            
             # For backward compatibility with the legacy summary function
             result.group_pass_at_n = pass_at_k.get(self.config.global_pass_at_N, 0.0)
 
@@ -2008,7 +1986,6 @@ class Layer2Orchestrator:
                     "selected_exemplar_ids": r.selected_exemplar_ids,
                     "selected_scores": r.selected_scores,
                     "subset_size": r.subset_size,
-                    "context_token_estimate": r.context_token_estimate,
                     "zero_score_fallback_triggered": r.zero_score_fallback_triggered
                 },
                 "context_payload_texts": r.selected_exemplar_texts,
@@ -2083,7 +2060,6 @@ class Layer2Orchestrator:
         
         agg_data = defaultdict(lambda: {
             "Total_Questions": 0, 
-            "Total_Context_Size": 0, 
             "Pass_At_Metrics": defaultdict(float)
         })
         
@@ -2091,7 +2067,6 @@ class Layer2Orchestrator:
         for r in self.all_results:
             thread_name = f"{r.application}_{r.scoring_strategy}"
             agg_data[thread_name]["Total_Questions"] += 1
-            agg_data[thread_name]["Total_Context_Size"] += r.context_token_estimate
             for k, val in r.pass_at_k_metrics.items():
                 agg_data[thread_name]["Pass_At_Metrics"][k] += val
                 if k > max_k: max_k = k
@@ -2099,15 +2074,14 @@ class Layer2Orchestrator:
         with open(temp_csv_filepath, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             expected_n = self.config.global_pass_at_N
-            headers = ["Configuration_Thread", "Total_Questions_Evaluated", "Average_Context_Tokens"]
+            headers = ["Configuration_Thread", "Total_Questions_Evaluated"]
             for k in range(1, expected_n + 1):
                 headers.append(f"Pass@{k}_Accuracy")
             writer.writerow(headers)
             
             for thread_name, stats in agg_data.items():
                 total_q = stats["Total_Questions"]
-                avg_context = stats["Total_Context_Size"] / total_q if total_q > 0 else 0
-                row = [thread_name, total_q, round(avg_context, 2)]
+                row = [thread_name, total_q]
                 for k in range(1, expected_n + 1):
                     avg_pass_k = stats["Pass_At_Metrics"][k] / total_q if total_q > 0 else 0
                     row.append(round(avg_pass_k, 4))
@@ -2139,13 +2113,11 @@ class Layer2Orchestrator:
             # Group 1: Configuration Identity
             "Utility_Calibration", "Evaluator_Mask", "Experimental_Block", "Strategy_Name",
             # Group 2: Block-Specific Hyperparameters
-            "Top_K", "Threshold", "Coverage_Target",
+            "Top_K", "Threshold",
             # Group 3: Global Execution Settings
-            "Global_Pass_at_N", "Model_Temperature",
+            "Global_Pass_at_N",
             # Group 4: Execution Scope
             "Total_Queries_Evaluated",
-            # Group 5: Context Efficiency
-            "Avg_Context_Tokens",
         ]
         
         # Group 6: Pass@N Metrics
@@ -2156,7 +2128,7 @@ class Layer2Orchestrator:
         headers.extend(["AP_Score_Reranked", "AP_Score_Original", "AP_Improvement"])
         
         # Group 9: Additional Analysis
-        headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Confidence_Variance"])
+        headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift"])
         
         # Write to CSV (Atomically)
         temp_csv_filepath = csv_filepath + ".tmp"
@@ -2174,14 +2146,11 @@ class Layer2Orchestrator:
                     thread_data.get("strategy", ""),
                     # Group 2: Block-Specific Hyperparameters
                     thread_data.get("top_k") if thread_data.get("top_k") is not None else "-",
-                    "-",  # Threshold (not used in current config; set to N/A)\n                    "-",  # Coverage_Target (not used in current config; set to N/A)
+                    "-",  # Threshold (not used in current config; set to N/A)
                     # Group 3: Global Execution Settings
                     self.config.global_pass_at_N,
-                    GLOBAL_CONFIG.get("DEFAULT_PASS_N_SOLVER_TEMPERATURE", 1.0),
                     # Group 4: Execution Scope
                     thread_data.get("total_queries", 0),
-                    # Group 5: Context Efficiency
-                    round(thread_data.get("avg_context_tokens", 0.0), 2),
                 ]
                 
                 # Group 6: Pass@N Metrics
@@ -2202,11 +2171,9 @@ class Layer2Orchestrator:
                 # Group 9: Additional Analysis
                 coverage = thread_data.get("avg_coverage_rate")
                 position_shift = thread_data.get("avg_position_shift")
-                confidence_var = thread_data.get("avg_confidence_variance")
                 row.extend([
                     round(coverage, 4) if coverage is not None else "-",
                     round(position_shift, 4) if position_shift is not None else "-",
-                    round(confidence_var, 4) if confidence_var is not None else "-",
                 ])
                 
                 writer.writerow(row)
