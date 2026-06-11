@@ -358,10 +358,7 @@ class PTUMathEngine:
 
         if isinstance(candidate_set, dict):
             items = list(candidate_set.items())
-            try:
-                items.sort(key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else kv[0])
-            except Exception:
-                pass
+            # Dictionary Sorting Bug Removed: Preserve true Layer 1 retrieval insertion order
 
             for key, value in items:
                 candidate_id = None
@@ -394,10 +391,7 @@ class PTUMathEngine:
 
         if isinstance(retrieved_set, dict):
             items = list(retrieved_set.items())
-            try:
-                items.sort(key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else kv[0])
-            except Exception:
-                pass
+            # Dictionary Sorting Bug Removed: Preserve true Layer 1 retrieval insertion order
 
             for key, value in items:
                 evaluator_id = None
@@ -447,23 +441,26 @@ class PTUMathEngine:
         return default
     
     def _fetch_cross_eval_score(self, candidate_id: Any, evaluator_id: Any) -> float:
-        """Fetch a cross-evaluation score from Layer 1 state in a robust way."""
-        row = self._lookup_value_by_key_variants(self.cross_eval_matrix, candidate_id, {})
-        if isinstance(row, dict):
-            score = self._lookup_value_by_key_variants(row, evaluator_id, 0.0)
-            return float(score) if score is not None else 0.0
-        # Support tuple-keyed cross evaluation matrices
-        tuple_key = (candidate_id, evaluator_id)
-        score = self._lookup_value_by_key_variants(self.cross_eval_matrix, tuple_key, None)
-        if score is not None:
-            return float(score)
-        score = self._lookup_value_by_key_variants(self.cross_eval_matrix, str(tuple_key), 0.0)
-        return float(score) if score is not None else 0.0
+        """Fetch a cross-evaluation score from Layer 1 state strictly. Fail on missing data."""
+        row = self._lookup_value_by_key_variants(self.cross_eval_matrix, candidate_id, None)
+        if not isinstance(row, dict):
+            tuple_key = (candidate_id, evaluator_id)
+            score = self._lookup_value_by_key_variants(self.cross_eval_matrix, tuple_key, None)
+            if score is None:
+                score = self._lookup_value_by_key_variants(self.cross_eval_matrix, str(tuple_key), None)
+        else:
+            score = self._lookup_value_by_key_variants(row, evaluator_id, None)
+            
+        if score is None:
+            raise ValueError(f"Fatal API missing-data error: No cross-eval score found for candidate {candidate_id} and evaluator {evaluator_id}.")
+        return float(score)
     
     def _fetch_intrinsic_baseline(self, evaluator_id: Any) -> float:
-        """Fetch intrinsic baseline score from Layer 1 state."""
-        score = self._lookup_value_by_key_variants(self.intrinsic_baselines, evaluator_id, 0.0)
-        return float(score) if score is not None else 0.0
+        """Fetch intrinsic baseline score from Layer 1 state strictly. Fail on missing data."""
+        score = self._lookup_value_by_key_variants(self.intrinsic_baselines, evaluator_id, None)
+        if score is None:
+            raise ValueError(f"Fatal API missing-data error: No intrinsic baseline found for evaluator {evaluator_id}.")
+        return float(score)
     
     def get_calibrated_ptu_matrix(self, calibration_mode: str = 'Marginal') -> np.ndarray:
         """
@@ -548,20 +545,18 @@ class PTUMathEngine:
                 induced_ccs = self._fetch_cross_eval_score(cand_id, eval_id)
                 intrinsic_ccs = self._fetch_intrinsic_baseline(eval_id)
                 
-                # Validate fetched scores are numeric
+                # Validate fetched scores are numeric (Strict Validation)
                 if not isinstance(induced_ccs, (int, float)) or np.isnan(induced_ccs):
-                    logger.warning(
-                        f"PTU computation: Invalid induced_ccs for candidate {cand_id} "
-                        f"and evaluator {eval_id}. Using 0.0."
+                    raise ValueError(
+                        f"Fatal math error: Invalid induced_ccs type/value for candidate {cand_id} "
+                        f"and evaluator {eval_id}. Value: {induced_ccs}"
                     )
-                    induced_ccs = 0.0
                 
                 if not isinstance(intrinsic_ccs, (int, float)) or np.isnan(intrinsic_ccs):
-                    logger.warning(
-                        f"PTU computation: Invalid intrinsic_ccs for evaluator {eval_id}. "
-                        f"Using 0.0."
+                    raise ValueError(
+                        f"Fatal math error: Invalid intrinsic_ccs type/value for evaluator {eval_id}. "
+                        f"Value: {intrinsic_ccs}"
                     )
-                    intrinsic_ccs = 0.0
                 
                 # NEW: Apply the mathematical toggle
                 if calibration_mode == 'Absolute':
@@ -684,22 +679,31 @@ class PTUMathEngine:
         return holistic
     
     def get_target_query_embedding_similarity(self) -> Dict[int, float]:
-        """Return the cached target query similarity score for each retrieval/evaluator."""
+        """Return the cached target query similarity score strictly. Fail on missing data."""
         similarity_map: Dict[int, float] = {}
         for evaluator_idx, evaluator in enumerate(self.retrieved_set):
-            similarity_score = 0.0
-            if isinstance(evaluator, dict):
-                similarity_score = float(evaluator.get('similarity_score', 0.0) or 0.0)
-            similarity_map[evaluator_idx] = similarity_score
+            if not isinstance(evaluator, dict) or 'similarity_score' not in evaluator or evaluator['similarity_score'] is None:
+                raise ValueError(
+                    f"Fatal API missing-data error: No embedding 'similarity_score' found for retrieved sample {evaluator_idx}."
+                )
+            similarity_map[evaluator_idx] = float(evaluator['similarity_score'])
         return similarity_map
 
     def _resolve_source_evaluator_index(self, candidate: Dict[str, Any], default_idx: int) -> int:
-        """Resolve the matrix evaluator index for a candidate's source exemplar."""
+        """Resolve the matrix evaluator index for a candidate's source exemplar strictly."""
         source_id = candidate.get('source_exemplar_idx') if isinstance(candidate, dict) else None
+        
+        # STRICT DATA INTEGRITY: Crash if the candidate has no parent assigned
         if source_id is None:
-            return default_idx
+            raise ValueError(f"Fatal structural error: Candidate is missing 'source_exemplar_idx'. Data: {candidate}")
+            
         source_key = self._normalize_id(source_id)
-        return self.evaluator_id_to_idx.get(source_key, default_idx)
+        
+        # Crash if the parent ID doesn't actually exist in the retrieved set
+        if source_key not in self.evaluator_id_to_idx:
+            raise ValueError(f"Fatal structural error: Source ID '{source_key}' not found in retrieved evaluators list.")
+            
+        return self.evaluator_id_to_idx[source_key]
     
     def get_scores_for_strategy(
         self,
@@ -799,8 +803,16 @@ class PTUMathEngine:
                         texts.append(f"Question: {q}\nRationale and Answer: {a}")
                     else:
                         eval_data = self.retrieved_set[src_eval_idx]
-                        q = eval_data.get('question', 'Unknown Question')
-                        a = eval_data.get('solution', 'Unknown Solution')
+                        q = eval_data.get('question')
+                        a = eval_data.get('solution')
+                        
+                        # STRICT DATA INTEGRITY: Crash if text is completely missing
+                        if not q or not a:
+                            raise ValueError(
+                                f"Fatal structural error: Missing text for retrieved exemplar '{eval_id}'. "
+                                f"Cannot construct LLM prompt."
+                            )
+                            
                         texts.append(f"Question: {q}\nRationale and Answer: {a}")
                         
         return ids, texts
@@ -855,13 +867,15 @@ def _normalize_ground_truth_label(label_obj: Any) -> bool:
 
 
 def _get_ground_truth_label(ground_truth_labels: Dict[Any, Any], cand_idx: int) -> bool:
-    """Fetch and normalize a candidate's ground truth correctness label."""
+    """Fetch and normalize a candidate's ground truth correctness label strictly."""
     if cand_idx in ground_truth_labels:
         return _normalize_ground_truth_label(ground_truth_labels[cand_idx])
     cand_key = str(cand_idx)
     if cand_key in ground_truth_labels:
         return _normalize_ground_truth_label(ground_truth_labels[cand_key])
-    return False
+    
+    # STRICT DATA INTEGRITY: Crash if the evaluator API failed to record a label
+    raise ValueError(f"Fatal API missing-data error: No ground truth label found for candidate index {cand_idx}.")
 
 
 # ============================================================================
@@ -1004,7 +1018,8 @@ class BlockA:
         original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
         
         ground_truth_labels_dict = {
-            self.ptu_engine.candidate_ids[i]: _normalize_ground_truth_label(self.ptu_engine.ground_truth_labels.get(i))
+            # STRICT DATA INTEGRITY: Use the safe function that crashes on missing labels
+            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(self.ptu_engine.ground_truth_labels, i)
             for i in range(len(self.ptu_engine.candidate_ids))
         }
 
@@ -1115,7 +1130,8 @@ class BlockA:
         # === NEW: Compute AP and ranking metrics for Block A ===
         original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
         ground_truth_labels_dict = {
-            self.ptu_engine.candidate_ids[i]: _normalize_ground_truth_label(self.ptu_engine.ground_truth_labels.get(i))
+            # STRICT DATA INTEGRITY: Use the safe function that crashes on missing labels
+            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(self.ptu_engine.ground_truth_labels, i)
             for i in range(len(self.ptu_engine.candidate_ids))
         }
         
@@ -1543,10 +1559,8 @@ class BlockC:
         
         if zero_score_fallback_triggered:
             # ===== FALLBACK PATH: Bypass complex coverage logic =====
-            # Determine fallback size
-            k_fallback = max(self.config.top_ks_group) if self.config.top_ks_group else 1
-            # Cap to not exceed total number of available candidates
-            k_fallback = min(k_fallback, len(self.ptu_engine.candidate_set))
+            # STRICT FALLBACK: If math is useless, return ALL members of the retrieved list
+            k_fallback = len(self.ptu_engine.candidate_set)
             
             # Use first K_fallback indices (original retrieval order)
             selected_candidate_indices = list(range(k_fallback))
@@ -1867,13 +1881,8 @@ class Layer2Orchestrator:
         """
         query_results = []
         
-        try:
-            ptu_engine = PTUMathEngine(layer1_state)
-        except (ValueError, RuntimeError) as e:
-            target_idx = layer1_state.get('target_query_idx', 'Unknown')
-            logger.error(f"Skipping Layer 2 Analysis for Query #{target_idx}: {e}")
-            print(f"  [!] Skipping Query #{target_idx} due to empty/invalid Layer 1 data.")
-            return [] # Skip this query and move to the next one
+        # Strict execution: Let errors crash the pipeline so we catch Layer 1 API failures immediately.
+        ptu_engine = PTUMathEngine(layer1_state)
         
         # === NEW: RUN ORIGINAL BASELINE EXACTLY ONCE PER QUESTION ===
         if self.config.run_block_A and getattr(self.config, 'run_block_A_baseline', False):
