@@ -864,7 +864,7 @@ def _normalize_ground_truth_label(label_obj: Any) -> bool:
     return bool(label_obj)
 
 
-def _get_ground_truth_label(ground_truth_labels: Dict[Any, Any], cand_idx: int) -> bool:
+def _get_ground_truth_label(ground_truth_labels: Dict[Any, Any], cand_idx: Any) -> bool:
     """Fetch and normalize a candidate's ground truth correctness label strictly."""
     if cand_idx in ground_truth_labels:
         return _normalize_ground_truth_label(ground_truth_labels[cand_idx])
@@ -1017,7 +1017,7 @@ class BlockA:
         
         ground_truth_labels_dict = {
             # STRICT DATA INTEGRITY: Use the safe function that crashes on missing labels
-            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(self.ptu_engine.ground_truth_labels, i)
+            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(self.ptu_engine.ground_truth_labels, self.ptu_engine.candidate_ids[i])
             for i in range(len(self.ptu_engine.candidate_ids))
         }
 
@@ -1128,7 +1128,7 @@ class BlockA:
         original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
         ground_truth_labels_dict = {
             # STRICT DATA INTEGRITY: Use the safe function that crashes on missing labels
-            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(self.ptu_engine.ground_truth_labels, i)
+            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(self.ptu_engine.ground_truth_labels, self.ptu_engine.candidate_ids[i])
             for i in range(len(self.ptu_engine.candidate_ids))
         }
         
