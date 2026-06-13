@@ -1097,11 +1097,13 @@ class BlockA:
         Run Block A experiments for a specific mask and strategy combination.
         
         Implements two-tier sorting system for Graceful Similarity Fallback:
-        - Tier 1: Candidates with score > threshold (sorted descending by score)
-        - Tier 2: Candidates with score <= threshold (sorted by original retrieval index)
+        ...
         """
         results = []
         threshold = self.config.activation_threshold
+        
+        # ---> FIX: Fetch the original ranking IDs for the AP metrics calculator <---
+        original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
         
         # Get scores for this strategy
         scores = self.ptu_engine.get_scores_for_strategy(
