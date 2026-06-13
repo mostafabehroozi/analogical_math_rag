@@ -251,7 +251,7 @@ class PTUMathEngine:
     from Layer 1 cached data.
     """
     
-    def __init__(self, layer1_state: Dict[str, Any]):
+    def __init__(self, layer1_state: Dict[str, Any], exemplar_data: Dict[str, Any] = None, hard_questions: List[str] = None):
         """
         Initialize with Layer 1 state (from cache).
         
@@ -281,9 +281,38 @@ class PTUMathEngine:
             )
         
         self.layer1_state = layer1_state
-        self.target_query_idx = layer1_state.get('target_query_idx')
-        self.target_query_text = layer1_state.get('target_query_text')
-        self.ground_truth_answer = layer1_state.get('ground_truth_answer')
+        self.exemplar_data = exemplar_data or {}
+        self.hard_questions = hard_questions or []
+        
+        # =========================================================
+        # BUG 1 FIX: BULLETPROOF INDEX EXTRACTION
+        # =========================================================
+        idx = layer1_state.get('target_query_idx') # 1. Try root
+        
+        if idx is None and 'target_query_data' in layer1_state:
+            idx = layer1_state['target_query_data'].get('query_index') # 2. Try nested dict
+            
+        if idx is None: # 3. Failsafe: Text matching in RAM
+            text_to_find = layer1_state.get('target_query_text')
+            if not text_to_find and 'target_query_data' in layer1_state:
+                text_to_find = layer1_state['target_query_data'].get('query_text')
+            
+            if text_to_find and text_to_find in self.hard_questions:
+                idx = self.hard_questions.index(text_to_find)
+                
+        if idx is None:
+            raise ValueError("Fatal: Could not determine target_query_idx from Layer 1 cache.")
+            
+        self.target_query_idx = int(idx)
+        
+        # === FETCH TEXT DIRECTLY FROM RAM ===
+        self.target_query_text = self.hard_questions[self.target_query_idx]
+        
+        # Safely fetch ground truth
+        if 'ground_truths' in self.exemplar_data:
+            self.ground_truth_answer = self.exemplar_data['ground_truths'][self.target_query_idx]
+        else:
+            self.ground_truth_answer = self.exemplar_data.get('solutions', [])[self.target_query_idx]
         
         # Extract raw Layer 1 data structures
         self.raw_retrieved_set = layer1_state.get('retrieved_set', [])
@@ -339,8 +368,7 @@ class PTUMathEngine:
         # Cache for computed scores
         self._score_cache = {}
         
-        # NEW: Build source exemplar cache directly from the Layer 1 execution trace
-        self._build_exemplar_cache_from_trace()
+        # We no longer need the trace hack, we fetch directly from RAM now.
         
         logger.info(
             f"PTU Math Engine initialized: "
@@ -754,26 +782,12 @@ class PTUMathEngine:
                     texts.append(cand['candidate_text'])
         return texts
 
-    def _build_exemplar_cache_from_trace(self):
-        """Reconstruct source exemplars (Q & A) resiliently from the execution trace."""
-        self.exemplar_cache = {}
-        import re
-        for entry in self.layer1_state.get('execution_trace', []):
-            if entry.get('step_name') == 'mirror_phase_0':
-                sub_step = entry.get('sub_step', '')
-                match = re.search(r'baseline_idx_(-?\d+)_attempt', sub_step)
-                if match:
-                    idx = str(match.group(1))
-                    ctx = entry.get('input_context', {})
-                    q = ctx.get('question', '')
-                    gt = ctx.get('ground_truth', '')
-                    if idx not in self.exemplar_cache and q and gt:
-                        self.exemplar_cache[idx] = {'question': q, 'solution': gt}
 
     def get_source_exemplars(self, candidate_indices: List[int]) -> Tuple[List[str], List[str]]:
         """
         Map candidate indices to their parent Source Exemplar IDs and Texts (Q+A).
         Deduplicates results and ignores Zero-Shot candidates (-1).
+        Fetches text securely from the raw exemplar_data in memory.
         """
         seen_ids = set()
         ids = []
@@ -794,24 +808,17 @@ class PTUMathEngine:
                     seen_ids.add(eval_id)
                     ids.append(eval_id)
                     
-                    # Fetch from trace cache or use raw fallback
-                    if eval_id in self.exemplar_cache:
-                        q = self.exemplar_cache[eval_id]['question']
-                        a = self.exemplar_cache[eval_id]['solution']
+                    # === DIRECT MEMORY LOOKUP (Bug 2 Fixed) ===
+                    try:
+                        raw_index = int(eval_id)
+                        q = self.exemplar_data['questions'][raw_index]
+                        a = self.exemplar_data['solutions'][raw_index]
                         texts.append(f"Question: {q}\nRationale and Answer: {a}")
-                    else:
-                        eval_data = self.retrieved_set[src_eval_idx]
-                        q = eval_data.get('question')
-                        a = eval_data.get('solution')
-                        
-                        # STRICT DATA INTEGRITY: Crash if text is completely missing
-                        if not q or not a:
-                            raise ValueError(
-                                f"Fatal structural error: Missing text for retrieved exemplar '{eval_id}'. "
-                                f"Cannot construct LLM prompt."
-                            )
-                            
-                        texts.append(f"Question: {q}\nRationale and Answer: {a}")
+                    except (ValueError, TypeError, IndexError) as e:
+                        raise ValueError(
+                            f"Fatal error mapping eval_id '{eval_id}' to dataset. "
+                            f"Make sure exemplar_data was passed correctly. Error: {e}"
+                        )
                         
         return ids, texts
     
@@ -1017,7 +1024,10 @@ class BlockA:
         
         ground_truth_labels_dict = {
             # STRICT DATA INTEGRITY: Use the safe function that crashes on missing labels
-            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(self.ptu_engine.ground_truth_labels, self.ptu_engine.candidate_ids[i])
+            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(
+                self.ptu_engine.ground_truth_labels, 
+                self.ptu_engine.candidate_ids[i]  # <--- BUG 3 FIX: Use the actual mapped ID, not the loop index 'i'
+            )
             for i in range(len(self.ptu_engine.candidate_ids))
         }
 
@@ -1124,11 +1134,12 @@ class BlockA:
         
         ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
         
-        # === NEW: Compute AP and ranking metrics for Block A ===
-        original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
         ground_truth_labels_dict = {
             # STRICT DATA INTEGRITY: Use the safe function that crashes on missing labels
-            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(self.ptu_engine.ground_truth_labels, self.ptu_engine.candidate_ids[i])
+            self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(
+                self.ptu_engine.ground_truth_labels, 
+                self.ptu_engine.candidate_ids[i]  # <--- BUG 3 FIX: Use the actual mapped ID, not the loop index 'i'
+            )
             for i in range(len(self.ptu_engine.candidate_ids))
         }
         
@@ -1837,12 +1848,14 @@ class Layer2Orchestrator:
     Manages the grid search across all base conditions and blocks.
     """
     
-    def __init__(self, config: Layer2Config, output_dir: str, api_manager_solve: Any, api_manager_eval: Any, global_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Layer2Config, output_dir: str, api_manager_solve: Any, api_manager_eval: Any, global_config: Optional[Dict[str, Any]] = None, exemplar_data: Optional[Dict[str, Any]] = None, hard_questions: Optional[List[str]] = None):
         self.config = config
         self.output_dir = output_dir
         self.api_manager_solve = api_manager_solve
         self.api_manager_eval = api_manager_eval
         self.global_config = global_config if global_config is not None else GLOBAL_CONFIG
+        self.exemplar_data = exemplar_data or {}       # <--- ADDED
+        self.hard_questions = hard_questions or []     # <--- ADDED
         self.inference_engine = ActiveInferenceEngine(api_manager_solve, api_manager_eval, self.global_config)
         self.all_results = []
         os.makedirs(output_dir, exist_ok=True)
@@ -1863,7 +1876,7 @@ class Layer2Orchestrator:
         query_results = []
         
         # Strict execution: Let errors crash the pipeline so we catch Layer 1 API failures immediately.
-        ptu_engine = PTUMathEngine(layer1_state)
+        ptu_engine = PTUMathEngine(layer1_state, self.exemplar_data, self.hard_questions) 
         
         # === NEW: RUN ORIGINAL BASELINE EXACTLY ONCE PER QUESTION ===
         if self.config.run_block_A and getattr(self.config, 'run_block_A_baseline', False):
@@ -2219,13 +2232,15 @@ def run_layer2_experiments(
     output_dir: str,
     api_manager_solve: Any,
     api_manager_eval: Any,
-    global_config: Optional[Dict[str, Any]] = None
+    global_config: Optional[Dict[str, Any]] = None,
+    exemplar_data: Optional[Dict[str, Any]] = None,
+    hard_questions: Optional[List[str]] = None       
 ) -> Tuple[List[ExperimentResult], Dict[str, Any]]:
     """
     Run complete Layer 2 analysis on Layer 1 cached states with Iterative Saving.
     """
     run_config = global_config if global_config is not None else GLOBAL_CONFIG
-    orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval, run_config)
+    orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval, run_config, exemplar_data, hard_questions) 
     
     # 1. Attempt to load previous progress if kernel crashed
     orchestrator.load_checkpoint()

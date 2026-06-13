@@ -179,7 +179,9 @@ def run_layer2_complete_pipeline(
     query_indices: Optional[List[int]] = None,
     top_k: int = 3,
     n_candidates: int = None,
-    global_config: Optional[Dict[str, Any]] = None
+    global_config: Optional[Dict[str, Any]] = None,
+    exemplar_data: Optional[Dict[str, Any]] = None,  # <--- ADDED
+    hard_questions: Optional[List[str]] = None       # <--- ADDED
 ) -> Tuple[List[Any], Dict[str, Any]]:
     """
     Complete end-to-end Layer 2 execution:
@@ -221,7 +223,9 @@ def run_layer2_complete_pipeline(
     logger.info(f"\nStep 4: Running Layer 2 experiments")
     all_results, master_report = run_layer2_experiments(
         layer1_states, layer2_config, layer2_output_dir, api_manager_solve, api_manager_eval,
-        global_config=global_config
+        global_config=global_config,
+        exemplar_data=exemplar_data,     # <--- ADDED
+        hard_questions=hard_questions    # <--- ADDED
     )
     
     # Step 5: Wrap up logging (Files are already saved by the Orchestrator)

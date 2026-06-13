@@ -1429,7 +1429,9 @@ def run_experiments(
                     layer2_config_dict=layer2_cfg,
                     top_k=top_k_val,
                     n_candidates=n_cand_val,
-                    global_config=current_config
+                    global_config=current_config,
+                    exemplar_data=exemplar_data,       # <--- ADDED
+                    hard_questions=hard_questions      # <--- ADDED
                 )
                 
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
@@ -1565,12 +1567,14 @@ def run_experiments(
                     layer1_cache_dir=global_config.get('LAYER1_CACHE_DIR', global_config['RESULTS_DIR']),
                     layer2_output_dir=l2_out_dir,
                     experiment_name=exp_name,
-                    api_manager_solve=solver_mgr,       # <-- Added missing argument
-                    api_manager_eval=eval_mgr,          # <-- Added missing argument
+                    api_manager_solve=solver_mgr,       
+                    api_manager_eval=eval_mgr,          
                     layer2_config_dict=layer2_cfg,
                     top_k=top_k_val,
                     n_candidates=n_cand_val,
-                    global_config=current_config
+                    global_config=current_config,
+                    exemplar_data=exemplar_data,       # <--- ADDED
+                    hard_questions=hard_questions      # <--- ADDED
                 )
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
             # --- END OF AUTOMATIC LAYER 2 EXECUTION ---
