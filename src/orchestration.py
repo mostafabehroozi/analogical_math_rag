@@ -1359,8 +1359,9 @@ def run_experiments(
                 for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
                     intermediate_log = run_pipeline_for_single_query(
                         hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers, hard_solutions=hard_solutions,
-                        run_mode='intermediate'
+                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers, 
+                        run_mode='intermediate',
+                        hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
                     )
                     run_logs.append(intermediate_log)
                     save_json(run_logs, log_file_path)
@@ -1408,7 +1409,8 @@ def run_experiments(
                     completed_log = run_pipeline_for_single_query(
                         hard_list_idx=original_idx, target_query=query_text, config=current_config,
                         embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                        run_mode='solve_only', existing_log=log_to_solve
+                        run_mode='solve_only', existing_log=log_to_solve,
+                        hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
                     )
                     completed_logs_map[original_idx] = completed_log
                     save_json(list(completed_logs_map.values()), log_file_path)
@@ -1481,7 +1483,8 @@ def run_experiments(
                         single_run_log = run_pipeline_for_single_query(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                            run_mode='full'
+                            run_mode='full',
+                            hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
                         )
                         run_logs.append(single_run_log)
                         save_json(run_logs, log_file_path)
@@ -1517,7 +1520,8 @@ def run_experiments(
                         intermediate_log = run_pipeline_for_single_query(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                            run_mode='intermediate'
+                            run_mode='intermediate',
+                            hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
                         )
                         run_logs.append(intermediate_log)
                         save_json(run_logs, log_file_path)
@@ -1551,7 +1555,8 @@ def run_experiments(
                         completed_log = run_pipeline_for_single_query(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                            run_mode='solve_only', existing_log=log_to_solve
+                            run_mode='solve_only', existing_log=log_to_solve,
+                            hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
                         )
                         completed_logs_map[original_idx] = completed_log
                         save_json(list(completed_logs_map.values()), log_file_path)
@@ -1590,8 +1595,9 @@ def run_experiments(
                     top_k=top_k_val,
                     n_candidates=n_cand_val,
                     global_config=current_config,
-                    exemplar_data=exemplar_data,       # <--- ADDED
-                    hard_questions=hard_questions      # <--- ADDED
+                    exemplar_data=exemplar_data,       
+                    hard_questions=hard_questions,      
+                    hard_solutions=hard_solutions
                 )
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
             # --- END OF AUTOMATIC LAYER 2 EXECUTION ---
