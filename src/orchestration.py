@@ -89,7 +89,8 @@ def run_pipeline_for_single_query(
     api_managers: Dict[str, Any],
     run_mode: str = 'full',
     existing_log: Optional[Dict[str, Any]] = None,
-    force_layer1_reexecution: bool = False
+    force_layer1_reexecution: bool = False,
+    hard_solutions: Optional[List[str]] = None  # <--- ADDED THIS LINE
 ) -> Dict[str, Any]:
     """
     Executes the RAG pipeline for a single query, supporting different execution modes
@@ -217,14 +218,25 @@ def run_pipeline_for_single_query(
         if do_force_layer1_reexecution:
             logger.info(f"🔄 Layer 1 force reexecution enabled for query #{hard_list_idx} (ignoring cache)")
         
-        # Get ground truth for this query
-        # The ground truth is expected to be available in exemplar_data or config
+        # Get ground truth for this query safely
         ground_truth = None
-        if 'ground_truths' in exemplar_data:
+
+        # 1. Primary: Use explicitly provided test solutions
+        if hard_solutions and hard_list_idx < len(hard_solutions):
+            ground_truth = hard_solutions[hard_list_idx]
+        # 2. Secondary: Check if injected into exemplar_data
+        elif 'ground_truths' in exemplar_data and hard_list_idx < len(exemplar_data['ground_truths']):
             ground_truth = exemplar_data['ground_truths'][hard_list_idx]
+        # 3. Fallback: Only allow fallback to training corpus IF it's a leave-one-out evaluation
         elif 'solutions' in exemplar_data:
-            # Try to find the ground truth from the hard questions dataset
-            ground_truth = exemplar_data['solutions'][hard_list_idx] if hard_list_idx < len(exemplar_data.get('solutions', [])) else None
+            # SAFEGUARD: Are we actually testing the training corpus against itself?
+            if config.get('hard_questions_length') == len(exemplar_data['solutions']):
+                ground_truth = exemplar_data['solutions'][hard_list_idx]
+            else:
+                raise ValueError(
+                    f"CRITICAL DATA MISALIGNMENT: Trying to evaluate test question #{hard_list_idx} "
+                    f"using training corpus solution #{hard_list_idx}. Provide 'hard_solutions' to fix this."
+                )
         
         if not ground_truth:
             logger.warning(f"Layer 1 enabled but no ground truth available for query #{hard_list_idx}. Skipping Layer 1.")
@@ -1272,7 +1284,8 @@ def run_experiments(
     hard_questions: List[str],
     embedding_model: SentenceTransformer,
     exemplar_data: Dict[str, Any],
-    api_managers: Dict[str, Any]
+    api_managers: Dict[str, Any],
+    hard_solutions: Optional[List[str]] = None
 ) -> Dict[str, List[Dict]]:
     """
     Orchestrates running multiple experiments with different configurations.
@@ -1280,6 +1293,9 @@ def run_experiments(
     """
     logger = logging.getLogger(__name__)
     all_results = {}
+    
+    # --- ADDED THIS LINE TO MAKE THE SAFEGUARD WORK ---
+    global_config['hard_questions_length'] = len(hard_questions)
 
     # --- special case: dataset construction experiments ---
     dataset_configs = [exp for exp in experiment_configs if exp.get("APPLY_DATASET_CONSTRUCTION")]
@@ -1343,7 +1359,7 @@ def run_experiments(
                 for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
                     intermediate_log = run_pipeline_for_single_query(
                         hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
+                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers, hard_solutions=hard_solutions,
                         run_mode='intermediate'
                     )
                     run_logs.append(intermediate_log)
@@ -1430,8 +1446,9 @@ def run_experiments(
                     top_k=top_k_val,
                     n_candidates=n_cand_val,
                     global_config=current_config,
-                    exemplar_data=exemplar_data,       # <--- ADDED
-                    hard_questions=hard_questions      # <--- ADDED
+                    exemplar_data=exemplar_data,       
+                    hard_questions=hard_questions,      
+                    hard_solutions=hard_solutions
                 )
                 
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)

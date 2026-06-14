@@ -251,7 +251,7 @@ class PTUMathEngine:
     from Layer 1 cached data.
     """
     
-    def __init__(self, layer1_state: Dict[str, Any], exemplar_data: Dict[str, Any] = None, hard_questions: List[str] = None):
+    def __init__(self, layer1_state: Dict[str, Any], exemplar_data: Dict[str, Any] = None, hard_questions: List[str] = None, hard_solutions: Optional[List[str]] = None):
         """
         Initialize with Layer 1 state (from cache).
         
@@ -283,6 +283,7 @@ class PTUMathEngine:
         self.layer1_state = layer1_state
         self.exemplar_data = exemplar_data or {}
         self.hard_questions = hard_questions or []
+        self.hard_solutions = hard_solutions or []  # <--- ADDED THIS LINE
         
         # =========================================================
         # BUG 1 FIX: BULLETPROOF INDEX EXTRACTION
@@ -308,11 +309,20 @@ class PTUMathEngine:
         # === FETCH TEXT DIRECTLY FROM RAM ===
         self.target_query_text = self.hard_questions[self.target_query_idx]
         
-        # Safely fetch ground truth
-        if 'ground_truths' in self.exemplar_data:
+        # Safely fetch ground truth with strict alignment checks
+        if self.hard_solutions and self.target_query_idx < len(self.hard_solutions):
+            self.ground_truth_answer = self.hard_solutions[self.target_query_idx]
+        elif 'ground_truths' in self.exemplar_data and self.target_query_idx < len(self.exemplar_data['ground_truths']):
             self.ground_truth_answer = self.exemplar_data['ground_truths'][self.target_query_idx]
         else:
-            self.ground_truth_answer = self.exemplar_data.get('solutions', [])[self.target_query_idx]
+            corpus_solutions = self.exemplar_data.get('solutions', [])
+            if len(self.hard_questions) == len(corpus_solutions):
+                self.ground_truth_answer = corpus_solutions[self.target_query_idx]
+            else:
+                raise ValueError(
+                    f"CRITICAL DATA MISALIGNMENT in Layer 2: Target query index {self.target_query_idx} "
+                    f"does not align with the retrieval corpus. You must pass 'hard_solutions' to Layer 2."
+                )
         
         # Extract raw Layer 1 data structures
         self.raw_retrieved_set = layer1_state.get('retrieved_set', [])
@@ -1850,14 +1860,15 @@ class Layer2Orchestrator:
     Manages the grid search across all base conditions and blocks.
     """
     
-    def __init__(self, config: Layer2Config, output_dir: str, api_manager_solve: Any, api_manager_eval: Any, global_config: Optional[Dict[str, Any]] = None, exemplar_data: Optional[Dict[str, Any]] = None, hard_questions: Optional[List[str]] = None):
+    def __init__(self, config: Layer2Config, output_dir: str, api_manager_solve: Any, api_manager_eval: Any, global_config: Optional[Dict[str, Any]] = None, exemplar_data: Optional[Dict[str, Any]] = None, hard_questions: Optional[List[str]] = None, hard_solutions: Optional[List[str]] = None):
         self.config = config
         self.output_dir = output_dir
         self.api_manager_solve = api_manager_solve
         self.api_manager_eval = api_manager_eval
         self.global_config = global_config if global_config is not None else GLOBAL_CONFIG
-        self.exemplar_data = exemplar_data or {}       # <--- ADDED
-        self.hard_questions = hard_questions or []     # <--- ADDED
+        self.exemplar_data = exemplar_data or {}       
+        self.hard_questions = hard_questions or []     
+        self.hard_solutions = hard_solutions or []     
         self.inference_engine = ActiveInferenceEngine(api_manager_solve, api_manager_eval, self.global_config)
         self.all_results = []
         os.makedirs(output_dir, exist_ok=True)
@@ -2236,13 +2247,14 @@ def run_layer2_experiments(
     api_manager_eval: Any,
     global_config: Optional[Dict[str, Any]] = None,
     exemplar_data: Optional[Dict[str, Any]] = None,
-    hard_questions: Optional[List[str]] = None       
+    hard_questions: Optional[List[str]] = None,
+    hard_solutions: Optional[List[str]] = None       # <--- ADDED THIS LINE
 ) -> Tuple[List[ExperimentResult], Dict[str, Any]]:
     """
     Run complete Layer 2 analysis on Layer 1 cached states with Iterative Saving.
     """
     run_config = global_config if global_config is not None else GLOBAL_CONFIG
-    orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval, run_config, exemplar_data, hard_questions) 
+    orchestrator = Layer2Orchestrator(config, output_dir, api_manager_solve, api_manager_eval, run_config, exemplar_data, hard_questions, hard_solutions) 
     
     # 1. Attempt to load previous progress if kernel crashed
     orchestrator.load_checkpoint()
