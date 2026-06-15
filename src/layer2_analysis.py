@@ -1700,7 +1700,10 @@ class ThreadAggregator:
         # Aggregate results by configuration thread
         for result in all_results:
             # Create unique thread identifier
-            thread_key = f"{result.utility_calibration}_{result.evaluator_setting}_{result.application}_{result.scoring_strategy}"
+            base_app = result.application
+            if result.scoring_strategy and result.scoring_strategy not in base_app:
+                base_app = f"{base_app}_{result.scoring_strategy}"
+            thread_key = f"{result.utility_calibration}_{result.evaluator_setting}_{base_app}"
             
             # Parse block and application details
             if "Block_A" in result.application:
@@ -1954,7 +1957,7 @@ class Layer2Orchestrator:
             # Map strictly to the required schema
             record = {
                 "main_question_id": r.target_query_idx,
-                "configuration_thread": f"{r.utility_calibration}_{r.evaluator_setting}_{r.application}_{r.scoring_strategy}",
+                "configuration_thread": f"{r.utility_calibration}_{r.evaluator_setting}_{r.application}" + (f"_{r.scoring_strategy}" if r.scoring_strategy and r.scoring_strategy not in r.application else ""),
                 "utility_calibration_mode": r.utility_calibration,
                 "context_selection_metadata": {
                     "selected_candidate_proxies": r.selected_candidates,
@@ -2040,11 +2043,17 @@ class Layer2Orchestrator:
         
         max_k = 0
         for r in self.all_results:
-            # FIX: Prevent duplicate strategy names in the legacy CSV
-            if r.scoring_strategy in r.application:
-                thread_name = r.application
+            # FIX: Prevent aggregating different calibrations and masks into the same row
+            # 1. Start with the application name, append strategy if missing
+            base_app = r.application
+            if r.scoring_strategy and r.scoring_strategy not in base_app:
+                base_app = f"{base_app}_{r.scoring_strategy}"
+            
+            # 2. Prepend calibration and evaluator setting (Unless it's the Baseline)
+            if r.utility_calibration == "Baseline" and r.evaluator_setting == "Baseline":
+                thread_name = base_app
             else:
-                thread_name = f"{r.application}_{r.scoring_strategy}"
+                thread_name = f"{r.utility_calibration}_{r.evaluator_setting}_{base_app}"
                 
             agg_data[thread_name]["Total_Questions"] += 1
             for k, val in r.pass_at_k_metrics.items():
