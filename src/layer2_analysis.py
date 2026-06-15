@@ -1144,69 +1144,18 @@ class BlockA:
         cache_key = (mask_type, strategy)
         self.ranked_indices_cache[cache_key] = ranked_indices.tolist()
         
-        ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
-        
+        # --- PRESERVE CORE VARIABLES NEEDED FOR TOP-K ---
         ground_truth_labels_dict = {
-            # STRICT DATA INTEGRITY: Use the safe function that crashes on missing labels
             self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(
                 self.ptu_engine.ground_truth_labels, 
-                self.ptu_engine.candidate_ids[i]  # <--- BUG 3 FIX: Use the actual mapped ID, not the loop index 'i'
+                self.ptu_engine.candidate_ids[i]
             )
             for i in range(len(self.ptu_engine.candidate_ids))
         }
-        
-        # Compute all ranking metrics
-        ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
-            ranked_candidate_ids,
-            original_ranking_ids,
-            ground_truth_labels_dict
-        )
-        
-        # Calculate position shift from original to reranked
         original_indices = [i for i in range(len(self.ptu_engine.candidate_ids))]
-        avg_position_shift = self.ptu_engine.compute_position_shift(original_indices, ranked_indices.tolist())
-        
-        # Calculate candidate coverage rate
         total_candidates = len(self.ptu_engine.candidate_ids)
-        coverage_rate = len(ranked_indices) / total_candidates if total_candidates > 0 else 0.0
         
-        cand_texts_a1 = self.ptu_engine.get_candidate_texts(ranked_indices.tolist())
-        exemplar_ids_a1, exemplar_texts_a1 = self.ptu_engine.get_source_exemplars(ranked_indices.tolist())
-        
-        result_a1 = ExperimentResult(
-            target_query_idx=self.ptu_engine.target_query_idx,
-            target_query_text=self.ptu_engine.target_query_text,
-            ground_truth_answer=self.ptu_engine.ground_truth_answer,
-            utility_calibration=utility_calibration,
-            evaluator_setting=mask_type,
-            scoring_strategy=strategy,
-            weight_taker=weight_taker,
-            weight_maker=weight_maker,
-            application=f"Block_A_Reranking_{strategy}",
-            subset_size=len(ranked_indices),
-            selected_candidates=ranked_candidate_ids,
-            selected_scores=[float(scores[idx]) for idx in ranked_indices],
-            selected_exemplar_ids=exemplar_ids_a1,
-            selected_exemplar_texts=exemplar_texts_a1,
-            selected_candidate_texts=cand_texts_a1,
-            zero_score_fallback_triggered=(len(cand_texts_a1) == 0),
-            list_ap_score=None,
-            group_pass_at_n=None,
-            # === NEW: Block A specific metrics ===
-            ap_score_reranked=ranking_metrics['ap_reranked'],
-            ap_score_original=ranking_metrics['ap_original'],
-            ap_improvement=ranking_metrics['ap_improvement'],
-            candidate_coverage_rate=coverage_rate,
-            avg_rerank_position_shift=avg_position_shift
-        )
-        results.append(result_a1)
-        
-        logger.info(
-            f"Block A A.1 - {mask_type} {strategy}: "
-            f"AP_Reranked = {ranking_metrics['ap_reranked']:.4f}, "
-            f"AP_Original = {ranking_metrics['ap_original']:.4f}, "
-            f"AP_Improvement = {ranking_metrics['ap_improvement']:.4f}"
-        )
+        # (Experiment A.1 full-list reranking has been successfully removed here)
         
         # Experiment A.2: Static Top-K Grouping
         for k in self.config.top_ks_group:
@@ -2091,7 +2040,12 @@ class Layer2Orchestrator:
         
         max_k = 0
         for r in self.all_results:
-            thread_name = f"{r.application}_{r.scoring_strategy}"
+            # FIX: Prevent duplicate strategy names in the legacy CSV
+            if r.scoring_strategy in r.application:
+                thread_name = r.application
+            else:
+                thread_name = f"{r.application}_{r.scoring_strategy}"
+                
             agg_data[thread_name]["Total_Questions"] += 1
             for k, val in r.pass_at_k_metrics.items():
                 agg_data[thread_name]["Pass_At_Metrics"][k] += val
