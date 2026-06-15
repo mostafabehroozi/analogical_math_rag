@@ -1889,7 +1889,7 @@ class Layer2Orchestrator:
         query_results = []
         
         # Strict execution: Let errors crash the pipeline so we catch Layer 1 API failures immediately.
-        ptu_engine = PTUMathEngine(layer1_state, self.exemplar_data, self.hard_questions) 
+        ptu_engine = PTUMathEngine(layer1_state, self.exemplar_data, self.hard_questions, self.hard_solutions) 
         
         # === NEW: RUN ORIGINAL BASELINE EXACTLY ONCE PER QUESTION ===
         if self.config.run_block_A and getattr(self.config, 'run_block_A_baseline', False):
