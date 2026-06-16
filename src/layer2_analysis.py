@@ -1041,19 +1041,19 @@ class BlockA:
             for i in range(len(self.ptu_engine.candidate_ids))
         }
 
+        # === AP SCORE FIX: Calculate AP once using the FULL list ===
+        full_original_metrics = RankingMetricsCalculator.compute_all_metrics(
+            original_ranking_ids, # Full list
+            original_ranking_ids, # Full list
+            ground_truth_labels_dict
+        )
+
         for k in self.config.top_ks_group:
             if k > len(original_indices):
                 continue
                 
             top_k_indices = original_indices[:k]
             top_k_candidate_ids = self.ptu_engine.candidate_indices_to_ids(top_k_indices)
-            
-            # Since this IS the original list, reranked metrics equal original metrics
-            top_k_ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
-                top_k_candidate_ids,
-                original_ranking_ids,
-                ground_truth_labels_dict
-            )
             
             cand_texts = self.ptu_engine.get_candidate_texts(top_k_indices)
             exemplar_ids, exemplar_texts = self.ptu_engine.get_source_exemplars(top_k_indices)
@@ -1077,8 +1077,8 @@ class BlockA:
                 zero_score_fallback_triggered=(len(cand_texts) == 0),
                 list_ap_score=None,
                 group_pass_at_n=None,
-                ap_score_reranked=top_k_ranking_metrics['ap_original'],
-                ap_score_original=top_k_ranking_metrics['ap_original'],
+                ap_score_reranked=full_original_metrics['ap_original'],
+                ap_score_original=full_original_metrics['ap_original'],
                 ap_improvement=0.0, # Baseline cannot improve upon itself
                 candidate_coverage_rate=k / len(original_indices) if original_indices else 0.0,
                 avg_rerank_position_shift=0.0
@@ -1155,7 +1155,14 @@ class BlockA:
         original_indices = [i for i in range(len(self.ptu_engine.candidate_ids))]
         total_candidates = len(self.ptu_engine.candidate_ids)
         
-        # (Experiment A.1 full-list reranking has been successfully removed here)
+        # === AP SCORE FIX: Calculate AP once using the FULL Reranked list ===
+        full_ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
+        
+        full_ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
+            full_ranked_candidate_ids, # Full RERANKED list
+            original_ranking_ids,      # Full ORIGINAL list
+            ground_truth_labels_dict
+        )
         
         # Experiment A.2: Static Top-K Grouping
         for k in self.config.top_ks_group:
@@ -1165,13 +1172,6 @@ class BlockA:
             top_k_indices = ranked_indices[:k].tolist()
             top_k_candidate_ids = self.ptu_engine.candidate_indices_to_ids(top_k_indices)
             pass_at_n = None
-            
-            # Compute ranking metrics for top-K list
-            top_k_ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
-                top_k_candidate_ids,
-                original_ranking_ids,
-                ground_truth_labels_dict
-            )
             
             # Calculate position shift for top-K
             top_k_position_shift = self.ptu_engine.compute_position_shift(original_indices, top_k_indices)
@@ -1202,9 +1202,9 @@ class BlockA:
                 list_ap_score=None,
                 group_pass_at_n=pass_at_n,
                 # === NEW: Block A TopK metrics ===
-                ap_score_reranked=top_k_ranking_metrics['ap_reranked'],
-                ap_score_original=top_k_ranking_metrics['ap_original'],
-                ap_improvement=top_k_ranking_metrics['ap_improvement'],
+                ap_score_reranked=full_ranking_metrics['ap_reranked'],
+                ap_score_original=full_ranking_metrics['ap_original'],
+                ap_improvement=full_ranking_metrics['ap_improvement'],
                 candidate_coverage_rate=top_k_coverage,
                 avg_rerank_position_shift=top_k_position_shift,
             )
