@@ -1084,7 +1084,7 @@ class BlockA:
             
             logger.info(
                 f"Block A BASELINE - Original_Retrieval Top-{k}: "
-                f"AP_Original = {top_k_ranking_metrics['ap_original']:.4f}, "
+                f"AP_Original = {full_original_metrics['ap_original']:.4f}, "
                 f"Pass@{self.config.global_pass_at_N} = PENDING"
             )
             
@@ -1209,7 +1209,7 @@ class BlockA:
             
             logger.info(
                 f"Block A A.2 - {mask_type} {strategy} Top-{k}: "
-                f"AP_Reranked = {top_k_ranking_metrics['ap_reranked']:.4f}, "
+                f"AP_Reranked = {full_ranking_metrics['ap_reranked']:.4f}, "
                 f"Pass@{self.config.global_pass_at_N} = PENDING"
             )
         
