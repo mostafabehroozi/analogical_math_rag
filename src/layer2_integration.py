@@ -131,8 +131,6 @@ def create_layer2_config_from_dict(config_dict: Dict[str, Any]) -> Layer2Config:
         config.utility_calibration_modes = config_dict['utility_calibration_modes']
     if 'evaluator_masking' in config_dict:
         config.evaluator_masking = config_dict['evaluator_masking']
-    if 'base_scoring_strategies' in config_dict:
-        config.base_scoring_strategies = config_dict['base_scoring_strategies']
     if 'global_pass_at_N' in config_dict:
         config.global_pass_at_N = config_dict['global_pass_at_N']
     if 'activation_threshold' in config_dict:

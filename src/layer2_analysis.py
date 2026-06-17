@@ -130,7 +130,6 @@ class Layer2Config:
     # Global Base Conditions
     utility_calibration_modes: List[str] = None  # NEW: ['Marginal', 'Absolute']
     evaluator_masking: List[str] = None  # ['Self', 'Others', 'All']
-    base_scoring_strategies: List[str] = None  # ['ScoreTake', 'ScoreMake', 'Holistic']
     global_pass_at_N: int = 3
     activation_threshold: float = 0.0  # Threshold for positive signal
     
@@ -156,8 +155,6 @@ class Layer2Config:
             self.utility_calibration_modes = ['Marginal', 'Absolute']
         if self.evaluator_masking is None:
             self.evaluator_masking = ['Self', 'Others', 'All']
-        if self.base_scoring_strategies is None:
-            self.base_scoring_strategies = ['ScoreTake', 'ScoreMake', 'Holistic']
         if self.block_A_strategies is None:
             self.block_A_strategies = ['ScoreTake', 'ScoreMake', 'Holistic']
         if self.top_ks_group is None:
