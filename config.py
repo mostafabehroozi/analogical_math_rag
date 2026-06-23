@@ -241,11 +241,11 @@ CONFIG = {
     "MULTIBRANCH_SOLVER_TEMPERATURE": 1.0,                # Temperature for final solving
     "MULTIBRANCH_SOLVER_ATTEMPTS_PER_BRANCH": 3,          # Pass@K attempts per branch
     
-    # Pass@N & Evaluation
+# Pass@N & Evaluation
     "N_PASS_ATTEMPTS": 3,
     "APPLY_FULL_PIPELINE_RETRY": False,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
-
+    "EVAL_PARSE_BOXED_GROUND_TRUTH": False,  # Extract \boxed{} line from NuminaMath solutions
 
     
     "APPLY_LAYER1_BASE_EXECUTION": False,  # Enable/disable Layer 1 system

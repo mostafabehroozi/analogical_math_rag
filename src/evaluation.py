@@ -54,6 +54,24 @@ class EvaluationResult(TypedDict):
     error_details: Optional[APIResponse]
 
 
+def _extract_last_boxed_line(solution_text: str) -> str:
+    """
+    Parses the NuminaMath solution to find the last line containing a '\boxed{}' answer.
+    If found, returns only that line. Otherwise, returns the original full solution.
+    """
+    if not solution_text or not isinstance(solution_text, str):
+        return solution_text
+        
+    lines = solution_text.split('\n')
+    # Search backwards to find the LAST occurrence of 'boxed'
+    for line in reversed(lines):
+        if 'boxed' in line:
+            return line.strip()
+            
+    # Fallback to the whole text if 'boxed' is not found
+    return solution_text
+
+
 def evaluate_single_answer_with_llm(
     model_answer: str,
     ground_truth: str,
@@ -80,6 +98,10 @@ def evaluate_single_answer_with_llm(
     # Guard clause: An empty or invalid answer is a distinct failure type.
     if not model_answer or not isinstance(model_answer, str):
         return {"is_correct": None, "status": "EMPTY_ANSWER", "error_details": None}
+
+    # Parse the boxed ground truth line if the config flag is enabled
+    if config.get("EVAL_PARSE_BOXED_GROUND_TRUTH", False):
+        ground_truth = _extract_last_boxed_line(ground_truth)
 
     # MODIFIED: Determine which LLM model to use based on the type of the active manager
     if isinstance(api_manager, GeminiAPIManager):

@@ -175,7 +175,8 @@ def run_pipeline_for_single_query(
                     "MIRROR_ENABLE_R0", "MIRROR_ACTIVE_CANDIDATE_LIMIT",
                     "MIRROR_ENABLE_REDUNDANCY_FILTER",
                     # Full Pipeline Retry Flag
-                    "APPLY_FULL_PIPELINE_RETRY"
+                    "APPLY_FULL_PIPELINE_RETRY",
+                    "EVAL_PARSE_BOXED_GROUND_TRUTH"
                 ]
             },
             "pipeline_status": "PENDING",
