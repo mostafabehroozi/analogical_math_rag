@@ -10,6 +10,7 @@ from src.prompts import (
 )
 from src.evaluation import evaluate_single_answer_with_llm
 from src.utils import create_trace_entry
+from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +58,15 @@ def _solve_and_evaluate(
     Helper function to generate N attempts and evaluate them on-the-fly.
     Returns the Pass@N accuracy score (0.0 to 1.0) and the list of generated text answers.
     """
-    model_solve = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
-    if hasattr(api_manager_solve, 'base_url') and 'avalai' in api_manager_solve.base_url:
+    # Dynamically determine the solver model based on the active API Manager type
+    if isinstance(api_manager_solve, GeminiAPIManager):
+        model_solve = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
+    elif isinstance(api_manager_solve, AvalAIAPIManager):
         model_solve = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
+    elif isinstance(api_manager_solve, OllamaAPIManager):
+        model_solve = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
+    else:
+        raise TypeError(f"Unsupported API manager type for solving: {type(api_manager_solve)}")
     
     attempts = []
     correct_count = 0
@@ -107,8 +114,18 @@ def run_core_simplification_phase1(
     temp_gen = config.get("CORE_SIMP_TEMPERATURE_GEN", 0.3)
     temp_solve = config.get("CORE_SIMP_TEMPERATURE_SOLVE", 1.0)
     
-    model_gen = config.get('GEMINI_MODEL_NAME_ADAPTATION')
-    model_solve = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
+    # Dynamically determine the generator (adaptation) and solver models
+    if isinstance(api_manager_solve, GeminiAPIManager):
+        model_gen = config.get('GEMINI_MODEL_NAME_ADAPTATION')
+        model_solve = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
+    elif isinstance(api_manager_solve, AvalAIAPIManager):
+        model_gen = config.get('AVALAI_MODEL_NAME_ADAPTATION')
+        model_solve = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
+    elif isinstance(api_manager_solve, OllamaAPIManager):
+        model_gen = config.get('OLLAMA_MODEL_NAME_ADAPTATION')
+        model_solve = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
+    else:
+        raise TypeError(f"Unsupported API manager type: {type(api_manager_solve)}")
     
     print("\n" + "="*70)
     print("  [CORE SIMPLIFICATION: PHASE 1 (A/B TEST)]")
