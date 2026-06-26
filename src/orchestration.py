@@ -1329,25 +1329,27 @@ def run_experiments(
             # nothing else to do
             return all_results
         
-    # SPECIAL CASE: Core-Preserving Simplification Phase 1 (Dataset Builder)
-    core_simp_configs = [exp for exp in experiment_configs if exp.get("APPLY_CORE_SIMP_PHASE1")]
-    # Update normal_configs to exclude Phase 1 configs
-    experiment_configs = [exp for exp in experiment_configs if not exp.get("APPLY_CORE_SIMP_PHASE1")]
+    # SPECIAL CASE: Core-Preserving Simplification Phase 1 & Phase 2
+    phase1_configs = [exp for exp in experiment_configs if exp.get("APPLY_CORE_SIMP_PHASE1")]
+    phase2_configs = [exp for exp in experiment_configs if exp.get("APPLY_CORE_SIMP_PHASE2")]
+    
+    # Update normal_configs to exclude Phase 1 and Phase 2 configs from the standard pipeline
+    experiment_configs = [exp for exp in experiment_configs if not (exp.get("APPLY_CORE_SIMP_PHASE1") or exp.get("APPLY_CORE_SIMP_PHASE2"))]
 
-    if core_simp_configs:
-        logger.info(f"Found {len(core_simp_configs)} Core Simplification Phase 1 config(s); running them now.")
+    # =========================================================================
+    # EXECUTE PHASE 1: Build the Donor Dataset
+    # =========================================================================
+    if phase1_configs:
+        logger.info(f"Found {len(phase1_configs)} Core Simplification Phase 1 config(s); running them now.")
         from src.core_simplification import run_core_simplification_phase1
         
-        for exp_overrides in core_simp_configs:
+        for exp_overrides in phase1_configs:
             current_config = global_config.copy()
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "core_simp_phase1")
             
-            # File to save successful (verified) simplifications
             dataset_filename = current_config.get("CORE_SIMP_DATASET_NAME", "core_simp_dataset.json")
             dataset_path = os.path.join(current_config['RESULTS_DIR'], dataset_filename)
-            
-            # File to save full logs (including failures/skips)
             log_file_path = os.path.join(current_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
             
             logger.info(f"--- Core Simplification Phase 1 '{exp_name}' starting ---")
@@ -1355,7 +1357,6 @@ def run_experiments(
             solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
             eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", "gemini"))
             
-            # Load existing successful dataset and full logs to allow pausing/resuming
             successful_samples = load_json(dataset_path) or []
             full_logs = load_json(log_file_path) or []
             completed_indices = {log.get('original_index') for log in full_logs if 'original_index' in log}
@@ -1364,33 +1365,23 @@ def run_experiments(
                 if idx in completed_indices:
                     continue
                     
-                # Safely get ground truth for on-the-fly evaluation
                 gt = None
-                if hard_solutions and idx < len(hard_solutions):
-                    gt = hard_solutions[idx]
-                elif 'ground_truths' in exemplar_data and idx < len(exemplar_data['ground_truths']):
-                    gt = exemplar_data['ground_truths'][idx]
-                elif 'solutions' in exemplar_data and len(exemplar_data['solutions']) == len(hard_questions):
-                    # Fallback for leave-one-out
-                    gt = exemplar_data['solutions'][idx]
+                if hard_solutions and idx < len(hard_solutions): gt = hard_solutions[idx]
+                elif 'ground_truths' in exemplar_data and idx < len(exemplar_data['ground_truths']): gt = exemplar_data['ground_truths'][idx]
+                elif 'solutions' in exemplar_data and len(exemplar_data['solutions']) == len(hard_questions): gt = exemplar_data['solutions'][idx]
                     
                 if not gt:
-                    logger.warning(f"No ground truth for query {idx}, skipping Phase 1 for this query.")
                     continue
                     
                 res = run_core_simplification_phase1(
-                    target_query=query,
-                    ground_truth=gt,
-                    api_manager_solve=solver_mgr,
-                    api_manager_eval=eval_mgr,
-                    config=current_config
+                    target_query=query, ground_truth=gt,
+                    api_manager_solve=solver_mgr, api_manager_eval=eval_mgr, config=current_config
                 )
                 
                 res['original_index'] = idx
                 full_logs.append(res)
                 save_json(full_logs, log_file_path)
                 
-                # If strictly successful, append to the final dataset
                 if res.get('status') == 'SUCCESS':
                     successful_samples.append(res)
                     save_json(successful_samples, dataset_path)
@@ -1398,10 +1389,39 @@ def run_experiments(
                 periodic_sync_check(idx, current_config)
                 
             all_results[exp_name] = full_logs
-            logger.info(f"--- Phase 1 '{exp_name}' finished. Saved {len(successful_samples)} verified samples to {dataset_filename} ---")
+            logger.info(f"--- Phase 1 '{exp_name}' finished. Saved {len(successful_samples)} verified samples. ---")
+
+    # =========================================================================
+    # EXECUTE PHASE 2: Analogical Evaluation (The 3 Branches)
+    # =========================================================================
+    if phase2_configs:
+        logger.info(f"Found {len(phase2_configs)} Core Simplification Phase 2 config(s); running them now.")
+        # We will create this file in the next step!
+        from src.core_simplification_layer2 import execute_core_simplification_phase2
+        
+        for exp_overrides in phase2_configs:
+            current_config = global_config.copy()
+            current_config.update(exp_overrides)
+            exp_name = current_config.get("experiment_name", "core_simp_phase2")
             
-        if not experiment_configs:
-            return all_results
+            logger.info(f"--- Core Simplification Phase 2 '{exp_name}' starting ---")
+            
+            # Pass everything to the Phase 2 engine
+            phase2_results = execute_core_simplification_phase2(
+                hard_questions=hard_questions,
+                hard_solutions=hard_solutions,
+                exemplar_data=exemplar_data,
+                embedding_model=embedding_model,
+                api_managers=api_managers,
+                config=current_config
+            )
+            
+            all_results[exp_name] = phase2_results
+            logger.info(f"--- Phase 2 '{exp_name}' finished. ---")
+
+    # If there are no normal experiments left to run, return early
+    if not experiment_configs:
+        return all_results
         
         
     # --- REWRITTEN LOGIC: Check for and handle cross-experiment deferred execution ---

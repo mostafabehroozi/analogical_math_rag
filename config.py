@@ -352,10 +352,16 @@ CONFIG = {
 
     # CORE-PRESERVING SIMPLIFICATION FLAGS
     "APPLY_CORE_SIMP_PHASE1": False,           # Master switch for Phase 1 (Dataset Construction)
-    "CORE_SIMP_PHASE1_N_ATTEMPTS": 5,          # The N value for Pass@N A/B testing
-    "CORE_SIMP_DATASET_NAME": "core_simp_dataset.json", # File to save successful simplifications
+    "APPLY_CORE_SIMP_PHASE2": False,           # Master switch for Phase 2 (Analogical Evaluation)
+    "CORE_SIMP_PHASE1_N_ATTEMPTS": 5,          # The N value for Pass@N A/B testing in Phase 1
+    "CORE_SIMP_DATASET_NAME": "core_simp_dataset.json", # File to save successful simplifications (Donors)
+    "CORE_SIMP_LAYER2_RESULTS_NAME": "core_simp_layer2_results.json", # File to save Phase 2 results
     "CORE_SIMP_TEMPERATURE_GEN": 0.3,          # Temp for generating the proxy question (keep low for logic)
     "CORE_SIMP_TEMPERATURE_SOLVE": 1.0,        # Temp for solving questions (standard)
+    
+    # Phase 2 Specific Tuning
+    "CORE_SIMP_LAYER2_K_RETRIEVAL": 3,         # How many unseen test questions to fetch per donor
+    "CORE_SIMP_LAYER2_N_ATTEMPTS": 5,          # N for Pass@N in Branch A, B, and C
 }
 
 # Initialize derived paths on module load (before any functions are called)
