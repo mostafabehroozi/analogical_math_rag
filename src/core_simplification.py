@@ -52,13 +52,13 @@ def _solve_and_evaluate(
     n_attempts: int,
     temp: float,
     trace_name_prefix: str,
-    local_trace: List[Dict]
+    local_trace: List[Dict],
+    target_correct_to_beat: int = -1  # <--- NEW: Target threshold
 ) -> Tuple[float, List[str]]:
     """
     Helper function to generate N attempts and evaluate them on-the-fly.
     Returns the Pass@N accuracy score (0.0 to 1.0) and the list of generated text answers.
     """
-    # Dynamically determine the solver model based on the active API Manager type
     if isinstance(api_manager_solve, GeminiAPIManager):
         model_solve = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
     elif isinstance(api_manager_solve, AvalAIAPIManager):
@@ -90,7 +90,16 @@ def _solve_and_evaluate(
         else:
             attempts.append(f"[GENERATION FAILED: {resp.get('error_message')}]")
             
-    # If no successful generations, score is 0
+        # --- NEW FEATURE: EARLY STOP IF MATHEMATICALLY IMPOSSIBLE TO BEAT BASELINE ---
+        if target_correct_to_beat >= 0:
+            remaining_attempts = n_attempts - (i + 1)
+            max_possible_correct = correct_count + remaining_attempts
+            # If the maximum we can possibly get is less than or equal to what we need to beat...
+            if max_possible_correct <= target_correct_to_beat:
+                print(f"       => [EARLY STOP] Max possible score ({max_possible_correct}/{n_attempts}) cannot beat baseline ({target_correct_to_beat}/{n_attempts}). Halting loop.")
+                break
+        # ----------------------------------------------------------------------------
+            
     if not attempts:
         return 0.0, attempts
         
@@ -131,9 +140,6 @@ def run_core_simplification_phase1(
     print("  [CORE SIMPLIFICATION: PHASE 1 (A/B TEST)]")
     print("="*70)
 
-    # ---------------------------------------------------------
-    # STEP A: Base Solve Loop (Control Group)
-    # ---------------------------------------------------------
     print(f"  -> [Step A] Running Baseline Control (N={n_attempts})...")
     base_prompt = create_final_reasoning_prompt_simple(target_query, config)
     
@@ -144,9 +150,18 @@ def run_core_simplification_phase1(
     )
     print(f"     => Base Consistency Score: {base_score:.2f} ({int(base_score * n_attempts)}/{n_attempts} correct)")
 
-    # ---------------------------------------------------------
+    # --- NEW FEATURE: EARLY EXIT FOR PERFECT BASELINE ---
+    if base_score >= 1.0:
+        print(f"     => [EARLY EXIT] Baseline is already perfect (1.0). Skipping simplification to save API costs.")
+        return {
+            "status": "SKIPPED_PERFECT_BASELINE", 
+            "base_score": base_score,
+            "original_question": target_query,
+            "ground_truth": ground_truth,
+            "trace": local_trace
+        }
+
     # STEP B: Proxy Generation & Failsafe Check
-    # ---------------------------------------------------------
     print(f"  -> [Step B] Generating Proxy via 4-Part Structural Prompt...")
     gen_prompt = create_core_simp_zero_shot_prompt(target_query)
     
@@ -164,17 +179,24 @@ def run_core_simplification_phase1(
     full_trace_text = gen_resp['text']
     parsed_parts = _parse_simplification_trace(full_trace_text)
     proxy_q = parsed_parts.get("proxy_question", "")
+    methodology = parsed_parts.get("simplification_methodology", "").lower()
     
     if not proxy_q:
         logger.error("Failed to parse Proxy Question from output.")
         return {"status": "FAILURE", "reason": "Parsing failed", "trace": local_trace}
 
-    # THE "DO NO HARM" FAILSAFE CHECK
-    # Strip whitespace, punctuation, and lowercase for a robust comparison
+    # --- NEW FEATURE: ENHANCED EXPLICIT FAILSAFE CHECK ---
+    # 1. Check if LLM explicitly declared it cannot simplify in the methodology
+    if "no safe simplification" in methodology:
+        print(f"     => [FAILSAFE TRIGGERED] Model explicitly stated no safe simplification is possible. Aborting.")
+        return {"status": "SKIPPED_FAILSAFE", "trace": local_trace}
+        
+    # 2. String comparison fallback (original failsafe)
     def clean_text(t): return re.sub(r'\W+', '', t.lower())
     if clean_text(proxy_q) == clean_text(target_query):
-        print(f"     => [FAILSAFE TRIGGERED] Model returned original question. Aborting augmentation.")
+        print(f"     => [FAILSAFE TRIGGERED] Model returned identical question. Aborting.")
         return {"status": "SKIPPED_FAILSAFE", "trace": local_trace}
+    # ------------------------------------------------------
         
     print(f"     => Proxy generated successfully:\n        '{proxy_q[:80]}...'")
 
@@ -199,16 +221,18 @@ def run_core_simplification_phase1(
     solved_proxy_rationale = proxy_solve_resp['text']
     solved_proxy_combined = f"Question: {proxy_q}\nRationale and Answer: {solved_proxy_rationale}"
 
-    # ---------------------------------------------------------
     # STEP D: Augmented Main Solve Loop (A/B Test Comparison)
-    # ---------------------------------------------------------
     print(f"  -> [Step D] Running Augmented Solve (N={n_attempts})...")
     aug_prompt = create_core_simp_augmented_solver_prompt(target_query, solved_proxy_combined)
+    
+    # Calculate exactly how many correct answers we need to beat the baseline
+    base_correct_count = int(base_score * n_attempts)
     
     aug_score, aug_attempts = _solve_and_evaluate(
         target_query, ground_truth, aug_prompt, 
         api_manager_solve, api_manager_eval, config, 
-        n_attempts, temp_solve, "augmented_solve", local_trace
+        n_attempts, temp_solve, "augmented_solve", local_trace,
+        target_correct_to_beat=base_correct_count # <--- NEW: Pass the target to trigger early stop
     )
     print(f"     => Augmented Consistency Score: {aug_score:.2f} ({int(aug_score * n_attempts)}/{n_attempts} correct)")
 
