@@ -348,6 +348,14 @@ CONFIG = {
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS": "mirror_hypothesis_gen_v1",
     "PROMPT_TEMPLATE_MIRROR_VERIFICATION": "mirror_verification_v1",
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT": "mirror_hypothesis_gen_zero_shot_v1",
+
+
+    # CORE-PRESERVING SIMPLIFICATION FLAGS
+    "APPLY_CORE_SIMP_PHASE1": False,           # Master switch for Phase 1 (Dataset Construction)
+    "CORE_SIMP_PHASE1_N_ATTEMPTS": 5,          # The N value for Pass@N A/B testing
+    "CORE_SIMP_DATASET_NAME": "core_simp_dataset.json", # File to save successful simplifications
+    "CORE_SIMP_TEMPERATURE_GEN": 0.3,          # Temp for generating the proxy question (keep low for logic)
+    "CORE_SIMP_TEMPERATURE_SOLVE": 1.0,        # Temp for solving questions (standard)
 }
 
 # Initialize derived paths on module load (before any functions are called)

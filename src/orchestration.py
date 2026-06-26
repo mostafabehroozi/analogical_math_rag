@@ -1328,7 +1328,82 @@ def run_experiments(
         if not experiment_configs:
             # nothing else to do
             return all_results
+        
+    # SPECIAL CASE: Core-Preserving Simplification Phase 1 (Dataset Builder)
+    core_simp_configs = [exp for exp in experiment_configs if exp.get("APPLY_CORE_SIMP_PHASE1")]
+    # Update normal_configs to exclude Phase 1 configs
+    experiment_configs = [exp for exp in experiment_configs if not exp.get("APPLY_CORE_SIMP_PHASE1")]
 
+    if core_simp_configs:
+        logger.info(f"Found {len(core_simp_configs)} Core Simplification Phase 1 config(s); running them now.")
+        from src.core_simplification import run_core_simplification_phase1
+        
+        for exp_overrides in core_simp_configs:
+            current_config = global_config.copy()
+            current_config.update(exp_overrides)
+            exp_name = current_config.get("experiment_name", "core_simp_phase1")
+            
+            # File to save successful (verified) simplifications
+            dataset_filename = current_config.get("CORE_SIMP_DATASET_NAME", "core_simp_dataset.json")
+            dataset_path = os.path.join(current_config['RESULTS_DIR'], dataset_filename)
+            
+            # File to save full logs (including failures/skips)
+            log_file_path = os.path.join(current_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
+            
+            logger.info(f"--- Core Simplification Phase 1 '{exp_name}' starting ---")
+            
+            solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
+            eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", "gemini"))
+            
+            # Load existing successful dataset and full logs to allow pausing/resuming
+            successful_samples = load_json(dataset_path) or []
+            full_logs = load_json(log_file_path) or []
+            completed_indices = {log.get('original_index') for log in full_logs if 'original_index' in log}
+            
+            for idx, query in enumerate(tqdm(hard_questions, desc=f"Phase 1: {exp_name}")):
+                if idx in completed_indices:
+                    continue
+                    
+                # Safely get ground truth for on-the-fly evaluation
+                gt = None
+                if hard_solutions and idx < len(hard_solutions):
+                    gt = hard_solutions[idx]
+                elif 'ground_truths' in exemplar_data and idx < len(exemplar_data['ground_truths']):
+                    gt = exemplar_data['ground_truths'][idx]
+                elif 'solutions' in exemplar_data and len(exemplar_data['solutions']) == len(hard_questions):
+                    # Fallback for leave-one-out
+                    gt = exemplar_data['solutions'][idx]
+                    
+                if not gt:
+                    logger.warning(f"No ground truth for query {idx}, skipping Phase 1 for this query.")
+                    continue
+                    
+                res = run_core_simplification_phase1(
+                    target_query=query,
+                    ground_truth=gt,
+                    api_manager_solve=solver_mgr,
+                    api_manager_eval=eval_mgr,
+                    config=current_config
+                )
+                
+                res['original_index'] = idx
+                full_logs.append(res)
+                save_json(full_logs, log_file_path)
+                
+                # If strictly successful, append to the final dataset
+                if res.get('status') == 'SUCCESS':
+                    successful_samples.append(res)
+                    save_json(successful_samples, dataset_path)
+                    
+                periodic_sync_check(idx, current_config)
+                
+            all_results[exp_name] = full_logs
+            logger.info(f"--- Phase 1 '{exp_name}' finished. Saved {len(successful_samples)} verified samples to {dataset_filename} ---")
+            
+        if not experiment_configs:
+            return all_results
+        
+        
     # --- REWRITTEN LOGIC: Check for and handle cross-experiment deferred execution ---
     is_cross_experiment_defer_enabled = any(
         exp.get('DEFER_SOLVE_STEP', False) for exp in experiment_configs

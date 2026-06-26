@@ -1805,6 +1805,126 @@ Rationale and Answer: [Merged Rationale and Answer]
 </Output>
 </Task>
 """,
+    
+    "core_simplification_zero_shot_v1": """You are an expert mathematical and logical reasoning AI. Your task is to perform "Core-Preserving Simplification" on a given complex problem. 
+
+Your goal is to create a simpler "Proxy Question" that shares the EXACT SAME logical structure as the original question. This simplified question will later be used as an analogical stepping-stone to help solve the original problem. Therefore, the core logic MUST remain identical so the correct Chain of Thought (CoT) trajectory is preserved.
+
+To do this, you must strictly follow the Structural Simplification Framework:
+
+### 1. Identify Problem Topology
+First, analyze the structure of the input question and classify it into one of two categories:
+*   **Multi-Sub-Question (Decomposable):** The problem intrinsically breaks down into multiple sub-parts or sub-questions. You have a "free hand" to simplify the peripheral sub-questions.
+*   **Single Coherent (Monolithic):** The problem is a single, tightly knit entity. You do not have a free hand to detach parts; you must carefully scale down the internal complexities without breaking the overall unified structure.
+
+### 2. Isolate the Trunk vs. Non-Trunk
+You must separate the core of the problem from the peripheral noise:
+*   **The Trunk (Core Logic):** This is the heart, the bottleneck, or the hardest logical leap of the question. It is the main backbone that the solving trajectory depends on. 
+    *   **CRITICAL RULE:** You MUST NOT simplify or alter the fundamental logic of the Trunk. If the problem requires a specific complex theorem or multi-step logical deduction at its core, that requirement must exist in the simplified version.
+*   **The Non-Trunk (Peripheral Complexity):** These are elements that do not define the core logic. Examples include highly complex arithmetic (e.g., large numbers, ugly fractions), distracting narrative fluff, or trivial introductory/peripheral sub-calculations.
+
+### 3. IMPORTANT NOTE: The "Do No Harm" Failsafe
+If you analyze the question and determine that there is NOTHING that can be safely simplified—meaning any attempt to simplify numbers, parts, or text would intrinsically alter the Trunk or change the main solving reasoning of the question—**DO NOT CHANGE IT.** You must never force a simplification if it risks destroying the core logic. In this scenario, you must leave the question exactly as it is and return it unchanged.
+
+### 4. Apply the Simplification Strategy
+If safe simplification is possible, base it on the topology to reduce cognitive load and help uncover the best initial CoT step:
+*   **If Multi-Sub-Question:** Keep the core "Trunk" sub-question completely intact. Radically simplify the other, non-core sub-questions (e.g., change convoluted numbers to simple integers, remove unnecessary conditions in the outer steps).
+*   **If Single Coherent:** Keep the mathematical relationships and sequence of operations perfectly isomorphic (identical in shape). Simply scale down the complex numbers into trivial integers (e.g., replace 13,459.22 with 3) and remove non-essential narrative text so the core logic is entirely exposed.
+
+---
+### INPUT
+**Original Question:** 
+{original_question}
+
+---
+### OUTPUT FORMAT
+Provide your response strictly in the following structure:
+
+**1. Topology Analysis:**
+(State whether the problem is 'Multi-Sub-Question' or 'Single Coherent' and briefly explain why.)
+
+**2. Trunk vs. Non-Trunk Breakdown:**
+*   **The Trunk (Core Logic):** (Identify the exact hardest part / bottleneck of the logic that must remain unchanged).
+*   **The Non-Trunk:** (Identify the arithmetic, sub-parts, or text that can be simplified. If none exist that can be safely altered, state "None".)
+
+**3. Simplification Methodology:**
+(Briefly state exactly what you will change. Example: "I will scale down the numbers in the peripheral sub-calculation." OR, if using the failsafe: "No safe simplification is possible without altering the core reasoning. I will output the original question unchanged.")
+
+**4. The Proxy Question:**
+(Write the final, simplified version of the question here. If no safe simplification was possible, write the exact original question here word-for-word.)
+""",
+
+    "core_simplification_few_shot_v1": """You are an expert mathematical and logical reasoning AI. Your task is to perform "Core-Preserving Simplification" on a given complex problem. 
+
+Your goal is to create a simpler "Proxy Question" that shares the EXACT SAME logical structure as the original question. This simplified question will later be used as an analogical stepping-stone to help solve the original problem. Therefore, the core logic MUST remain identical so the correct Chain of Thought (CoT) trajectory is preserved.
+
+To do this, you must strictly follow the Structural Simplification Framework:
+
+### 1. Identify Problem Topology
+*   **Multi-Sub-Question (Decomposable):** The problem intrinsically breaks down into multiple sub-parts. You have a "free hand" to simplify the peripheral sub-questions.
+*   **Single Coherent (Monolithic):** The problem is a single, tightly knit entity. You must carefully scale down internal complexities without breaking the unified structure.
+
+### 2. Isolate the Trunk vs. Non-Trunk
+*   **The Trunk (Core Logic):** The heart/bottleneck of the question. **CRITICAL RULE:** You MUST NOT simplify or alter the fundamental logic of the Trunk. 
+*   **The Non-Trunk:** Distracting peripheral complexity (ugly arithmetic, narrative fluff, etc.).
+
+### 3. IMPORTANT NOTE: The "Do No Harm" Failsafe
+If nothing can be safely simplified without altering the Trunk, **DO NOT CHANGE IT.** Output the original question unchanged.
+
+### 4. Apply the Simplification Strategy
+*   **If Multi-Sub-Question:** Keep the Trunk intact. Radically simplify non-core sub-questions.
+*   **If Single Coherent:** Keep mathematical relationships isomorphic. Scale down complex numbers into trivial integers.
+
+---
+### DEMONSTRATION (Perfect Example of How to Apply the Rules)
+Here is a verified, perfect example of how to perform this simplification on a structurally similar problem:
+
+{donor_demonstration}
+
+---
+### YOUR TURN: INPUT
+**Original Question:** 
+{original_question}
+
+---
+### OUTPUT FORMAT
+Provide your response strictly in the following structure:
+
+**1. Topology Analysis:**
+(State whether the problem is 'Multi-Sub-Question' or 'Single Coherent' and briefly explain why.)
+
+**2. Trunk vs. Non-Trunk Breakdown:**
+*   **The Trunk (Core Logic):** (Identify the exact hardest part / bottleneck).
+*   **The Non-Trunk:** (Identify what can be safely altered, or state "None").
+
+**3. Simplification Methodology:**
+(Briefly state exactly what you will change, or if you are using the failsafe).
+
+**4. The Proxy Question:**
+(Write the final, simplified version of the question here).
+""",
+
+    "core_simp_augmented_solver_v1": """Solve the Main Problem using standard mathematical methods. 
+
+To help you find the correct Chain of Thought and optimal first step, you have been provided with an Analogous Stepping-Stone. This stepping-stone is a simplified version of the exact same logical problem, alongside its correct solution. 
+Study how the core logic (the "Trunk") was solved in the stepping-stone, and map that exact same logical strategy to the complex numbers and specific details of the Main Problem.
+
+<Analogous Stepping-Stone>
+{solved_proxy_question}
+</Analogous Stepping-Stone>
+
+<Main Problem to Solve>
+{main_question}
+</Main Problem to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Step-by-step derivation for the Main Problem, using the logical pathway demonstrated in the stepping-stone]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
+""",
 
 
 
@@ -2018,4 +2138,23 @@ def create_mirror_verification_prompt(validation_question: str, hypothesis_quest
         validation_question=validation_question,
         hypothesis_question=hypothesis_question,
         hypothesis_solution=hypothesis_solution
+    )
+
+
+def create_core_simp_zero_shot_prompt(original_question: str) -> str:
+    template = PROMPT_TEMPLATES["core_simplification_zero_shot_v1"]
+    return template.format(original_question=original_question)
+
+def create_core_simp_few_shot_prompt(original_question: str, donor_demonstration: str) -> str:
+    template = PROMPT_TEMPLATES["core_simplification_few_shot_v1"]
+    return template.format(
+        original_question=original_question,
+        donor_demonstration=donor_demonstration
+    )
+
+def create_core_simp_augmented_solver_prompt(main_question: str, solved_proxy_question: str) -> str:
+    template = PROMPT_TEMPLATES["core_simp_augmented_solver_v1"]
+    return template.format(
+        main_question=main_question,
+        solved_proxy_question=solved_proxy_question
     )
