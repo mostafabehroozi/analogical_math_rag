@@ -562,35 +562,48 @@ Final Answer:
 </Your Answer/Output Format>
 """,
 
-    "evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
+    "final_solver_simple_v3": """Solve the Main Question using standard mathematical methods. Focus strictly on the mathematical steps and logic, avoiding conversational language, teaching explanations, or filler words.
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+
+<Your Answer/Output Format>
+Rationale:
+[Formal step-by-step derivation]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>
+""",
+
+
+"evaluator_v1": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the final answer in 'Ground Truth'.
 Both 'Model Output' and 'Ground Truth' may contain intermediate steps (Chain-of-Thought) leading to a final answer.
 
 Follow these two steps precisely:
 
 Step 1: Extract Final Answers
-- From 'Model Output', extract only the final numerical or definitive answer. Try to isolate the number or simple expression.
-- From 'Ground Truth', extract only the final numerical or definitive answer. Try to isolate the number or simple expression.
-- Present these extracted answers clearly. If you cannot confidently extract an answer, state "Extraction Failed" for that part.
+Extract only the final numerical or definitive answer expression from both 'Model Output' and 'Ground Truth', writing "Extraction Failed" if you cannot confidently extract an answer.
 
 Step 2: Evaluate Equivalence
 - Compare the 'Extracted Model Answer' with the 'Extracted Ground Truth Answer'.
 - If either extraction failed, the evaluation must be 'false'.
 - Consider common mathematical equivalences (e.g., "2+2" vs "4", "sqrt(9)" vs "3", "1/2" vs "0.5", "1,000" vs "1000", "$5" vs "5").
-- Respond ONLY with the single word 'true' or 'false' for this evaluation part.
+- Respond ONLY with the single word 'true' or 'false' for the evaluation.
 
 Output Format (Strictly follow this format):
 Extracted Model Answer: [Your extracted answer from Model Output]
 Extracted Ground Truth Answer: [Your extracted answer from Ground Truth]
 Evaluation: [true OR false]
 
----
 Model Output:
 {model_answer}
----
+
 Ground Truth:
 {ground_truth}
----
-Begin Output:
+
 """,
 
     "duplicate_question_check_v1": """You are a text comparison assistant. Your task is to determine if the 'Main Question' is identical to ANY of the questions in the 'Retrieved Questions' list.
@@ -1812,45 +1825,45 @@ Your goal is to create a simpler "Proxy Question" that shares the EXACT SAME log
 
 To do this, you must strictly follow the Structural Simplification Framework:
 
-### 1. Identify Problem Topology
+1. Identify Problem Topology
 First, analyze the structure of the input question and classify it into one of two categories:
-*   **Multi-Sub-Question (Decomposable):** The problem intrinsically breaks down into multiple sub-parts or sub-questions. You have a "free hand" to simplify the peripheral sub-questions.
-*   **Single Coherent (Monolithic):** The problem is a single, tightly knit entity. You do not have a free hand to detach parts; you must carefully scale down the internal complexities without breaking the overall unified structure.
+Multi-Sub-Question (Decomposable): The problem intrinsically breaks down into multiple sub-parts or sub-questions. You have a "free hand" to simplify the peripheral sub-questions.
+Single Coherent (Monolithic): The problem is a single, tightly knit entity. You do not have a free hand to detach parts; you must carefully scale down the internal complexities without breaking the overall unified structure.
 
-### 2. Isolate the Trunk vs. Non-Trunk
+2. Isolate the Trunk vs. Non-Trunk
 You must separate the core of the problem from the peripheral noise:
-*   **The Trunk (Core Logic):** This is the heart, the bottleneck, or the hardest logical leap of the question. It is the main backbone that the solving trajectory depends on. 
-    *   **CRITICAL RULE:** You MUST NOT simplify or alter the fundamental logic of the Trunk. If the problem requires a specific complex theorem or multi-step logical deduction at its core, that requirement must exist in the simplified version.
-*   **The Non-Trunk (Peripheral Complexity):** These are elements that do not define the core logic. Examples include highly complex arithmetic (e.g., large numbers, ugly fractions), distracting narrative fluff, or trivial introductory/peripheral sub-calculations.
+The Trunk (Core Logic): This is the heart, the bottleneck, or the hardest logical leap of the question. It is the main backbone that the solving trajectory depends on. 
+CRITICAL RULE:** You MUST NOT simplify or alter the fundamental logic of the Trunk. If the problem requires a specific complex theorem or multi-step logical deduction at its core, that requirement must exist in the simplified version.
+The Non-Trunk (Peripheral Complexity): These are elements that do not define the core logic. Examples include highly complex arithmetic (e.g., large numbers, ugly fractions), distracting narrative fluff, or trivial introductory/peripheral sub-calculations.
 
-### 3. IMPORTANT NOTE: The "Do No Harm" Failsafe
-If you analyze the question and determine that there is NOTHING that can be safely simplified—meaning any attempt to simplify numbers, parts, or text would intrinsically alter the Trunk or change the main solving reasoning of the question—**DO NOT CHANGE IT.** You must never force a simplification if it risks destroying the core logic. In this scenario, you must leave the question exactly as it is and return it unchanged.
+3. IMPORTANT NOTE: The "Do No Harm" Failsafe
+If you analyze the question and determine that there is NOTHING that can be safely simplified—meaning any attempt to simplify numbers, parts, or text would intrinsically alter the Trunk or change the main solving reasoning of the question—DO NOT CHANGE IT. You must never force a simplification if it risks destroying the core logic. In this scenario, you must leave the question exactly as it is and return it unchanged.
 
-### 4. Apply the Simplification Strategy
+4. Apply the Simplification Strategy
 If safe simplification is possible, base it on the topology to reduce cognitive load and help uncover the best initial CoT step:
-*   **If Multi-Sub-Question:** Keep the core "Trunk" sub-question completely intact. Radically simplify the other, non-core sub-questions (e.g., change convoluted numbers to simple integers, remove unnecessary conditions in the outer steps).
-*   **If Single Coherent:** Keep the mathematical relationships and sequence of operations perfectly isomorphic (identical in shape). Simply scale down the complex numbers into trivial integers (e.g., replace 13,459.22 with 3) and remove non-essential narrative text so the core logic is entirely exposed.
+If Multi-Sub-Question: Keep the core "Trunk" sub-question completely intact. Radically simplify the other, non-core sub-questions (e.g., change convoluted numbers to simple integers, remove unnecessary conditions in the outer steps).
+If Single Coherent: Keep the mathematical relationships and sequence of operations perfectly isomorphic (identical in shape). Simply scale down the complex numbers into trivial integers (e.g., replace 13,459.22 with 3) and remove non-essential narrative text so the core logic is entirely exposed.
 
----
-### INPUT
-**Original Question:** 
+
+INPUT
+Original Question:
 {original_question}
 
----
-### OUTPUT FORMAT
+
+OUTPUT FORMAT
 Provide your response strictly in the following structure:
 
-**1. Topology Analysis:**
+1. Topology Analysis:
 (State whether the problem is 'Multi-Sub-Question' or 'Single Coherent' and briefly explain why.)
 
-**2. Trunk vs. Non-Trunk Breakdown:**
-*   **The Trunk (Core Logic):** (Identify the exact hardest part / bottleneck of the logic that must remain unchanged).
-*   **The Non-Trunk:** (Identify the arithmetic, sub-parts, or text that can be simplified. If none exist that can be safely altered, state "None".)
+2. Trunk vs. Non-Trunk Breakdown:
+The Trunk (Core Logic): (Identify the exact hardest part / bottleneck of the logic that must remain unchanged).
+The Non-Trunk: (Identify the arithmetic, sub-parts, or text that can be simplified. If none exist that can be safely altered, state "None".)
 
-**3. Simplification Methodology:**
+3. Simplification Methodology:
 (Briefly state exactly what you will change. Example: "I will scale down the numbers in the peripheral sub-calculation." OR, if using the failsafe: "No safe simplification is possible without altering the core reasoning. I will output the original question unchanged.")
 
-**4. The Proxy Question:**
+4. The Proxy Question:
 (Write the final, simplified version of the question here. If no safe simplification was possible, write the exact original question here word-for-word.)
 """,
 
@@ -1860,51 +1873,51 @@ Your goal is to create a simpler "Proxy Question" that shares the EXACT SAME log
 
 To do this, you must strictly follow the Structural Simplification Framework:
 
-### 1. Identify Problem Topology
-*   **Multi-Sub-Question (Decomposable):** The problem intrinsically breaks down into multiple sub-parts. You have a "free hand" to simplify the peripheral sub-questions.
-*   **Single Coherent (Monolithic):** The problem is a single, tightly knit entity. You must carefully scale down internal complexities without breaking the unified structure.
+1. Identify Problem Topology
+Multi-Sub-Question (Decomposable): The problem intrinsically breaks down into multiple sub-parts. You have a "free hand" to simplify the peripheral sub-questions.
+Single Coherent (Monolithic): The problem is a single, tightly knit entity. You must carefully scale down internal complexities without breaking the unified structure.
 
-### 2. Isolate the Trunk vs. Non-Trunk
-*   **The Trunk (Core Logic):** The heart/bottleneck of the question. **CRITICAL RULE:** You MUST NOT simplify or alter the fundamental logic of the Trunk. 
-*   **The Non-Trunk:** Distracting peripheral complexity (ugly arithmetic, narrative fluff, etc.).
+2. Isolate the Trunk vs. Non-Trunk
+The Trunk (Core Logic): The heart/bottleneck of the question. CRITICAL RULE: You MUST NOT simplify or alter the fundamental logic of the Trunk. 
+The Non-Trunk: Distracting peripheral complexity (ugly arithmetic, narrative fluff, etc.).
 
-### 3. IMPORTANT NOTE: The "Do No Harm" Failsafe
-If nothing can be safely simplified without altering the Trunk, **DO NOT CHANGE IT.** Output the original question unchanged.
+3. IMPORTANT NOTE: The "Do No Harm" Failsafe
+If nothing can be safely simplified without altering the Trunk, DO NOT CHANGE IT. Output the original question unchanged.
 
-### 4. Apply the Simplification Strategy
-*   **If Multi-Sub-Question:** Keep the Trunk intact. Radically simplify non-core sub-questions.
-*   **If Single Coherent:** Keep mathematical relationships isomorphic. Scale down complex numbers into trivial integers.
+4. Apply the Simplification Strategy
+If Multi-Sub-Question: Keep the Trunk intact. Radically simplify non-core sub-questions.
+If Single Coherent: Keep mathematical relationships isomorphic. Scale down complex numbers into trivial integers.
 
----
-### DEMONSTRATION (Perfect Example of How to Apply the Rules)
+
+DEMONSTRATION (Perfect Example of How to Apply the Rules)
 Here is a verified, perfect example of how to perform this simplification on a structurally similar problem:
 
 {donor_demonstration}
 
----
-### YOUR TURN: INPUT
-**Original Question:** 
+
+YOUR TURN: INPUT
+Original Question:
 {original_question}
 
----
-### OUTPUT FORMAT
+
+OUTPUT FORMAT
 Provide your response strictly in the following structure:
 
-**1. Topology Analysis:**
+1. Topology Analysis:
 (State whether the problem is 'Multi-Sub-Question' or 'Single Coherent' and briefly explain why.)
 
-**2. Trunk vs. Non-Trunk Breakdown:**
-*   **The Trunk (Core Logic):** (Identify the exact hardest part / bottleneck).
-*   **The Non-Trunk:** (Identify what can be safely altered, or state "None").
+2. Trunk vs. Non-Trunk Breakdown:
+The Trunk (Core Logic): (Identify the exact hardest part / bottleneck).
+The Non-Trunk: (Identify what can be safely altered, or state "None").
 
-**3. Simplification Methodology:**
+3. Simplification Methodology:
 (Briefly state exactly what you will change, or if you are using the failsafe).
 
-**4. The Proxy Question:**
+4. The Proxy Question:
 (Write the final, simplified version of the question here).
 """,
 
-    "core_simp_augmented_solver_v1": """Solve the Main Problem using standard mathematical methods. 
+    "core_simp_augmented_solver_v1": """You are an expert mathematical and logical reasoning system. Solve the Main Question by directly applying the reasoning trajectory of the provided Solved Example. This example is highly similar and shares the exact same underlying structural logic as your target question.
 
 To help you find the correct Chain of Thought and optimal first step, you have been provided with an Analogous Stepping-Stone. This stepping-stone is a simplified version of the exact same logical problem, alongside its correct solution. 
 Study how the core logic (the "Trunk") was solved in the stepping-stone, and map that exact same logical strategy to the complex numbers and specific details of the Main Problem.
@@ -1923,9 +1936,29 @@ Rationale:
 
 Final Answer:
 [Your final answer]
-</Your Answer/Output Format>
-""",
+</Your Answer/Output Format>""",
 
+    "core_simp_augmented_solver_v2": """You are an expert math solver. 
+
+You must solve the Main Question by copying the exact logical steps used in the Solved Example. 
+
+The Solved Example is a simpler version of the exact same problem. Do not invent a new method. Read the Solved Example, find the step-by-step logic it used, and apply that exact same logic to the numbers in the Main Question.
+
+<Solved Example>
+{solved_proxy_question}
+</Solved Example>
+
+<Main Problem to Solve>
+{main_question}
+</Main Problem to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Write your step-by-step derivation here, strictly copying the method from the Solved Example]
+
+Final Answer:
+[Your final answer]
+</Your Answer/Output Format>""",
 
 
 }
