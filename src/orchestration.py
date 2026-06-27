@@ -1385,6 +1385,7 @@ def run_experiments(
                 if res.get('status') == 'SUCCESS':
                     successful_samples.append(res)
                     save_json(successful_samples, dataset_path)
+                    print(f"\n   🌟 [MILESTONE] Total verified donors collected so far: {len(successful_samples)}")
                     
                 periodic_sync_check(idx, current_config)
                 
