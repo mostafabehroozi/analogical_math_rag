@@ -162,9 +162,9 @@ def run_parallel_evaluation_branches(
     print(f"     => Score A: {score_a:.2f}")
 
     # -------------------------------------------------------------------------
-    # Helper Function for Branches B and C
+    # Helper Function for Branches B and C (Fully Optimized)
     # -------------------------------------------------------------------------
-    def _execute_simplification_branch(branch_name: str, gen_prompt: str) -> tuple:
+    def _execute_simplification_branch(branch_name: str, gen_prompt: str, match_proxy: str = None, match_results: tuple = None) -> tuple:
         print(f"  -> [{branch_name}] Generating Proxy...")
         
         # 1. Generate Proxy
@@ -172,6 +172,8 @@ def run_parallel_evaluation_branches(
         local_trace.append(create_trace_entry("layer2", f"{branch_name}_generate", {"prompt": gen_prompt}, resp_gen, {"model": m_gen}))
         
         is_fallback = False
+        proxy_q = ""
+        
         if resp_gen['status'] != 'SUCCESS':
             is_fallback = True
             print(f"     => Proxy generation API failed. Triggering Fallback.")
@@ -185,16 +187,26 @@ def run_parallel_evaluation_branches(
             if not proxy_q or clean_text(proxy_q) == clean_text(t_q):
                 is_fallback = True
                 print(f"     => Failsafe triggered or parsing failed. Triggering Fallback.")
+                
+            # === NEW: CONVERGENCE OPTIMIZATION ===
+            elif match_proxy and clean_text(proxy_q) == clean_text(match_proxy):
+                print(f"     => [CONVERGENCE] Branch generated the exact same proxy as Branch B!")
+                print(f"     => Recycling Branch B's solve and evaluation results to save API costs.")
+                local_trace.append({
+                    "step": "layer2", 
+                    "sub_step": f"{branch_name}_convergence", 
+                    "note": "Recycled previous branch results because generated proxy was identical."
+                })
+                # match_results contains (score_b, attempts_b)
+                return match_results[0], match_results[1], resp_gen['text'], "CONVERGED_WITH_B", proxy_q
+            # =====================================
 
         # 2. Execute solving logic
         if is_fallback:
-            # Fallback is identical to Branch A. We just solve original.
-            prompt_solve = create_final_reasoning_prompt_simple(t_q, config)
-            score, attempts = _solve_and_evaluate(
-                t_q, t_gt, prompt_solve, api_manager_solve, api_manager_eval, config,
-                n_attempts, temp_solve, f"{branch_name}_fallback_solve", local_trace, target_correct_to_beat=-1
-            )
-            return score, attempts, resp_gen.get('text', 'API_FAILED'), "FALLBACK_TRIGGERED"
+            # OPTIMIZATION: Recycle Branch A's results
+            print(f"     => Re-using Branch A baseline results to save API costs.")
+            local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_fallback_solve", "note": "Recycled Branch A results"})
+            return score_a, attempts_a, resp_gen.get('text', 'API_FAILED'), "FALLBACK_TRIGGERED", proxy_q
         else:
             # Solve the Proxy
             print(f"  -> [{branch_name}] Solving Proxy...")
@@ -202,17 +214,22 @@ def run_parallel_evaluation_branches(
             resp_proxy = api_manager_solve.generate_content(prompt_proxy_solve, m_solve, temp_solve)
             local_trace.append(create_trace_entry("layer2", f"{branch_name}_solve_proxy", {"prompt": prompt_proxy_solve}, resp_proxy, {"model": m_solve}))
             
-            if resp_proxy['status'] != 'SUCCESS':
-                # If proxy solving fails, we also fallback to standard solve
-                prompt_solve = create_final_reasoning_prompt_simple(t_q, config)
-                score, attempts = _solve_and_evaluate(
-                    t_q, t_gt, prompt_solve, api_manager_solve, api_manager_eval, config,
-                    n_attempts, temp_solve, f"{branch_name}_fallback_solve2", local_trace, target_correct_to_beat=-1
-                )
-                return score, attempts, resp_gen['text'], "FALLBACK_PROXY_SOLVE_FAILED"
+            # === NEW: EMPTY RESPONSE FAST-FAIL OPTIMIZATION ===
+            proxy_solution_text = resp_proxy.get('text', '').strip()
+            
+            if resp_proxy['status'] != 'SUCCESS' or not proxy_solution_text:
+                error_reason = "API failed" if resp_proxy['status'] != 'SUCCESS' else "Empty/Blank response"
+                print(f"     => Proxy solve failed ({error_reason}). Re-using Branch A baseline results.")
+                local_trace.append({
+                    "step": "layer2", 
+                    "sub_step": f"{branch_name}_fallback_solve2", 
+                    "note": f"Recycled Branch A results due to proxy solve failure: {error_reason}"
+                })
+                return score_a, attempts_a, resp_gen['text'], "FALLBACK_PROXY_SOLVE_FAILED", proxy_q
+            # ==================================================
             
             # Augmented Solve
-            solved_proxy_combined = f"Question: {proxy_q}\nRationale and Answer: {resp_proxy['text']}"
+            solved_proxy_combined = f"Question: {proxy_q}\nRationale and Answer: {proxy_solution_text}"
             print(f"  -> [{branch_name}] Augmented Main Solve (N={n_attempts})...")
             prompt_aug = create_core_simp_augmented_solver_prompt(t_q, solved_proxy_combined)
             
@@ -220,13 +237,13 @@ def run_parallel_evaluation_branches(
                 t_q, t_gt, prompt_aug, api_manager_solve, api_manager_eval, config,
                 n_attempts, temp_solve, f"{branch_name}_aug_solve", local_trace, target_correct_to_beat=-1
             )
-            return score, attempts, resp_gen['text'], "SUCCESS"
+            return score, attempts, resp_gen['text'], "SUCCESS", proxy_q
 
     # -------------------------------------------------------------------------
     # BRANCH B: Zero-Shot Simplification
     # -------------------------------------------------------------------------
     prompt_b = create_core_simp_zero_shot_prompt(t_q)
-    score_b, attempts_b, trace_b, status_b = _execute_simplification_branch("Branch B (Zero-Shot)", prompt_b)
+    score_b, attempts_b, trace_b, status_b, proxy_q_b = _execute_simplification_branch("Branch B (Zero-Shot)", prompt_b)
     
     results["branch_b_score"] = score_b
     results["branch_b_status"] = status_b
@@ -238,7 +255,12 @@ def run_parallel_evaluation_branches(
     # BRANCH C: Few-Shot Analogical Simplification (Core Innovation)
     # -------------------------------------------------------------------------
     prompt_c = create_core_simp_few_shot_prompt(t_q, d_trace)
-    score_c, attempts_c, trace_c, status_c = _execute_simplification_branch("Branch C (Few-Shot Analogical)", prompt_c)
+    
+    # Pass Branch B's data so Branch C can check for convergence
+    match_data_b = (score_b, attempts_b)
+    score_c, attempts_c, trace_c, status_c, proxy_q_c = _execute_simplification_branch(
+        "Branch C (Few-Shot Analogical)", prompt_c, match_proxy=proxy_q_b, match_results=match_data_b
+    )
     
     results["branch_c_score"] = score_c
     results["branch_c_status"] = status_c

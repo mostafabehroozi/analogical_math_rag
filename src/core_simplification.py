@@ -152,7 +152,7 @@ def run_core_simplification_phase1(
         }
 
     # STEP B: Proxy Generation & Failsafe Check
-    print(f"  -> [Step B] Generating Proxy via 4-Part Structural Prompt...")
+    print(f"  -> [Step B] Generating Proxy Question...")
     gen_prompt = create_core_simp_zero_shot_prompt(target_query)
     
     gen_resp = api_manager_solve.generate_content(gen_prompt, model_gen, temp_gen)
