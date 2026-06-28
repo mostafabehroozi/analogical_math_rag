@@ -1941,7 +1941,6 @@ Final Answer:
     "core_simp_augmented_solver_v2": """You are an expert math solver. 
 
 You must solve the Main Question by copying the exact logical steps used in the Solved Example. 
-
 The Solved Example is a simpler version of the exact same problem. Do not invent a new method. Read the Solved Example, find the step-by-step logic it used, and apply that exact same logic to the numbers in the Main Question.
 
 <Solved Example>
