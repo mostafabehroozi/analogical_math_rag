@@ -1850,21 +1850,8 @@ Original Question:
 {original_question}
 
 
-OUTPUT FORMAT
-Provide your response strictly in the following structure:
-
-1. Topology Analysis:
-(State whether the problem is 'Multi-Sub-Question' or 'Single Coherent' and briefly explain why.)
-
-2. Trunk vs. Non-Trunk Breakdown:
-The Trunk (Core Logic): (Identify the exact hardest part / bottleneck of the logic that must remain unchanged).
-The Non-Trunk: (Identify the arithmetic, sub-parts, or text that can be simplified. If none exist that can be safely altered, state "None".)
-
-3. Simplification Methodology:
-(Briefly state exactly what you will change. Example: "I will scale down the numbers in the peripheral sub-calculation." OR, if using the failsafe: "No safe simplification is possible without altering the core reasoning. I will output the original question unchanged.")
-
-4. The Proxy Question:
-(Write the final, simplified version of the question here. If no safe simplification was possible, write the exact original question here word-for-word.)
+OUTPUT FORMAT (Strictly follow this format):
+Simplified Question: [Your simplified proxy question here, or the exact original question if no safe simplification is possible]
 """,
 
     "core_simplification_few_shot_v1": """You are an expert mathematical and logical reasoning AI. Your task is to perform "Core-Preserving Simplification" on a given complex problem. 
@@ -1900,21 +1887,8 @@ Original Question:
 {original_question}
 
 
-OUTPUT FORMAT
-Provide your response strictly in the following structure:
-
-1. Topology Analysis:
-(State whether the problem is 'Multi-Sub-Question' or 'Single Coherent' and briefly explain why.)
-
-2. Trunk vs. Non-Trunk Breakdown:
-The Trunk (Core Logic): (Identify the exact hardest part / bottleneck).
-The Non-Trunk: (Identify what can be safely altered, or state "None").
-
-3. Simplification Methodology:
-(Briefly state exactly what you will change, or if you are using the failsafe).
-
-4. The Proxy Question:
-(Write the final, simplified version of the question here).
+OUTPUT FORMAT (Strictly follow this format):
+Simplified Question: [Your simplified proxy question here, or the exact original question if no safe simplification is possible]
 """,
 
     "core_simp_augmented_solver_v1": """You are an expert mathematical and logical reasoning system. Solve the Main Question by directly applying the reasoning trajectory of the provided Solved Example. This example is highly similar and shares the exact same underlying structural logic as your target question.

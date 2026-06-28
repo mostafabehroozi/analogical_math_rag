@@ -16,29 +16,19 @@ logger = logging.getLogger(__name__)
 
 def _parse_simplification_trace(llm_output: str) -> Dict[str, str]:
     """
-    Parses the strict 4-part output from the zero-shot simplification prompt.
-    Returns a dictionary containing the extracted parts.
+    Parses the streamlined output from the simplification prompt.
+    Extracts the text following 'Simplified Question:'.
     """
-    parsed = {
-        "topology_analysis": "",
-        "trunk_breakdown": "",
-        "simplification_methodology": "",
-        "proxy_question": ""
-    }
+    parsed = {"proxy_question": ""}
     
-    # Simple regex parsing based on the expected headers
-    try:
-        # Extract Part 4 (The Proxy Question)
-        part4_match = re.search(r"\*\*4\. The Proxy Question:\*\*(.*?)$", llm_output, re.DOTALL | re.IGNORECASE)
-        if part4_match:
-            parsed["proxy_question"] = part4_match.group(1).strip()
-        else:
-            # Fallback if markdown asterisks are missing
-            part4_fallback = re.search(r"4\. The Proxy Question:(.*?)$", llm_output, re.DOTALL | re.IGNORECASE)
-            if part4_fallback:
-                parsed["proxy_question"] = part4_fallback.group(1).strip()
-    except Exception as e:
-        logger.warning(f"Failed to parse Proxy Question: {e}")
+    # Extract everything after "Simplified Question:"
+    match = re.search(r"Simplified Question:\s*(.*)", llm_output, re.DOTALL | re.IGNORECASE)
+    
+    if match:
+        parsed["proxy_question"] = match.group(1).strip()
+    else:
+        # Fallback: If the LLM just outputs the question without the tag, grab it all
+        parsed["proxy_question"] = llm_output.strip()
         
     return parsed
 
@@ -179,20 +169,15 @@ def run_core_simplification_phase1(
     full_trace_text = gen_resp['text']
     parsed_parts = _parse_simplification_trace(full_trace_text)
     proxy_q = parsed_parts.get("proxy_question", "")
-    methodology = parsed_parts.get("simplification_methodology", "").lower()
     
     if not proxy_q:
         logger.error("Failed to parse Proxy Question from output.")
         return {"status": "FAILURE", "reason": "Parsing failed", "trace": local_trace}
 
-    # --- NEW FEATURE: ENHANCED EXPLICIT FAILSAFE CHECK ---
-    # 1. Check if LLM explicitly declared it cannot simplify in the methodology
-    if "no safe simplification" in methodology:
-        print(f"     => [FAILSAFE TRIGGERED] Model explicitly stated no safe simplification is possible. Aborting.")
-        return {"status": "SKIPPED_FAILSAFE", "trace": local_trace}
-        
-    # 2. String comparison fallback (original failsafe)
+    # --- ENHANCED EXPLICIT FAILSAFE CHECK ---
+    # We rely entirely on string comparison to see if the LLM changed the question
     def clean_text(t): return re.sub(r'\W+', '', t.lower())
+    
     if clean_text(proxy_q) == clean_text(target_query):
         print(f"     => [FAILSAFE TRIGGERED] Model returned identical question. Aborting.")
         return {"status": "SKIPPED_FAILSAFE", "trace": local_trace}

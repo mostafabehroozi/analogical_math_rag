@@ -92,13 +92,18 @@ def build_paired_test_suite(
             if actual_unseen_idx not in already_assigned_unseen_indices:
                 already_assigned_unseen_indices.add(actual_unseen_idx)
                 
-                # Bundle the test question with its perfect donor trace
+                # Construct a clean demonstration from the donor's original and proxy questions
+                donor_original = donor.get('original_question', '')
+                donor_proxy = donor.get('proxy_question', '')
+                demo_text = f"Original Question:\n{donor_original}\n\nSimplified Question:\n{donor_proxy}"
+                
+                # Bundle the test question with its perfect donor demonstration
                 paired_test_suite.append({
                     "test_idx": actual_unseen_idx,
                     "test_question": hard_questions[actual_unseen_idx],
                     "ground_truth": hard_solutions[actual_unseen_idx],
                     "linked_donor_original_idx": donor.get('original_index'),
-                    "linked_donor_trace_text": donor.get('proxy_generation_full_trace')
+                    "linked_donor_trace_text": demo_text  # We inject the clean demo text here!
                 })
                 assigned_count += 1
 
@@ -173,12 +178,11 @@ def run_parallel_evaluation_branches(
         else:
             parsed = _parse_simplification_trace(resp_gen['text'])
             proxy_q = parsed.get("proxy_question", "")
-            methodology = parsed.get("simplification_methodology", "").lower()
             
             def clean_text(t): return re.sub(r'\W+', '', t.lower())
             
             # Failsafe Checks
-            if "no safe simplification" in methodology or not proxy_q or clean_text(proxy_q) == clean_text(t_q):
+            if not proxy_q or clean_text(proxy_q) == clean_text(t_q):
                 is_fallback = True
                 print(f"     => Failsafe triggered or parsing failed. Triggering Fallback.")
 
