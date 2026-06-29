@@ -1819,36 +1819,107 @@ Rationale and Answer: [Merged Rationale and Answer]
 </Task>
 """,
     
-    "core_simplification_zero_shot_v1": """You are an expert mathematical and logical reasoning AI. Your task is to perform "Core-Preserving Simplification" on a given complex problem. 
+"core_simplification_zero_shot_v1": """You are an expert mathematical AI. Your task is to perform "Core-Preserving Simplification" on a complex math competition problem.
 
-Your goal is to create a simpler "Proxy Question" that shares the EXACT SAME logical structure as the original question. This simplified question will later be used as an analogical stepping-stone to help solve the original problem. Therefore, the core logic MUST remain identical so the correct Chain of Thought (CoT) trajectory is preserved.
+Your goal is to create a simpler "Proxy Question" that acts as an easy analogical stepping-stone. The Proxy Question MUST share the EXACT SAME logical structure, Chain of Thought, and theorems as the original problem, but be computationally and cognitively much easier.
 
-To do this, you must strictly follow the Structural Simplification Framework:
+To do this, use the following framework:
 
-1. Identify Problem Topology
-First, analyze the structure of the input question and classify it into one of two categories:
-Multi-Sub-Question (Decomposable): The problem intrinsically breaks down into multiple sub-parts or sub-questions. You have a "free hand" to simplify the peripheral sub-questions.
-Single Coherent (Monolithic): The problem is a single, tightly knit entity. You do not have a free hand to detach parts; you must carefully scale down the internal complexities without breaking the overall unified structure.
+STEP 1: Identify the "Core Logical Engine" (The Untouchable Logic)
+Identify the fundamental math concept required (e.g., Stars and Bars, Vieta's formulas, modular inverses). You MUST NOT alter the problem so much that this core theorem is bypassed.
 
-2. Isolate the Trunk vs. Non-Trunk
-You must separate the core of the problem from the peripheral noise:
-The Trunk (Core Logic): This is the heart, the bottleneck, or the hardest logical leap of the question. It is the main backbone that the solving trajectory depends on. 
-CRITICAL RULE:** You MUST NOT simplify or alter the fundamental logic of the Trunk. If the problem requires a specific complex theorem or multi-step logical deduction at its core, that requirement must exist in the simplified version.
-The Non-Trunk (Peripheral Complexity): These are elements that do not define the core logic. Examples include highly complex arithmetic (e.g., large numbers, ugly fractions), distracting narrative fluff, or trivial introductory/peripheral sub-calculations.
+STEP 2: Apply Vectors of Simplification
+Analyze the problem and safely simplify its peripheral complexities. Below is a diverse toolkit of simplification vectors. 
+IMPORTANT: The examples provided below are basic "toy" examples used merely to illustrate the concepts. The actual input problem you receive will be significantly more complex, convoluted, and multi-layered. You must look past the surface complexity, deeply analyze the specific problem, and apply the *underlying principles* of these vectors. Use them as strong inspiration, but feel free to combine them, adapt them, or invent other contextual simplifications required to dismantle your specific problem, provided they preserve the Core Engine.
 
-3. IMPORTANT NOTE: The "Do No Harm" Failsafe
-If you analyze the question and determine that there is NOTHING that can be safely simplified—meaning any attempt to simplify numbers, parts, or text would intrinsically alter the Trunk or change the main solving reasoning of the question—DO NOT CHANGE IT. You must never force a simplification if it risks destroying the core logic. In this scenario, you must leave the question exactly as it is and return it unchanged.
+Study the Valid vs. Invalid examples to understand the exact boundaries of what preserves versus what destroys logic:
 
-4. Apply the Simplification Strategy
-If safe simplification is possible, base it on the topology to reduce cognitive load and help uncover the best initial CoT step:
-If Multi-Sub-Question: Keep the core "Trunk" sub-question completely intact. Radically simplify the other, non-core sub-questions (e.g., change convoluted numbers to simple integers, remove unnecessary conditions in the outer steps).
-If Single Coherent: Keep the mathematical relationships and sequence of operations perfectly isomorphic (identical in shape). Simply scale down the complex numbers into trivial integers (e.g., replace 13,459.22 with 3) and remove non-essential narrative text so the core logic is entirely exposed.
+[Arithmetic]
+- Magnitude Downscaling: Reduce giant constants to friendly numbers.
+  Valid: "Find 2024^2024 mod 5" -> "Find 4^4 mod 5" (Modular exponentiation preserved).
+  Invalid: "Find the sum of the digits of 2024" -> "Find the sum of the digits of 1" (Trivializes the problem).
+- Fraction Flattening: Convert messy rationals to simple whole numbers.
+  Valid: "Solve (17/13)x + 5/13 = 22/13" -> "Solve 2x + 1 = 5" (Algebraic isolation preserved).
+  Invalid: "Find the fractional part of 17/5" -> "Find the fractional part of 3" (Answer becomes trivially 0; logic destroyed).
+- Radical Taming: Replace ugly irrationals with perfect squares or small surds.
+  Valid: "Solve sqrt(199 - x) = 13" -> "Solve sqrt(25 - x) = 4" (Squaring/isolation logic preserved).
+  Invalid: "Rationalize 1 / (sqrt(3) + sqrt(2))" -> "Rationalize 1 / (3 + 2)" (Conjugate multiplication step destroyed).
+- Prime Substitution: Swap giant primes for small primes.
+  Valid: "Highest power of 997 dividing 10000!" -> "Highest power of 5 dividing 20!" (Legendre's formula preserved).
+  Invalid: "Prove prime p=997 cannot be a^2 - b^2" -> "Prove p=8 cannot be a^2 - b^2" (8 is not prime; breaks the premise).
 
+[Algebra]
+- Degree Lowering: Shrink massive exponents to the lowest non-trivial degree.
+  Valid: "Find roots of x^100 - 1 = 0" -> "Find roots of x^4 - 1 = 0" (Roots of unity concept preserved).
+  Invalid: "Coefficient of x^50 in (1+x)^100" -> "Coefficient of x^1 in (1+x)^2" (Trivializes binomial expansion).
+- Coefficient Smoothing: Replace un-factorable coefficients with easy ones.
+  Valid: "Minimum of 143x^2 - 286x + 5" -> "Minimum of 2x^2 - 4x + 1" (Vertex formula x=-b/2a preserved).
+  Invalid: "Factor 143x^2 + 15x + 2" -> "Factor x^2 + 3x + 2" (Removes the need for the AC method/grouping).
+- Variable Reduction: Reduce symmetric multi-variable systems.
+  Valid: "System x+y+z=6, xy+yz+zx=11, xyz=6" -> "System x+y=3, xy=2" (Vieta's logic preserved on a lower degree).
+  Invalid: "Volume of 3D ellipsoid x^2/a^2 + y^2/b^2 + z^2/c^2 = 1" -> "Area of 1D line x^2/a^2 = 1" (Destroys 3D calculus).
+- Sequence Truncation: Shorten long sums/products to a few terms.
+  Valid: "Telescoping sum of 1/(n(n+1)) to 1000 terms" -> "...to 4 terms" (Telescoping cancellation still happens).
+  Invalid: "Find the limit as n -> infinity" -> "Find the 3rd term" (Calculus limit concept completely removed).
+
+[Combinatorics]
+- Population Scaling: Shrink massive sets to small, countable sets.
+  Valid: "Seat 100 people at a circular table" -> "Seat 5 people..." ((n-1)! logic preserved).
+  Invalid: "Seat 2 people at a circular table" (Outputs (2-1)!=1, bypassing combinatorial thought).
+- State-Space Shrinking: Reduce dimensions of grids or graphs.
+  Valid: "Paths on 10x10 grid avoiding (5,5)" -> "Paths on 4x4 grid avoiding (2,2)" (Inclusion-exclusion preserved).
+  Invalid: "Paths on a 1x1 grid" (No room for an obstacle; destroys the logic).
+- Event Iteration Reduction: Lower the number of repeated probability events.
+  Valid: "Expected heads in 100 coin flips" -> "Expected heads in 4 flips" (Linearity of expectation preserved).
+  Invalid: "Expected heads in 1 coin flip" (Bypasses the summation/expected value of multiple events).
+- Die/Spinner Downgrading: Reduce the complexity of random generators.
+  Valid: "Roll five 20-sided dice, sum to 50" -> "Roll three 4-sided dice, sum to 8" (Generating functions preserved).
+  Invalid: "Roll one 4-sided die, chance it equals 2" (Removes convolution/summation logic entirely).
+
+[Geometry]
+- Coordinate Normalization: Shift huge/negative coordinates near the origin.
+  Valid: "Distance from (1005, -2048) to (1008, -2044)" -> "Distance from (0,0) to (3,4)" (Distance formula preserved).
+  Invalid: "Area of polygon with vertices (10,10), (10,-10)..." -> "Area of polygon with vertex (0,0)" (A single point isn't a polygon).
+- Angle Standardizing: Replace obscure angles with standard unit-circle angles.
+  Valid: "sin(13)cos(17) + cos(13)sin(17)" -> "sin(15)cos(15) + cos(15)sin(15)" (Angle addition formula preserved).
+  Invalid: "Period of sin(17x)" -> "Period of sin(x)" (Removes the 2pi/b calculation entirely).
+- Polygon Side Reduction: Shrink N-gons to simpler shapes.
+  Valid: "Sum of interior angles of 100-gon" -> "...of a hexagon" ((n-2)*180 formula preserved).
+  Invalid: "Number of diagonals in 100-gon" -> "...in a triangle" (Triangles have 0 diagonals; trivializes the formula).
+- Shape Regularization: Simplify arbitrary shapes if the theorem is universal.
+  Valid: "Arbitrary convex quadrilateral with orthogonal diagonals, find area" -> "Kite with orthogonal diagonals..." (Area=1/2*d1*d2 holds).
+  Invalid: "Prove Euler line passes through orthocenter of scalene triangle" -> "...of equilateral triangle" (Centers share the same point; line vanishes).
+
+[Number Theory]
+- Modulo Minimization: Lower giant modulo bases.
+  Valid: "Last 3 digits of 7^999 (i.e., mod 1000)" -> "Last digit of 7^99 (i.e., mod 10)" (Euler's totient preserved).
+  Invalid: "Find x mod 1000" -> "Find x mod 1" (Mod 1 is always 0; modular arithmetic destroyed).
+- Base/Radix Lowering: Convert arithmetic in large bases to smaller bases.
+  Valid: "Convert A4F base 16 to base 10" -> "Convert 210 base 3 to base 10" (Base expansion logic preserved).
+  Invalid: "Trailing zeros of 100! in base 16" -> "...in base 10" (Base 16 requires checking powers of 2, a different logical step than base 10).
+- Diophantine Shrinking: Simplify constants in linear Diophantine equations.
+  Valid: "Integer solutions to 1001x + 2003y = 5" -> "Integer solutions to 7x + 11y = 5" (Extended Euclidean Algorithm preserved).
+  Invalid: "Integer solutions to 1001x + 2003y = 5" -> "1x + 1y = 5" (Trivializes the algorithm).
+
+[Formatting]
+- Goal Un-nesting: Remove arbitrary final formatting arithmetic.
+  Valid: "Find radius r, then calculate floor(100*pi*r^2 - 17)" -> "Find the area pi*r^2" (Keeps core geometry, removes formatting noise).
+  Invalid: "Find roots r1, r2, then calculate (r1^2 + r2^2)" -> "Find roots r1, r2" (Calculating sum of squares requires a specific algebraic manipulation that is lost).
+
+
+STEP 3: The Mathematical Safety Check
+Ensure your selected simplifications do not break math rules:
+- Parity/Divisibility: If a number MUST be even for the problem to work, your smaller number must be even.
+- Geometry Constraints: Do not violate the Triangle Inequality.
+- Probabilities: Numerators must not exceed denominators.
+- Keywords: NEVER remove words defining constraints (e.g., "distinct", "integer", "consecutive").
+
+STEP 4: The Failsafe
+If the question relies entirely on specific numbers (e.g., factoring a specific prime), or if any simplification would destroy the Core Logical Engine, DO NOT CHANGE IT. Output the exact original question.
 
 INPUT
 Original Question:
 {original_question}
-
 
 OUTPUT FORMAT (Strictly follow this format):
 Simplified Question: [Your simplified proxy question here, or the exact original question if no safe simplification is possible]
