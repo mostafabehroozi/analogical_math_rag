@@ -1361,33 +1361,36 @@ def run_experiments(
             full_logs = load_json(log_file_path) or []
             completed_indices = {log.get('original_index') for log in full_logs if 'original_index' in log}
             
-            for idx, query in enumerate(tqdm(hard_questions, desc=f"Phase 1: {exp_name}")):
-                if idx in completed_indices:
-                    continue
+            # --- NEW: Filter out completed questions BEFORE starting the progress bar ---
+            queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_indices]
+            
+            if not queries_to_process:
+                logger.info(f"All queries for Phase 1 '{exp_name}' are already processed. Skipping.")
+            else:
+                for loop_idx, (original_idx, query) in enumerate(tqdm(queries_to_process, desc=f"Phase 1: {exp_name}")):
+                    gt = None
+                    if hard_solutions and original_idx < len(hard_solutions): gt = hard_solutions[original_idx]
+                    elif 'ground_truths' in exemplar_data and original_idx < len(exemplar_data['ground_truths']): gt = exemplar_data['ground_truths'][original_idx]
+                    elif 'solutions' in exemplar_data and len(exemplar_data['solutions']) == len(hard_questions): gt = exemplar_data['solutions'][original_idx]
+                        
+                    if not gt:
+                        continue
+                        
+                    res = run_core_simplification_phase1(
+                        target_query=query, ground_truth=gt,
+                        api_manager_solve=solver_mgr, api_manager_eval=eval_mgr, config=current_config
+                    )
                     
-                gt = None
-                if hard_solutions and idx < len(hard_solutions): gt = hard_solutions[idx]
-                elif 'ground_truths' in exemplar_data and idx < len(exemplar_data['ground_truths']): gt = exemplar_data['ground_truths'][idx]
-                elif 'solutions' in exemplar_data and len(exemplar_data['solutions']) == len(hard_questions): gt = exemplar_data['solutions'][idx]
+                    res['original_index'] = original_idx
+                    full_logs.append(res)
+                    save_json(full_logs, log_file_path)
                     
-                if not gt:
-                    continue
-                    
-                res = run_core_simplification_phase1(
-                    target_query=query, ground_truth=gt,
-                    api_manager_solve=solver_mgr, api_manager_eval=eval_mgr, config=current_config
-                )
-                
-                res['original_index'] = idx
-                full_logs.append(res)
-                save_json(full_logs, log_file_path)
-                
-                if res.get('status') == 'SUCCESS':
-                    successful_samples.append(res)
-                    save_json(successful_samples, dataset_path)
-                    print(f"\n   🌟 [MILESTONE] Total verified donors collected so far: {len(successful_samples)}")
-                    
-                periodic_sync_check(idx, current_config)
+                    if res.get('status') == 'SUCCESS':
+                        successful_samples.append(res)
+                        save_json(successful_samples, dataset_path)
+                        print(f"\n   🌟 [MILESTONE] Total verified donors collected so far: {len(successful_samples)}")
+                        
+                    periodic_sync_check(loop_idx, current_config)
                 
             all_results[exp_name] = full_logs
             logger.info(f"--- Phase 1 '{exp_name}' finished. Saved {len(successful_samples)} verified samples. ---")

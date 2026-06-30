@@ -304,11 +304,14 @@ def execute_core_simplification_phase2(
     if not test_suite:
         return all_results
         
+    tests_to_process = [item for item in test_suite if item['test_idx'] not in completed_test_indices]
+    
+    if not tests_to_process:
+        logger.info(f"All test items for Phase 2 are already processed. Skipping.")
+        return all_results
+
     # 3. Execution Loop
-    for loop_idx, test_item in enumerate(tqdm(test_suite, desc="Phase 2 Execution")):
-        if test_item['test_idx'] in completed_test_indices:
-            continue
-            
+    for loop_idx, test_item in enumerate(tqdm(tests_to_process, desc="Phase 2 Execution")):
         # Execute the 3 Branches
         branch_results = run_parallel_evaluation_branches(test_item, solver_mgr, eval_mgr, config)
         
