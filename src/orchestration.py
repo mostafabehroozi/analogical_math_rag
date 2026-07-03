@@ -1410,8 +1410,27 @@ def run_experiments(
             
             logger.info(f"--- Core Simplification Phase 2 '{exp_name}' starting ---")
             
-            # Pass everything to the Phase 2 engine
-            phase2_results = execute_core_simplification_phase2(
+            # =========================================================================
+    # SPECIAL CASE: Merging Dataset Construction
+    # =========================================================================
+    merging_ds_configs = [exp for exp in experiment_configs if exp.get("APPLY_MERGING_DATASET_CONSTRUCTION")]
+    # Update experiment_configs to exclude merging configs from the standard pipeline
+    experiment_configs = [exp for exp in experiment_configs if not exp.get("APPLY_MERGING_DATASET_CONSTRUCTION")]
+
+    if merging_ds_configs:
+        logger.info(f"Found {len(merging_ds_configs)} Merging Dataset Construction config(s); running them now.")
+        # We will create this file in the next step!
+        from src.merging_dataset_builder import build_merging_dataset
+        
+        for exp_overrides in merging_ds_configs:
+            current_config = global_config.copy()
+            current_config.update(exp_overrides)
+            exp_name = current_config.get("experiment_name", "merging_dataset_construction")
+            
+            logger.info(f"--- Merging Dataset Construction '{exp_name}' starting ---")
+            
+            # Pass everything to the new dataset builder
+            ds_results = build_merging_dataset(
                 hard_questions=hard_questions,
                 hard_solutions=hard_solutions,
                 exemplar_data=exemplar_data,
@@ -1420,8 +1439,8 @@ def run_experiments(
                 config=current_config
             )
             
-            all_results[exp_name] = phase2_results
-            logger.info(f"--- Phase 2 '{exp_name}' finished. ---")
+            all_results[exp_name] = ds_results
+            logger.info(f"--- Merging Dataset Construction '{exp_name}' finished. ---")
 
     # If there are no normal experiments left to run, return early
     if not experiment_configs:

@@ -362,6 +362,13 @@ CONFIG = {
     # Phase 2 Specific Tuning
     "CORE_SIMP_LAYER2_K_RETRIEVAL": 3,         # How many unseen test questions to fetch per donor
     "CORE_SIMP_LAYER2_N_ATTEMPTS": 5,          # N for Pass@N in Branch A, B, and C
+    
+    # --- MERGING DATASET CONSTRUCTION FLAGS ---
+    "APPLY_MERGING_DATASET_CONSTRUCTION": False, # Master switch for the new dataset builder
+    "MERGING_DS_BASE_CHECK": True,               # If True, requires Few-Shot CCS > Base CCS
+    "MERGING_DS_CCS_N": 5,                       # N attempts for calculating Correctness Consistency Score
+    "MERGING_DS_TEMPERATURE": 0.7,               # Temperature for sampling multiple reasoning paths
+    "MERGING_DS_OUTPUT_FILENAME": "merging_fine_tuning_dataset.json",
 }
 
 # Initialize derived paths on module load (before any functions are called)
