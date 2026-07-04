@@ -1819,7 +1819,7 @@ Rationale and Answer: [Merged Rationale and Answer]
 </Task>
 """,
     
-"core_simplification_zero_shot_v1": """You are an expert mathematical AI. Your task is to perform "Core-Preserving Simplification" on a complex math competition problem.
+    "core_simplification_zero_shot_v1": """You are an expert mathematical AI. Your task is to perform "Core-Preserving Simplification" on a complex math competition problem.
 
 Your goal is to create a simpler "Proxy Question" that acts as an easy analogical stepping-stone. The Proxy Question MUST share the EXACT SAME logical structure, Chain of Thought, and theorems as the original problem, but be computationally and cognitively much easier.
 
@@ -1925,42 +1925,120 @@ OUTPUT FORMAT (Strictly follow this format):
 Simplified Question: [Your simplified proxy question here, or the exact original question if no safe simplification is possible]
 """,
 
-    "core_simplification_few_shot_v1": """You are an expert mathematical and logical reasoning AI. Your task is to perform "Core-Preserving Simplification" on a given complex problem. 
 
-Your goal is to create a simpler "Proxy Question" that shares the EXACT SAME logical structure as the original question. This simplified question will later be used as an analogical stepping-stone to help solve the original problem. Therefore, the core logic MUST remain identical so the correct Chain of Thought (CoT) trajectory is preserved.
+    "core_simplification_few_shot_v1": """You are an expert mathematical AI. Your task is to perform "Core-Preserving Simplification" on a complex math competition problem.
 
-To do this, you must strictly follow the Structural Simplification Framework:
+Your goal is to create a simpler "Proxy Question" that acts as an easy analogical stepping-stone. The Proxy Question MUST share the EXACT SAME logical structure, Chain of Thought, and theorems as the original problem, but be computationally and cognitively much easier.
 
-1. Identify Problem Topology
-Multi-Sub-Question (Decomposable): The problem intrinsically breaks down into multiple sub-parts. You have a "free hand" to simplify the peripheral sub-questions.
-Single Coherent (Monolithic): The problem is a single, tightly knit entity. You must carefully scale down internal complexities without breaking the unified structure.
+To do this, use the following framework:
 
-2. Isolate the Trunk vs. Non-Trunk
-The Trunk (Core Logic): The heart/bottleneck of the question. CRITICAL RULE: You MUST NOT simplify or alter the fundamental logic of the Trunk. 
-The Non-Trunk: Distracting peripheral complexity (ugly arithmetic, narrative fluff, etc.).
+STEP 1: Identify the "Core Logical Engine" (The Untouchable Logic)
+Identify the fundamental math concept required (e.g., Stars and Bars, Vieta's formulas, modular inverses). You MUST NOT alter the problem so much that this core theorem is bypassed.
 
-3. IMPORTANT NOTE: The "Do No Harm" Failsafe
-If nothing can be safely simplified without altering the Trunk, DO NOT CHANGE IT. Output the original question unchanged.
+STEP 2: Apply Vectors of Simplification
+Analyze the problem and safely simplify its peripheral complexities. Below is a diverse toolkit of simplification vectors. 
+IMPORTANT: The examples provided below are basic "toy" examples used merely to illustrate the concepts. The actual input problem you receive will be significantly more complex, convoluted, and multi-layered. You must look past the surface complexity, deeply analyze the specific problem, and apply the *underlying principles* of these vectors. Use them as strong inspiration, but feel free to combine them, adapt them, or invent other contextual simplifications required to dismantle your specific problem, provided they preserve the Core Engine.
 
-4. Apply the Simplification Strategy
-If Multi-Sub-Question: Keep the Trunk intact. Radically simplify non-core sub-questions.
-If Single Coherent: Keep mathematical relationships isomorphic. Scale down complex numbers into trivial integers.
+Study the Valid vs. Invalid examples to understand the exact boundaries of what preserves versus what destroys logic:
+
+[Arithmetic]
+- Magnitude Downscaling: Reduce giant constants to friendly numbers.
+  Valid: "Find 2024^2024 mod 5" -> "Find 4^4 mod 5" (Modular exponentiation preserved).
+  Invalid: "Find the sum of the digits of 2024" -> "Find the sum of the digits of 1" (Trivializes the problem).
+- Fraction Flattening: Convert messy rationals to simple whole numbers.
+  Valid: "Solve (17/13)x + 5/13 = 22/13" -> "Solve 2x + 1 = 5" (Algebraic isolation preserved).
+  Invalid: "Find the fractional part of 17/5" -> "Find the fractional part of 3" (Answer becomes trivially 0; logic destroyed).
+- Radical Taming: Replace ugly irrationals with perfect squares or small surds.
+  Valid: "Solve sqrt(199 - x) = 13" -> "Solve sqrt(25 - x) = 4" (Squaring/isolation logic preserved).
+  Invalid: "Rationalize 1 / (sqrt(3) + sqrt(2))" -> "Rationalize 1 / (3 + 2)" (Conjugate multiplication step destroyed).
+- Prime Substitution: Swap giant primes for small primes.
+  Valid: "Highest power of 997 dividing 10000!" -> "Highest power of 5 dividing 20!" (Legendre's formula preserved).
+  Invalid: "Prove prime p=997 cannot be a^2 - b^2" -> "Prove p=8 cannot be a^2 - b^2" (8 is not prime; breaks the premise).
+
+[Algebra]
+- Degree Lowering: Shrink massive exponents to the lowest non-trivial degree.
+  Valid: "Find roots of x^100 - 1 = 0" -> "Find roots of x^4 - 1 = 0" (Roots of unity concept preserved).
+  Invalid: "Coefficient of x^50 in (1+x)^100" -> "Coefficient of x^1 in (1+x)^2" (Trivializes binomial expansion).
+- Coefficient Smoothing: Replace un-factorable coefficients with easy ones.
+  Valid: "Minimum of 143x^2 - 286x + 5" -> "Minimum of 2x^2 - 4x + 1" (Vertex formula x=-b/2a preserved).
+  Invalid: "Factor 143x^2 + 15x + 2" -> "Factor x^2 + 3x + 2" (Removes the need for the AC method/grouping).
+- Variable Reduction: Reduce symmetric multi-variable systems.
+  Valid: "System x+y+z=6, xy+yz+zx=11, xyz=6" -> "System x+y=3, xy=2" (Vieta's logic preserved on a lower degree).
+  Invalid: "Volume of 3D ellipsoid x^2/a^2 + y^2/b^2 + z^2/c^2 = 1" -> "Area of 1D line x^2/a^2 = 1" (Destroys 3D calculus).
+- Sequence Truncation: Shorten long sums/products to a few terms.
+  Valid: "Telescoping sum of 1/(n(n+1)) to 1000 terms" -> "...to 4 terms" (Telescoping cancellation still happens).
+  Invalid: "Find the limit as n -> infinity" -> "Find the 3rd term" (Calculus limit concept completely removed).
+
+[Combinatorics]
+- Population Scaling: Shrink massive sets to small, countable sets.
+  Valid: "Seat 100 people at a circular table" -> "Seat 5 people..." ((n-1)! logic preserved).
+  Invalid: "Seat 2 people at a circular table" (Outputs (2-1)!=1, bypassing combinatorial thought).
+- State-Space Shrinking: Reduce dimensions of grids or graphs.
+  Valid: "Paths on 10x10 grid avoiding (5,5)" -> "Paths on 4x4 grid avoiding (2,2)" (Inclusion-exclusion preserved).
+  Invalid: "Paths on a 1x1 grid" (No room for an obstacle; destroys the logic).
+- Event Iteration Reduction: Lower the number of repeated probability events.
+  Valid: "Expected heads in 100 coin flips" -> "Expected heads in 4 flips" (Linearity of expectation preserved).
+  Invalid: "Expected heads in 1 coin flip" (Bypasses the summation/expected value of multiple events).
+- Die/Spinner Downgrading: Reduce the complexity of random generators.
+  Valid: "Roll five 20-sided dice, sum to 50" -> "Roll three 4-sided dice, sum to 8" (Generating functions preserved).
+  Invalid: "Roll one 4-sided die, chance it equals 2" (Removes convolution/summation logic entirely).
+
+[Geometry]
+- Coordinate Normalization: Shift huge/negative coordinates near the origin.
+  Valid: "Distance from (1005, -2048) to (1008, -2044)" -> "Distance from (0,0) to (3,4)" (Distance formula preserved).
+  Invalid: "Area of polygon with vertices (10,10), (10,-10)..." -> "Area of polygon with vertex (0,0)" (A single point isn't a polygon).
+- Angle Standardizing: Replace obscure angles with standard unit-circle angles.
+  Valid: "sin(13)cos(17) + cos(13)sin(17)" -> "sin(15)cos(15) + cos(15)sin(15)" (Angle addition formula preserved).
+  Invalid: "Period of sin(17x)" -> "Period of sin(x)" (Removes the 2pi/b calculation entirely).
+- Polygon Side Reduction: Shrink N-gons to simpler shapes.
+  Valid: "Sum of interior angles of 100-gon" -> "...of a hexagon" ((n-2)*180 formula preserved).
+  Invalid: "Number of diagonals in 100-gon" -> "...in a triangle" (Triangles have 0 diagonals; trivializes the formula).
+- Shape Regularization: Simplify arbitrary shapes if the theorem is universal.
+  Valid: "Arbitrary convex quadrilateral with orthogonal diagonals, find area" -> "Kite with orthogonal diagonals..." (Area=1/2*d1*d2 holds).
+  Invalid: "Prove Euler line passes through orthocenter of scalene triangle" -> "...of equilateral triangle" (Centers share the same point; line vanishes).
+
+[Number Theory]
+- Modulo Minimization: Lower giant modulo bases.
+  Valid: "Last 3 digits of 7^999 (i.e., mod 1000)" -> "Last digit of 7^99 (i.e., mod 10)" (Euler's totient preserved).
+  Invalid: "Find x mod 1000" -> "Find x mod 1" (Mod 1 is always 0; modular arithmetic destroyed).
+- Base/Radix Lowering: Convert arithmetic in large bases to smaller bases.
+  Valid: "Convert A4F base 16 to base 10" -> "Convert 210 base 3 to base 10" (Base expansion logic preserved).
+  Invalid: "Trailing zeros of 100! in base 16" -> "...in base 10" (Base 16 requires checking powers of 2, a different logical step than base 10).
+- Diophantine Shrinking: Simplify constants in linear Diophantine equations.
+  Valid: "Integer solutions to 1001x + 2003y = 5" -> "Integer solutions to 7x + 11y = 5" (Extended Euclidean Algorithm preserved).
+  Invalid: "Integer solutions to 1001x + 2003y = 5" -> "1x + 1y = 5" (Trivializes the algorithm).
+
+[Formatting]
+- Goal Un-nesting: Remove arbitrary final formatting arithmetic.
+  Valid: "Find radius r, then calculate floor(100*pi*r^2 - 17)" -> "Find the area pi*r^2" (Keeps core geometry, removes formatting noise).
+  Invalid: "Find roots r1, r2, then calculate (r1^2 + r2^2)" -> "Find roots r1, r2" (Calculating sum of squares requires a specific algebraic manipulation that is lost).
 
 
-DEMONSTRATION (Perfect Example of How to Apply the Rules)
-Here is a verified, perfect example of how to perform this simplification on a structurally similar problem:
+STEP 3: The Mathematical Safety Check
+Ensure your selected simplifications do not break math rules:
+- Parity/Divisibility: If a number MUST be even for the problem to work, your smaller number must be even.
+- Geometry Constraints: Do not violate the Triangle Inequality.
+- Probabilities: Numerators must not exceed denominators.
+- Keywords: NEVER remove words defining constraints (e.g., "distinct", "integer", "consecutive").
 
+STEP 4: The Failsafe
+If the question relies entirely on specific numbers (e.g., factoring a specific prime), or if any simplification would destroy the Core Logical Engine, DO NOT CHANGE IT. Output the exact original question.
+
+STEP 5: Learn from the Donor Demonstration (Few-Shot Analogical Reasoning)
+Below is a verified example (the "Donor Demonstration") showing how a structurally similar problem was successfully simplified. 
+CRITICAL INSTRUCTION: Use this example to learn *how* to apply the principles and analogical reasoning. However, DO NOT blindly copy its exact transformations. You must independently analyze the new Original Question, use professional mathematical reasoning to recognize which specific simplifications are safe and appropriate for its unique context, and ensure you do not violate the Valid vs. Invalid boundaries defined in STEP 2. Rely on deep structural understanding, not superficial mimicry.
+
+DEMONSTRATION:
 {donor_demonstration}
 
-
-YOUR TURN: INPUT
+INPUT
 Original Question:
 {original_question}
-
 
 OUTPUT FORMAT (Strictly follow this format):
 Simplified Question: [Your simplified proxy question here, or the exact original question if no safe simplification is possible]
 """,
+
 
     "core_simp_augmented_solver_v1": """You are an expert mathematical and logical reasoning system. Solve the Main Question by directly applying the reasoning trajectory of the provided Solved Example. This example is highly similar and shares the exact same underlying structural logic as your target question.
 
@@ -2004,16 +2082,132 @@ Final Answer:
 [Your final answer]
 </Your Answer/Output Format>""",
 
-    "CORE_SIMP_FEW_SHOT_SHORT_TEMPLATE" : """You are a math expert. Simplify the 'Target Complex Question' into a much shorter, proxy question by removing the complicated numbers, edge cases, and distracting narrative. Keep the core mathematical concept identical.
 
-Look at how this example was simplified:
-{donor_trace}
+    "core_simplification_few_shot_medium": """You are an expert mathematical AI. Your task is to perform "Core-Preserving Simplification" on a complex math competition problem.
 
-Now, simplify this question:
-Target Complex Question: {target_question}
+Your goal is to create a simpler "Proxy Question" that acts as an easy analogical stepping-stone. The Proxy Question MUST share the EXACT SAME logical structure, Chain of Thought, and theorems as the original problem, but be computationally and cognitively much easier.
 
-Output your response using exactly this format:
-Simplified Question: [Your short, proxy question here]
+To do this, use the following framework:
+
+STEP 1: Identify the "Core Logical Engine" (The Untouchable Logic)
+Identify the fundamental math concept required (e.g., Stars and Bars, Vieta's formulas, modular inverses). You MUST NOT alter the problem so much that this core theorem is bypassed.
+
+STEP 2: Apply Vectors of Simplification
+Analyze the problem and safely simplify its peripheral complexities. Below is a condensed toolkit of simplification vectors. 
+IMPORTANT: The examples below are basic "toy" examples to illustrate the concepts. You must look past the surface complexity of your actual problem, deeply analyze it, and apply the *underlying principles* of these vectors.
+
+Study the Valid vs. Invalid examples to understand the exact boundaries of what preserves versus what destroys logic:
+
+[Arithmetic & Algebra]
+- Downscaling & Smoothing: Reduce giant constants, roots, fractions, and polynomial degrees without bypassing necessary operations.
+  Valid: "2024^2024 mod 5" -> "4^4 mod 5" (Modular exponentiation preserved).
+  Invalid: "...mod 5" -> "Sum of digits of 1" (Trivializes problem).
+  Valid: "Roots of x^100 - 1 = 0" -> "Roots of x^4 - 1 = 0" (Roots of unity preserved).
+  Invalid: "Coeff of x^50 in (1+x)^100" -> "Coeff of x^1 in (1+x)^2" (Trivializes binomial expansion).
+- Variable & Sequence Reduction: Shorten long sums, products, or symmetric systems.
+  Valid: "Telescoping sum to 1000 terms" -> "...to 4 terms" (Cancellation logic remains).
+  Invalid: "Limit as n -> infinity" -> "Find the 3rd term" (Destroys calculus limit concept).
+
+[Combinatorics]
+- State-Space & Population Shrinking: Reduce grid sizes, set sizes, or probability iterations.
+  Valid: "Paths on 10x10 grid avoiding (5,5)" -> "4x4 grid avoiding (2,2)" (Inclusion-exclusion kept).
+  Invalid: "...on a 1x1 grid" (No room for obstacle; logic destroyed).
+  Valid: "Seat 100 people at round table" -> "Seat 5 people" ((n-1)! formula kept).
+  Invalid: "Seat 2 people..." (Yields (2-1)!=1; bypasses combinatorial thought).
+
+[Geometry]
+- Normalization & Shape Reduction: Shift coordinates to origin, shrink N-gons, or use standard angles.
+  Valid: "Distance from (1005, -2048) to..." -> "Distance from (0,0) to (3,4)" (Distance formula kept).
+  Invalid: "Area of polygon with vertices..." -> "...with vertex (0,0)" (A point is not a polygon).
+  Valid: "Interior angles of 100-gon" -> "...of a hexagon".
+  Invalid: "Diagonals in 100-gon" -> "...in a triangle" (Triangles have 0 diagonals; destroys formula).
+
+[Number Theory & Formatting]
+- Modulo/Base Lowering & Un-nesting: Shrink modulos/bases and remove arbitrary final formatting math.
+  Valid: "Last 3 digits of 7^999" -> "Last digit of 7^99" (Euler's totient preserved).
+  Invalid: "Find x mod 1000" -> "Find x mod 1" (Always 0; destroys modular arithmetic).
+  Valid: "Find r, then calc floor(100*pi*r^2 - 17)" -> "Find area pi*r^2" (Removes formatting noise).
+  Invalid: "Find roots r1, r2, then calc r1^2 + r2^2" -> "Find roots r1, r2" (Loses algebraic manipulation).
+
+STEP 3: The Mathematical Safety Check
+Ensure your selected simplifications do not break math rules:
+- Parity/Divisibility: If a number MUST be even for the problem to work, your smaller number must be even.
+- Geometry Constraints: Do not violate the Triangle Inequality.
+- Probabilities: Numerators must not exceed denominators.
+- Keywords: NEVER remove words defining constraints (e.g., "distinct", "integer", "consecutive").
+
+STEP 4: The Failsafe
+If the question relies entirely on specific numbers (e.g., factoring a specific prime), or if any simplification would destroy the Core Logical Engine, DO NOT CHANGE IT. Output the exact original question.
+
+STEP 5: Learn from the Donor Demonstration (Few-Shot Analogical Reasoning)
+Below is a verified example (the "Donor Demonstration") showing how a structurally similar problem was successfully simplified. 
+CRITICAL INSTRUCTION: Use this example to learn *how* to apply the principles and analogical reasoning. However, DO NOT blindly copy its exact transformations. You must independently analyze the new Original Question, use professional mathematical reasoning to recognize which specific simplifications are safe and appropriate for its unique context, and ensure you do not violate the Valid vs. Invalid boundaries defined in STEP 2. Rely on deep structural understanding, not superficial mimicry.
+
+DEMONSTRATION:
+{donor_demonstration}
+
+INPUT
+Original Question:
+{original_question}
+
+OUTPUT FORMAT (Strictly follow this format):
+Simplified Question: [Your simplified proxy question here, or the exact original question if no safe simplification is possible]
+""",
+
+    "core_simplification_few_shot_small": """You are an expert mathematical AI. Your task is to perform "Core-Preserving Simplification" on a complex math competition problem.
+
+Your goal is to create a simpler "Proxy Question" that acts as an easy analogical stepping-stone. The Proxy Question MUST share the EXACT SAME logical structure, Chain of Thought, and theorems as the original problem, but be computationally and cognitively much easier.
+
+To do this, use the following framework:
+
+STEP 1: Identify the "Core Logical Engine" (The Untouchable Logic)
+Identify the fundamental math concept required (e.g., Stars and Bars, Vieta's formulas, modular inverses). You MUST NOT alter the problem so much that this core theorem is bypassed.
+
+STEP 2: Safely Simplify Peripheral Complexities
+Analyze the problem and safely simplify its non-core elements. You may downscale giant constants, reduce polynomial degrees, shrink grid/population sizes, or simplify geometric shapes. 
+IMPORTANT: You must preserve the mathematical steps required to solve the problem. Do not trivialize the problem (e.g., reducing a complex modulo question to "mod 1", which destroys the logic, or shrinking a polygon to a single point). The simplified parameters must still force the solver to use the exact same underlying theorem.
+
+STEP 3: The Mathematical Safety Check
+Ensure your selected simplifications do not break math rules:
+- Parity/Divisibility: If a number MUST be even for the problem to work, your smaller number must be even.
+- Geometry Constraints: Do not violate the Triangle Inequality.
+- Probabilities: Numerators must not exceed denominators.
+- Keywords: NEVER remove words defining constraints (e.g., "distinct", "integer", "consecutive").
+
+STEP 4: The Failsafe
+If the question relies entirely on specific numbers (e.g., factoring a specific prime), or if any simplification would destroy the Core Logical Engine, DO NOT CHANGE IT. Output the exact original question.
+
+STEP 5: Learn from the Donor Demonstration (Few-Shot Analogical Reasoning)
+Below is a verified example (the "Donor Demonstration") showing how a structurally similar problem was successfully simplified. 
+CRITICAL INSTRUCTION: Use this example to learn *how* to apply the principles and analogical reasoning. However, DO NOT blindly copy its exact transformations. You must independently analyze the new Original Question, use professional mathematical reasoning to recognize which specific simplifications are safe and appropriate for its unique context, and ensure you do not trivialize the underlying logic. Rely on deep structural understanding, not superficial mimicry.
+
+DEMONSTRATION:
+{donor_demonstration}
+
+INPUT
+Original Question:
+{original_question}
+
+OUTPUT FORMAT (Strictly follow this format):
+Simplified Question: [Your simplified proxy question here, or the exact original question if no safe simplification is possible]
+""",
+
+    "core_simplification_few_shot_nano": """You are a helpful mathematical AI. Your task is to simplify a complex math problem into an easier "Proxy Question".
+
+To do this, you must keep the EXACT same mathematical logic, theorems, and critical keywords as the original problem, but scale down the complexity. Do not make the problem so simple that it breaks the underlying math or solves itself. If the problem cannot be simplified safely without destroying the core logic, just output the exact original question.
+
+HOW TO DO IT:
+Below is a verified example. Look very carefully at how the Original Question in the example was simplified. Notice exactly what parts were changed to be easier, and what parts were left completely untouched to preserve the core math. The example shows you exactly what a safe, effective simplification looks like for this specific type of problem. Deeply understand the example, and then apply that exact same style of simplification to your new problem.
+
+EXAMPLE DEMONSTRATION:
+{donor_demonstration}
+
+YOUR TURN:
+Original Question:
+{original_question}
+
+OUTPUT FORMAT (Strictly follow this format):
+Simplified Question: [Your simplified proxy question here, or the exact original question if no safe simplification is possible]
 """
 
 
@@ -2022,14 +2216,27 @@ Simplified Question: [Your short, proxy question here]
 }
 
 
-def create_core_simp_few_shot_short_prompt(target_question: str, donor_trace: str) -> str:
+def create_core_simp_few_shot_short_prompt(target_question: str, donor_trace: str, config: dict = None) -> str:
     """
     Creates a concise, short-instruction few-shot prompt for core-preserving simplification (Branch D).
     """
-    return CORE_SIMP_FEW_SHOT_SHORT_TEMPLATE.format(
+    config = config or {}
+    # Fetch the template name from config
+    template_name = config.get("PROMPT_TEMPLATE_CORE_SIMP_BRANCH_D")
+    
+    # If a custom template is set and exists in PROMPT_TEMPLATES, use it. 
+    # Otherwise, fall back to the original constant.
+    if template_name and template_name in PROMPT_TEMPLATES:
+        template = PROMPT_TEMPLATES[template_name]
+    else:
+        template = core_simplification_few_shot_medium
+
+    return template.format(
         target_question=target_question,
         donor_trace=donor_trace
     )
+
+
 def create_reverse_transformation_main_to_exemplar_prompt(main_question: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
     """Creates a prompt to transform the main question to match the retrieved exemplar."""
     template = PROMPT_TEMPLATES["reverse_transformation_main_to_exemplar"]
@@ -2245,8 +2452,13 @@ def create_core_simp_zero_shot_prompt(original_question: str) -> str:
     template = PROMPT_TEMPLATES["core_simplification_zero_shot_v1"]
     return template.format(original_question=original_question)
 
-def create_core_simp_few_shot_prompt(original_question: str, donor_demonstration: str) -> str:
-    template = PROMPT_TEMPLATES["core_simplification_few_shot_v1"]
+def create_core_simp_few_shot_prompt(original_question: str, donor_demonstration: str, config: dict = None) -> str:
+    config = config or {}
+    # Fetch the template name from config, fallback to the original v1
+    template_name = config.get("PROMPT_TEMPLATE_CORE_SIMP_BRANCH_C", "core_simplification_few_shot_v1")
+    
+    template = PROMPT_TEMPLATES.get(template_name)
+    
     return template.format(
         original_question=original_question,
         donor_demonstration=donor_demonstration

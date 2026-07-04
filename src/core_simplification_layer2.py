@@ -265,7 +265,7 @@ def run_parallel_evaluation_branches(
     # BRANCH C: Few-Shot Analogical Simplification (Complex Prompt)
     # -------------------------------------------------------------------------
     if config.get("CORE_SIMP_RUN_BRANCH_C", True):
-        prompt_c = create_core_simp_few_shot_prompt(t_q, d_trace)
+        prompt_c = create_core_simp_few_shot_prompt(t_q, d_trace, config)
         match_data_b = (score_b, attempts_b)
         score_c, attempts_c, trace_c, status_c, proxy_q_c = _execute_simplification_branch(
             "Branch C (Few-Shot Complex)", prompt_c, match_proxy=proxy_q_b, match_results=match_data_b
@@ -284,7 +284,7 @@ def run_parallel_evaluation_branches(
     # BRANCH D: Few-Shot Analogical Simplification (Concise Prompt)
     # -------------------------------------------------------------------------
     if config.get("CORE_SIMP_RUN_BRANCH_D", True):
-        prompt_d = create_core_simp_few_shot_short_prompt(t_q, d_trace)
+        prompt_d = create_core_simp_few_shot_short_prompt(t_q, d_trace, config)
         # We also pass match_proxy so it saves API calls if it outputs the same proxy as Branch B
         match_data_b = (score_b, attempts_b) 
         score_d, attempts_d, trace_d, status_d, proxy_q_d = _execute_simplification_branch(
