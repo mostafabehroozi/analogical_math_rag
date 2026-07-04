@@ -1400,7 +1400,6 @@ def run_experiments(
     # =========================================================================
     if phase2_configs:
         logger.info(f"Found {len(phase2_configs)} Core Simplification Phase 2 config(s); running them now.")
-        # We will create this file in the next step!
         from src.core_simplification_layer2 import execute_core_simplification_phase2
         
         for exp_overrides in phase2_configs:
@@ -1410,7 +1409,21 @@ def run_experiments(
             
             logger.info(f"--- Core Simplification Phase 2 '{exp_name}' starting ---")
             
-            # =========================================================================
+            # --- MISSING BLOCK ADDED HERE ---
+            phase2_results = execute_core_simplification_phase2(
+                hard_questions=hard_questions,
+                hard_solutions=hard_solutions,
+                exemplar_data=exemplar_data,
+                embedding_model=embedding_model,
+                api_managers=api_managers,
+                config=current_config
+            )
+            
+            all_results[exp_name] = phase2_results
+            logger.info(f"--- Phase 2 '{exp_name}' finished. ---")
+            # --------------------------------
+
+    # =========================================================================
     # SPECIAL CASE: Merging Dataset Construction
     # =========================================================================
     merging_ds_configs = [exp for exp in experiment_configs if exp.get("APPLY_MERGING_DATASET_CONSTRUCTION")]

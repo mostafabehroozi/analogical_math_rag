@@ -2216,25 +2216,6 @@ Simplified Question: [Your simplified proxy question here, or the exact original
 }
 
 
-def create_core_simp_few_shot_short_prompt(target_question: str, donor_trace: str, config: dict = None) -> str:
-    """
-    Creates a concise, short-instruction few-shot prompt for core-preserving simplification (Branch D).
-    """
-    config = config or {}
-    # Fetch the template name from config
-    template_name = config.get("PROMPT_TEMPLATE_CORE_SIMP_BRANCH_D")
-    
-    # If a custom template is set and exists in PROMPT_TEMPLATES, use it. 
-    # Otherwise, fall back to the original constant.
-    if template_name and template_name in PROMPT_TEMPLATES:
-        template = PROMPT_TEMPLATES[template_name]
-    else:
-        template = core_simplification_few_shot_medium
-
-    return template.format(
-        target_question=target_question,
-        donor_trace=donor_trace
-    )
 
 
 def create_reverse_transformation_main_to_exemplar_prompt(main_question: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
@@ -2452,12 +2433,43 @@ def create_core_simp_zero_shot_prompt(original_question: str) -> str:
     template = PROMPT_TEMPLATES["core_simplification_zero_shot_v1"]
     return template.format(original_question=original_question)
 
-def create_core_simp_few_shot_prompt(original_question: str, donor_demonstration: str, config: dict = None) -> str:
+def create_core_simp_few_shot_short_prompt(original_question: str, donor_demonstration: str, config: dict = None) -> str:
+    """
+    Creates a concise, short-instruction few-shot prompt for core-preserving simplification (Branch D).
+    """
     config = config or {}
-    # Fetch the template name from config, fallback to the original v1
+    
+    # Fetch the template name from config, fallback to the medium template key
+    template_name = config.get("PROMPT_TEMPLATE_CORE_SIMP_BRANCH_D", "core_simplification_few_shot_medium")
+    
+    # Safely get the template from the dictionary
+    template = PROMPT_TEMPLATES.get(template_name)
+    
+    # Absolute fallback just in case the dictionary lookup fails
+    if not template:
+        template = PROMPT_TEMPLATES.get("core_simplification_few_shot_medium")
+
+    # The keys here MUST match {original_question} and {donor_demonstration} in the string
+    return template.format(
+        original_question=original_question,
+        donor_demonstration=donor_demonstration
+    )
+
+def create_core_simp_few_shot_prompt(original_question: str, donor_demonstration: str, config: dict = None) -> str:
+    """
+    Creates a detailed few-shot prompt for core-preserving simplification (Branch C).
+    """
+    config = config or {}
+    
+    # Fetch the template name from config, fallback to the v1 template key
     template_name = config.get("PROMPT_TEMPLATE_CORE_SIMP_BRANCH_C", "core_simplification_few_shot_v1")
     
+    # Safely get the template
     template = PROMPT_TEMPLATES.get(template_name)
+    
+    # Absolute fallback just in case
+    if not template:
+        template = PROMPT_TEMPLATES.get("core_simplification_few_shot_v1")
     
     return template.format(
         original_question=original_question,
