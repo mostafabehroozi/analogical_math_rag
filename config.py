@@ -351,8 +351,14 @@ CONFIG = {
 
 
     # CORE-PRESERVING SIMPLIFICATION FLAGS
+# CORE-PRESERVING SIMPLIFICATION FLAGS
     "APPLY_CORE_SIMP_PHASE1": False,           # Master switch for Phase 1 (Dataset Construction)
     "APPLY_CORE_SIMP_PHASE2": False,           # Master switch for Phase 2 (Analogical Evaluation)
+    "CORE_SIMP_RUN_BRANCH_A": True,            # Branch A: Baseline (Direct Solve)
+    "CORE_SIMP_RUN_BRANCH_B": True,            # Branch B: Zero-Shot Simplification
+    "CORE_SIMP_RUN_BRANCH_C": True,            # Branch C: Few-Shot (Complex/Detailed Prompt)
+    "CORE_SIMP_RUN_BRANCH_D": True,            # Branch D: Few-Shot (Short/Concise Prompt)
+    "CORE_SIMP_PHASE1_N_ATTEMPTS": 5,          # The N value for Pass@N A/B testing in Phase 1
     "CORE_SIMP_PHASE1_N_ATTEMPTS": 5,          # The N value for Pass@N A/B testing in Phase 1
     "CORE_SIMP_DATASET_NAME": "core_simp_dataset.json", # File to save successful simplifications (Donors)
     "CORE_SIMP_LAYER2_RESULTS_NAME": "core_simp_layer2_results.json", # File to save Phase 2 results

@@ -2004,9 +2004,32 @@ Final Answer:
 [Your final answer]
 </Your Answer/Output Format>""",
 
+    "CORE_SIMP_FEW_SHOT_SHORT_TEMPLATE" : """You are a math expert. Simplify the 'Target Complex Question' into a much shorter, proxy question by removing the complicated numbers, edge cases, and distracting narrative. Keep the core mathematical concept identical.
+
+Look at how this example was simplified:
+{donor_trace}
+
+Now, simplify this question:
+Target Complex Question: {target_question}
+
+Output your response using exactly this format:
+Simplified Question: [Your short, proxy question here]
+"""
+
+
+
 
 }
 
+
+def create_core_simp_few_shot_short_prompt(target_question: str, donor_trace: str) -> str:
+    """
+    Creates a concise, short-instruction few-shot prompt for core-preserving simplification (Branch D).
+    """
+    return CORE_SIMP_FEW_SHOT_SHORT_TEMPLATE.format(
+        target_question=target_question,
+        donor_trace=donor_trace
+    )
 def create_reverse_transformation_main_to_exemplar_prompt(main_question: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
     """Creates a prompt to transform the main question to match the retrieved exemplar."""
     template = PROMPT_TEMPLATES["reverse_transformation_main_to_exemplar"]

@@ -18,7 +18,8 @@ from src.prompts import (
     create_final_reasoning_prompt_simple,
     create_core_simp_zero_shot_prompt,
     create_core_simp_few_shot_prompt,
-    create_core_simp_augmented_solver_prompt
+    create_core_simp_augmented_solver_prompt,
+    create_core_simp_few_shot_short_prompt
 )
 
 # Import shared helpers from Phase 1 to keep code DRY
@@ -149,20 +150,24 @@ def run_parallel_evaluation_branches(
     # -------------------------------------------------------------------------
     # BRANCH A: Baseline (Direct Solve)
     # -------------------------------------------------------------------------
-    print(f"  -> [Branch A] Baseline Direct Solve (N={n_attempts})...")
-    prompt_a = create_final_reasoning_prompt_simple(t_q, config)
-    
-    # Note: target_correct_to_beat=-1 ensures no early stopping. We want full Pass@N data.
-    score_a, attempts_a = _solve_and_evaluate(
-        t_q, t_gt, prompt_a, api_manager_solve, api_manager_eval, config,
-        n_attempts, temp_solve, "branch_a_baseline", local_trace, target_correct_to_beat=-1
-    )
-    results["branch_a_score"] = score_a
-    results["branch_a_attempts"] = attempts_a
-    print(f"     => Score A: {score_a:.2f}")
+    if config.get("CORE_SIMP_RUN_BRANCH_A", True):
+        print(f"  -> [Branch A] Baseline Direct Solve (N={n_attempts})...")
+        prompt_a = create_final_reasoning_prompt_simple(t_q, config)
+        score_a, attempts_a = _solve_and_evaluate(
+            t_q, t_gt, prompt_a, api_manager_solve, api_manager_eval, config,
+            n_attempts, temp_solve, "branch_a_baseline", local_trace, target_correct_to_beat=-1
+        )
+        results["branch_a_score"] = score_a
+        results["branch_a_attempts"] = attempts_a
+        print(f"     => Score A: {score_a:.2f}")
+    else:
+        print("  -> [Branch A] SKIPPED via config.")
+        score_a, attempts_a = 0.0, []  # Safe defaults in case fallback is needed
+        results["branch_a_score"] = None
+        results["branch_a_status"] = "SKIPPED"
 
     # -------------------------------------------------------------------------
-    # Helper Function for Branches B and C (Fully Optimized)
+    # Helper Function for Branches B, C, and D (Fully Optimized)
     # -------------------------------------------------------------------------
     def _execute_simplification_branch(branch_name: str, gen_prompt: str, match_proxy: str = None, match_results: tuple = None) -> tuple:
         print(f"  -> [{branch_name}] Generating Proxy...")
@@ -188,17 +193,17 @@ def run_parallel_evaluation_branches(
                 is_fallback = True
                 print(f"     => Failsafe triggered or parsing failed. Triggering Fallback.")
                 
-            # === NEW: CONVERGENCE OPTIMIZATION ===
+            # === CONVERGENCE OPTIMIZATION ===
             elif match_proxy and clean_text(proxy_q) == clean_text(match_proxy):
-                print(f"     => [CONVERGENCE] Branch generated the exact same proxy as Branch B!")
-                print(f"     => Recycling Branch B's solve and evaluation results to save API costs.")
+                print(f"     => [CONVERGENCE] Branch generated the exact same proxy as a previous branch!")
+                print(f"     => Recycling previous solve and evaluation results to save API costs.")
                 local_trace.append({
                     "step": "layer2", 
                     "sub_step": f"{branch_name}_convergence", 
                     "note": "Recycled previous branch results because generated proxy was identical."
                 })
                 # match_results contains (score_b, attempts_b)
-                return match_results[0], match_results[1], resp_gen['text'], "CONVERGED_WITH_B", proxy_q
+                return match_results[0], match_results[1], resp_gen['text'], "CONVERGED", proxy_q
             # =====================================
 
         # 2. Execute solving logic
@@ -214,7 +219,7 @@ def run_parallel_evaluation_branches(
             resp_proxy = api_manager_solve.generate_content(prompt_proxy_solve, m_solve, temp_solve)
             local_trace.append(create_trace_entry("layer2", f"{branch_name}_solve_proxy", {"prompt": prompt_proxy_solve}, resp_proxy, {"model": m_solve}))
             
-            # === NEW: EMPTY RESPONSE FAST-FAIL OPTIMIZATION ===
+            # === EMPTY RESPONSE FAST-FAIL OPTIMIZATION ===
             proxy_solution_text = resp_proxy.get('text', '').strip()
             
             if resp_proxy['status'] != 'SUCCESS' or not proxy_solution_text:
@@ -242,31 +247,58 @@ def run_parallel_evaluation_branches(
     # -------------------------------------------------------------------------
     # BRANCH B: Zero-Shot Simplification
     # -------------------------------------------------------------------------
-    prompt_b = create_core_simp_zero_shot_prompt(t_q)
-    score_b, attempts_b, trace_b, status_b, proxy_q_b = _execute_simplification_branch("Branch B (Zero-Shot)", prompt_b)
-    
-    results["branch_b_score"] = score_b
-    results["branch_b_status"] = status_b
-    results["branch_b_trace_text"] = trace_b
-    results["branch_b_attempts"] = attempts_b
-    print(f"     => Score B: {score_b:.2f} ({status_b})")
+    if config.get("CORE_SIMP_RUN_BRANCH_B", True):
+        prompt_b = create_core_simp_zero_shot_prompt(t_q)
+        score_b, attempts_b, trace_b, status_b, proxy_q_b = _execute_simplification_branch("Branch B (Zero-Shot)", prompt_b)
+        results["branch_b_score"] = score_b
+        results["branch_b_status"] = status_b
+        results["branch_b_trace_text"] = trace_b
+        results["branch_b_attempts"] = attempts_b
+        print(f"     => Score B: {score_b:.2f} ({status_b})")
+    else:
+        print("  -> [Branch B] SKIPPED via config.")
+        score_b, attempts_b, proxy_q_b = 0.0, [], None # Safe defaults
+        results["branch_b_score"] = None
+        results["branch_b_status"] = "SKIPPED"
 
     # -------------------------------------------------------------------------
-    # BRANCH C: Few-Shot Analogical Simplification (Core Innovation)
+    # BRANCH C: Few-Shot Analogical Simplification (Complex Prompt)
     # -------------------------------------------------------------------------
-    prompt_c = create_core_simp_few_shot_prompt(t_q, d_trace)
-    
-    # Pass Branch B's data so Branch C can check for convergence
-    match_data_b = (score_b, attempts_b)
-    score_c, attempts_c, trace_c, status_c, proxy_q_c = _execute_simplification_branch(
-        "Branch C (Few-Shot Analogical)", prompt_c, match_proxy=proxy_q_b, match_results=match_data_b
-    )
-    
-    results["branch_c_score"] = score_c
-    results["branch_c_status"] = status_c
-    results["branch_c_trace_text"] = trace_c
-    results["branch_c_attempts"] = attempts_c
-    print(f"     => Score C: {score_c:.2f} ({status_c})")
+    if config.get("CORE_SIMP_RUN_BRANCH_C", True):
+        prompt_c = create_core_simp_few_shot_prompt(t_q, d_trace)
+        match_data_b = (score_b, attempts_b)
+        score_c, attempts_c, trace_c, status_c, proxy_q_c = _execute_simplification_branch(
+            "Branch C (Few-Shot Complex)", prompt_c, match_proxy=proxy_q_b, match_results=match_data_b
+        )
+        results["branch_c_score"] = score_c
+        results["branch_c_status"] = status_c
+        results["branch_c_trace_text"] = trace_c
+        results["branch_c_attempts"] = attempts_c
+        print(f"     => Score C: {score_c:.2f} ({status_c})")
+    else:
+        print("  -> [Branch C] SKIPPED via config.")
+        results["branch_c_score"] = None
+        results["branch_c_status"] = "SKIPPED"
+
+    # -------------------------------------------------------------------------
+    # BRANCH D: Few-Shot Analogical Simplification (Concise Prompt)
+    # -------------------------------------------------------------------------
+    if config.get("CORE_SIMP_RUN_BRANCH_D", True):
+        prompt_d = create_core_simp_few_shot_short_prompt(t_q, d_trace)
+        # We also pass match_proxy so it saves API calls if it outputs the same proxy as Branch B
+        match_data_b = (score_b, attempts_b) 
+        score_d, attempts_d, trace_d, status_d, proxy_q_d = _execute_simplification_branch(
+            "Branch D (Few-Shot Concise)", prompt_d, match_proxy=proxy_q_b, match_results=match_data_b
+        )
+        results["branch_d_score"] = score_d
+        results["branch_d_status"] = status_d
+        results["branch_d_trace_text"] = trace_d
+        results["branch_d_attempts"] = attempts_d
+        print(f"     => Score D: {score_d:.2f} ({status_d})")
+    else:
+        print("  -> [Branch D] SKIPPED via config.")
+        results["branch_d_score"] = None
+        results["branch_d_status"] = "SKIPPED"
     
     # Store all traces for debugging
     results["execution_trace"] = local_trace
