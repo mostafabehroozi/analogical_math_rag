@@ -274,10 +274,20 @@ def run_parallel_evaluation_branches(
 
         # 2. Execute solving logic
         if is_fallback:
-            # OPTIMIZATION: Recycle Branch A's results
-            print(f"     => Re-using Branch A baseline results to save API costs.")
-            local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_fallback_solve", "note": f"Recycled Branch A results due to: {fallback_reason}"})
-            return score_a, attempts_a, resp_gen.get('text', 'API_FAILED'), fallback_reason, proxy_q
+            if attempts_a:
+                # OPTIMIZATION: Branch A ran, recycle its results
+                print(f"     => Re-using Branch A baseline results to save API costs.")
+                local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_fallback_solve", "note": f"Recycled Branch A results due to: {fallback_reason}"})
+                return score_a, attempts_a, resp_gen.get('text', 'API_FAILED'), fallback_reason, proxy_q
+            else:
+                # SAFEGUARD: Branch A was OFF. We must perform a fresh baseline solve.
+                print(f"     => Branch A was OFF. Performing a fresh direct solve for fallback...")
+                prompt_fallback = create_final_reasoning_prompt_simple(t_q, config)
+                fb_score, fb_attempts = _solve_and_evaluate(
+                    t_q, t_gt, prompt_fallback, api_manager_solve, api_manager_eval, config,
+                    n_attempts, temp_solve, f"{branch_name}_fallback_solve_fresh", local_trace, target_correct_to_beat=-1
+                )
+                return fb_score, fb_attempts, resp_gen.get('text', 'API_FAILED'), fallback_reason, proxy_q
         else:
             # Solve the Proxy
             print(f"  -> [{branch_name}] Solving Proxy...")
@@ -290,13 +300,19 @@ def run_parallel_evaluation_branches(
             
             if resp_proxy['status'] != 'SUCCESS' or not proxy_solution_text:
                 error_reason = "API failed" if resp_proxy['status'] != 'SUCCESS' else "Empty/Blank response"
-                print(f"     => Proxy solve failed ({error_reason}). Re-using Branch A baseline results.")
-                local_trace.append({
-                    "step": "layer2", 
-                    "sub_step": f"{branch_name}_fallback_solve2", 
-                    "note": f"Recycled Branch A results due to proxy solve failure: {error_reason}"
-                })
-                return score_a, attempts_a, resp_gen['text'], "FALLBACK_PROXY_SOLVE_FAILED", proxy_q
+                
+                if attempts_a:
+                    print(f"     => Proxy solve failed ({error_reason}). Re-using Branch A baseline results.")
+                    local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_fallback_solve2", "note": f"Recycled Branch A results due to: {error_reason}"})
+                    return score_a, attempts_a, resp_gen['text'], "FALLBACK_PROXY_SOLVE_FAILED", proxy_q
+                else:
+                    print(f"     => Proxy solve failed ({error_reason}). Branch A was OFF, performing fresh direct solve...")
+                    prompt_fallback = create_final_reasoning_prompt_simple(t_q, config)
+                    fb_score, fb_attempts = _solve_and_evaluate(
+                        t_q, t_gt, prompt_fallback, api_manager_solve, api_manager_eval, config,
+                        n_attempts, temp_solve, f"{branch_name}_fallback_solve2_fresh", local_trace, target_correct_to_beat=-1
+                    )
+                    return fb_score, fb_attempts, resp_gen['text'], "FALLBACK_PROXY_SOLVE_FAILED", proxy_q
             # ==================================================
             
             # Augmented Solve
