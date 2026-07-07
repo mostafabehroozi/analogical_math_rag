@@ -104,7 +104,11 @@ def build_paired_test_suite(
                     "test_question": hard_questions[actual_unseen_idx],
                     "ground_truth": hard_solutions[actual_unseen_idx],
                     "linked_donor_original_idx": donor.get('original_index'),
-                    "linked_donor_trace_text": demo_text  # We inject the clean demo text here!
+                    "linked_donor_trace_text": demo_text,  # We inject the clean demo text here!
+                    
+                    "linked_donor_original_q": donor.get('original_question'),
+                    "linked_donor_ground_truth": donor.get('ground_truth'),
+                    "linked_donor_base_score": donor.get('base_score', 0.0)
                 })
                 assigned_count += 1
 
@@ -124,6 +128,10 @@ def run_parallel_evaluation_branches(
     t_q = test_item["test_question"]
     t_gt = test_item["ground_truth"]
     d_trace = test_item["linked_donor_trace_text"]
+    
+    d_q = test_item.get("linked_donor_original_q", "")
+    d_gt = test_item.get("linked_donor_ground_truth", "")
+    d_base_score = test_item.get("linked_donor_base_score", 0.0)
     
     n_attempts = config.get("CORE_SIMP_LAYER2_N_ATTEMPTS", 5)
     temp_gen = config.get("CORE_SIMP_TEMPERATURE_GEN", 0.3)
@@ -178,9 +186,11 @@ def run_parallel_evaluation_branches(
         
         is_fallback = False
         proxy_q = ""
+        fallback_reason = "FALLBACK_TRIGGERED"  # Default reason
         
         if resp_gen['status'] != 'SUCCESS':
             is_fallback = True
+            fallback_reason = "API_FAILED"
             print(f"     => Proxy generation API failed. Triggering Fallback.")
         else:
             parsed = _parse_simplification_trace(resp_gen['text'])
@@ -191,6 +201,7 @@ def run_parallel_evaluation_branches(
             # Failsafe Checks
             if not proxy_q or clean_text(proxy_q) == clean_text(t_q):
                 is_fallback = True
+                fallback_reason = "FAILSAFE_IDENTICAL_OR_EMPTY"
                 print(f"     => Failsafe triggered or parsing failed. Triggering Fallback.")
                 
             # === CONVERGENCE OPTIMIZATION ===
@@ -206,12 +217,67 @@ def run_parallel_evaluation_branches(
                 return match_results[0], match_results[1], resp_gen['text'], "CONVERGED", proxy_q
             # =====================================
 
+            # === NEW: BIDIRECTIONAL MIRROR FILTER (Steps 4 & 5) ===
+            elif config.get("CORE_SIMP_ENABLE_MIRROR_FILTER", False) and "Few-Shot" in branch_name:
+                print(f"     => [Mirror Filter] Verifying analogical symmetry (Test B -> Donor A)...")
+                
+                # A. Inverted Demo Creation
+                inverted_demo = f"Original Question:\n{t_q}\n\nSimplified Question:\n{proxy_q}"
+                
+                # B. Mirror Generation (A_simp_mirrored)
+                prompt_mirror_gen = create_core_simp_few_shot_prompt(d_q, inverted_demo, config)
+                resp_mirror_gen = api_manager_solve.generate_content(prompt_mirror_gen, m_gen, temp_gen)
+                local_trace.append(create_trace_entry("layer2", f"{branch_name}_mirror_gen", {"prompt": prompt_mirror_gen}, resp_mirror_gen, {"model": m_gen}))
+                
+                if resp_mirror_gen['status'] != 'SUCCESS':
+                    print(f"        -> Mirror generation failed. Rejecting.")
+                    is_fallback = True
+                    fallback_reason = "REJECTED_MIRROR_GEN_FAIL"
+                else:
+                    parsed_mirror = _parse_simplification_trace(resp_mirror_gen['text'])
+                    proxy_a = parsed_mirror.get("proxy_question", "")
+                    
+                    # C. Mirror Solve
+                    prompt_mirror_solve = create_final_reasoning_prompt_simple(proxy_a, config)
+                    resp_mirror_solve = api_manager_solve.generate_content(prompt_mirror_solve, m_solve, temp_solve)
+                    local_trace.append(create_trace_entry("layer2", f"{branch_name}_mirror_solve", {"prompt": prompt_mirror_solve}, resp_mirror_solve, {"model": m_solve}))
+                    
+                    if resp_mirror_solve['status'] != 'SUCCESS' or not resp_mirror_solve['text'].strip():
+                        print(f"        -> Mirror solve failed. Rejecting.")
+                        is_fallback = True
+                        fallback_reason = "REJECTED_MIRROR_SOLVE_FAIL"
+                    else:
+                        # D. Validation (Calculate CCS_mirrored)
+                        mirrored_combined = f"Question: {proxy_a}\nRationale and Answer: {resp_mirror_solve['text']}"
+                        prompt_mirror_aug = create_core_simp_augmented_solver_prompt(d_q, mirrored_combined)
+                        
+                        mirror_n = config.get("CORE_SIMP_MIRROR_N_ATTEMPTS", 3)
+                        # Early-stopping optimization: mathematically must beat baseline
+                        target_correct = int(d_base_score * mirror_n) 
+                        
+                        ccs_mirrored, _ = _solve_and_evaluate(
+                            d_q, d_gt, prompt_mirror_aug, api_manager_solve, api_manager_eval, config,
+                            mirror_n, temp_solve, f"{branch_name}_mirror_eval", local_trace, target_correct_to_beat=target_correct
+                        )
+                        
+                        # E. The Filter Gate
+                        print(f"        -> CCS_mirrored(A) = {ccs_mirrored:.2f} | CCS_base(A) = {d_base_score:.2f}")
+                        if ccs_mirrored <= d_base_score:
+                            print(f"     => [Mirror Filter] REJECTED. Symmetry broken (CCS_m <= CCS_b). Falling back to Branch A.")
+                            local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_mirror_filter", "note": f"Rejected: {ccs_mirrored:.2f} <= {d_base_score:.2f}"})
+                            is_fallback = True
+                            fallback_reason = "REJECTED_BY_MIRROR_FILTER"
+                        else:
+                            print(f"     => [Mirror Filter] PASSED! Analogical symmetry confirmed.")
+                            local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_mirror_filter", "note": f"Passed: {ccs_mirrored:.2f} > {d_base_score:.2f}"})
+            # ========================================================
+
         # 2. Execute solving logic
         if is_fallback:
             # OPTIMIZATION: Recycle Branch A's results
             print(f"     => Re-using Branch A baseline results to save API costs.")
-            local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_fallback_solve", "note": "Recycled Branch A results"})
-            return score_a, attempts_a, resp_gen.get('text', 'API_FAILED'), "FALLBACK_TRIGGERED", proxy_q
+            local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_fallback_solve", "note": f"Recycled Branch A results due to: {fallback_reason}"})
+            return score_a, attempts_a, resp_gen.get('text', 'API_FAILED'), fallback_reason, proxy_q
         else:
             # Solve the Proxy
             print(f"  -> [{branch_name}] Solving Proxy...")
