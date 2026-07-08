@@ -90,6 +90,7 @@ class ExperimentResult:
     ap_improvement: Optional[float] = None  # Delta: reranked - original
     candidate_coverage_rate: Optional[float] = None  # Fraction of candidate set used
     avg_rerank_position_shift: Optional[float] = None  # Avg rank movement (Block A only)
+    boundary_encapsulation: Optional[float] = None  # NEW: Dedicated metric for Block B
     
     # Meta
     timestamp: str = None
@@ -1354,6 +1355,7 @@ class BlockB:
             
             encapsulation = (true_inside + (false_outside if total_outside > 0 else 0)) / len(ranked_list_for_boundary)
             
+            result.boundary_encapsulation = float(encapsulation)  # Save it cleanly
             result.notes = f"Boundary encapsulation: {encapsulation:.4f}"
             logger.info(f"  Boundary encapsulation: {encapsulation:.4f}")
         
@@ -1722,7 +1724,8 @@ class ThreadAggregator:
             "ap_scores_original": [],
             "ap_improvements": [],
             "coverage_rates": [],
-            "position_shifts": []
+            "position_shifts": [],
+            "encapsulations": []
         })
         
         # Aggregate results by configuration thread
@@ -1783,6 +1786,8 @@ class ThreadAggregator:
                 agg_data[thread_key]["coverage_rates"].append(result.candidate_coverage_rate)
             if result.avg_rerank_position_shift is not None:
                 agg_data[thread_key]["position_shifts"].append(result.avg_rerank_position_shift)
+            if result.boundary_encapsulation is not None:
+                agg_data[thread_key]["encapsulations"].append(result.boundary_encapsulation)
         
         # Convert aggregated lists to averages
         for thread_key, data in agg_data.items():
@@ -1796,6 +1801,7 @@ class ThreadAggregator:
             # Average additional metrics
             data["avg_coverage_rate"] = np.mean(data["coverage_rates"]) if data["coverage_rates"] else None
             data["avg_position_shift"] = np.mean(data["position_shifts"]) if data["position_shifts"] else None
+            data["avg_encapsulation"] = np.mean(data["encapsulations"]) if data["encapsulations"] else None
             
             # Convert Pass@K sum to average
             for k in data["pass_at_metrics"]:
@@ -2145,7 +2151,7 @@ class Layer2Orchestrator:
         headers.extend(["AP_Score_Reranked", "AP_Score_Original", "AP_Improvement"])
         
         # Group 9: Additional Analysis
-        headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift"])
+        headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Avg_Boundary_Encapsulation"])
         
         # Write to CSV (Atomically)
         temp_csv_filepath = csv_filepath + ".tmp"
@@ -2188,9 +2194,12 @@ class Layer2Orchestrator:
                 # Group 9: Additional Analysis
                 coverage = thread_data.get("avg_coverage_rate")
                 position_shift = thread_data.get("avg_position_shift")
+                encapsulation = thread_data.get("avg_encapsulation") 
+                
                 row.extend([
                     round(coverage, 4) if coverage is not None else "-",
                     round(position_shift, 4) if position_shift is not None else "-",
+                    round(encapsulation, 4) if encapsulation is not None else "-", 
                 ])
                 
                 writer.writerow(row)
