@@ -149,6 +149,8 @@ def create_layer2_config_from_dict(config_dict: Dict[str, Any]) -> Layer2Config:
     # Block B settings
     if 'dynamic_k_methods' in config_dict:
         config.dynamic_k_methods = config_dict['dynamic_k_methods']
+    if 'block_B_zero_shot_fallback' in config_dict:
+        config.block_B_zero_shot_fallback = config_dict['block_B_zero_shot_fallback'] 
     if 'block_B_weight_taker' in config_dict:
         config.block_B_weight_taker = config_dict['block_B_weight_taker']
     if 'block_B_weight_maker' in config_dict:

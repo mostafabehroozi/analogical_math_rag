@@ -42,7 +42,7 @@ from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.evaluation import evaluate_single_answer_with_llm
 from src.hf_sync import periodic_sync_check
 from tqdm import tqdm
-from src.prompts import create_final_reasoning_prompt, create_final_reasoning_prompt_simple, EXEMPLAR_FORMAT
+from src.prompts import create_final_reasoning_prompt, create_final_reasoning_prompt_simple, EXEMPLAR_FORMAT, PROMPT_TEMPLATES
 from config import CONFIG as GLOBAL_CONFIG
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,7 @@ class ExperimentResult:
     selected_candidate_texts: List[str] = None
     final_prompt_text: Optional[str] = None
     zero_score_fallback_triggered: bool = False
+    is_zero_shot_fallback: bool = False
     executions: List[Dict[str, Any]] = None  
     pass_at_k_metrics: Dict[int, float] = None
     
@@ -145,6 +146,7 @@ class Layer2Config:
     block_B_weight_taker: float = 1.0
     block_B_weight_maker: float = 1.0
     run_boundary_intersection_test: bool = False
+    block_B_zero_shot_fallback: bool = False     # <--- ADD THIS NEW LINE
     
     # Block C Configurations
     coverage_perspectives: List[str] = None  # ['Candidate_Centric', 'Evaluator_Centric']
@@ -912,7 +914,7 @@ class ActiveInferenceEngine:
         else:
             self.model_name = self.global_config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
 
-    def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int):
+    def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int, use_mirror_baseline_template: bool = False):
         # NEW: Deduplicate text strings to save tokens and prevent redundant context
         unique_contexts = []
         if context_texts:
@@ -922,7 +924,11 @@ class ActiveInferenceEngine:
             context_texts = unique_contexts
 
         # 1. Prompt Assembly
-        if not context_texts:
+        if use_mirror_baseline_template:
+            template_name = self.global_config.get("PROMPT_TEMPLATE_MIRROR_BASELINE", "mirror_baseline_zero_shot_v1")
+            base_template = PROMPT_TEMPLATES.get(template_name, "Problem: {question}\nSolve this step-by-step.\nFinal Answer:")
+            prompt = base_template.format(question=target_query)
+        elif not context_texts:
             prompt = create_final_reasoning_prompt_simple(target_query, self.global_config)
         else:
             formatted_contexts = []
@@ -1282,24 +1288,28 @@ class BlockB:
         
         # SMART FALLBACK LOGIC 
         zero_score_fallback_triggered = False
+        is_zero_shot_fallback = False
+        
         if len(positive_indices) > 0:
             # Normal case: K_dynamic = count of positive indices
             k_dynamic = len(positive_indices)
         else:
-            # Fallback: All candidates scored <= threshold
-            # Use the maximum K from top_ks_group as fallback
-            k_dynamic = max(self.config.top_ks_group) if self.config.top_ks_group else 1
-            # Cap to not exceed total number of candidates
-            k_dynamic = min(k_dynamic, len(self.ptu_engine.candidate_set))
             zero_score_fallback_triggered = True
             
-            # Use first K_dynamic candidates from the reranked Block A list
-            # (which naturally puts original retrieval order if all PTU scores are 0)
-            if ranked_list_for_boundary:
-                positive_indices = ranked_list_for_boundary[:k_dynamic]
+            if self.config.block_B_zero_shot_fallback:
+                # --- NEW FEATURE: Zero-Shot Fallback (K=0) ---
+                k_dynamic = 0
+                positive_indices = []
+                is_zero_shot_fallback = True
             else:
-                # Fallback to first K candidates in original order
-                positive_indices = list(range(k_dynamic))
+                # ORIGINAL FEATURE: Max-K Fallback
+                k_dynamic = max(self.config.top_ks_group) if self.config.top_ks_group else 1
+                k_dynamic = min(k_dynamic, len(self.ptu_engine.candidate_set))
+                
+                if ranked_list_for_boundary:
+                    positive_indices = ranked_list_for_boundary[:k_dynamic]
+                else:
+                    positive_indices = list(range(k_dynamic))
         
         # Evaluate the dynamic group
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(positive_indices)
@@ -1323,6 +1333,7 @@ class BlockB:
             selected_exemplar_texts=exemplar_texts_b,
             selected_candidate_texts=self.ptu_engine.get_candidate_texts(positive_indices),
             zero_score_fallback_triggered=zero_score_fallback_triggered,
+            is_zero_shot_fallback=is_zero_shot_fallback,
             list_ap_score=None,
             group_pass_at_n=pass_at_n
         )
@@ -1719,7 +1730,8 @@ class ThreadAggregator:
             "top_k": None,
             "threshold": None,
             "total_queries": 0,
-            "pass_at_metrics": defaultdict(float),  # {k: sum_of_passes}
+            "fallback_count": 0,                    
+            "pass_at_metrics": defaultdict(float),  
             "ap_scores_reranked": [],
             "ap_scores_original": [],
             "ap_improvements": [],
@@ -1768,6 +1780,8 @@ class ThreadAggregator:
             
             # Aggregate counts
             agg_data[thread_key]["total_queries"] += 1
+            if getattr(result, 'zero_score_fallback_triggered', False):
+                agg_data[thread_key]["fallback_count"] += 1
             
             # Aggregate Pass@K metrics
             for k, val in result.pass_at_k_metrics.items():
@@ -1795,6 +1809,7 @@ class ThreadAggregator:
             
             # Averages
             data["avg_ap_reranked"] = np.mean(data["ap_scores_reranked"]) if data["ap_scores_reranked"] else None
+            data["fallback_rate"] = data["fallback_count"] / total_q if total_q > 0 else 0.0
             data["avg_ap_original"] = np.mean(data["ap_scores_original"]) if data["ap_scores_original"] else None
             data["avg_ap_improvement"] = np.mean(data["ap_improvements"]) if data["ap_improvements"] else None
             
@@ -1968,7 +1983,8 @@ class Layer2Orchestrator:
                 target_query=result.target_query_text,
                 ground_truth=result.ground_truth_answer,
                 context_texts=result.selected_exemplar_texts, 
-                n_attempts=self.config.global_pass_at_N
+                n_attempts=self.config.global_pass_at_N,
+                use_mirror_baseline_template=getattr(result, 'is_zero_shot_fallback', False) # <--- ADD THIS LINE
             )
             
             # Attach live payloads to the result object
@@ -1999,7 +2015,8 @@ class Layer2Orchestrator:
                     "selected_scores": r.selected_scores,
                     "subset_size": r.subset_size,
                     "zero_score_fallback_triggered": r.zero_score_fallback_triggered,
-                    "boundary_encapsulation": r.boundary_encapsulation  
+                    "boundary_encapsulation": r.boundary_encapsulation,
+                    "is_zero_shot_fallback": getattr(r, 'is_zero_shot_fallback', False)  
                 },
                 "context_payload_texts": r.selected_exemplar_texts,
                 "final_prompt_text": r.final_prompt_text,
@@ -2152,7 +2169,7 @@ class Layer2Orchestrator:
         headers.extend(["AP_Score_Reranked", "AP_Score_Original", "AP_Improvement"])
         
         # Group 9: Additional Analysis
-        headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Avg_Boundary_Encapsulation"])
+        headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Avg_Boundary_Encapsulation", "Avg_Rerank_Position_Shift"])
         
         # Write to CSV (Atomically)
         temp_csv_filepath = csv_filepath + ".tmp"
@@ -2193,11 +2210,13 @@ class Layer2Orchestrator:
                 ])
                 
                 # Group 9: Additional Analysis
+                fallback_rate = thread_data.get("fallback_rate", 0.0)
                 coverage = thread_data.get("avg_coverage_rate")
                 position_shift = thread_data.get("avg_position_shift")
                 encapsulation = thread_data.get("avg_encapsulation") 
                 
                 row.extend([
+                    round(fallback_rate, 4),
                     round(coverage, 4) if coverage is not None else "-",
                     round(position_shift, 4) if position_shift is not None else "-",
                     round(encapsulation, 4) if encapsulation is not None else "-", 
