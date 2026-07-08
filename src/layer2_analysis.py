@@ -1998,7 +1998,8 @@ class Layer2Orchestrator:
                     "selected_exemplar_ids": r.selected_exemplar_ids,
                     "selected_scores": r.selected_scores,
                     "subset_size": r.subset_size,
-                    "zero_score_fallback_triggered": r.zero_score_fallback_triggered
+                    "zero_score_fallback_triggered": r.zero_score_fallback_triggered,
+                    "boundary_encapsulation": r.boundary_encapsulation  
                 },
                 "context_payload_texts": r.selected_exemplar_texts,
                 "final_prompt_text": r.final_prompt_text,
