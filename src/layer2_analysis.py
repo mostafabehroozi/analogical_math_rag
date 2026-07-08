@@ -1602,63 +1602,6 @@ class BlockC:
                     subset_size = len(winning_evals)
                 
             else:  # Evaluator_Centric
-                winning_evals = set()
-                evaluator_max_counts = self._compute_evaluator_maximum_counts(ptu_matrix, threshold)
-                for cand_idx in range(self.ptu_engine.n_candidates):
-                    row = ptu_matrix[cand_idx, :]
-                    max_ptu = np.max(row)
-                    
-                    if max_ptu > threshold:
-                        tied_evaluators = np.where(row == max_ptu)[0].tolist()
-                        selected_idx = self._apply_hierarchical_tiebreaker_evaluator_centric(
-                            tied_evaluators, ptu_matrix, cand_idx, score_make,
-                            target_query_embedding_similarity, evaluator_max_counts
-                        )
-                        winning_evals.add(selected_idx)
-                
-                selected_candidate_indices = [
-                    idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
-                    if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_evals
-                ]
-                subset_size = len(winning_evals)
-                
-                # Find max PTU for each evaluator (column maxima)
-                winning_source_evals = set()
-                
-                already_selected_cands: Set[int] = set()
-                for eval_idx in range(self.ptu_engine.n_evaluators):
-                    col = ptu_matrix[:, eval_idx]
-                    max_ptu = np.max(col)
-                    
-                    if max_ptu > threshold:
-                        # Find all candidates with this max value
-                        tied_candidates = np.where(col == max_ptu)[0].tolist()
-                        
-                        # Apply tie-breaking with pre-computed holistic scores
-                        selected_idx = self._apply_hierarchical_tiebreaker_candidate_centric(
-                            tied_candidates,
-                            ptu_matrix,
-                            eval_idx,
-                            score_take,
-                            target_query_embedding_similarity,
-                            already_selected_cands,
-                            holistic_scores_candidate_centric
-                        )
-                        already_selected_cands.add(selected_idx)
-                        
-                        src_eval = self.ptu_engine._resolve_source_evaluator_index(
-                            self.ptu_engine.candidate_set[selected_idx], selected_idx
-                        )
-                        winning_source_evals.add(src_eval)
-                
-                # Collect ALL candidates associated with the winning source samples
-                selected_candidate_indices = [
-                    idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
-                    if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_source_evals
-                ]
-                subset_size = len(winning_source_evals)
-                
-            else:  # Evaluator_Centric
                 # Find max PTU for each candidate (row maxima)
                 winning_evals = set()
                 
