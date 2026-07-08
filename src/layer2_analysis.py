@@ -162,7 +162,7 @@ class Layer2Config:
         if self.dynamic_k_methods is None:
             self.dynamic_k_methods = ['K_take', 'K_make', 'K_both']
         if self.coverage_perspectives is None:
-            self.coverage_perspectives = ['Candidate_Centric', 'Evaluator_Centric']
+            self.coverage_perspectives = ['Candidate_Centric', 'Evaluator_Centric', 'Both_Centric']
 
 
 # ============================================================================
@@ -1551,6 +1551,86 @@ class BlockC:
                     max_ptu = np.max(col)
                     
                     if max_ptu > threshold:
+                        tied_candidates = np.where(col == max_ptu)[0].tolist()
+                        selected_idx = self._apply_hierarchical_tiebreaker_candidate_centric(
+                            tied_candidates, ptu_matrix, eval_idx, score_take,
+                            target_query_embedding_similarity, already_selected_cands,
+                            holistic_scores_candidate_centric
+                        )
+                        already_selected_cands.add(selected_idx)
+                        src_eval = self.ptu_engine._resolve_source_evaluator_index(
+                            self.ptu_engine.candidate_set[selected_idx], selected_idx
+                        )
+                        winning_source_evals.add(src_eval)
+                
+                selected_candidate_indices = [
+                    idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
+                    if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_source_evals
+                ]
+                subset_size = len(winning_source_evals)
+
+            elif perspective == 'Both_Centric':
+                winning_evals = set()
+                # 1. Scan the grid for Mutual Agreements (Mutual Peaks)
+                for cand_idx in range(self.ptu_engine.n_candidates):
+                    row = ptu_matrix[cand_idx, :]
+                    max_row_val = np.max(row)
+                    
+                    if max_row_val > threshold:
+                        # Get Evaluators that gave this Candidate its highest score
+                        best_evals_for_cand = np.where(row == max_row_val)[0]
+                        for eval_idx in best_evals_for_cand:
+                            # Look at this specific Evaluator's column
+                            col = ptu_matrix[:, eval_idx]
+                            max_col_val = np.max(col)
+                            
+                            # MUTUAL AGREEMENT: Does this Evaluator also think this Candidate is its best?
+                            if max_col_val == max_row_val:
+                                winning_evals.add(eval_idx)
+                
+                # 2. Fallback if no mutual agreements are found
+                if len(winning_evals) == 0:
+                    zero_score_fallback_triggered = True
+                    subset_size = len(self.ptu_engine.candidate_set)
+                    selected_candidate_indices = list(range(subset_size))
+                    logger.info(f"Block C - {mask_type} Both_Centric (NO MUTUAL AGREEMENT): Triggering Fallback.")
+                else:
+                    selected_candidate_indices = [
+                        idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
+                        if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_evals
+                    ]
+                    subset_size = len(winning_evals)
+                
+            else:  # Evaluator_Centric
+                winning_evals = set()
+                evaluator_max_counts = self._compute_evaluator_maximum_counts(ptu_matrix, threshold)
+                for cand_idx in range(self.ptu_engine.n_candidates):
+                    row = ptu_matrix[cand_idx, :]
+                    max_ptu = np.max(row)
+                    
+                    if max_ptu > threshold:
+                        tied_evaluators = np.where(row == max_ptu)[0].tolist()
+                        selected_idx = self._apply_hierarchical_tiebreaker_evaluator_centric(
+                            tied_evaluators, ptu_matrix, cand_idx, score_make,
+                            target_query_embedding_similarity, evaluator_max_counts
+                        )
+                        winning_evals.add(selected_idx)
+                
+                selected_candidate_indices = [
+                    idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
+                    if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_evals
+                ]
+                subset_size = len(winning_evals)
+                
+                # Find max PTU for each evaluator (column maxima)
+                winning_source_evals = set()
+                
+                already_selected_cands: Set[int] = set()
+                for eval_idx in range(self.ptu_engine.n_evaluators):
+                    col = ptu_matrix[:, eval_idx]
+                    max_ptu = np.max(col)
+                    
+                    if max_ptu > threshold:
                         # Find all candidates with this max value
                         tied_candidates = np.where(col == max_ptu)[0].tolist()
                         
@@ -1618,13 +1698,19 @@ class BlockC:
         # Determine which scores to use based on perspective and fallback condition
         if zero_score_fallback_triggered:
             # In fallback mode, use score_take (all zeros anyway)
-            score_take = self.ptu_engine.compute_score_take(ptu_matrix)
-            log_scores = score_take
+            log_scores = self.ptu_engine.compute_score_take(ptu_matrix)
         else:
             # Normal mode: Pick the right scores depending on the strategy
-            score_take = self.ptu_engine.compute_score_take(ptu_matrix)
-            score_make = self.ptu_engine.compute_score_make(ptu_matrix)
-            log_scores = score_take if perspective == 'Candidate_Centric' else score_make
+            if perspective == 'Candidate_Centric':
+                log_scores = self.ptu_engine.compute_score_take(ptu_matrix)
+            elif perspective == 'Evaluator_Centric':
+                log_scores = self.ptu_engine.compute_score_make(ptu_matrix)
+            else: # Both_Centric
+                log_scores = self.ptu_engine.compute_holistic_score(
+                    ptu_matrix, 
+                    self.config.block_C_tiebreaker_weight_taker, 
+                    self.config.block_C_tiebreaker_weight_maker
+                )
         
         result = ExperimentResult(
             target_query_idx=self.ptu_engine.target_query_idx,
