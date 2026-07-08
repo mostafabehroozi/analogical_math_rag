@@ -1578,14 +1578,16 @@ class BlockC:
                     
                     if max_row_val > threshold:
                         # Get Evaluators that gave this Candidate its highest score
-                        best_evals_for_cand = np.where(row == max_row_val)[0]
+                        # (Using np.isclose to prevent floating point mismatch bugs)
+                        best_evals_for_cand = np.where(np.isclose(row, max_row_val, atol=1e-6))[0]
+                        
                         for eval_idx in best_evals_for_cand:
                             # Look at this specific Evaluator's column
                             col = ptu_matrix[:, eval_idx]
                             max_col_val = np.max(col)
                             
                             # MUTUAL AGREEMENT: Does this Evaluator also think this Candidate is its best?
-                            if max_col_val == max_row_val:
+                            if np.isclose(max_col_val, max_row_val, atol=1e-6):
                                 winning_evals.add(eval_idx)
                 
                 # 2. Fallback if no mutual agreements are found
