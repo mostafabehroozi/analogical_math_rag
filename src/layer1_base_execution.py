@@ -462,31 +462,18 @@ def _execute_candidate_generation(
 ) -> Dict[str, Any]:
     """
     Executes Step B: Candidate Generation.
-    
-    Generates exactly one candidate per retrieved exemplar using strict 1-shot mapping.
-    Each candidate H_i is generated using only exemplar R_i as the analogical reference.
-    
-    Returns:
-        {
-            "status": "SUCCESS" | "PARTIAL" | "FAILURE",
-            "candidates": {
-                <retrieved_idx>: {
-                    "candidate_text": str,
-                    "source_exemplar_idx": int,
-                    "generation_status": "SUCCESS" | "FAILURE"
-                }
-            }
-        }
+    Generates exactly one candidate per retrieved exemplar (1-shot)
+    AND optionally generates N Zero-Shot candidates.
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"[Layer 1 - Step B] Generating {len(retrieved_indices)} candidates (1-shot constraint)")
+    zs_n = config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0)
+    logger.info(f"[Layer 1 - Step B] Generating {len(retrieved_indices)} 1-shot candidates and {zs_n} zero-shot candidates")
     
     candidates = {}
     failed_count = 0
     
     try:
-        # Generate candidates using the existing _generate_hypotheses function
-        # We use the retrieved indices as the candidate_indices directly
+        # 1. Standard 1-Shot Generation
         hypotheses = _generate_hypotheses(
             target_query=target_query,
             candidate_indices=retrieved_indices,
@@ -496,36 +483,73 @@ def _execute_candidate_generation(
             trace_accumulator=trace_accumulator
         )
         
-        # Convert hypotheses dict to our standardized format
+        # USE ORIGINAL INTEGER KEYS FOR BACKWARD COMPATIBILITY
         for exemplar_idx, hypothesis_text in hypotheses.items():
             if hypothesis_text:
                 candidates[exemplar_idx] = {
+                    "candidate_id": exemplar_idx,
                     "candidate_text": hypothesis_text,
                     "source_exemplar_idx": exemplar_idx,
                     "generation_status": "SUCCESS"
                 }
             else:
                 candidates[exemplar_idx] = {
+                    "candidate_id": exemplar_idx,
                     "candidate_text": None,
                     "source_exemplar_idx": exemplar_idx,
                     "generation_status": "FAILURE"
                 }
                 failed_count += 1
         
-        status = "SUCCESS" if failed_count == 0 else ("PARTIAL" if failed_count < len(retrieved_indices) else "FAILURE")
+        # 2. NEW: Zero-Shot Candidate Generation
+        if zs_n > 0:
+            from src.prompts import PROMPT_TEMPLATES
+            if isinstance(api_manager, GeminiAPIManager): model_name = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
+            elif isinstance(api_manager, AvalAIAPIManager): model_name = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
+            else: model_name = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
+            
+            tmpl_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT", "mirror_hypothesis_gen_zero_shot_v1")
+            tmpl_zero = PROMPT_TEMPLATES.get(tmpl_name, "{target_query}")
+            prompt = tmpl_zero.format(target_query=target_query)
+            
+            for i in range(zs_n):
+                zs_id = f"zs_{i}"
+                resp = api_manager.generate_content(prompt, model_name, temperature=0.7)
+                
+                trace_accumulator.append(create_trace_entry(
+                    "layer1_candidate_gen", f"zero_shot_{i}",
+                    {"prompt": prompt}, resp, {"model": model_name, "temp": 0.7}
+                ))
+                
+                if resp['status'] == 'SUCCESS' and resp['text']:
+                    candidates[zs_id] = {
+                        "candidate_id": zs_id,
+                        "candidate_text": resp['text'],
+                        "source_exemplar_idx": -1, # Special flag for No Parent
+                        "generation_status": "SUCCESS"
+                    }
+                else:
+                    candidates[zs_id] = {
+                        "candidate_id": zs_id,
+                        "candidate_text": None,
+                        "source_exemplar_idx": -1,
+                        "generation_status": "FAILURE"
+                    }
+                    failed_count += 1
+        
+        total_expected = len(retrieved_indices) + zs_n
+        status = "SUCCESS" if failed_count == 0 else ("PARTIAL" if failed_count < total_expected else "FAILURE")
         
         return {
             "status": status,
             "candidates": candidates,
-            "generated_count": len(hypotheses) - failed_count,
+            "generated_count": total_expected - failed_count,
             "failed_count": failed_count
         }
     
     except Exception as e:
-        logger.error(f"Candidate generation failed with exception: {e}", exc_info=True)
+        logger.error(f"Candidate generation failed: {e}", exc_info=True)
         return {"status": "FAILURE", "error": str(e), "candidates": {}}
-
-
 # ============================================================================
 # STEP C: BASELINE & EVALUATOR CONSTRUCTION
 # ============================================================================

@@ -253,6 +253,7 @@ CONFIG = {
     "LAYER1_CACHE_DIR": RESULTS_DIR,
     "LAYER1_N_CANDIDATES": None,           # Number of candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
+    "LAYER1_ZERO_SHOT_CANDIDATES_N": 5,    # Number of zero-shot candidates to generate in Layer 1 (0 = OFF)
     
     "APPLY_LAYER2_ANALYSIS": False,
     "LAYER2_CONFIG": {

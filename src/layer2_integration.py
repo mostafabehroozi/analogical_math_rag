@@ -105,18 +105,21 @@ def extract_layer1_states_for_layer2(
 def create_layer2_config_from_dict(config_dict: Dict[str, Any]) -> Layer2Config:
     """
     Create a Layer2Config instance from a dictionary.
-    
-    Args:
-        config_dict: Dictionary with Layer 2 configuration keys
-    
-    Returns:
-        Layer2Config instance
     """
     config = Layer2Config()
     if 'layer2_config_name' in config_dict:
         config.layer2_config_name = config_dict['layer2_config_name']
     
     # Block toggles
+    # --- NEW ZERO-SHOT TOGGLES ---
+    if 'run_block_zero_baseline' in config_dict:
+        config.run_block_zero_baseline = config_dict['run_block_zero_baseline']
+    if 'run_block_zero' in config_dict:
+        config.run_block_zero = config_dict['run_block_zero']
+    if 'block_zero_strategies' in config_dict:
+        config.block_zero_strategies = config_dict['block_zero_strategies']
+    # -----------------------------
+    
     if 'run_block_A_baseline' in config_dict:
         config.run_block_A_baseline = config_dict['run_block_A_baseline'] 
     if 'run_block_A' in config_dict:

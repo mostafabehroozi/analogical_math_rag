@@ -72,7 +72,7 @@ class ExperimentResult:
     selected_scores: List[float] = None  # NEW: Store the scores of chosen samples
     selected_exemplar_ids: List[str] = None    # NEW: Store the Parent Source IDs
     selected_exemplar_texts: List[str] = None  # NEW: Store the Parent Source Texts
-    
+    is_precalculated: bool = False # Flag to bypass LLM inference (used for Block_Zero)
     # Evaluation Metrics (Legacy)
     list_ap_score: Optional[float] = None  
     group_pass_at_n: Optional[float] = None  
@@ -121,10 +121,13 @@ class ExperimentResult:
 @dataclass
 class Layer2Config:
     """Configuration for Layer 2 experiments."""
-    layer2_config_name: str = "default_run"  # <--- ADD THIS LINE
+    layer2_config_name: str = "default_run"  
     
     # Block Execution Toggles
-    run_block_A_baseline: bool = True  # <--- ADD THIS NEW LINE
+    run_block_zero_baseline: bool = True  
+    run_block_zero: bool = True           
+    block_zero_strategies: List[str] = None 
+    run_block_A_baseline: bool = True  
     run_block_A: bool = True
     run_block_B: bool = True
     run_block_C: bool = True
@@ -154,6 +157,8 @@ class Layer2Config:
     block_C_tiebreaker_weight_maker: float = 1.0
     
     def __post_init__(self):
+        if self.block_zero_strategies is None:
+            self.block_zero_strategies = ['ScoreTake']
         if self.utility_calibration_modes is None:
             self.utility_calibration_modes = ['Marginal', 'Absolute']
         if self.evaluator_masking is None:
@@ -733,6 +738,10 @@ class PTUMathEngine:
         if source_id is None:
             raise ValueError(f"Fatal structural error: Candidate is missing 'source_exemplar_idx'. Data: {candidate}")
             
+        # === NEW: SAFEGUARD FOR ZERO-SHOT CANDIDATES ===
+        if source_id == -1 or str(source_id) == "-1":
+            return -1  # Indicates this candidate has no parent
+            
         source_key = self._normalize_id(source_id)
         
         # Crash if the parent ID doesn't actually exist in the retrieved set
@@ -1012,6 +1021,88 @@ class ActiveInferenceEngine:
 # ============================================================================
 # BLOCK A: BASELINE RERANKING & STATIC GROUPING
 # ============================================================================
+
+# ============================================================================
+# BLOCK ZERO: ZERO-SHOT BASELINE & BEST-OF-N (NEW)
+# ============================================================================
+# ============================================================================
+# BLOCK ZERO: ZERO-SHOT BASELINE & BEST-OF-N (NEW)
+# ============================================================================
+class BlockZero:
+    """
+    Evaluates purely zero-shot candidates generated in Layer 1.
+    Operates offline by fetching pre-calculated correctness from the PTU Engine.
+    """
+    def __init__(self, ptu_engine: PTUMathEngine, config: Layer2Config):
+        self.ptu_engine = ptu_engine
+        self.config = config
+
+    def _build_pass_at_k_dict(self, is_correct: bool) -> Dict[int, float]:
+        """Fills out the Pass@K metrics uniformly for the CSV"""
+        val = 1.0 if is_correct else 0.0
+        # If Pass@1 is true, all subsequent K's are also true.
+        return {k: val for k in range(1, self.config.global_pass_at_N + 1)}
+
+    def run_baseline(self) -> List[ExperimentResult]:
+        """Runs the Zero-Shot Baseline (always selects candidate 'zs_0')"""
+        cand_idx = None
+        for idx, cid in enumerate(self.ptu_engine.candidate_ids):
+            if cid == "zs_0":
+                cand_idx = idx
+                break
+                
+        if cand_idx is None:
+            return [] # No zero-shot candidates found
+            
+        is_correct = _get_ground_truth_label(self.ptu_engine.ground_truth_labels, "zs_0")
+        
+        result = ExperimentResult(
+            target_query_idx=self.ptu_engine.target_query_idx,
+            target_query_text=self.ptu_engine.target_query_text,
+            ground_truth_answer=self.ptu_engine.ground_truth_answer,
+            utility_calibration="Baseline",
+            evaluator_setting="None",
+            scoring_strategy="Zero_Shot_Baseline",
+            application="Block_Zero_Baseline",
+            subset_size=1,
+            selected_candidates=["zs_0"],
+            selected_candidate_texts=self.ptu_engine.get_candidate_texts([cand_idx]),
+            is_precalculated=True,
+            pass_at_k_metrics=self._build_pass_at_k_dict(is_correct), # <--- UPDATED
+            group_pass_at_n=1.0 if is_correct else 0.0
+        )
+        return [result]
+
+    def run_best_of_n(self, ptu_matrix: np.ndarray, calib_mode: str, strategy: str) -> List[ExperimentResult]:
+        """Scores all zero-shot candidates using the evaluators, selects the best."""
+        zs_indices = [idx for idx, cid in enumerate(self.ptu_engine.candidate_ids) if str(cid).startswith("zs_")]
+        
+        if not zs_indices:
+            return []
+            
+        scores = self.ptu_engine.get_scores_for_strategy(ptu_matrix, strategy)
+        best_idx = max(zs_indices, key=lambda i: (scores[i], -i))
+        best_cid = self.ptu_engine.candidate_ids[best_idx]
+        
+        is_correct = _get_ground_truth_label(self.ptu_engine.ground_truth_labels, best_cid)
+        
+        result = ExperimentResult(
+            target_query_idx=self.ptu_engine.target_query_idx,
+            target_query_text=self.ptu_engine.target_query_text,
+            ground_truth_answer=self.ptu_engine.ground_truth_answer,
+            utility_calibration=calib_mode,
+            evaluator_setting="All", 
+            scoring_strategy=strategy,
+            application="Block_Zero_BestOfN",
+            subset_size=1,
+            selected_candidates=[best_cid],
+            selected_scores=[float(scores[best_idx])],
+            selected_candidate_texts=self.ptu_engine.get_candidate_texts([best_idx]),
+            is_precalculated=True,
+            pass_at_k_metrics=self._build_pass_at_k_dict(is_correct), # <--- UPDATED
+            group_pass_at_n=1.0 if is_correct else 0.0
+        )
+        return [result]
 
 class BlockA:
     """
@@ -1749,12 +1840,14 @@ class ThreadAggregator:
             thread_key = f"{result.utility_calibration}_{result.evaluator_setting}_{base_app}"
             
             # Parse block and application details
-            if "Block_A" in result.application:
+            if "Block_Zero" in result.application:
+                block = "Block_Zero"
+                top_k = 1  # Always 1 for Zero-Shot
+            elif "Block_A" in result.application:
                 block = "Block_A"
                 if "Reranking" in result.application:
                     top_k = None
                 else:
-                    # Look for the number dynamically
                     parts = result.application.split("_")
                     top_k = None
                     for part in parts:
@@ -1836,8 +1929,8 @@ class ThreadAggregator:
             List of (thread_name, thread_data) tuples sorted hierarchically
         """
         calib_order = {"Baseline": -1, "Marginal": 0, "Absolute": 1} 
-        mask_order = {"Baseline": -1, "Self": 0, "Others": 1, "All": 2} 
-        block_order = {"Block_A": 0, "Block_B": 1, "Block_C": 2}
+        mask_order = {"Baseline": -1, "None": -0.5, "Self": 0, "Others": 1, "All": 2} 
+        block_order = {"Block_Zero": 0, "Block_A": 1, "Block_B": 2, "Block_C": 3}
         
         def sort_key(item):
             thread_name, data = item
@@ -1892,18 +1985,31 @@ class Layer2Orchestrator:
         # Strict execution: Let errors crash the pipeline so we catch Layer 1 API failures immediately.
         ptu_engine = PTUMathEngine(layer1_state, self.exemplar_data, self.hard_questions, self.hard_solutions) 
         
-        # === NEW: RUN ORIGINAL BASELINE EXACTLY ONCE PER QUESTION ===
+        # RUN ORIGINAL BASELINE EXACTLY ONCE PER QUESTION
         if self.config.run_block_A and getattr(self.config, 'run_block_A_baseline', False):
             logger.info(f"\n[BLOCK A BASELINE] Executing Original Retrieval Baseline")
             block_a_baseline = BlockA(ptu_engine, self.config)
             baseline_results = block_a_baseline.run_original_baseline()
             query_results.extend(baseline_results)
-        # ============================================================
+
+        # RUN ZERO-SHOT BASELINE EXACTLY ONCE PER QUESTION
+        if getattr(self.config, 'run_block_zero_baseline', False):
+            logger.info(f"\n[BLOCK ZERO BASELINE] Executing Zero-Shot Baseline")
+            block_zero = BlockZero(ptu_engine, self.config)
+            query_results.extend(block_zero.run_baseline())
 
         # Grid search: For each calibration mode, then for each mask type
         for calib_mode in self.config.utility_calibration_modes:
             # 1. Fetch mathematically calibrated base PTU
             calibrated_ptu = ptu_engine.get_calibrated_ptu_matrix(calib_mode)
+
+            # BLOCK ZERO (Best-of-N) 
+            # Run this outside the mask_type loop because zero-shot candidates have no parents to mask
+            if getattr(self.config, 'run_block_zero', False):
+                logger.info(f"\n[BLOCK ZERO] Zero-Shot Best-of-N ({calib_mode})")
+                block_zero = BlockZero(ptu_engine, self.config)
+                for strategy in getattr(self.config, 'block_zero_strategies', ['ScoreTake']):
+                    query_results.extend(block_zero.run_best_of_n(calibrated_ptu, calib_mode, strategy))
             
             for mask_type in self.config.evaluator_masking:
                 # 2. Apply Masking to the calibrated PTU
@@ -1973,9 +2079,14 @@ class Layer2Orchestrator:
                         )
                         query_results.extend(results)
         
-        # ===== ACTIVE INFERENCE EXECUTION =====
+        # ACTIVE INFERENCE EXECUTION
         logger.info(f"\n[ACTIVE INFERENCE] Executing LLM for {len(query_results)} configurations...")
         for result in query_results:
+            # BYPASS LLM FOR PRECALCULATED RESULTS (Like Block Zero) 
+            if getattr(result, 'is_precalculated', False):
+                logger.info(f"  -> Skipping LLM for {result.application} (Result Precalculated from Layer 1)")
+                continue
+
             logger.info(f"  -> Running LLM for: {result.application} (Pass@{self.config.global_pass_at_N})")
             
             # THE PROXY PRINCIPLE FIX: Pass the Source Exemplars to the Solver, NOT the drafted Candidates!
