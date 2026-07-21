@@ -1,6 +1,4 @@
-#======================================================================
-#   File: src/pipeline_steps.py
-#======================================================================
+#src/pipeline_steps.py
 
 import logging
 import re
@@ -14,10 +12,6 @@ from collections import deque
 from src.evaluation import evaluate_single_answer_with_llm
 from src.prompts import PROMPT_TEMPLATES
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
-# --- CRITICAL: Ensure these API classes are imported ---
-# (Adjust the path 'src.api_manager' if your file is named differently)
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager 
-
 from src.utils import create_trace_entry
 from src.evaluation import evaluate_single_answer_with_llm
 from src.prompts import PROMPT_TEMPLATES
@@ -403,8 +397,7 @@ def _rank_and_filter_candidates(
 
     # 3. Redundancy Filtering: Remove Covered Candidates
     if not enable_redundancy or not enable_filtering:
-        # If redundancy is off, the final selection IS the base selection
-        # We still return sorted_candidates as the master list
+
         return base_indices, base_indices, sorted_candidates
 
     final_selection = []
@@ -1153,7 +1146,7 @@ def augment_question(
     aug_mode = config.get("HIERARCHICAL_AUGMENTATION_MODE", "decomposition")
     schedule = config.get("AUGMENTATION_SCHEDULE")
 
-    # --- NEW: Two-Step Augmentation Mode (Solve -> Simplify) ---
+    # Two-Step Augmentation Mode (Solve -> Simplify)
     if config.get("HIERARCHICAL_AUGMENTATION_TWO_STEP", False):
         logger.info("Running Two-Step Augmentation (Solve -> Simplify).")
         
@@ -1196,7 +1189,7 @@ def augment_question(
         
         return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None, "trace": local_trace}
 
-    # --- Existing Schedule-based Logic ---
+    # Existing Schedule-based Logic
     if isinstance(schedule, list) and len(schedule) == 2:
         num_calls, questions_per_call = schedule
         logger.info(f"Using augmentation schedule: {num_calls} calls, {questions_per_call} questions per call.")
@@ -1578,9 +1571,7 @@ def generate_reasoning_pathways(
 
 
 
-# ==============================================================================
 #   Analogical Mirroring Logic (MIRROR_AS_EVALUATOR)
-# ==============================================================================
 
 def optimize_demonstrations_via_mirroring(
     target_query: str,
@@ -1597,7 +1588,7 @@ def optimize_demonstrations_via_mirroring(
     trace_accumulator = [] 
     
     try:
-        # --- Phase 0: Initialization ---
+        # Phase 0: Initialization
         # 1. Apply Candidate Limit (Cost Saving)
         limit = config.get("MIRROR_ACTIVE_CANDIDATE_LIMIT", 5)
         active_candidates = retrieved_indices[:limit]
@@ -1620,7 +1611,7 @@ def optimize_demonstrations_via_mirroring(
             trace_accumulator=trace_accumulator
         )
 
-        # --- Phase 1: Hypothesis Generation (Forward Pass) ---
+        # Phase 1: Hypothesis Generation (Forward Pass) 
         hypotheses = _generate_hypotheses(
             target_query=target_query,
             candidate_indices=active_candidates,
@@ -1630,7 +1621,7 @@ def optimize_demonstrations_via_mirroring(
             trace_accumulator=trace_accumulator
         )
         
-        # --- Phase 2: Mirror Evaluation (Backward Pass) ---
+        # Phase 2: Mirror Evaluation (Backward Pass) 
         # Returns matrix: {candidate_idx: {validation_idx: score}}
         consistency_matrix = _evaluate_mirror_consistency(
             target_query=target_query,
@@ -1642,7 +1633,7 @@ def optimize_demonstrations_via_mirroring(
             trace_accumulator=trace_accumulator
         )
         
-        # --- Phase 3: Utility Scoring ---
+        # Phase 3: Utility Scoring 
         candidate_scores = {} 
         candidate_contributions = {} 
         
@@ -1823,9 +1814,6 @@ def apply_mirror_reranking(
             contribs = {}
             
             for val_idx in validation_indices:
-                # Allow self-evaluation to contribute to utility
-                # if cand_idx == val_idx:
-                #     continue
                 
                 mirror_acc = consistency_matrix.get(cand_idx, {}).get(val_idx, 0.0)
                 base_acc = baseline_scores.get(val_idx, 0.0)
@@ -1913,7 +1901,6 @@ def solve_with_parallel_benchmarking(
         strategy_name = f"strategy_{len(group_tuple)}shot_idx{''.join(map(str, group_tuple))}"
         
         # Map tuple indices (0, 1) to actual retrieved indices
-        # We must ensure we don't go out of bounds of what was actually retrieved
         current_indices = []
         valid_strategy = True
         for ptr in group_tuple:
@@ -1927,9 +1914,6 @@ def solve_with_parallel_benchmarking(
             print(f"   [Benchmark] Skipping {strategy_name} (Not enough retrieved samples)")
             continue
 
-        # 2. Construct Prompt (Standard Prompting)
-        # We reuse the standard 'final_solver' template logic here
-        # Construct the examples block manually
         examples_block = ""
         for i, idx in enumerate(current_indices):
             ex_q = exemplar_data[idx]['question']
@@ -1937,13 +1921,9 @@ def solve_with_parallel_benchmarking(
             # Format using standard exemplar format
             examples_block += f"<Example {i+1}>\nQuestion: {ex_q}\nRationale and Answer: {ex_a}\n</Example {i+1}>\n\n"
             
-        # Create final prompt
-        # We assume standard solver prompt v2/v3/v4 used in config
+
         from src.prompts import create_final_reasoning_prompt
-        # Mocking the 'final_examples' list just for the prompt creator to work
-        # The prompt creator expects a list of strings, so we pass pre-formatted strings or raw text?
-        # Looking at 'create_final_reasoning_prompt', it takes a list of strings.
-        # Let's construct the list of strings.
+
         formatted_examples = [
              f"Question: {exemplar_data[idx]['question']}\nRationale and Answer: {exemplar_data[idx]['solution']}"
              for idx in current_indices
@@ -2239,12 +2219,10 @@ def solve_with_analogical_consistency(
     
     local_trace = []
 
-    # --- NEW CONFIG FLAGS FOR UPGRADE ---
     use_rag_generation = config.get("REVERSE_VALIDATION_USE_RAG_GENERATION", False)
     gen_k = config.get("REVERSE_VALIDATION_GENERATION_K", 3)
     enable_baseline_check = config.get("REVERSE_VALIDATION_ENABLE_BASELINE_CHECK", True) # <-- NEW MASTER SWITCH
 
-    # --- ORIGINAL CONFIG FLAGS ---
     n_candidates = config.get("REVERSE_VALIDATION_CANDIDATES_N", 5)
     k_validators = config.get("REVERSE_VALIDATION_RETRIEVAL_K", 3)
     n_validation_attempts = config.get("REVERSE_VALIDATION_ATTEMPTS_N", 5)
@@ -2258,9 +2236,7 @@ def solve_with_analogical_consistency(
     validator_indices = []
 
     if use_rag_generation:
-        # =========================================================================
-        # NEW UPGRADED PATH: PHASE 0 & 1 (Unified Retrieval + RAG Generation)
-        # =========================================================================
+        # PHASE 0 & 1 (Unified Retrieval + RAG Generation)
         total_k_to_retrieve = gen_k + k_validators
         print(f"\n  [Phase 0] Unified Retrieval for {gen_k} Helpers + {k_validators} Validators...")
         
@@ -2279,13 +2255,9 @@ def solve_with_analogical_consistency(
         all_indices = retrieval_res['retrieved_indices']
         helper_indices = all_indices[:gen_k]
         
-        # FIX: Ensure validators INCLUDE the helpers so the candidate 
-        # is tested against its own original source exemplar!
-        # You can either use all of them:
+
         validator_indices = all_indices 
         
-        # OR just use the helpers as their own validators:
-        # validator_indices = helper_indices
         
         print(f"\n  [Phase 1] Generating Candidates using RAG Helpers ({len(helper_indices)} helpers)...")
         for h_idx in helper_indices:
@@ -2355,9 +2327,7 @@ def solve_with_analogical_consistency(
         print(f"\n  [Phase 2] Using {len(validator_indices)} Pre-retrieved Validators...")
 
     else:
-        # =========================================================================
         # ORIGINAL PATH: EXACTLY AS IT WAS WRITTEN BEFORE
-        # =========================================================================
         print(f"\n  [Phase 1] Generating {n_candidates} Candidate Solutions...")
         
         candidate_config = config.copy()
@@ -2431,9 +2401,7 @@ def solve_with_analogical_consistency(
         validator_indices = retrieval_res['retrieved_indices']
         print(f"    -> Retrieved {len(validator_indices)} validators.")
 
-    # =========================================================================
     # PHASE 2.5: FORMAT VALIDATORS & CALCULATE BASELINES
-    # =========================================================================
     if not candidates:
         return {"status": "FAILURE", "error": "No candidates were generated", "trace": local_trace}
 
@@ -2473,9 +2441,7 @@ def solve_with_analogical_consistency(
             baseline_scores[v_idx] = v_correct / n_validation_attempts
             print(f"      -> Validator #{v_idx} Baseline Score: {baseline_scores[v_idx]:.2f}")
 
-    # =========================================================================
     # PHASE 3: REVERSE VALIDATION LOOP WITH BASELINE THRESHOLDS
-    # =========================================================================
     print(f"\n  [Phase 3] Reverse Validation Loop ({len(candidates)} Candidates x {len(validators)} Validators x {n_validation_attempts} Attempts)...")
     
     candidate_stats = []
@@ -2551,16 +2517,14 @@ def solve_with_analogical_consistency(
             "validator_breakdown": validator_details
         })
 
-    # =========================================================================
     # PHASE 4: SELECTION & FALLBACK LOGIC
-    # =========================================================================
     if not candidate_stats:
         return {"status": "FAILURE", "error": "No stats generated", "trace": local_trace}
         
     candidate_stats.sort(key=lambda x: x['consistency_score'], reverse=True)
     best_candidate_stat = candidate_stats[0]
     
-    # --- NEW FALLBACK LOGIC ---
+    # NEW FALLBACK LOGIC 
     if enable_baseline_check and best_candidate_stat['consistency_score'] <= 0.0:
         print(f"\n  [Selection] ALL candidates failed to beat the baseline on all validators.")
         print(f"  [Selection] Triggering FALLBACK to Candidate #1.")
@@ -2705,9 +2669,7 @@ def select_best_transformations(
         )
         return best_candidate[0]
     
-    # =========================================================================
     # PROCESS EACH RETRIEVED SAMPLE WITH CENTRALIZED POOL ARCHITECTURE
-    # =========================================================================
     for sample_idx, retrieved_idx in enumerate(retrieved_indices):
         original_q = exemplar_data['questions'][retrieved_idx]
         original_sol = exemplar_data['solutions'][retrieved_idx]
@@ -2716,7 +2678,7 @@ def select_best_transformations(
         print(f"\n[SAMPLE {sample_idx+1}/{len(retrieved_indices)}] Retrieved Index #{retrieved_idx}")
         print(f"  Original Q: {original_q[:60]}...")
         
-        # ===== PHASE 1: CENTRALIZED POOL CONSTRUCTION =====
+        # PHASE 1: CENTRALIZED POOL CONSTRUCTION
         print(f"  [PHASE 1] Building centralized candidate pool...")
         
         pool = []
@@ -2772,7 +2734,7 @@ def select_best_transformations(
         pool_size = len(pool)
         print(f"  Pool size: {pool_size} (1 original + {n_transformations} transformations)")
         
-        # ===== PHASE 2: UNIFIED MIRROR SCORING (ONCE PER POOL) =====
+        # PHASE 2: UNIFIED MIRROR SCORING (ONCE PER POOL)
         print(f"  [PHASE 2] Running unified mirror scoring over entire pool...")
         
         scores = []
@@ -2841,7 +2803,7 @@ def select_best_transformations(
         
         print(f"  Scored all {len(pool)} candidates: {scores}")
         
-        # ===== PHASE 3: DETERMINISTIC SELECTION WITH TIE-BREAKING =====
+        # PHASE 3: DETERMINISTIC SELECTION WITH TIE-BREAKING
         print(f"  [PHASE 3] Applying deterministic selection with tie-breaking...")
         
         best_idx = argmax_tiebreak(scores)
@@ -2851,7 +2813,7 @@ def select_best_transformations(
         
         print(f"  Selected: Index {best_idx} ({best_source}), Score: {best_score:.3f}")
         
-        # ===== BUILD EVALUATION CONTEXT =====
+        # BUILD EVALUATION CONTEXT
         evaluation_contexts[retrieved_idx] = {
             "scenario": "Best-of-Transformation (Centralized Pool)",
             "pool_index": best_idx,
@@ -2874,9 +2836,7 @@ def select_best_transformations(
             "all_scores": scores
         }
     
-    # =========================================================================
     # BUILD OUTPUT
-    # =========================================================================
     print(f"\n{'='*80}")
     print(f"  [BEST-OF-TRANSFORMATION] Centralized Pool Processing Complete")
     print(f"  Total Retrieved Samples: {len(retrieved_indices)}")

@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import List, Tuple, Dict, Optional, Any, TypedDict, Union
 
 import openai
-import ollama  # NEW: Import for local LLM support
+import ollama
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 
@@ -67,7 +67,7 @@ def execute_with_retry(config: dict, api_call_func) -> APIResponse:
     enable_retry = config.get("ENABLE_API_RETRY", False)
     max_retries = config.get("MAX_API_RETRIES", 3)
     retry_delay = config.get("API_RETRY_DELAY_SECONDS", 5)
-    retry_all_errors = config.get("RETRY_ALL_API_ERRORS", True)  # NEW: Feature flag for retrying all error types
+    retry_all_errors = config.get("RETRY_ALL_API_ERRORS", True)  
 
     if not enable_retry:
         return api_call_func()
@@ -81,8 +81,7 @@ def execute_with_retry(config: dict, api_call_func) -> APIResponse:
         if response["status"] == "SUCCESS":
             return response
 
-        # Handle BLOCKED / RATE_LIMITED: by default they were non-retryable,
-        # but if `RETRY_ALL_API_ERRORS` is enabled we should treat them as retryable.
+
         if response["status"] in ("BLOCKED", "RATE_LIMITED"):
             if not retry_all_errors:
                 logger.warning(

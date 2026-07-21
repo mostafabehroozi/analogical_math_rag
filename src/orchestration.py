@@ -90,7 +90,7 @@ def run_pipeline_for_single_query(
     run_mode: str = 'full',
     existing_log: Optional[Dict[str, Any]] = None,
     force_layer1_reexecution: bool = False,
-    hard_solutions: Optional[List[str]] = None  # <--- ADDED THIS LINE
+    hard_solutions: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Executes the RAG pipeline for a single query, supporting different execution modes
@@ -183,24 +183,24 @@ def run_pipeline_for_single_query(
             "execution_trace": [], 
             "steps": {},
             "steps_alternatives": {},
-            "benchmarks": {} # NEW: Store Track A results
+            "benchmarks": {} #Store Track A results
         }
 
-    # --- API Manager Selection ---
+    # API Manager Selection 
     provider_for_adapt = config.get('API_PROVIDER_ADAPTATION', 'gemini')
     manager_for_adapt = api_managers[provider_for_adapt]
     provider_for_solve = config.get('API_PROVIDER_SOLVER', 'gemini')
     manager_for_solve = api_managers[provider_for_solve]
     
-    # NEW: Specific Manager for Augmentation
+    # Specific Manager for Augmentation
     provider_for_aug = config.get('API_PROVIDER_AUGMENTATION', provider_for_adapt) # Fallback to adapt if not set
     manager_for_aug = api_managers[provider_for_aug]
     
-    # NEW: Specific Manager for Evaluation (needed for Reverse Validation loop)
+    # Specific Manager for Evaluation (needed for Reverse Validation loop)
     provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
     manager_for_eval = api_managers[provider_for_eval]
 
-    # NEW: Specific Manager for Simplification
+    # Specific Manager for Simplification
     provider_for_simp = config.get('API_PROVIDER_SIMPLIFICATION', provider_for_adapt)
     manager_for_simp = api_managers[provider_for_simp]
 
@@ -277,7 +277,7 @@ def run_pipeline_for_single_query(
             # Otherwise, continue with the main pipeline (if LAYER1_ONLY_MODE is False)
             logger.info(f"Layer 1 completed. Status: {layer1_state.get('overall_status')}. Proceeding with main pipeline.")
 
-    # --- MULTI-BRANCH TRANSFORMATION EXPERIMENTS ---
+    # MULTI-BRANCH TRANSFORMATION EXPERIMENTS 
     if config.get('APPLY_MULTIBRANCH_TRANSFORMATION', False):
         print("\n[PRE-PROCESSING] MULTI-BRANCH TRANSFORMATION EXPERIMENTS ENABLED")
         print("  Architecture: Centralized pool with three parallel selection strategies")
@@ -394,10 +394,9 @@ def run_pipeline_for_single_query(
                         f"Branches processed: {list(generated_answers.keys())}"
                     )
                     
-                    # ========================================================================
+
                     # OPTIONAL: Set primary solving results to the strongest branch (bot_n_plus_r)
                     # This allows downstream evaluation to work transparently
-                    # ========================================================================
                     if 'bot_n_plus_r' in generated_answers:
                         primary_solutions = generated_answers['bot_n_plus_r']
                         primary_branch = 'bot_n_plus_r'
@@ -437,7 +436,7 @@ def run_pipeline_for_single_query(
             run_log['pipeline_status'] = "FAILURE"
             return run_log
 
-    # --- BEST-OF-TRANSFORMATION Pre-processing (Enhancement to best-of-N) ---
+    # BEST-OF-TRANSFORMATION Pre-processing (Enhancement to best-of-N) 
     if config.get('APPLY_BEST_OF_TRANSFORMATION', False):
         print("\n[PRE-PROCESSING] BEST-OF-TRANSFORMATION ENABLED")
         
@@ -508,9 +507,8 @@ def run_pipeline_for_single_query(
                             f"Source={selection_info.get('selected_source', 'N/A')}"
                         )
                     
-                    # ========================================================================
-                    # NEW: Integrated Mirror Re-Ranking Stage (After Transformation)
-                    # ========================================================================
+
+                    # Integrated Mirror Re-Ranking Stage (After Transformation)
                     if config.get('APPLY_MIRROR_RERANKING', False):
                         print("\n[INTEGRATION] UNIFIED MIRROR RE-RANKING ENABLED")
                         
@@ -575,7 +573,7 @@ def run_pipeline_for_single_query(
             logger.warning("USE_RETRIEVAL is False, cannot apply best-of-transformation")
             run_log['best_transformations'] = None
 
-    # --- ALTERNATIVE: Direct Mirror Re-Ranking After Retrieval (without Best-of-Transformation) ---
+    # ALTERNATIVE: Direct Mirror Re-Ranking After Retrieval (without Best-of-Transformation) 
     if config.get('APPLY_MIRROR_RERANKING', False) and not config.get('APPLY_BEST_OF_TRANSFORMATION', False):
         if config.get('USE_RETRIEVAL', True):
             print("\n[INTEGRATION] UNIFIED MIRROR RE-RANKING ENABLED (Direct After Retrieval)")
@@ -631,7 +629,7 @@ def run_pipeline_for_single_query(
         else:
             logger.warning("USE_RETRIEVAL is False, cannot apply mirror re-ranking directly")
 
-    # --- MODE: Reverse Validation (Analogical Consistency) ---
+    # MODE: Reverse Validation (Analogical Consistency) 
     if config.get('APPLY_REVERSE_VALIDATION', False):
         print("\n[MODE] ANALOGICAL CONSISTENCY (REVERSE VALIDATION) ACTIVATED")
         # This mode replaces the standard solve flow entirely.
@@ -657,7 +655,7 @@ def run_pipeline_for_single_query(
             
         return run_log
 
-    # --- MODE: Hierarchical Augmentation (Tree-Based) ---
+    # MODE: Hierarchical Augmentation (Tree-Based) 
     if config.get('APPLY_HIERARCHICAL_AUGMENTATION', False):
         print("\n[MODE] HIERARCHICAL AUGMENTATION ACTIVATED")
         
@@ -668,7 +666,7 @@ def run_pipeline_for_single_query(
         all_root_attempts = []
         last_hierarchical_result = None
         
-        # --- SCENARIO A: Full Pipeline Retry (N Distinct Trees) ---
+        # SCENARIO A: Full Pipeline Retry (N Distinct Trees) 
         if is_full_retry and n_passes > 1:
             logger.info(f"Full Pipeline Retry Enabled for Hierarchical Mode: Generating {n_passes} distinct trees.")
             
@@ -715,7 +713,7 @@ def run_pipeline_for_single_query(
             # Store iteration data
             run_log['full_pipeline_iterations_data'] = full_pipeline_iterations_data
 
-        # --- SCENARIO B: Standard Pass@N (1 Tree, N Root Solves) ---
+        # SCENARIO B: Standard Pass@N (1 Tree, N Root Solves) 
         else:
             # If retry is False, we pass the original config. 
             # The internal logic in propagate_solutions_upward handles the N loops.
@@ -742,7 +740,7 @@ def run_pipeline_for_single_query(
                 if not all_root_attempts and last_hierarchical_result.get('root_solution'):
                     all_root_attempts = [last_hierarchical_result['root_solution']]
 
-        # --- Final Log Construction ---
+        # Final Log Construction
         run_log['steps']['hierarchical_process'] = last_hierarchical_result
         
         # Populate the location the Evaluator looks for
@@ -760,7 +758,7 @@ def run_pipeline_for_single_query(
             run_log['pipeline_status'] = "FAILURE: Hierarchical process failed to produce solutions."
         return run_log
 
-    # --- MODE: Analogical Consistency Check (The "Pathway" approach - OLD VERSION) ---
+    # MODE: Analogical Consistency Check (The "Pathway" approach - OLD VERSION)
     if config.get('APPLY_CONSISTENCY_ANALOGICAL_CHECK', False):
         print("\n[MODE] ANALOGICAL CONSISTENCY CHECK (PATHWAY) ACTIVATED")
         
@@ -822,9 +820,9 @@ def run_pipeline_for_single_query(
         run_log['pipeline_status'] = "SUCCESS"
         return run_log
 
-    # --- Standard Pipeline Execution (with Parallel Benchmarking & Mirroring) ---
+    # Standard Pipeline Execution (with Parallel Benchmarking & Mirroring) 
     
-    # --- SETUP FULL PIPELINE RETRY LOGIC ---
+    # SETUP FULL PIPELINE RETRY LOGIC 
     full_retry_mode = config.get('APPLY_FULL_PIPELINE_RETRY', False)
     
     if full_retry_mode and run_mode == 'full':
@@ -844,7 +842,7 @@ def run_pipeline_for_single_query(
     iteration_details = []
     final_pipeline_status = "PENDING"
 
-    # --- PIPELINE ITERATION LOOP ---
+    # PIPELINE ITERATION LOOP
     for iteration_idx in range(n_pipeline_iterations):
         if full_retry_mode:
             print(f"\n[FULL PIPELINE ITERATION] {iteration_idx + 1}/{n_pipeline_iterations}")
@@ -855,9 +853,8 @@ def run_pipeline_for_single_query(
         # Structure: { "primary": {step: val}, "group_0": {step: val}, ... }
         iter_log_strategies = {} 
 
-        # ============================================================================
+
         # PHASE 1: ACQUIRE & OPTIMIZE (Retrieve + Mirror)
-        # ============================================================================
         if run_mode in ['full', 'intermediate']:
             # -- Step 1: Retrieve --
             retrieved_indices_initial = []
@@ -888,7 +885,7 @@ def run_pipeline_for_single_query(
             else:
                 print("\n[STEP 1] RETRIEVE SKIPPED (USE_RETRIEVAL is False).")
 
-            # -- Step 2: Optimization (Mirroring) --
+            # Step 2: Optimization (Mirroring)
             # This creates List 2 (Master), List 3 (Base), List 4 (Redundancy)
             
             master_sorted_indices = []
@@ -926,20 +923,13 @@ def run_pipeline_for_single_query(
                     master_sorted_indices = retrieved_indices_initial
 
 
-        # ============================================================================
         # PHASE 2: FORK (Track A & Track B)
-        # ============================================================================
-        
-        # We prepare a list of tasks to execute. 
-        # Each task: (strategy_name, indices_list, n_samples_override, is_benchmark)
         execution_tasks = []
 
         if not pipeline_halted:
             
-            # --- TRACK A: BENCHMARKING (Ranking Robustness) ---
-            # Operates on 'master_sorted_indices' (List 2)
-            # Logic: Slice strictly based on config tuples.
-            # Sample: N = GROUP_CONSISTENCY_SAMPLES_N
+            # TRACK A: BENCHMARKING (Ranking Robustness) 
+
             
             if config.get("APPLY_MIRROR_AS_EVALUATOR", False) or config.get("APPLY_GROUP_CONSISTENCY_SELECTION", False):
                 # We use the group candidates config to drive Track A
@@ -972,10 +962,9 @@ def run_pipeline_for_single_query(
                     else:
                         logger.warning(f"Skipping benchmark group {group_tuple}: Not enough items in Master List.")
 
-            # --- TRACK B: VALIDATION (Feature Check) ---
+            # TRACK B: VALIDATION (Feature Check)
             # Operates on 'validation_strategies' (List 3 & List 4)
             # Logic: Use whole list.
-            # Sample: N = 1 (Hardcoded)
             
             if validation_strategies:
                 print(f"\n[TRACK B] FEATURE VALIDATION (N=1)")
@@ -1001,7 +990,7 @@ def run_pipeline_for_single_query(
                             "type": "validation"
                         })
             
-            # --- FALLBACK / DEFAULT ---
+            # FALLBACK / DEFAULT 
             # If no mirroring and no benchmarking, we just run the master list as "primary"
             if not execution_tasks:
                  execution_tasks.append({
@@ -1012,10 +1001,8 @@ def run_pipeline_for_single_query(
                 })
 
 
-        # ============================================================================
+
         # PHASE 3: EXECUTE TASKS (Adapt -> Solve)
-        # ============================================================================
-        
         # If running in solve_only mode, we need to load the intermediate state differently
         if run_mode == 'solve_only':
              # In solve_only mode, we assume the log contains the necessary keys.
@@ -1043,7 +1030,7 @@ def run_pipeline_for_single_query(
             local_step_log = {} 
             current_exemplars_for_step = [] 
             
-            # --- ADAPTATION PHASE ---
+            # ADAPTATION PHASE 
             if run_mode in ['full', 'intermediate']:
                 if config.get('USE_RETRIEVAL'):
                     if indices == [-1]: # Zero-shot
@@ -1151,7 +1138,7 @@ def run_pipeline_for_single_query(
                 iter_log_strategies[strat_name] = local_step_log
                 iter_log_strategies[strat_name]['final_exemplars'] = current_exemplars_for_step
 
-            # --- SOLVE PHASE ---
+            #  SOLVE PHASE 
             if run_mode in ['full', 'solve_only']:
                 # Recover exemplars if in solve_only mode
                 if run_mode == 'solve_only':
@@ -1219,7 +1206,7 @@ def run_pipeline_for_single_query(
                 if 'trace' in solve_result:
                     run_log['execution_trace'].extend(solve_result.pop('trace'))
 
-                # --- STORAGE LOGIC ---
+                # STORAGE LOGIC 
                 if task_type == 'benchmark':
                     if 'benchmarks' not in run_log: run_log['benchmarks'] = {}
                     # Merge intermediate log with solve result for completeness
@@ -1295,10 +1282,10 @@ def run_experiments(
     logger = logging.getLogger(__name__)
     all_results = {}
     
-    # --- ADDED THIS LINE TO MAKE THE SAFEGUARD WORK ---
+    # ADDED THIS LINE TO MAKE THE SAFEGUARD WORK 
     global_config['hard_questions_length'] = len(hard_questions)
 
-    # --- special case: dataset construction experiments ---
+    # special case: dataset construction experiments 
     dataset_configs = [exp for exp in experiment_configs if exp.get("APPLY_DATASET_CONSTRUCTION")]
     normal_configs = [exp for exp in experiment_configs if not exp.get("APPLY_DATASET_CONSTRUCTION")]
 
@@ -1310,7 +1297,6 @@ def run_experiments(
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "dataset_construction")
             logger.info(f"--- Dataset experiment '{exp_name}' starting ---")
-            # pick appropriate managers
             solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
             eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", current_config.get("API_PROVIDER_SOLVER", "gemini")))
             ds_result = construct_two_shot_dataset(
@@ -1320,13 +1306,11 @@ def run_experiments(
                 api_manager_eval=eval_mgr,
                 config=current_config
             )
-            # results are saved by the builder; we just note them
             all_results[exp_name] = ds_result
             logger.info(f"--- Dataset experiment '{exp_name}' finished ---")
         # replace list for the remaining pipeline with the normal ones
         experiment_configs = normal_configs
         if not experiment_configs:
-            # nothing else to do
             return all_results
         
     # SPECIAL CASE: Core-Preserving Simplification Phase 1 & Phase 2
@@ -1336,9 +1320,8 @@ def run_experiments(
     # Update normal_configs to exclude Phase 1 and Phase 2 configs from the standard pipeline
     experiment_configs = [exp for exp in experiment_configs if not (exp.get("APPLY_CORE_SIMP_PHASE1") or exp.get("APPLY_CORE_SIMP_PHASE2"))]
 
-    # =========================================================================
+
     # EXECUTE PHASE 1: Build the Donor Dataset
-    # =========================================================================
     if phase1_configs:
         logger.info(f"Found {len(phase1_configs)} Core Simplification Phase 1 config(s); running them now.")
         from src.core_simplification import run_core_simplification_phase1
@@ -1361,7 +1344,7 @@ def run_experiments(
             full_logs = load_json(log_file_path) or []
             completed_indices = {log.get('original_index') for log in full_logs if 'original_index' in log}
             
-            # --- NEW: Filter out completed questions BEFORE starting the progress bar ---
+            # Filter out completed questions BEFORE starting the progress bar 
             queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_indices]
             
             if not queries_to_process:
@@ -1395,9 +1378,7 @@ def run_experiments(
             all_results[exp_name] = full_logs
             logger.info(f"--- Phase 1 '{exp_name}' finished. Saved {len(successful_samples)} verified samples. ---")
 
-    # =========================================================================
     # EXECUTE PHASE 2: Analogical Evaluation (The 3 Branches)
-    # =========================================================================
     if phase2_configs:
         logger.info(f"Found {len(phase2_configs)} Core Simplification Phase 2 config(s); running them now.")
         from src.core_simplification_layer2 import execute_core_simplification_phase2
@@ -1409,7 +1390,6 @@ def run_experiments(
             
             logger.info(f"--- Core Simplification Phase 2 '{exp_name}' starting ---")
             
-            # --- MISSING BLOCK ADDED HERE ---
             phase2_results = execute_core_simplification_phase2(
                 hard_questions=hard_questions,
                 hard_solutions=hard_solutions,
@@ -1421,11 +1401,8 @@ def run_experiments(
             
             all_results[exp_name] = phase2_results
             logger.info(f"--- Phase 2 '{exp_name}' finished. ---")
-            # --------------------------------
 
-    # =========================================================================
     # SPECIAL CASE: Merging Dataset Construction
-    # =========================================================================
     merging_ds_configs = [exp for exp in experiment_configs if exp.get("APPLY_MERGING_DATASET_CONSTRUCTION")]
     # Update experiment_configs to exclude merging configs from the standard pipeline
     experiment_configs = [exp for exp in experiment_configs if not exp.get("APPLY_MERGING_DATASET_CONSTRUCTION")]
@@ -1460,7 +1437,6 @@ def run_experiments(
         return all_results
         
         
-    # --- REWRITTEN LOGIC: Check for and handle cross-experiment deferred execution ---
     is_cross_experiment_defer_enabled = any(
         exp.get('DEFER_SOLVE_STEP', False) for exp in experiment_configs
     )
@@ -1469,7 +1445,7 @@ def run_experiments(
         logger.info("Cross-experiment deferred mode is ENABLED. Running in two phases.")
         print("\n" + "#"*25 + " PHASE 1: EXECUTING INTERMEDIATE STEPS FOR ALL EXPERIMENTS " + "#"*25)
         
-        # --- PHASE 1: Intermediate Steps for ALL experiments ---
+        # PHASE 1: Intermediate Steps for ALL experiments 
         for exp_overrides in experiment_configs:
             current_config = global_config.copy()
             current_config.update(exp_overrides)
@@ -1493,12 +1469,12 @@ def run_experiments(
                         hard_list_idx=original_idx, target_query=query_text, config=current_config,
                         embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers, 
                         run_mode='intermediate',
-                        hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
+                        hard_solutions=hard_solutions
                     )
                     run_logs.append(intermediate_log)
                     save_json(run_logs, log_file_path)
                     
-                    # --- NEW: Save Layer 1 Cache Synchronously ---
+                    # Save Layer 1 Cache Synchronously 
                     if 'layer1_base_execution_state' in intermediate_log:
                         l1_state = intermediate_log['layer1_base_execution_state']
                         t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
@@ -1506,7 +1482,6 @@ def run_experiments(
                         c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                         c_file = _get_cache_filename(t_k, n_cands, exp_name)
                         _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
-                    # ---------------------------------------------
                     
                     periodic_sync_check(loop_idx, current_config)
             else:
@@ -1591,7 +1566,7 @@ def run_experiments(
         print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
 
     else:
-        # --- Original Mode: Run each experiment sequentially ---
+        # Original Mode: Run each experiment sequentially
         logger.info("Deferred mode is DISABLED. Running experiments sequentially.")
         for exp_overrides in experiment_configs:
             current_config = global_config.copy()
@@ -1621,7 +1596,7 @@ def run_experiments(
                         run_logs.append(single_run_log)
                         save_json(run_logs, log_file_path)
                         
-                        # --- NEW: Save Layer 1 Cache Synchronously ---
+                        # Save Layer 1 Cache Synchronously
                         if 'layer1_base_execution_state' in single_run_log:
                             l1_state = single_run_log['layer1_base_execution_state']
                             t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
@@ -1629,16 +1604,14 @@ def run_experiments(
                             c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                             c_file = _get_cache_filename(t_k, n_cands, exp_name)
                             _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
-                        # ---------------------------------------------
                         
                         periodic_sync_check(loop_idx, current_config)
                 
-                # FIXED: Ensure the logs variable is named correctly so it doesn't crash 
-                # and flows properly into Layer 2
+
                 final_logs = run_logs
 
             else:
-                # --- Single-Experiment Deferred Mode ---
+                # Single-Experiment Deferred Mode 
                 logger.info(f"Running '{exp_name}' in single-experiment deferred solve mode.")
                 
                 # PHASE 1: Intermediate Steps
@@ -1653,12 +1626,12 @@ def run_experiments(
                             hard_list_idx=original_idx, target_query=query_text, config=current_config,
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                             run_mode='intermediate',
-                            hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
+                            hard_solutions=hard_solutions  
                         )
                         run_logs.append(intermediate_log)
                         save_json(run_logs, log_file_path)
                         
-                        # --- NEW: Save Layer 1 Cache Synchronously ---
+                        # Save Layer 1 Cache Synchronously 
                         if 'layer1_base_execution_state' in intermediate_log and intermediate_log['layer1_base_execution_state'].get('_needs_saving'):
                             l1_state = intermediate_log['layer1_base_execution_state']
                             t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
@@ -1666,7 +1639,7 @@ def run_experiments(
                             c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                             c_file = _get_cache_filename(t_k, n_cands, exp_name)
                             _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
-                        # ---------------------------------------------
+
                         
                         periodic_sync_check(loop_idx, current_config)
                 else:
@@ -1703,7 +1676,6 @@ def run_experiments(
             all_results[exp_name] = final_logs
             logger.info(f"########## Finished Experiment: {exp_name} ##########")
 
-            # --- AUTOMATIC LAYER 2 EXECUTION ---
             if current_config.get('APPLY_LAYER2_ANALYSIS', False):
                 print("\n" + "#"*25 + f" STARTING LAYER 2 ANALYSIS FOR: {exp_name} " + "#"*25)
                 
@@ -1732,7 +1704,6 @@ def run_experiments(
                     hard_solutions=hard_solutions
                 )
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
-            # --- END OF AUTOMATIC LAYER 2 EXECUTION ---
 
         print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
         
