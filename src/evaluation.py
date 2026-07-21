@@ -40,10 +40,8 @@ try:
 except ImportError:
     wandb = None
 
-# Import custom project modules
 from src.utils import save_json, load_json
 from src.hf_sync import periodic_sync_check
-# MODIFIED: Import manager classes for type checking and APIResponse type
 from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
 # Define a structured type for the result of a single LLM-based evaluation
@@ -201,7 +199,7 @@ def analyze_experiment_logs(
 
         logger.info(f"Loaded {len(detailed_evaluations)} existing evaluation entries for '{exp_name}'.")
 
-        # --- Phase 2: Process Logs (Detecting Strategies) ---
+        # Phase 2: Process Logs (Detecting Strategies)
         new_evaluations = []
         logs_modified = False
 
@@ -293,7 +291,7 @@ def analyze_experiment_logs(
         # Final save
         save_json(detailed_evaluations, eval_file_path)
 
-        # --- Phase 3: Aggregate Results (Per Strategy) ---
+        # Phase 3: Aggregate Results (Per Strategy)
         # We need to collect all possible K values encountered in this run to normalize reporting
         all_encountered_k = set(global_pass_k_values)
         
@@ -346,7 +344,7 @@ def analyze_experiment_logs(
                          if any(is_correct_list):
                              metrics_by_strategy[strat]["pass_k_counts"][k] += 1
         
-        # --- Phase 4: Compile Final Summary Row ---
+        # Phase 4: Compile Final Summary Row
         exp_summary = {
             "experiment_name": exp_name
         }
@@ -377,7 +375,7 @@ def analyze_experiment_logs(
     
     analysis_df = pd.DataFrame(analysis_summary)
     
-    # --- Log evaluation results to W&B ---
+    # Log evaluation results to W&B
     if config.get('WANDB_PERSIST_ONLINE', False) and wandb is not None:
         try:
             from src.wandb_sync import log_experiment_metrics
@@ -403,7 +401,7 @@ def analyze_experiment_logs(
     return analysis_df
 
 
-# --- SHARED HELPERS FOR CONSISTENCY ANALYSIS ---
+# SHARED HELPERS FOR CONSISTENCY ANALYSIS 
 
 def _extract_answer_simple(text: str) -> str:
     """
@@ -437,7 +435,7 @@ def _calculate_semantic_consistency(
     return float(mean_similarity)
 
 
-# --- PATHWAY CONSISTENCY ANALYSIS (OLD FEATURE) ---
+# PATHWAY CONSISTENCY ANALYSIS (OLD FEATURE)
 
 def analyze_analogical_consistency_logs(
     all_experiments_logs: Dict[str, List[Dict]],
@@ -524,7 +522,7 @@ def analyze_analogical_consistency_logs(
     return pd.DataFrame(pathway_records)
 
 
-# --- GROUP CONSISTENCY ANALYSIS (CORRELATION STUDY - LEGACY SUPPORT) ---
+# GROUP CONSISTENCY ANALYSIS (CORRELATION STUDY - LEGACY SUPPORT)
 
 def analyze_group_consistency_correlation(
     all_experiments_logs: Dict[str, List[Dict]],
@@ -612,11 +610,6 @@ def analyze_group_consistency_correlation(
                     
                 # 4. Check if ANY answer in the group was correct (to detect lucky guesses)
                 # We need to be careful with API usage here. If we have 5 attempts, evaluating all 5
-                # is expensive.
-                # Optimization: We check the majority answer first. 
-                # If majority is correct, then 'any_correct' is True.
-                # If majority is wrong, we *might* check others if we really want to find lucky guesses.
-                # For this implementation, we will check unique answers only.
                 any_correct = majority_is_correct
                 if not majority_is_correct and clean_answers:
                     unique_answers = set(clean_answers)
