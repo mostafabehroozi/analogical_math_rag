@@ -41,6 +41,15 @@ from src.pipeline_steps import (
 )
 from src.evaluation import evaluate_single_answer_with_llm
 
+# --- OVERRIDE PRINT TO BE THREAD-SAFE ---
+from src.context_logger import tprint
+
+def thread_safe_print(*args, **kwargs):
+    message = " ".join(str(a) for a in args)
+    tprint(message, level="INFO")
+
+print = thread_safe_print
+
 
 # ============================================================================
 # CACHE MANAGEMENT

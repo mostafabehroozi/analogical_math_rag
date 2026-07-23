@@ -84,6 +84,13 @@ from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
 from src.prompts import EXEMPLAR_FORMAT, create_analogical_adaptation_prompt
 
+# --- OVERRIDE PRINT TO BE THREAD-SAFE ---
+def thread_safe_print(*args, **kwargs):
+    message = " ".join(str(a) for a in args)
+    tprint(message, level="INFO")
+
+print = thread_safe_print
+
 def run_pipeline_for_single_query(
     hard_list_idx: int,
     target_query: str,

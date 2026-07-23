@@ -200,96 +200,82 @@ def analyze_experiment_logs(
         logger.info(f"Loaded {len(detailed_evaluations)} existing evaluation entries for '{exp_name}'.")
 
         # Phase 2: Process Logs (Detecting Strategies)
-        new_evaluations = []
-        logs_modified = False
-
-        # Select the correct API manager for evaluation
         provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
         manager_for_eval = api_managers[provider_for_eval]
 
-        for loop_idx, log in enumerate(tqdm(query_logs, desc=f"Evaluating {exp_name}")):
+        # 1. Gather all tasks that need evaluation
+        tasks_to_run = []
+        for log in query_logs:
             hard_list_idx = log["target_query_original_hard_list_idx"]
             ground_truth = ground_truths[hard_list_idx]
             
-            # 1. Identify all strategies present in this log
             strategies_to_evaluate = {}
-            
-            # A. Primary Strategy (Standard location)
+            # A. Primary Strategy
             primary_attempts = log.get("steps", {}).get("solving", {}).get("solution_attempts", [])
-            if primary_attempts:
-                strategies_to_evaluate['primary'] = primary_attempts
+            if primary_attempts: strategies_to_evaluate['primary'] = primary_attempts
             
-            # B. Track A: Benchmarks (New location)
-            # These are the statistical robust checks (e.g. group_0_1, group_0)
+            # B. Track A: Benchmarks
             benchmarks = log.get("benchmarks", {})
             for strat_name, result_data in benchmarks.items():
                 attempts = result_data.get("solution_attempts", [])
-                if attempts:
-                    strategies_to_evaluate[strat_name] = attempts
+                if attempts: strategies_to_evaluate[strat_name] = attempts
 
-            # C. Track B: Validations & Alternatives (steps_alternatives)
-            # e.g., "base_filtering", "redundancy_filtering"
+            # C. Track B: Validations & Alternatives
             alternatives = log.get("steps_alternatives", {})
             for strat_name, strat_data in alternatives.items():
                 alt_attempts = strat_data.get("solving", {}).get("solution_attempts", [])
-                if alt_attempts:
-                    strategies_to_evaluate[strat_name] = alt_attempts
+                if alt_attempts: strategies_to_evaluate[strat_name] = alt_attempts
 
-            # 2. Evaluate each strategy
             for strat_name, attempts in strategies_to_evaluate.items():
-                
-                # Check if already evaluated
-                if (hard_list_idx, strat_name) in evaluated_map:
-                    continue
+                if (hard_list_idx, strat_name) not in evaluated_map:
+                    tasks_to_run.append({
+                        "hard_list_idx": hard_list_idx,
+                        "strat_name": strat_name,
+                        "attempts": attempts,
+                        "ground_truth": ground_truth
+                    })
 
-                # Proceed to evaluate
+        # 2. Execute Evaluations in Parallel
+        if tasks_to_run:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            max_workers = config.get("BATCH_MAX_WORKERS", 5)
+            
+            def eval_worker(task):
                 is_correct_list, status_list, error_details_list = [], [], []
-
-                for i, attempt in enumerate(attempts):
-                    # Case 1: Generation was successful (attempt is a string)
+                for attempt in task["attempts"]:
                     if isinstance(attempt, str):
-                        # print(f"    -> Eval ({strat_name}) Q#{hard_list_idx} Attempt {i+1}")
-                        eval_result = evaluate_single_answer_with_llm(attempt, ground_truth, manager_for_eval, config)
-                        
+                        eval_result = evaluate_single_answer_with_llm(attempt, task["ground_truth"], manager_for_eval, config)
                         is_correct_list.append(eval_result["is_correct"])
                         status_list.append(eval_result["status"])
                         error_details_list.append(eval_result["error_details"])
-                    
-                    # Case 2: Generation failed
                     elif isinstance(attempt, dict) and attempt.get('status') == 'FAILURE':
                         is_correct_list.append(None)
                         status_list.append("GENERATION_FAILED")
                         error_details_list.append(attempt.get("error_info"))
-
-                    # Case 3: Unexpected format
                     else:
                         is_correct_list.append(None)
                         status_list.append("INVALID_ATTEMPT_FORMAT")
                         error_details_list.append(None)
 
-                # Construct result entry
-                eval_entry = {
-                    "hard_list_idx": hard_list_idx,
-                    "strategy": strat_name, # Tag with strategy name
+                return {
+                    "hard_list_idx": task["hard_list_idx"],
+                    "strategy": task["strat_name"],
                     "is_correct_list": is_correct_list,
                     "evaluation_status_list": status_list,
                     "evaluation_error_details": error_details_list,
-                    "attempts": attempts 
+                    "attempts": task["attempts"]
                 }
-                
-                detailed_evaluations.append(eval_entry)
-                evaluated_map[(hard_list_idx, strat_name)] = eval_entry
-                new_evaluations.append(eval_entry)
-                logs_modified = True
 
-            # Periodic save
-            if loop_idx % 10 == 0 and logs_modified:
-                save_json(detailed_evaluations, eval_file_path)
-                periodic_sync_check(loop_idx, config)
-                logs_modified = False
-
-        # Final save
-        save_json(detailed_evaluations, eval_file_path)
+            # Run with a progress bar!
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(eval_worker, task) for task in tasks_to_run]
+                for future in tqdm(as_completed(futures), total=len(futures), desc=f"Evaluating {exp_name}"):
+                    eval_entry = future.result()
+                    detailed_evaluations.append(eval_entry)
+                    evaluated_map[(eval_entry["hard_list_idx"], eval_entry["strategy"])] = eval_entry
+            
+            # Final save after all tasks complete
+            save_json(detailed_evaluations, eval_file_path)
 
         # Phase 3: Aggregate Results (Per Strategy)
         # We need to collect all possible K values encountered in this run to normalize reporting

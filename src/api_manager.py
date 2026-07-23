@@ -404,8 +404,15 @@ class OllamaAPIManager:
                 response = self.client.generate(model=model_name, prompt=prompt, options=options)
                 return {"status": "SUCCESS", "text": response["response"], "error_type": None, "error_message": None, "error_details": None}
             except ollama.ResponseError as error:
+                if self.config.get("BATCH_PROCESSING_ENABLED", False):
+                    time.sleep(float(self.config.get("API_RETRY_DELAY_SECONDS", 5.0)))
+                    
                 return {"status": "ERROR", "text": None, "error_type": "OllamaResponseError", "error_message": str(error), "error_details": repr(error)}
+                
             except Exception as error:
+                if self.config.get("BATCH_PROCESSING_ENABLED", False):
+                    time.sleep(float(self.config.get("API_RETRY_DELAY_SECONDS", 5.0)))
+                    
                 return {"status": "ERROR", "text": None, "error_type": "OllamaConnectionError", "error_message": str(error), "error_details": repr(error)}
 
         return execute_with_retry(self.config, attempt)
