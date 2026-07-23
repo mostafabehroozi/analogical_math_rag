@@ -131,6 +131,25 @@ def save_json(data: dict or list, file_path: str, indent: int = 4) -> bool:
             print(f"ERROR: Failed to save JSON to {file_path}: {e}")
         return False
 
+
+def save_json_atomic(data: dict or list, file_path: str, indent: int = 4) -> bool:
+    """Atomically replace a JSON file after successfully writing its full content."""
+    temp_path = file_path + ".tmp"
+    try:
+        if not save_json(data, temp_path, indent=indent):
+            return False
+        os.replace(temp_path, file_path)
+        return True
+    except OSError as e:
+        logging.getLogger(__name__).error(f"Failed atomic JSON save to {file_path}: {e}", exc_info=True)
+        return False
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
 def load_json(file_path: str) -> dict or list or None:
     """
     Loads data from a JSON file with robust error handling.

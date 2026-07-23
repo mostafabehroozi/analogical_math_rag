@@ -25,6 +25,16 @@ CONFIG = {
     "API_RETRY_DELAY_SECONDS": 20.0,
     "RETRY_ALL_API_ERRORS": True,  # If True, retry all API error types; if False, only retry RETRYABLE_ERROR_TYPES
     "API_RESPONSE_TRUNCATION_LENGTH": 50,
+    # Batch execution is intentionally opt-in until quotas are configured and
+    # the existing experiment has been validated with a small batch.
+    "BATCH_PROCESSING_ENABLED": False,
+    "BATCH_SIZE": 5,
+    "BATCH_MAX_WORKERS": 5,
+    "BATCH_FAILURE_POLICY": "halt_after_failed_batch",
+    "BATCH_WRITE_JOURNALS": True,
+    "HF_SYNC_INTERVAL_BATCHES": 1,
+    "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
+    "API_REQUEST_TIMEOUT_SECONDS": 180.0,
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "DATA_DIR": DATA_DIR,
     "LOGS_DIR": LOGS_DIR,
@@ -45,7 +55,7 @@ CONFIG = {
     # Per-model rate-limit settings. Each entry may be a dict for all keys,
     # or a list of quota dicts with optional api_key values for key-specific settings.
     "GEMINI_MODEL_QUOTAS": {
-        "models/gemma-3-27b-it": [{"api_key": None, "delay_seconds": 2, "rpd": 1000}],
+        "models/gemma-3-27b-it": [{"api_key": None, "rpm": 30, "rpd": 1000}],
     },
     "GLOBAL_API_CALL_DELAY_SECONDS": 5,
 
@@ -62,7 +72,7 @@ CONFIG = {
     # Per-model rate-limit settings. Use a dict for all keys, or a list of quota dicts
     # with optional api_key for per-key customization.
     "AVALAI_MODEL_QUOTAS": {
-        "default": {"delay_seconds": 2}
+        "default": {"rpm": 30}
     },
     "AVALAI_MODEL_NAME_ADAPTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_FINAL_SOLVER": "openai.gpt-oss-20b-1:0",

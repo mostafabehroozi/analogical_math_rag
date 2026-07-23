@@ -5,8 +5,9 @@ import logging
 from tqdm import tqdm
 from typing import Dict, Any, List
 
-from src.utils import save_json, load_json
-from src.hf_sync import periodic_sync_check
+from src.utils import save_json, save_json_atomic, load_json
+from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
+from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
 from src.pipeline_steps import retrieve
 from src.prompts import (
     create_final_reasoning_prompt,
@@ -208,6 +209,47 @@ def build_merging_dataset(
     if not queries_to_process:
         logger.info(f"All queries for '{exp_name}' are already processed. Returning existing results.")
         return full_logs
+
+    if config.get("BATCH_PROCESSING_ENABLED", False):
+        ground_truths = {}
+        for original_idx, query in queries_to_process:
+            gt = None
+            if hard_solutions and original_idx < len(hard_solutions):
+                gt = hard_solutions[original_idx]
+            elif 'ground_truths' in exemplar_data and original_idx < len(exemplar_data['ground_truths']):
+                gt = exemplar_data['ground_truths'][original_idx]
+            elif 'solutions' in exemplar_data and len(exemplar_data['solutions']) == len(hard_questions):
+                gt = exemplar_data['solutions'][original_idx]
+            if gt:
+                ground_truths[original_idx] = gt
+            else:
+                logger.warning("Skipping index %s: No ground truth available.", original_idx)
+
+        logs_by_index = {log.get("original_index"): log for log in full_logs if "original_index" in log}
+        def worker(item: QuestionWorkItem) -> Dict[str, Any]:
+            result = process_single_question(
+                target_query=item.question, ground_truth=ground_truths[item.index], exemplar_data=exemplar_data,
+                embedding_model=embedding_model, api_manager_solve=solver_mgr, api_manager_eval=eval_mgr, config=config,
+            )
+            result["original_index"] = item.index
+            return result
+        def commit(results: List[QuestionResult], _batch_id: str, batch_number: int) -> None:
+            for result in results:
+                logs_by_index[result.item.index] = result.value
+                value = result.value
+                if value.get("status") == "SUCCESS" and value.get("dataset_entry"):
+                    entry = value["dataset_entry"]
+                    entry["metadata"] = {"original_index": result.item.index, "few_shot_ccs": value.get("few_shot_ccs"), "base_ccs": value.get("base_ccs")}
+                    successful_dataset.append(entry)
+            if not save_json_atomic([logs_by_index[index] for index in sorted(logs_by_index)], log_file_path):
+                raise RuntimeError("Failed to commit merging run logs")
+            if not save_json_atomic(successful_dataset, dataset_path):
+                raise RuntimeError("Failed to commit merging dataset")
+            periodic_batch_sync_check(batch_number - 1, config)
+        BatchCoordinator(config, exp_name, "merging").run(
+            [QuestionWorkItem(index=index, question=query) for index, query in queries_to_process if index in ground_truths], worker, commit
+        )
+        return [logs_by_index[index] for index in sorted(logs_by_index)]
 
     for loop_idx, (original_idx, query) in enumerate(tqdm(queries_to_process, desc=f"Merging DS: {exp_name}")):
         

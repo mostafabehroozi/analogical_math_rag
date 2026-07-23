@@ -71,13 +71,15 @@ from src.multibranch_transformation import multibranch_transformation_experiment
 from src.layer1_base_execution import (
     run_layer1_base_execution, 
     _save_cached_state, 
+    _save_cached_states_batch,
     _get_cache_filename, 
     _get_cache_path
 )
 from src.layer2_integration import run_layer2_complete_pipeline
 
-from src.utils import save_json, load_json
-from src.hf_sync import periodic_sync_check
+from src.utils import save_json, save_json_atomic, load_json
+from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
+from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
 from src.prompts import EXEMPLAR_FORMAT, create_analogical_adaptation_prompt
 
 def run_pipeline_for_single_query(
@@ -1266,6 +1268,81 @@ def run_pipeline_for_single_query(
     return run_log
 
 
+def _log_query_index(run_log: Dict[str, Any]) -> Optional[int]:
+    value = run_log.get("target_query_original_hard_list_idx")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_pipeline_items_in_batches(
+    items: List[QuestionWorkItem],
+    existing_logs: List[Dict[str, Any]],
+    log_file_path: str,
+    experiment_name: str,
+    phase_name: str,
+    run_mode: str,
+    current_config: Dict[str, Any],
+    embedding_model: SentenceTransformer,
+    exemplar_data: Dict[str, Any],
+    api_managers: Dict[str, Any],
+    hard_solutions: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    """Run a phase in fixed batches and commit logs/cache only at batch boundaries."""
+    logs_by_index = {
+        query_index: log for log in existing_logs
+        if (query_index := _log_query_index(log)) is not None
+    }
+    unindexed_logs = [log for log in existing_logs if _log_query_index(log) is None]
+
+    def worker(item: QuestionWorkItem) -> Dict[str, Any]:
+        return run_pipeline_for_single_query(
+            hard_list_idx=item.index,
+            target_query=item.question,
+            config=current_config,
+            embedding_model=embedding_model,
+            exemplar_data=exemplar_data,
+            api_managers=api_managers,
+            run_mode=run_mode,
+            existing_log=item.existing_log,
+            hard_solutions=hard_solutions,
+        )
+
+    def commit(results: List[QuestionResult], batch_id: str, batch_number: int) -> None:
+        for result in results:
+            run_log = result.value
+            run_log["batch_metadata"] = {
+                "batch_id": batch_id,
+                "phase": phase_name,
+                "terminal_status": result.terminal_status,
+                "elapsed_seconds": round(result.elapsed_seconds, 3),
+            }
+            logs_by_index[result.item.index] = run_log
+
+        committed_logs = [logs_by_index[index] for index in sorted(logs_by_index)] + unindexed_logs
+        if not save_json_atomic(committed_logs, log_file_path):
+            raise RuntimeError(f"Could not commit batch {batch_id} run log: {log_file_path}")
+
+        layer1_states = {
+            result.item.index: result.value["layer1_base_execution_state"]
+            for result in results
+            if isinstance(result.value.get("layer1_base_execution_state"), dict)
+        }
+        if layer1_states:
+            top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+            n_candidates = current_config.get("LAYER1_N_CANDIDATES") or top_k
+            cache_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
+            cache_path = _get_cache_path(cache_dir, _get_cache_filename(top_k, n_candidates, experiment_name))
+            if not _save_cached_states_batch(cache_path, layer1_states, top_k, n_candidates, experiment_name, batch_id):
+                raise RuntimeError(f"Could not commit Layer-1 cache for batch {batch_id}")
+
+        periodic_batch_sync_check(batch_number - 1, current_config)
+
+    BatchCoordinator(current_config, experiment_name, phase_name).run(items, worker, commit)
+    return [logs_by_index[index] for index in sorted(logs_by_index)] + unindexed_logs
+
+
 def run_experiments(
     experiment_configs: List[Dict[str, Any]],
     global_config: Dict[str, Any],
@@ -1464,26 +1541,37 @@ def run_experiments(
             queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
 
             if queries_to_process:
-                for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
-                    intermediate_log = run_pipeline_for_single_query(
-                        hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers, 
-                        run_mode='intermediate',
-                        hard_solutions=hard_solutions
+                if current_config.get("BATCH_PROCESSING_ENABLED", False):
+                    run_logs = _run_pipeline_items_in_batches(
+                        items=[QuestionWorkItem(index=index, question=question) for index, question in queries_to_process],
+                        existing_logs=run_logs,
+                        log_file_path=log_file_path,
+                        experiment_name=exp_name,
+                        phase_name="intermediate",
+                        run_mode="intermediate",
+                        current_config=current_config,
+                        embedding_model=embedding_model,
+                        exemplar_data=exemplar_data,
+                        api_managers=api_managers,
+                        hard_solutions=hard_solutions,
                     )
-                    run_logs.append(intermediate_log)
-                    save_json(run_logs, log_file_path)
-                    
-                    # Save Layer 1 Cache Synchronously 
-                    if 'layer1_base_execution_state' in intermediate_log:
-                        l1_state = intermediate_log['layer1_base_execution_state']
-                        t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-                        n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
-                        c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
-                        c_file = _get_cache_filename(t_k, n_cands, exp_name)
-                        _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
-                    
-                    periodic_sync_check(loop_idx, current_config)
+                else:
+                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
+                        intermediate_log = run_pipeline_for_single_query(
+                            hard_list_idx=original_idx, target_query=query_text, config=current_config,
+                            embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
+                            run_mode='intermediate', hard_solutions=hard_solutions,
+                        )
+                        run_logs.append(intermediate_log)
+                        save_json(run_logs, log_file_path)
+                        if 'layer1_base_execution_state' in intermediate_log:
+                            l1_state = intermediate_log['layer1_base_execution_state']
+                            t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+                            n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
+                            c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
+                            c_file = _get_cache_filename(t_k, n_cands, exp_name)
+                            _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
+                        periodic_sync_check(loop_idx, current_config)
             else:
                 logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
 
@@ -1509,21 +1597,33 @@ def run_experiments(
             if logs_to_solve:
                 completed_logs_map = {log['target_query_original_hard_list_idx']: log for log in intermediate_logs if log.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'}
 
-                for loop_idx, log_to_solve in enumerate(tqdm(logs_to_solve, desc=f"{exp_name} - Phase 2: Solving")):
-                    original_idx = log_to_solve['target_query_original_hard_list_idx']
-                    query_text = log_to_solve['target_query_text']
-                    
-                    completed_log = run_pipeline_for_single_query(
-                        hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                        embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                        run_mode='solve_only', existing_log=log_to_solve,
-                        hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
+                if current_config.get("BATCH_PROCESSING_ENABLED", False):
+                    final_logs = _run_pipeline_items_in_batches(
+                        items=[QuestionWorkItem(index=log['target_query_original_hard_list_idx'], question=log['target_query_text'], existing_log=log) for log in logs_to_solve],
+                        existing_logs=list(completed_logs_map.values()),
+                        log_file_path=log_file_path,
+                        experiment_name=exp_name,
+                        phase_name="solve",
+                        run_mode="solve_only",
+                        current_config=current_config,
+                        embedding_model=embedding_model,
+                        exemplar_data=exemplar_data,
+                        api_managers=api_managers,
+                        hard_solutions=hard_solutions,
                     )
-                    completed_logs_map[original_idx] = completed_log
-                    save_json(list(completed_logs_map.values()), log_file_path)
-                    periodic_sync_check(loop_idx, current_config)
-                
-                final_logs = list(completed_logs_map.values())
+                else:
+                    for loop_idx, log_to_solve in enumerate(tqdm(logs_to_solve, desc=f"{exp_name} - Phase 2: Solving")):
+                        original_idx = log_to_solve['target_query_original_hard_list_idx']
+                        query_text = log_to_solve['target_query_text']
+                        completed_log = run_pipeline_for_single_query(
+                            hard_list_idx=original_idx, target_query=query_text, config=current_config,
+                            embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
+                            run_mode='solve_only', existing_log=log_to_solve, hard_solutions=hard_solutions,
+                        )
+                        completed_logs_map[original_idx] = completed_log
+                        save_json(list(completed_logs_map.values()), log_file_path)
+                        periodic_sync_check(loop_idx, current_config)
+                    final_logs = list(completed_logs_map.values())
             else:
                  logger.info(f"All solve steps for '{exp_name}' are already complete.")
                  final_logs = intermediate_logs
@@ -1585,6 +1685,21 @@ def run_experiments(
                 
                 if not queries_to_process:
                     logger.info(f"All queries for '{exp_name}' are already processed. Skipping LLM execution.")
+                elif current_config.get("BATCH_PROCESSING_ENABLED", False):
+                    logger.info("Running '%s' in synchronized batch mode.", exp_name)
+                    run_logs = _run_pipeline_items_in_batches(
+                        items=[QuestionWorkItem(index=index, question=question) for index, question in queries_to_process],
+                        existing_logs=run_logs,
+                        log_file_path=log_file_path,
+                        experiment_name=exp_name,
+                        phase_name="full",
+                        run_mode="full",
+                        current_config=current_config,
+                        embedding_model=embedding_model,
+                        exemplar_data=exemplar_data,
+                        api_managers=api_managers,
+                        hard_solutions=hard_solutions,
+                    )
                 else:
                     for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"Running {exp_name}")):
                         single_run_log = run_pipeline_for_single_query(
@@ -1613,64 +1728,82 @@ def run_experiments(
             else:
                 # Single-Experiment Deferred Mode 
                 logger.info(f"Running '{exp_name}' in single-experiment deferred solve mode.")
-                
-                # PHASE 1: Intermediate Steps
                 print(f"\n--- {exp_name}: STARTING PHASE 1 of 2 (Intermediate Steps) ---")
                 run_logs = load_json(log_file_path) or []
                 completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE'}
                 queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
 
                 if queries_to_process:
-                    for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
-                        intermediate_log = run_pipeline_for_single_query(
-                            hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                            embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                            run_mode='intermediate',
-                            hard_solutions=hard_solutions  
+                    if current_config.get("BATCH_PROCESSING_ENABLED", False):
+                        run_logs = _run_pipeline_items_in_batches(
+                            items=[QuestionWorkItem(index=index, question=question) for index, question in queries_to_process],
+                            existing_logs=run_logs,
+                            log_file_path=log_file_path,
+                            experiment_name=exp_name,
+                            phase_name="intermediate",
+                            run_mode="intermediate",
+                            current_config=current_config,
+                            embedding_model=embedding_model,
+                            exemplar_data=exemplar_data,
+                            api_managers=api_managers,
+                            hard_solutions=hard_solutions,
                         )
-                        run_logs.append(intermediate_log)
-                        save_json(run_logs, log_file_path)
-                        
-                        # Save Layer 1 Cache Synchronously 
-                        if 'layer1_base_execution_state' in intermediate_log and intermediate_log['layer1_base_execution_state'].get('_needs_saving'):
-                            l1_state = intermediate_log['layer1_base_execution_state']
-                            t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-                            n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
-                            c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
-                            c_file = _get_cache_filename(t_k, n_cands, exp_name)
-                            _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
-
-                        
-                        periodic_sync_check(loop_idx, current_config)
+                    else:
+                        for loop_idx, (original_idx, query_text) in enumerate(tqdm(queries_to_process, desc=f"{exp_name} - Phase 1: Intermediate")):
+                            intermediate_log = run_pipeline_for_single_query(
+                                hard_list_idx=original_idx, target_query=query_text, config=current_config,
+                                embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
+                                run_mode='intermediate', hard_solutions=hard_solutions,
+                            )
+                            run_logs.append(intermediate_log)
+                            save_json(run_logs, log_file_path)
+                            if 'layer1_base_execution_state' in intermediate_log and intermediate_log['layer1_base_execution_state'].get('_needs_saving'):
+                                l1_state = intermediate_log['layer1_base_execution_state']
+                                t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+                                n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
+                                c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
+                                c_file = _get_cache_filename(t_k, n_cands, exp_name)
+                                _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
+                            periodic_sync_check(loop_idx, current_config)
                 else:
                     logger.info(f"All intermediate steps for '{exp_name}' are already complete.")
 
-                # PHASE 2: Final Solving Step
                 print(f"\n--- {exp_name}: STARTING PHASE 2 of 2 (Final Solving) ---")
-                intermediate_logs = load_json(log_file_path)
+                intermediate_logs = load_json(log_file_path) or run_logs
                 logs_to_solve = [log for log in intermediate_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
                 
                 if logs_to_solve:
                     completed_logs_map = {log['target_query_original_hard_list_idx']: log for log in intermediate_logs if log.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'}
-
-                    for loop_idx, log_to_solve in enumerate(tqdm(logs_to_solve, desc=f"{exp_name} - Phase 2: Solving")):
-                        original_idx = log_to_solve['target_query_original_hard_list_idx']
-                        query_text = log_to_solve['target_query_text']
-                        
-                        completed_log = run_pipeline_for_single_query(
-                            hard_list_idx=original_idx, target_query=query_text, config=current_config,
-                            embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
-                            run_mode='solve_only', existing_log=log_to_solve,
-                            hard_solutions=hard_solutions  # <--- ADDED FIXED PARAMETER
+                    if current_config.get("BATCH_PROCESSING_ENABLED", False):
+                        final_logs = _run_pipeline_items_in_batches(
+                            items=[QuestionWorkItem(index=log['target_query_original_hard_list_idx'], question=log['target_query_text'], existing_log=log) for log in logs_to_solve],
+                            existing_logs=list(completed_logs_map.values()),
+                            log_file_path=log_file_path,
+                            experiment_name=exp_name,
+                            phase_name="solve",
+                            run_mode="solve_only",
+                            current_config=current_config,
+                            embedding_model=embedding_model,
+                            exemplar_data=exemplar_data,
+                            api_managers=api_managers,
+                            hard_solutions=hard_solutions,
                         )
-                        completed_logs_map[original_idx] = completed_log
-                        save_json(list(completed_logs_map.values()), log_file_path)
-                        periodic_sync_check(loop_idx, current_config)
-                    
-                    final_logs = list(completed_logs_map.values())
+                    else:
+                        for loop_idx, log_to_solve in enumerate(tqdm(logs_to_solve, desc=f"{exp_name} - Phase 2: Solving")):
+                            original_idx = log_to_solve['target_query_original_hard_list_idx']
+                            query_text = log_to_solve['target_query_text']
+                            completed_log = run_pipeline_for_single_query(
+                                hard_list_idx=original_idx, target_query=query_text, config=current_config,
+                                embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
+                                run_mode='solve_only', existing_log=log_to_solve, hard_solutions=hard_solutions,
+                            )
+                            completed_logs_map[original_idx] = completed_log
+                            save_json(list(completed_logs_map.values()), log_file_path)
+                            periodic_sync_check(loop_idx, current_config)
+                        final_logs = list(completed_logs_map.values())
                 else:
-                     logger.info(f"All solve steps for '{exp_name}' are already complete.")
-                     final_logs = intermediate_logs
+                    logger.info(f"All solve steps for '{exp_name}' are already complete.")
+                    final_logs = intermediate_logs
             
             save_json(final_logs, log_file_path)
             all_results[exp_name] = final_logs

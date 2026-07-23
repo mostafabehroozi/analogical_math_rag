@@ -1,685 +1,423 @@
-"""
-API management module for interacting with various LLM providers.
+"""Thread-safe API managers with per-key rolling RPM scheduling.
 
-This file contains the API manager classes responsible for:
-- Managing API credentials and endpoints.
-- Handling rate limiting.
-- Making API calls with robust, granular error handling.
-- Returning a standardized, structured response for consistent control flow.
-- Providing detailed, configurable console logging for all API calls.
-
-This version implements specific exception handling to return rich error details,
-enabling more sophisticated retry and debugging logic in the main pipeline.
-It also uses the explicit `GenerationConfig` object for Gemini API calls.
-
-Currently supported providers:
-- GeminiAPIManager: For Google's Gemini models.
-- AvalAIAPIManager: For OpenAI-compatible endpoints like AvalAI.
+Every remote request is reserved by a shared scheduler before it is sent.  The
+scheduler is scoped to ``(provider, key, model)`` so a temporary failure on one
+credential never blocks healthy credentials.  The public ``generate_content``
+interface remains compatible with the rest of the pipeline.
 """
 
-import sys
-import time
+from __future__ import annotations
+
+import contextlib
+import contextvars
+import json
 import logging
+import threading
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple, Dict, Optional, Any, TypedDict, Union
+from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Tuple, TypedDict, Union
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-import openai
-import ollama
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
+try:  # Keep scheduler/batch tests importable without optional provider SDKs.
+    import ollama
+except ModuleNotFoundError:  # pragma: no cover - depends on deployment extras
+    ollama = None
+try:
+    import openai
+except ModuleNotFoundError:  # pragma: no cover - depends on deployment extras
+    openai = None
 
 
-# Error types that are safe to retry (transient network/server issues)
 RETRYABLE_ERROR_TYPES = {
-    "APITimeoutError",
-    "APIConnectionError",
-    "ResourceExhausted",
-    "OllamaConnectionError",
-    "UnknownError",
-    "APIStatusError",
-    "ModelMismatch",  # Retry if the wrong model was returned (fallback scenario)
+    "APITimeoutError", "APIConnectionError", "ResourceExhausted",
+    "OllamaConnectionError", "UnknownError", "APIStatusError",
+    "RateLimitError", "ProactiveRateLimit",
 }
+NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "InvalidArgument", "Safety", "NoChoices", "ModelMismatch"}
 
 
-class APIResponse(TypedDict):
-    """A standardized structure for all API call results."""
-    status: str  # e.g., "SUCCESS", "ERROR", "BLOCKED", "RATE_LIMITED"
+class APIResponse(TypedDict, total=False):
+    status: str
     text: Optional[str]
     error_type: Optional[str]
     error_message: Optional[str]
     error_details: Optional[Any]
+    request_meta: Dict[str, Any]
 
 
-def execute_with_retry(config: dict, api_call_func) -> APIResponse:
-    """
-    Executes an API call function with optional retry logic based on config flags.
+_api_call_context: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "api_call_context", default={}
+)
 
-    Args:
-        config (dict): The main configuration dictionary.
-        api_call_func (callable): A zero-argument callable that performs the API call
-                                  and returns an APIResponse.
 
-    Returns:
-        APIResponse: The result of the API call (successful or final failed attempt).
-    """
+@contextlib.contextmanager
+def api_call_context(**context: Any) -> Iterator[None]:
+    """Attach batch/question metadata to API monitoring without changing call sites."""
+    token = _api_call_context.set({**_api_call_context.get(), **context})
+    try:
+        yield
+    finally:
+        _api_call_context.reset(token)
+
+
+def _mask_key(api_key: str) -> str:
+    return f"…{api_key[-4:]}" if api_key else "<missing>"
+
+
+@dataclass(frozen=True)
+class KeyLease:
+    api_key: str
+    model_name: str
+    rolling_requests: int
+    daily_requests: int
+
+
+class RPMKeyScheduler:
+    """A condition-protected, fair rolling-60-second scheduler for API keys."""
+
+    WINDOW_SECONDS = 60.0
+
+    def __init__(
+        self,
+        api_keys: List[str],
+        quota_for_key: Callable[[str, str], Dict[str, Any]],
+        config: Dict[str, Any],
+        provider_name: str,
+    ) -> None:
+        self.api_keys = list(api_keys)
+        self.quota_for_key = quota_for_key
+        self.config = config
+        self.provider_name = provider_name
+        self._condition = threading.Condition(threading.RLock())
+        self._recent: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
+        self._daily: Dict[Tuple[str, str, str], int] = defaultdict(int)
+        self._cooldown_until: Dict[Tuple[str, str], float] = defaultdict(float)
+        self._disabled: Dict[str, str] = {}
+        self._tie_breaker = 0
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+    def _rpm(self, quota: Dict[str, Any]) -> int:
+        rpm = quota.get("rpm", self.config.get("DEFAULT_API_RPM"))
+        if rpm is None:
+            # Legacy configurations used delay_seconds.  This conversion is only
+            # a compatibility fallback; new batch configurations should set rpm.
+            delay = float(quota.get("delay_seconds", 1.0))
+            rpm = max(1, int(self.WINDOW_SECONDS / max(delay, 1.0)))
+        return max(1, int(rpm))
+
+    def acquire(self, model_name: str) -> Optional[KeyLease]:
+        """Reserve the least-used ready key, waiting only for the necessary key."""
+        while True:
+            with self._condition:
+                now = time.monotonic()
+                today = self._today()
+                ready: List[Tuple[int, int, int, str, int]] = []
+                waits: List[float] = []
+
+                for position, api_key in enumerate(self.api_keys):
+                    if api_key in self._disabled:
+                        continue
+                    quota = self.quota_for_key(model_name, api_key)
+                    key_model = (api_key, model_name)
+                    timestamps = self._recent[key_model]
+                    while timestamps and now - timestamps[0] >= self.WINDOW_SECONDS:
+                        timestamps.popleft()
+
+                    rpd = quota.get("rpd", float("inf"))
+                    daily_key = (api_key, model_name, today)
+                    if self._daily[daily_key] >= rpd:
+                        continue
+
+                    cooldown = self._cooldown_until[key_model]
+                    rpm = self._rpm(quota)
+                    if now < cooldown:
+                        waits.append(cooldown - now)
+                        continue
+                    if len(timestamps) >= rpm:
+                        waits.append(max(0.001, timestamps[0] + self.WINDOW_SECONDS - now))
+                        continue
+
+                    # Favour low rolling usage first, then low daily usage. The
+                    # rotating final key prevents one identical key from winning ties.
+                    tie = (position - self._tie_breaker) % max(1, len(self.api_keys))
+                    ready.append((len(timestamps), self._daily[daily_key], tie, api_key, position))
+
+                if ready:
+                    ready.sort()
+                    rolling, daily, _, selected_key, position = ready[0]
+                    self._recent[(selected_key, model_name)].append(now)
+                    self._daily[(selected_key, model_name, today)] += 1
+                    self._tie_breaker = (position + 1) % max(1, len(self.api_keys))
+                    return KeyLease(selected_key, model_name, rolling + 1, daily + 1)
+
+                if not waits:
+                    return None  # Every key is disabled or has exhausted RPD.
+
+                self._condition.wait(timeout=max(0.001, min(waits)))
+
+    def cooldown(self, api_key: str, model_name: str, seconds: Optional[float] = None) -> None:
+        delay = float(seconds if seconds is not None else self.config.get("API_KEY_ERROR_COOLDOWN_SECONDS", 20.0))
+        with self._condition:
+            key = (api_key, model_name)
+            self._cooldown_until[key] = max(self._cooldown_until[key], time.monotonic() + max(0.0, delay))
+            self._condition.notify_all()
+
+    def disable(self, api_key: str, reason: str) -> None:
+        with self._condition:
+            self._disabled[api_key] = reason
+            self._condition.notify_all()
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._condition:
+            now = time.monotonic()
+            return {
+                "provider": self.provider_name,
+                "disabled_keys": {_mask_key(k): v for k, v in self._disabled.items()},
+                "cooldowns": {
+                    f"{_mask_key(key)}:{model}": round(max(0.0, until - now), 3)
+                    for (key, model), until in self._cooldown_until.items() if until > now
+                },
+            }
+
+
+def execute_with_retry(config: Dict[str, Any], api_call_func: Callable[[], APIResponse]) -> APIResponse:
+    """Retry without terminating the process; managers re-enter their scheduler each time."""
     logger = logging.getLogger(__name__)
-
-    enable_retry = config.get("ENABLE_API_RETRY", False)
-    max_retries = config.get("MAX_API_RETRIES", 3)
-    retry_delay = config.get("API_RETRY_DELAY_SECONDS", 5)
-    retry_all_errors = config.get("RETRY_ALL_API_ERRORS", True)  
-
-    if not enable_retry:
+    if not config.get("ENABLE_API_RETRY", False):
         return api_call_func()
 
+    max_attempts = max(1, int(config.get("MAX_API_RETRIES", 3)))
+    retry_all = config.get("RETRY_ALL_API_ERRORS", True)
     last_response: Optional[APIResponse] = None
-
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, max_attempts + 1):
         response = api_call_func()
-
-        # Success — return immediately
         if response["status"] == "SUCCESS":
             return response
 
+        error_type = response.get("error_type") or response.get("status", "ERROR")
+        retryable = error_type not in NON_RETRYABLE_ERROR_TYPES and (retry_all or error_type in RETRYABLE_ERROR_TYPES)
+        if not retryable or attempt == max_attempts:
+            response["retry_exhausted"] = attempt == max_attempts
+            return response
 
-        if response["status"] in ("BLOCKED", "RATE_LIMITED"):
-            if not retry_all_errors:
-                logger.warning(
-                    f"API call returned non-retryable status '{response['status']}' "
-                    f"(type: {response['error_type']}). Not retrying."
-                )
-                return response
-            # When retry_all_errors is True, fall through and treat like an ERROR for retry purposes.
-            error_type = response.get("error_type", response["status"]) or response["status"]
-            logger.warning(
-                f"API call returned status '{response['status']}' (type: {error_type}). "
-                f"RETRY_ALL_API_ERRORS enabled — will attempt retries."
-            )
-        else:
-            # status == "ERROR" — check if the error type is retryable
-            error_type = response.get("error_type", "")
-            # If RETRY_ALL_API_ERRORS is False, use selective retrying; otherwise retry all error types
-            if not retry_all_errors and error_type not in RETRYABLE_ERROR_TYPES:
-                logger.warning(
-                    f"API call failed with non-retryable error type '{error_type}'. Not retrying."
-                )
-                return response
-
+        logger.warning("API attempt %s/%s failed (%s); retrying through key scheduler.", attempt, max_attempts, error_type)
+        # In batch mode a failed key was put into its own cooldown by the manager.
+        # Do not impose the old global retry sleep on unrelated keys.
+        if not config.get("BATCH_PROCESSING_ENABLED", False):
+            time.sleep(float(config.get("API_RETRY_DELAY_SECONDS", 5.0)))
         last_response = response
-
-        if attempt < max_retries:
-            logger.warning(
-                f"Retryable API error '{error_type}' on attempt {attempt}/{max_retries}. "
-                f"Retrying in {retry_delay}s..."
-            )
-            print(f"[RETRY] Attempt {attempt}/{max_retries} failed ({error_type}). Retrying in {retry_delay}s...")
-            time.sleep(retry_delay)
-        else:
-            logger.critical(
-                f"API call failed after {max_retries} attempts. "
-                f"Last error: {error_type} — {response.get('error_message')}. "
-                f"Halting application."
-            )
-            print(
-                f"\n[FATAL] API call failed after {max_retries} attempts.\n"
-                f"Last error type: {error_type}\n"
-                f"Last error message: {response.get('error_message')}\n"
-                f"Halting application."
-            )
-            sys.exit(1)
-
-    return last_response
+    return last_response or {"status": "ERROR", "text": None, "error_type": "RetryError", "error_message": "No API attempt was made", "error_details": None}
 
 
-class GeminiAPIManager:
-    """
-    Manages API keys, rate limits, and calls to the Google Gemini API with enhanced error handling.
-    """
-    def __init__(self, api_keys: List[str], model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
-        """
-        Initializes the Gemini API manager.
+class _KeyedAPIManager:
+    provider_name = "remote"
 
-        Args:
-            api_keys (List[str]): A list of Gemini API keys.
-            model_quotas (Dict): A dictionary defining per-model rate limits (delay, rpd).
-            global_delay_seconds (int): A minimum delay between any two API calls.
-            config (Optional[Dict]): The main configuration dictionary to read control flags.
-        """
-        self.logger = logging.getLogger(__name__)
-
+    def __init__(self, api_keys: List[str], model_quotas: Dict[str, Any], config: Optional[Dict[str, Any]]) -> None:
         if not api_keys:
-            self.logger.critical("GeminiAPIManager initialized with an empty list of API keys. All calls will fail.")
             raise ValueError("API keys list cannot be empty.")
-
-        self.api_keys_list: List[str] = api_keys
-        self.model_quotas: Dict[str, Dict[str, Any]] = model_quotas
-        self.global_delay_seconds: int = global_delay_seconds
-        
-        self.config = config if config else {}
-        
-        self.key_usage_timestamps: Dict[Tuple[str, str], float] = {}
-        self.key_daily_counts: Dict[Tuple[str, str, str], int] = {}
-        self.last_global_call_timestamp: float = 0
-        
-        self.current_key_index: int = 0
-
+        self.logger = logging.getLogger(__name__)
+        self.api_keys_list = list(api_keys)
+        self.model_quotas = model_quotas or {}
+        self.config = config or {}
         self.print_details = self.config.get("PRINT_API_CALL_DETAILS", False)
         self.truncation_length = self.config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
-        
-        self._print_timing_checkpoints = self.config.get("PRINT_API_TIMING_CHECKPOINTS", False)
-        self._last_checkpoint_timestamp: Optional[float] = None
+        self.scheduler = RPMKeyScheduler(self.api_keys_list, self._get_quota_for_key, self.config, self.provider_name)
 
-        self.logger.info(f"GeminiAPIManager initialized with {len(self.api_keys_list)} keys.")
-        
+    def _get_quota_for_key(self, model_name: str, api_key: str) -> Dict[str, Any]:
+        model_entry = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
+        if isinstance(model_entry, dict):
+            return model_entry
+        if isinstance(model_entry, list):
+            default: Dict[str, Any] = {}
+            for quota in model_entry:
+                target = quota.get("api_key")
+                if target == api_key or (isinstance(target, (list, tuple, set)) and api_key in target):
+                    return quota
+                if target is None:
+                    default = quota
+            return default
+        return {}
+
+    def _request_meta(self, lease: KeyLease) -> Dict[str, Any]:
+        return {
+            "provider": self.provider_name,
+            "model": lease.model_name,
+            "key": _mask_key(lease.api_key),
+            "rolling_requests": lease.rolling_requests,
+            "daily_requests": lease.daily_requests,
+            **_api_call_context.get(),
+        }
+
+    def _print(self, message: str) -> None:
+        if self.print_details:
+            context = _api_call_context.get()
+            prefix = " ".join(f"{k}={v}" for k, v in context.items() if v is not None)
+            print(f"[API {self.provider_name}{' ' + prefix if prefix else ''}] {message}")
+
+
+class GeminiAPIManager(_KeyedAPIManager):
+    """Gemini manager using REST requests so every call is bound to its selected key."""
+
+    provider_name = "gemini"
+
+    def __init__(self, api_keys: List[str], model_quotas: Dict[str, Any], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
+        super().__init__(api_keys, model_quotas, config)
+        self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0))
+        if global_delay_seconds:
+            self.logger.info("GLOBAL_API_CALL_DELAY_SECONDS is ignored by the RPM scheduler.")
+
+    def _generation_config(self, model_name: str, temperature: Optional[float]) -> Dict[str, Any]:
+        max_tokens: Optional[int] = None
+        if model_name == self.config.get("GEMINI_MODEL_NAME_FINAL_SOLVER"):
+            max_tokens = self.config.get("DEFAULT_FINAL_SOLVER_MAX_TOKENS", 8192)
+        elif model_name == self.config.get("GEMINI_MODEL_NAME_ADAPTATION"):
+            max_tokens = self.config.get("DEFAULT_ADAPTATION_MAX_TOKENS", 2048)
+        elif model_name == self.config.get("GEMINI_MODEL_NAME_EVALUATOR"):
+            max_tokens = self.config.get("DEFAULT_EVALUATOR_MAX_TOKENS", 512)
+        result: Dict[str, Any] = {}
+        if temperature is not None:
+            result["temperature"] = temperature
+        if max_tokens is not None:
+            result["maxOutputTokens"] = max_tokens
+        return result
+
+    def _call_rest(self, api_key: str, prompt: str, model_name: str, generation_config: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent"
+        payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": generation_config}
+        request = Request(
+            url, data=json.dumps(payload).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        )
         try:
-            genai.configure(api_key=self.api_keys_list[0])
-            self.logger.info("Initial Gemini API configuration with the first key was successful.")
-        except Exception as e:
-            self.logger.error(f"Initial Gemini API configuration failed. Error: {e}", exc_info=True)
-
-    def _get_current_date_str(self) -> str:
-        """Returns the current UTC date as a formatted string."""
-        return datetime.utcnow().strftime('%Y-%m-%d')
-    
-    def _get_quota_for_key(self, model_name: str, api_key: str) -> Dict[str, Any]:
-        """Resolves the quota configuration for a specific model and API key."""
-        model_entry = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
-
-        if isinstance(model_entry, dict):
-            return model_entry
-
-        if isinstance(model_entry, list):
-            default_quota = {}
-            for quota in model_entry:
-                target_key = quota.get("api_key")
-                if target_key == api_key:
-                    return quota
-                if target_key is None:
-                    default_quota = quota
-                elif isinstance(target_key, (list, tuple, set)) and api_key in target_key:
-                    return quota
-            return default_quota
-
-        return {}
-
-    def _select_key_and_apply_delay(self, model_name: str) -> Optional[str]:
-        """
-        Finds an available API key, applies the necessary rate-limiting delay,
-        and records the call's start timestamp.
-        """
-        if not self.api_keys_list:
-            return None
-
-        now = time.time()
-        time_since_last_global_call = now - self.last_global_call_timestamp
-        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global_call)
-
-        candidates = []
-        for current_api_key in self.api_keys_list:
-            quota = self._get_quota_for_key(model_name, current_api_key)
-            required_per_key_delay = quota.get("delay_seconds", 1)
-            max_rpd = quota.get("rpd", float('inf'))
-
-            current_date_str = self._get_current_date_str()
-            daily_usage_key = (current_api_key, model_name, current_date_str)
-            current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
-            if current_daily_calls >= max_rpd:
-                continue
-
-            last_call_timestamp_key = (current_api_key, model_name)
-            last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
-            time_since_last_call = now - last_call_time
-            per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
-            final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
-
-            candidates.append((
-                current_api_key,
-                final_sleep_duration,
-                current_daily_calls,
-                last_call_time,
-            ))
-
-        if not candidates:
-            self.logger.warning(f"All {len(self.api_keys_list)} API keys are rate-limited for model '{model_name}'.")
-            return None
-
-        candidates.sort(key=lambda item: (item[1], item[2], item[3]))
-        selected_key, sleep_duration, _, _ = candidates[0]
-
-        if sleep_duration > 0:
-            self.logger.info(f"Rate limit requires sleeping for {sleep_duration:.2f}s.")
-            print(f"Sleeping for {sleep_duration:.2f} seconds due to rate limiting.")
-            time.sleep(sleep_duration)
-
-        current_call_start_time = time.time()
-        if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-            elapsed = current_call_start_time - self._last_checkpoint_timestamp
-            print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-        self._last_checkpoint_timestamp = current_call_start_time
-        self.last_global_call_timestamp = current_call_start_time
-        self.key_usage_timestamps[(selected_key, model_name)] = current_call_start_time
-        self.current_key_index = (self.api_keys_list.index(selected_key) + 1) % len(self.api_keys_list)
-        return selected_key
-
-    def _increment_daily_usage(self, api_key: str, model_name: str) -> None:
-        """Increments the daily call count for a given key and model."""
-        current_date_str = self._get_current_date_str()
-        daily_usage_key = (api_key, model_name, current_date_str)
-        self.key_daily_counts[daily_usage_key] = self.key_daily_counts.get(daily_usage_key, 0) + 1
-        
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                return int(response.status), json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            try:
+                return error.code, json.loads(body)
+            except json.JSONDecodeError:
+                return error.code, {"error": {"message": body}}
+        except (URLError, TimeoutError) as error:
+            return 0, {"error": {"message": str(error), "type": "ConnectionError"}}
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
-        """Generates content using the Gemini API, handling key selection, rate limiting, and specific errors."""
-        
-        if self.print_details:
-            print("\n" + "--- [API Call Start: Gemini] ---")
-            print(f"Model: {model_name}, Temperature: {temperature}")
-            print("Prompt Sent (truncated):")
-            print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
-            print("----------------------------------")
+        self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
 
-        def _inner_call() -> APIResponse:
-            # MOVED INSIDE: Re-check keys on every retry attempt
-            api_key = self._select_key_and_apply_delay(model_name)
+        def attempt() -> APIResponse:
+            lease = self.scheduler.acquire(model_name)
+            if lease is None:
+                return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": f"No eligible Gemini key for {model_name}.", "error_details": self.scheduler.snapshot()}
+            meta = self._request_meta(lease)
+            status_code, payload = self._call_rest(lease.api_key, prompt, model_name, self._generation_config(model_name, temperature))
+            if 200 <= status_code < 300:
+                candidates = payload.get("candidates", [])
+                parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+                text = "".join(part.get("text", "") for part in parts)
+                if text:
+                    self._print(f"success model={model_name} key={meta['key']}")
+                    return {"status": "SUCCESS", "text": text, "error_type": None, "error_message": None, "error_details": None, "request_meta": meta}
+                return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": "Gemini returned no text.", "error_details": payload.get("promptFeedback"), "request_meta": meta}
 
-            if api_key is None:
-                error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
-                if self.print_details:
-                    print(f"\n!!! [API Call FAILED: Gemini] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
+            error = payload.get("error", {}) if isinstance(payload, dict) else {}
+            message = error.get("message", str(payload))
+            if status_code == 429:
+                self.scheduler.cooldown(lease.api_key, model_name)
+                error_type, api_status = "ResourceExhausted", "RATE_LIMITED"
+            elif status_code in (401, 403):
+                self.scheduler.disable(lease.api_key, f"HTTP {status_code}")
+                error_type, api_status = "AuthenticationError", "ERROR"
+            elif status_code == 400:
+                error_type, api_status = "InvalidArgument", "ERROR"
+            else:
+                self.scheduler.cooldown(lease.api_key, model_name)
+                error_type, api_status = ("APIConnectionError" if status_code == 0 else "UnknownError"), "ERROR"
+            self._print(f"failure model={model_name} key={meta['key']} type={error_type}")
+            return {"status": api_status, "text": None, "error_type": error_type, "error_message": message, "error_details": payload, "request_meta": meta}
 
-            caught_exception = None
-            try:
-                max_tokens = None
-                if model_name == self.config.get('GEMINI_MODEL_NAME_FINAL_SOLVER'):
-                    max_tokens = self.config.get('DEFAULT_FINAL_SOLVER_MAX_TOKENS', 8192)
-                elif model_name == self.config.get('GEMINI_MODEL_NAME_ADAPTATION'):
-                    max_tokens = self.config.get('DEFAULT_ADAPTATION_MAX_TOKENS', 2048)
-                elif model_name == self.config.get('GEMINI_MODEL_NAME_EVALUATOR'):
-                    max_tokens = self.config.get('DEFAULT_EVALUATOR_MAX_TOKENS', 512)
-                
-                generation_config_params = {}
-                if temperature is not None:
-                    generation_config_params['temperature'] = temperature
-                if max_tokens is not None:
-                    generation_config_params['max_output_tokens'] = max_tokens
-                
-                generation_config = genai.types.GenerationConfig(**generation_config_params)
-                
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(model_name)
-                
-                self.logger.info(f"Calling Gemini model '{model_name}' with key ending in ...{api_key[-4:]} and config: {generation_config_params}")
-                
-                response = model.generate_content(
-                    prompt,
-                    generation_config=generation_config
-                )
-
-                self._increment_daily_usage(api_key, model_name)
-
-                if not response.parts:
-                    block_reason = "Unknown"
-                    if response.prompt_feedback and response.prompt_feedback.block_reason:
-                        block_reason = response.prompt_feedback.block_reason.name
-                    error_msg = f"Response was empty or blocked. Reason: {block_reason}."
-                    if self.print_details:
-                        print(f"\n!!! [API Call BLOCKED: Gemini] !!!\nReason: {block_reason}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                    return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": error_msg, "error_details": str(response.prompt_feedback)}
-                
-                response_text = response.text
-                if self.print_details:
-                    print("--- [API Call SUCCESS: Gemini] ---")
-                    print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
-                    print("----------------------------------\n")
-                
-                return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
-
-            except google_exceptions.ResourceExhausted as e:
-                status, error_type, msg = "RATE_LIMITED", "ResourceExhausted", f"Gemini API rate limit exceeded: {e}"
-                caught_exception = e
-            except google_exceptions.InvalidArgument as e:
-                status, error_type, msg = "ERROR", "InvalidArgument", f"Invalid argument sent to Gemini API: {e}"
-                caught_exception = e
-            except Exception as e:
-                status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the Gemini API: {e}"
-                caught_exception = e
-            
-            self.logger.error(f"Gemini API call FAILED. Key: ...{api_key[-4:]}. Type: {error_type}. Error: {msg}", exc_info=True)
-            self._increment_daily_usage(api_key, model_name)
-            if self.print_details:
-                print(f"\n!!! [API Call FAILED: Gemini] !!!")
-                print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
-                print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-            
-            return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
-
-        return execute_with_retry(self.config, _inner_call)
+        return execute_with_retry(self.config, attempt)
 
 
-class AvalAIAPIManager:
-    """
-    Manages API calls to an OpenAI-compatible endpoint like AvalAI with support
-    for multiple API keys, key rotation, per-key rate limiting, and enhanced error handling.
-    """
-    def __init__(self, api_key_or_list: Union[str, List[str]], base_url: str, model_quotas: Dict[str, Dict[str, Any]], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
-        """
-        Initializes the OpenAI-compatible API manager.
+class AvalAIAPIManager(_KeyedAPIManager):
+    provider_name = "avalai"
 
-        Args:
-            api_key_or_list (str | List[str]): The API key or list of API keys for the service.
-            base_url (str): The base URL of the API endpoint.
-            model_quotas (Dict): Configuration for rate limiting (e.g., delay_seconds, rpd).
-            global_delay_seconds (int): A minimum delay between any two API calls.
-            config (Optional[Dict]): The main configuration dictionary to read control flags.
-        """
-        self.logger = logging.getLogger(__name__)
-
-        if not api_key_or_list or not base_url:
-            self.logger.critical("AvalAIAPIManager initialized with missing API key(s) or base URL.")
-            raise ValueError("API key(s) and base URL cannot be empty for AvalAIAPIManager.")
-
-        # Normalize to a list of keys
-        if isinstance(api_key_or_list, str):
-            self.api_keys_list: List[str] = [api_key_or_list]
-        else:
-            self.api_keys_list: List[str] = list(api_key_or_list)
-
-        # Create a client per key so we can rotate easily
-        self.clients: Dict[str, openai.OpenAI] = {}
-        for k in self.api_keys_list:
-            self.clients[k] = openai.OpenAI(api_key=k, base_url=base_url)
-
-        self.model_quotas = model_quotas
-        self.config = config if config else {}
-
-        self.global_delay_seconds = global_delay_seconds
-        self.last_global_call_timestamp: float = 0
-
-        # Per-key tracking
-        self.key_usage_timestamps: Dict[Tuple[str, str], float] = {}
-        self.key_daily_counts: Dict[Tuple[str, str, str], int] = {}
-        self.current_key_index: int = 0
-
-        # Per-model last call timestamps for fallback book-keeping
-        self.last_model_call_timestamps: Dict[str, float] = {}
-
-        # --- Read control flags from config ---
-        self.print_details = self.config.get("PRINT_API_CALL_DETAILS", False) if config else False
-        self.truncation_length = self.config.get("API_RESPONSE_TRUNCATION_LENGTH", 50) if config else 50
-
-        # --- Timing Checkpoint Feature ---
-        self._print_timing_checkpoints = self.config.get("PRINT_API_TIMING_CHECKPOINTS", False) if config else False
-        self._last_checkpoint_timestamp: Optional[float] = None
-        # --- End of Timing Checkpoint Feature ---
-
-        self.logger.info(f"AvalAIAPIManager initialized for endpoint: {base_url} with {len(self.api_keys_list)} key(s)")
-
-    def _get_current_date_str(self) -> str:
-        return datetime.utcnow().strftime('%Y-%m-%d')
-
-    def _get_quota_for_key(self, model_name: str, api_key: str) -> Dict[str, Any]:
-        model_entry = self.model_quotas.get(model_name, self.model_quotas.get("default", {}))
-
-        if isinstance(model_entry, dict):
-            return model_entry
-
-        if isinstance(model_entry, list):
-            default_quota = {}
-            for quota in model_entry:
-                target_key = quota.get("api_key")
-                if target_key == api_key:
-                    return quota
-                if target_key is None:
-                    default_quota = quota
-                elif isinstance(target_key, (list, tuple, set)) and api_key in target_key:
-                    return quota
-            return default_quota
-
-        return {}
-
-    def _select_key_and_apply_delay(self, model_name: str) -> Optional[str]:
-        """
-        Selects an available API key, applies per-key and global rate-limit delays,
-        records timestamps, and returns the selected key. Returns None if all
-        keys are rate-limited.
-        """
-        if not self.api_keys_list:
-            return None
-
-        now = time.time()
-        time_since_last_global = now - self.last_global_call_timestamp
-        global_sleep_needed = max(0, self.global_delay_seconds - time_since_last_global)
-
-        candidates = []
-        for current_api_key in self.api_keys_list:
-            quota = self._get_quota_for_key(model_name, current_api_key)
-            required_per_key_delay = quota.get("delay_seconds", 1)
-            max_rpd = quota.get("rpd", float('inf'))
-
-            current_date_str = self._get_current_date_str()
-            daily_usage_key = (current_api_key, model_name, current_date_str)
-            current_daily_calls = self.key_daily_counts.get(daily_usage_key, 0)
-            if current_daily_calls >= max_rpd:
-                continue
-
-            last_call_timestamp_key = (current_api_key, model_name)
-            last_call_time = self.key_usage_timestamps.get(last_call_timestamp_key, 0)
-            time_since_last_call = now - last_call_time
-            per_key_sleep_needed = max(0, required_per_key_delay - time_since_last_call)
-            final_sleep_duration = max(global_sleep_needed, per_key_sleep_needed)
-
-            candidates.append((
-                current_api_key,
-                final_sleep_duration,
-                current_daily_calls,
-                last_call_time,
-            ))
-
-        if not candidates:
-            self.logger.warning(f"All {len(self.api_keys_list)} API keys are rate-limited for model '{model_name}'.")
-            return None
-
-        candidates.sort(key=lambda item: (item[1], item[2], item[3]))
-        selected_key, sleep_duration, _, _ = candidates[0]
-
-        if sleep_duration > 0:
-            self.logger.info(f"Rate limit requires sleeping for {sleep_duration:.2f}s.")
-            print(f"Sleeping for {sleep_duration:.2f} seconds due to rate limiting.")
-            time.sleep(sleep_duration)
-
-        current_call_start_time = time.time()
-        if self._print_timing_checkpoints and self._last_checkpoint_timestamp is not None:
-            elapsed = current_call_start_time - self._last_checkpoint_timestamp
-            print(f"    [TIMING CHECKPOINT] Time since last API call started: {elapsed:.2f} seconds.")
-        self._last_checkpoint_timestamp = current_call_start_time
-        self.last_global_call_timestamp = current_call_start_time
-        self.key_usage_timestamps[(selected_key, model_name)] = current_call_start_time
-        self.current_key_index = (self.api_keys_list.index(selected_key) + 1) % len(self.api_keys_list)
-        return selected_key
-
-    def _increment_daily_usage(self, api_key: str, model_name: str) -> None:
-        current_date_str = self._get_current_date_str()
-        daily_usage_key = (api_key, model_name, current_date_str)
-        self.key_daily_counts[daily_usage_key] = self.key_daily_counts.get(daily_usage_key, 0) + 1
+    def __init__(self, api_key_or_list: Union[str, List[str]], base_url: str, model_quotas: Dict[str, Any], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
+        if openai is None:
+            raise ImportError("AvalAIAPIManager requires the optional 'openai' package.")
+        keys = [api_key_or_list] if isinstance(api_key_or_list, str) else list(api_key_or_list)
+        if not base_url:
+            raise ValueError("base_url cannot be empty for AvalAIAPIManager.")
+        super().__init__(keys, model_quotas, config)
+        self.clients = {key: openai.OpenAI(api_key=key, base_url=base_url) for key in self.api_keys_list}
+        if global_delay_seconds:
+            self.logger.info("GLOBAL_API_CALL_DELAY_SECONDS is ignored by the RPM scheduler.")
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
-        """Generates content using an OpenAI-compatible API, handling key selection, rate limiting and specific errors."""
-        if self.print_details:
-            print("\n" + "--- [API Call Start: AvalAI] ---")
-            print(f"Model: {model_name}, Temperature: {temperature}")
-            print("Prompt Sent (truncated):")
-            print(f"{prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
-            print("----------------------------------")
+        self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
 
-        def _inner_call() -> APIResponse:
-            # MOVED INSIDE: Now if keys are rate-limited, the retry loop catches it!
-            selected_key = self._select_key_and_apply_delay(model_name)
-
-            if selected_key is None:
-                error_msg = f"All API keys are proactively rate-limited for model '{model_name}'."
-                if self.print_details:
-                    print(f"\n!!! [API Call FAILED: AvalAI] !!!\nError Type: ProactiveRateLimit\nDetails: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": error_msg, "error_details": None}
-
-            client = self.clients[selected_key]
-            
-            caught_exception = None
+        def attempt() -> APIResponse:
+            lease = self.scheduler.acquire(model_name)
+            if lease is None:
+                return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": f"No eligible AvalAI key for {model_name}.", "error_details": self.scheduler.snapshot()}
+            meta = self._request_meta(lease)
             try:
-                self.logger.info(f"Calling OpenAI-compatible model '{model_name}' with key ending in ...{selected_key[-4:]}")
-                
-                completion = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature
+                completion = self.clients[lease.api_key].chat.completions.create(
+                    model=model_name, messages=[{"role": "user", "content": prompt}], temperature=temperature
                 )
+                returned_model = getattr(completion, "model", None)
+                if returned_model and returned_model != model_name:
+                    return {"status": "ERROR", "text": None, "error_type": "ModelMismatch", "error_message": f"Requested {model_name!r}; provider returned {returned_model!r}.", "error_details": {"requested": model_name, "returned": returned_model}, "request_meta": meta}
+                choices = getattr(completion, "choices", [])
+                text = choices[0].message.content if choices else None
+                if not text:
+                    return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": "Provider returned no completion choices.", "error_details": None, "request_meta": meta}
+                self._print(f"success model={model_name} key={meta['key']}")
+                return {"status": "SUCCESS", "text": text, "error_type": None, "error_message": None, "error_details": None, "request_meta": meta}
+            except openai.RateLimitError as error:
+                self.scheduler.cooldown(lease.api_key, model_name)
+                return {"status": "RATE_LIMITED", "text": None, "error_type": "RateLimitError", "error_message": str(error), "error_details": repr(error), "request_meta": meta}
+            except Exception as error:
+                auth_errors = tuple(cls for cls in (getattr(openai, "AuthenticationError", None), getattr(openai, "PermissionDeniedError", None)) if cls)
+                if auth_errors and isinstance(error, auth_errors):
+                    self.scheduler.disable(lease.api_key, type(error).__name__)
+                else:
+                    self.scheduler.cooldown(lease.api_key, model_name)
+                error_type = type(error).__name__
+                return {"status": "ERROR", "text": None, "error_type": error_type, "error_message": str(error), "error_details": repr(error), "request_meta": meta}
 
-                self._increment_daily_usage(selected_key, model_name)
-
-                if not completion.choices:
-                    error_msg = "Response was empty or blocked (no choices returned)."
-                    self.logger.warning(f"API call to '{model_name}' returned no choices.")
-                    if self.print_details:
-                        print(f"\n!!! [API Call BLOCKED: AvalAI] !!!\nReason: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                    return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": error_msg, "error_details": None}
-
-                # --- NEW: Validate that the returned model matches the requested model ---
-                returned_model = getattr(completion, 'model', None)
-                if returned_model != model_name:
-                    error_msg = f"Model mismatch: Requested '{model_name}' but API returned '{returned_model}'. Stopping to ensure correct model is used."
-                    self.logger.error(error_msg)
-                    print(f"✗ API Call FAILED - Model Mismatch!")
-                    print(f"  Requested: {model_name}")
-                    print(f"  Returned:  {returned_model}")
-                    if self.print_details:
-                        print(f"\n!!! [API Call FAILED: AvalAI] !!!\nReason: {error_msg}\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                    return {"status": "ERROR", "text": None, "error_type": "ModelMismatch", "error_message": error_msg, "error_details": {"requested": model_name, "returned": returned_model}}
-
-                response_text = completion.choices[0].message.content
-                if self.print_details:
-                    print("--- [API Call SUCCESS: AvalAI] ---")
-                    print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
-                    print("----------------------------------\n")
-
-                # --- NEW: Always print model information for transparency ---
-                print(f"✓ API Call Completed - Model: {model_name} (Confirmed: {returned_model})")
-
-                return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
-
-            except openai.RateLimitError as e:
-                status, error_type, msg = "RATE_LIMITED", "RateLimitError", f"OpenAI API rate limit exceeded: {e}"
-                caught_exception = e
-            except openai.APIStatusError as e:
-                status, error_type, msg = "ERROR", "APIStatusError", f"OpenAI API returned an error status {e.status_code}: {e.response}"
-                caught_exception = e
-            except openai.APITimeoutError as e:
-                status, error_type, msg = "ERROR", "APITimeoutError", f"OpenAI API request timed out: {e}"
-                caught_exception = e
-            except openai.APIConnectionError as e:
-                status, error_type, msg = "ERROR", "APIConnectionError", f"Failed to connect to OpenAI API: {e}"
-                caught_exception = e
-            except Exception as e:
-                status, error_type, msg = "ERROR", "UnknownError", f"An unexpected error occurred with the OpenAI API: {e}"
-                caught_exception = e
-
-            self.logger.error(f"OpenAI API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
-            if self.print_details:
-                print(f"\n!!! [API Call FAILED: AvalAI] !!!")
-                print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
-                print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-            
-            # Record this failed attempt's usage count as well to avoid repeated attempts on the same key
-            try:
-                self._increment_daily_usage(selected_key, model_name)
-            except Exception:
-                pass
-
-            return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
-
-        return execute_with_retry(self.config, _inner_call)
+        return execute_with_retry(self.config, attempt)
 
 
 class OllamaAPIManager:
-    """
-    Manages API calls to a local Ollama instance, conforming to the standard manager interface.
-    """
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initializes the Ollama API manager.
+    """Local manager retaining the same response contract (no API-key scheduler)."""
 
-        Args:
-            config (Dict[str, Any]): The main configuration dictionary.
-        """
+    def __init__(self, config: Dict[str, Any]):
+        if ollama is None:
+            raise ImportError("OllamaAPIManager requires the optional 'ollama' package.")
         self.logger = logging.getLogger(__name__)
         self.config = config
+        self.print_details = config.get("PRINT_API_CALL_DETAILS", False)
+        self.truncation_length = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
+        self.client = ollama.Client(host=config.get("OLLAMA_BASE_URL", "http://localhost:11434"))
 
-        base_url = self.config.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        
-        try:
-            self.client = ollama.Client(host=base_url)
-            # A simple check to see if the server is responsive
-            self.client.list()
-            self.logger.info(f"OllamaAPIManager initialized and connected to endpoint: {base_url}")
-        except Exception as e:
-            self.logger.critical(f"Failed to connect to Ollama server at {base_url}. Please ensure Ollama is running. Error: {e}")
-            raise ConnectionError(f"Could not connect to Ollama at {base_url}") from e
-
-        # Read control flags from config for consistent logging
-        self.print_details = self.config.get("PRINT_API_CALL_DETAILS", False)
-        self.truncation_length = self.config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
-        
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
-        """Generates content using a local Ollama model."""
-        if self.print_details:
-            print("\n" + "--- [API Call Start: Ollama] ---")
-            print(f"Model: {model_name}, Temperature: {temperature}")
-            print(f"Prompt Sent (truncated): {prompt[:self.truncation_length]}{'...' if len(prompt) > self.truncation_length else ''}")
-            print("----------------------------------")
-            
-        def _inner_call() -> APIResponse:
-            caught_exception = None
+        def attempt() -> APIResponse:
             try:
-                options = {}
+                options: Dict[str, Any] = {}
                 if temperature is not None:
-                    options['temperature'] = temperature
+                    options["temperature"] = temperature
+                if self.config.get("OLLAMA_THINK_MODE"):
+                    options["think"] = self.config["OLLAMA_THINK_MODE"]
+                response = self.client.generate(model=model_name, prompt=prompt, options=options)
+                return {"status": "SUCCESS", "text": response["response"], "error_type": None, "error_message": None, "error_details": None}
+            except ollama.ResponseError as error:
+                return {"status": "ERROR", "text": None, "error_type": "OllamaResponseError", "error_message": str(error), "error_details": repr(error)}
+            except Exception as error:
+                return {"status": "ERROR", "text": None, "error_type": "OllamaConnectionError", "error_message": str(error), "error_details": repr(error)}
 
-                # --- NEW CODE: Add the think parameter here ---
-                think_mode = self.config.get("OLLAMA_THINK_MODE")
-                if think_mode:
-                    options['think'] = think_mode
-                # ----------------------------------------------
-
-                self.logger.info(f"Calling Ollama model '{model_name}'.")
-                
-                response = self.client.generate(
-                    model=model_name,
-                    prompt=prompt,
-                    options=options
-                )
-                
-                response_text = response['response']
-                
-                if self.print_details:
-                    print("--- [API Call SUCCESS: Ollama] ---")
-                    print(f"Response (truncated): {response_text[:self.truncation_length]}{'...' if len(response_text) > self.truncation_length else ''}")
-                    print("----------------------------------\n")
-
-                return {"status": "SUCCESS", "text": response_text, "error_type": None, "error_message": None, "error_details": None}
-
-            except ollama.ResponseError as e:
-                status, error_type, msg = "ERROR", "OllamaResponseError", f"Ollama API returned an error: {e.error}"
-                caught_exception = e
-            except Exception as e:  # Catches connection errors etc.
-                status, error_type, msg = "ERROR", "OllamaConnectionError", f"An unexpected error occurred with the Ollama client: {e}"
-                caught_exception = e
-
-            self.logger.error(f"Ollama API call FAILED. Type: {error_type}. Error: {msg}", exc_info=True)
-            if self.print_details:
-                print(f"\n!!! [API Call FAILED: Ollama] !!!")
-                print(f"Model: {model_name}\nError Type: {error_type}\nError Details:\n{repr(caught_exception)}")
-                print("--- Prompt that caused the error ---\n" + prompt + "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-            
-            return {"status": status, "text": None, "error_type": error_type, "error_message": msg, "error_details": repr(caught_exception)}
-
-
-        return execute_with_retry(self.config, _inner_call)
+        return execute_with_retry(self.config, attempt)

@@ -189,6 +189,80 @@ def _save_cached_state(
         return False
 
 
+def _save_cached_states_batch(
+    cache_path: str,
+    states_by_query_index: Dict[int, Dict[str, Any]],
+    top_k: int,
+    n_candidates: int,
+    experiment_name: str,
+    batch_id: Optional[str] = None,
+) -> bool:
+    """Merge completed Layer-1 states and persist them with one atomic write.
+
+    Worker threads must return their states to the batch coordinator; this helper
+    is deliberately called only after every question in that batch is terminal.
+    """
+    if not states_by_query_index:
+        return True
+    try:
+        combined_data = load_json(cache_path) if os.path.exists(cache_path) else None
+        if not isinstance(combined_data, dict):
+            combined_data = {
+                "metadata": {
+                    "created_at": time.time(), "experiment_name": experiment_name,
+                    "top_k": top_k, "n_candidates": n_candidates,
+                    "config_snapshot": {}, "completed_queries": [], "queries_in_progress": [],
+                },
+                "queries": {},
+            }
+        combined_data.setdefault("queries", {})
+        metadata = combined_data.setdefault("metadata", {})
+        completed = set(metadata.get("completed_queries", []))
+        in_progress = set(metadata.get("queries_in_progress", []))
+        for query_index, state in states_by_query_index.items():
+            combined_data["queries"][str(query_index)] = state
+            if isinstance(state, dict) and state.get("_needs_saving"):
+                state.pop("_needs_saving", None)
+            # Incomplete Layer-1 state stays resumable but is still included in
+            # the coordinator's atomic batch artifact.
+            statuses = state.get("step_statuses", {}) if isinstance(state, dict) else {}
+            if statuses and all(value == "SUCCESS" for value in statuses.values()):
+                completed.add(query_index)
+                in_progress.discard(query_index)
+            else:
+                in_progress.add(query_index)
+        metadata.update({
+            "experiment_name": experiment_name,
+            "top_k": top_k,
+            "n_candidates": n_candidates,
+            "updated_at": time.time(),
+            "total_queries": len(combined_data["queries"]),
+            "completed_queries": sorted(completed),
+            "queries_in_progress": sorted(in_progress),
+        })
+        if batch_id:
+            metadata["last_committed_batch_id"] = batch_id
+        temp_path = cache_path + ".tmp"
+        if not save_json(combined_data, temp_path):
+            return False
+        os.replace(temp_path, cache_path)
+        logging.getLogger(__name__).info(
+            "Saved %s Layer-1 states in committed batch %s to %s",
+            len(states_by_query_index), batch_id or "<legacy>", cache_path,
+        )
+        return True
+    except Exception as e:
+        logging.getLogger(__name__).error("Failed batch Layer-1 cache save to %s: %s", cache_path, e, exc_info=True)
+        return False
+    finally:
+        temp_path = cache_path + ".tmp"
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
 def _save_step_checkpoint(
     cache_path: str,
     target_query_index: int,

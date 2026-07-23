@@ -9,8 +9,9 @@ from typing import Dict, Any, List
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 
-from src.utils import load_json, save_json, create_trace_entry
-from src.hf_sync import periodic_sync_check
+from src.utils import load_json, save_json, save_json_atomic, create_trace_entry
+from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
+from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
 # Import shared prompts
@@ -423,6 +424,23 @@ def execute_core_simplification_phase2(
     if not tests_to_process:
         logger.info(f"All test items for Phase 2 are already processed. Skipping.")
         return all_results
+
+    if config.get("BATCH_PROCESSING_ENABLED", False):
+        results_by_index = {result.get("test_idx"): result for result in all_results if "test_idx" in result}
+        tests_by_index = {item["test_idx"]: item for item in tests_to_process}
+        def worker(item: QuestionWorkItem) -> Dict[str, Any]:
+            return run_parallel_evaluation_branches(tests_by_index[item.index], solver_mgr, eval_mgr, config)
+        def commit(results: List[QuestionResult], _batch_id: str, batch_number: int) -> None:
+            for result in results:
+                results_by_index[result.item.index] = result.value
+            committed = [results_by_index[index] for index in sorted(results_by_index)]
+            if not save_json_atomic(committed, results_path):
+                raise RuntimeError("Failed to commit core simplification Phase 2 results")
+            periodic_batch_sync_check(batch_number - 1, config)
+        BatchCoordinator(config, config.get("experiment_name", "core_simp_phase2"), "core_simp_phase2").run(
+            [QuestionWorkItem(index=item["test_idx"], question=item.get("test_question", "")) for item in tests_to_process], worker, commit
+        )
+        return [results_by_index[index] for index in sorted(results_by_index)]
 
     # 3. Execution Loop
     for loop_idx, test_item in enumerate(tqdm(tests_to_process, desc="Phase 2 Execution")):
