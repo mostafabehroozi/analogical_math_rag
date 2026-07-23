@@ -184,12 +184,17 @@ def periodic_sync_check(loop_counter: int, config: dict):
         print("--- Sync complete. ---\n")
 
 
+import threading 
+
 def periodic_batch_sync_check(batch_counter: int, config: dict):
     """Synchronize only after a committed batch, never from a worker thread."""
     if not config.get("PERSIST_RESULTS_ONLINE"):
         return
     sync_interval = config.get("HF_SYNC_INTERVAL_BATCHES", config.get("HF_SYNC_INTERVAL", 10))
     if (batch_counter + 1) % max(1, int(sync_interval)) == 0:
-        print(f"\n--- Reached committed batch #{batch_counter + 1}. Syncing results to Hugging Face Hub. ---")
-        sync_workspace_to_hub(config)
-        print("--- Batch sync complete. ---\n")
+        print(f"\n--- Reached committed batch #{batch_counter + 1}. Spawning background thread to sync to HF Hub. ---")
+        
+        # We start a background "daemon" thread. It runs sync_workspace_to_hub silently!
+        threading.Thread(target=sync_workspace_to_hub, args=(config,), daemon=True).start()
+        
+        print("--- Background sync started. Pipeline continuing immediately... ---\n")

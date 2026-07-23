@@ -35,10 +35,9 @@ except ModuleNotFoundError:  # pragma: no cover - depends on deployment extras
 RETRYABLE_ERROR_TYPES = {
     "APITimeoutError", "APIConnectionError", "ResourceExhausted",
     "OllamaConnectionError", "UnknownError", "APIStatusError",
-    "RateLimitError", "ProactiveRateLimit",
+    "RateLimitError", 
 }
-NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "InvalidArgument", "Safety", "NoChoices", "ModelMismatch"}
-
+NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "InvalidArgument", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit"}
 
 class APIResponse(TypedDict, total=False):
     status: str
