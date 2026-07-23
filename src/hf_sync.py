@@ -187,6 +187,7 @@ def periodic_sync_check(loop_counter: int, config: dict):
 import threading 
 
 _sync_lock = threading.Lock()
+_active_sync_thread = None  
 
 def _threaded_sync(config: dict):
     """Wrapper that only runs if no other sync is currently running."""
@@ -203,13 +204,23 @@ def _threaded_sync(config: dict):
 
 def periodic_batch_sync_check(batch_counter: int, config: dict):
     """Synchronize only after a committed batch, never from a worker thread."""
+    global _active_sync_thread
+    
     if not config.get("PERSIST_RESULTS_ONLINE"):
         return
     sync_interval = config.get("HF_SYNC_INTERVAL_BATCHES", config.get("HF_SYNC_INTERVAL", 10))
     if (batch_counter + 1) % max(1, int(sync_interval)) == 0:
         print(f"\n--- Reached committed batch #{batch_counter + 1}. Spawning background thread to sync to HF Hub. ---")
         
-        # We now point the thread to our safe, locked wrapper function!
-        threading.Thread(target=_threaded_sync, args=(config,), daemon=True).start()
+        _active_sync_thread = threading.Thread(target=_threaded_sync, args=(config,), daemon=False)
+        _active_sync_thread.start()
         
         print("--- Background sync check requested. Pipeline continuing immediately... ---\n")
+
+def wait_for_final_sync():
+    """Call this at the end of your script to ensure uploads finish."""
+    global _active_sync_thread
+    if _active_sync_thread and _active_sync_thread.is_alive():
+        print("\n⏳ Waiting for final Hugging Face background sync to finish before exiting...")
+        _active_sync_thread.join()
+        print("✅ Background sync complete!")

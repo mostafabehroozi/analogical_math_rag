@@ -186,15 +186,17 @@ def execute_with_retry(config: Dict[str, Any], api_call_func: Callable[[], APIRe
             return response
 
         error_type = response.get("error_type") or response.get("status", "ERROR")
-        retryable = error_type not in NON_RETRYABLE_ERROR_TYPES and (retry_all or error_type in RETRYABLE_ERROR_TYPES)
+        
+        if error_type in NON_RETRYABLE_ERROR_TYPES:
+            retryable = False
+        else:
+            retryable = retry_all or (error_type in RETRYABLE_ERROR_TYPES)
+
         if not retryable or attempt == max_attempts:
             response["retry_exhausted"] = attempt == max_attempts
             return response
 
-        # NEW: Uses tprint so the warning shows up on the console with the Q# tag!
         tprint(f"API attempt {attempt}/{max_attempts} failed ({error_type}); retrying with next available key.", level="WARNING")
-        # In batch mode a failed key was put into its own cooldown by the manager.
-        # Do not impose the old global retry sleep on unrelated keys.
         if not config.get("BATCH_PROCESSING_ENABLED", False):
             time.sleep(float(config.get("API_RETRY_DELAY_SECONDS", 5.0)))
         last_response = response
@@ -392,27 +394,33 @@ class OllamaAPIManager:
         self.print_details = config.get("PRINT_API_CALL_DETAILS", False)
         self.truncation_length = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
         self.client = ollama.Client(host=config.get("OLLAMA_BASE_URL", "http://localhost:11434"))
+        
+        import threading
+        max_concurrent = config.get("OLLAMA_MAX_CONCURRENT", 1) # Only run 1 at a time locally
+        self.semaphore = threading.Semaphore(max_concurrent)
+        # ---------------------------------------------------------------
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
         def attempt() -> APIResponse:
-            try:
-                options: Dict[str, Any] = {}
-                if temperature is not None:
-                    options["temperature"] = temperature
-                if self.config.get("OLLAMA_THINK_MODE"):
-                    options["think"] = self.config["OLLAMA_THINK_MODE"]
-                response = self.client.generate(model=model_name, prompt=prompt, options=options)
-                return {"status": "SUCCESS", "text": response["response"], "error_type": None, "error_message": None, "error_details": None}
-            except ollama.ResponseError as error:
-                if self.config.get("BATCH_PROCESSING_ENABLED", False):
-                    time.sleep(float(self.config.get("API_RETRY_DELAY_SECONDS", 5.0)))
+            with self.semaphore:
+                try:
+                    options: Dict[str, Any] = {}
+                    if temperature is not None:
+                        options["temperature"] = temperature
+                    if self.config.get("OLLAMA_THINK_MODE"):
+                        options["think"] = self.config["OLLAMA_THINK_MODE"]
+                    response = self.client.generate(model=model_name, prompt=prompt, options=options)
+                    return {"status": "SUCCESS", "text": response["response"], "error_type": None, "error_message": None, "error_details": None}
+                except ollama.ResponseError as error:
+                    if self.config.get("BATCH_PROCESSING_ENABLED", False):
+                        time.sleep(float(self.config.get("API_RETRY_DELAY_SECONDS", 5.0)))
+                        
+                    return {"status": "ERROR", "text": None, "error_type": "OllamaResponseError", "error_message": str(error), "error_details": repr(error)}
                     
-                return {"status": "ERROR", "text": None, "error_type": "OllamaResponseError", "error_message": str(error), "error_details": repr(error)}
-                
-            except Exception as error:
-                if self.config.get("BATCH_PROCESSING_ENABLED", False):
-                    time.sleep(float(self.config.get("API_RETRY_DELAY_SECONDS", 5.0)))
-                    
-                return {"status": "ERROR", "text": None, "error_type": "OllamaConnectionError", "error_message": str(error), "error_details": repr(error)}
+                except Exception as error:
+                    if self.config.get("BATCH_PROCESSING_ENABLED", False):
+                        time.sleep(float(self.config.get("API_RETRY_DELAY_SECONDS", 5.0)))
+                        
+                    return {"status": "ERROR", "text": None, "error_type": "OllamaConnectionError", "error_message": str(error), "error_details": repr(error)}
 
         return execute_with_retry(self.config, attempt)

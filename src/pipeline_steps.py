@@ -53,14 +53,18 @@ from src.prompts import (
 )
 
 from src.context_logger import tprint
+import builtins
 
 def silent_context_print(*args, **kwargs):
     """
-    Secretly intercepts all print() calls in this file.
-    Instead of spamming the console, it sends them to the log file 
-    with the correct Batch and Question ID attached!
+    Secretly intercepts all print() calls in this file safely.
+    Instead of spamming the console, it sends them to the log file.
     """
-    message = " ".join(str(a) for a in args)
+    if 'file' in kwargs or kwargs.get('end', '\n') != '\n':
+        builtins.print(*args, **kwargs)
+        return
+    sep = kwargs.get('sep', ' ')
+    message = sep.join(str(a) for a in args)
     tprint(message, level="DEBUG")
 
 print = silent_context_print

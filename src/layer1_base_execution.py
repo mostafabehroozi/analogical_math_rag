@@ -41,14 +41,19 @@ from src.pipeline_steps import (
 )
 from src.evaluation import evaluate_single_answer_with_llm
 
-# --- OVERRIDE PRINT TO BE THREAD-SAFE ---
+
+import builtins
 from src.context_logger import tprint
 
-def thread_safe_print(*args, **kwargs):
-    message = " ".join(str(a) for a in args)
+def safe_thread_print(*args, **kwargs):
+    if 'file' in kwargs or kwargs.get('end', '\n') != '\n':
+        builtins.print(*args, **kwargs)
+        return
+    sep = kwargs.get('sep', ' ')
+    message = sep.join(str(a) for a in args)
     tprint(message, level="INFO")
 
-print = thread_safe_print
+print = safe_thread_print
 
 
 # ============================================================================

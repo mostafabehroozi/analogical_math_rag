@@ -241,30 +241,33 @@ def analyze_experiment_logs(
             max_workers = config.get("BATCH_MAX_WORKERS", 5)
             
             def eval_worker(task):
-                is_correct_list, status_list, error_details_list = [], [], []
-                for attempt in task["attempts"]:
-                    if isinstance(attempt, str):
-                        eval_result = evaluate_single_answer_with_llm(attempt, task["ground_truth"], manager_for_eval, config)
-                        is_correct_list.append(eval_result["is_correct"])
-                        status_list.append(eval_result["status"])
-                        error_details_list.append(eval_result["error_details"])
-                    elif isinstance(attempt, dict) and attempt.get('status') == 'FAILURE':
-                        is_correct_list.append(None)
-                        status_list.append("GENERATION_FAILED")
-                        error_details_list.append(attempt.get("error_info"))
-                    else:
-                        is_correct_list.append(None)
-                        status_list.append("INVALID_ATTEMPT_FORMAT")
-                        error_details_list.append(None)
+                from src.context_logger import pipeline_context
+                
+                with pipeline_context(query_idx=task["hard_list_idx"], batch_id="evaluation"):
+                    is_correct_list, status_list, error_details_list = [], [], []
+                    for attempt in task["attempts"]:
+                        if isinstance(attempt, str):
+                            eval_result = evaluate_single_answer_with_llm(attempt, task["ground_truth"], manager_for_eval, config)
+                            is_correct_list.append(eval_result["is_correct"])
+                            status_list.append(eval_result["status"])
+                            error_details_list.append(eval_result["error_details"])
+                        elif isinstance(attempt, dict) and attempt.get('status') == 'FAILURE':
+                            is_correct_list.append(None)
+                            status_list.append("GENERATION_FAILED")
+                            error_details_list.append(attempt.get("error_info"))
+                        else:
+                            is_correct_list.append(None)
+                            status_list.append("INVALID_ATTEMPT_FORMAT")
+                            error_details_list.append(None)
 
-                return {
-                    "hard_list_idx": task["hard_list_idx"],
-                    "strategy": task["strat_name"],
-                    "is_correct_list": is_correct_list,
-                    "evaluation_status_list": status_list,
-                    "evaluation_error_details": error_details_list,
-                    "attempts": task["attempts"]
-                }
+                    return {
+                        "hard_list_idx": task["hard_list_idx"],
+                        "strategy": task["strat_name"],
+                        "is_correct_list": is_correct_list,
+                        "evaluation_status_list": status_list,
+                        "evaluation_error_details": error_details_list,
+                        "attempts": task["attempts"]
+                    }
 
             # Run with a progress bar!
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
