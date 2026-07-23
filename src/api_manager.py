@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Tuple, TypedDict, Union
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from src.context_logger import ctx_query_idx, ctx_batch_id, tprint
 
 try:  # Keep scheduler/batch tests importable without optional provider SDKs.
     import ollama
@@ -46,21 +47,6 @@ class APIResponse(TypedDict, total=False):
     error_message: Optional[str]
     error_details: Optional[Any]
     request_meta: Dict[str, Any]
-
-
-_api_call_context: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
-    "api_call_context", default={}
-)
-
-
-@contextlib.contextmanager
-def api_call_context(**context: Any) -> Iterator[None]:
-    """Attach batch/question metadata to API monitoring without changing call sites."""
-    token = _api_call_context.set({**_api_call_context.get(), **context})
-    try:
-        yield
-    finally:
-        _api_call_context.reset(token)
 
 
 def _mask_key(api_key: str) -> str:
@@ -166,12 +152,12 @@ class RPMKeyScheduler:
         with self._condition:
             key = (api_key, model_name)
             self._cooldown_until[key] = max(self._cooldown_until[key], time.monotonic() + max(0.0, delay))
-            self._condition.notify_all()
+            # BUG FIX: Removed self._condition.notify_all() here. 
+            # We don't wake up threads when taking a resource away!
 
     def disable(self, api_key: str, reason: str) -> None:
         with self._condition:
             self._disabled[api_key] = reason
-            self._condition.notify_all()
 
     def snapshot(self) -> Dict[str, Any]:
         with self._condition:
@@ -206,7 +192,8 @@ def execute_with_retry(config: Dict[str, Any], api_call_func: Callable[[], APIRe
             response["retry_exhausted"] = attempt == max_attempts
             return response
 
-        logger.warning("API attempt %s/%s failed (%s); retrying through key scheduler.", attempt, max_attempts, error_type)
+        # NEW: Uses tprint so the warning shows up on the console with the Q# tag!
+        tprint(f"API attempt {attempt}/{max_attempts} failed ({error_type}); retrying with next available key.", level="WARNING")
         # In batch mode a failed key was put into its own cooldown by the manager.
         # Do not impose the old global retry sleep on unrelated keys.
         if not config.get("BATCH_PROCESSING_ENABLED", False):
@@ -251,14 +238,16 @@ class _KeyedAPIManager:
             "key": _mask_key(lease.api_key),
             "rolling_requests": lease.rolling_requests,
             "daily_requests": lease.daily_requests,
-            **_api_call_context.get(),
+            # NEW: Grab the query ID from the context engine
+            "query_idx": ctx_query_idx.get(),
+            "batch_id": ctx_batch_id.get(),
         }
 
     def _print(self, message: str) -> None:
         if self.print_details:
-            context = _api_call_context.get()
-            prefix = " ".join(f"{k}={v}" for k, v in context.items() if v is not None)
-            print(f"[API {self.provider_name}{' ' + prefix if prefix else ''}] {message}")
+            # NEW: Use tprint with DEBUG level. 
+            # This hides the spam from the console but saves it to the log file!
+            tprint(f"[API {self.provider_name}] {message}", level="DEBUG")
 
 
 class GeminiAPIManager(_KeyedAPIManager):

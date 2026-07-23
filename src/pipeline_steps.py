@@ -52,6 +52,19 @@ from src.prompts import (
     EXEMPLAR_FORMAT
 )
 
+from src.context_logger import tprint
+
+def silent_context_print(*args, **kwargs):
+    """
+    Secretly intercepts all print() calls in this file.
+    Instead of spamming the console, it sends them to the log file 
+    with the correct Batch and Question ID attached!
+    """
+    message = " ".join(str(a) for a in args)
+    tprint(message, level="DEBUG")
+
+print = silent_context_print
+
 def log_time_diagnostic(message: str, start_time: float, indent: int = 0) -> float:
     end_time = time.time()
     elapsed = end_time - start_time

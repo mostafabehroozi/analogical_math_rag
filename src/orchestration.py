@@ -52,6 +52,8 @@ from tqdm import tqdm
 import os
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
+from src.context_logger import pipeline_context, tprint
+
 
 from src.pipeline_steps import (
     retrieve, adapt, merge, solve,
@@ -1297,19 +1299,37 @@ def _run_pipeline_items_in_batches(
     unindexed_logs = [log for log in existing_logs if _log_query_index(log) is None]
 
     def worker(item: QuestionWorkItem) -> Dict[str, Any]:
-        return run_pipeline_for_single_query(
-            hard_list_idx=item.index,
-            target_query=item.question,
-            config=current_config,
-            embedding_model=embedding_model,
-            exemplar_data=exemplar_data,
-            api_managers=api_managers,
-            run_mode=run_mode,
-            existing_log=item.existing_log,
-            hard_solutions=hard_solutions,
-        )
+        # Inject context! Now, everything running inside this block automatically knows its Q#
+        with pipeline_context(query_idx=item.index, batch_id=phase_name):
+            return run_pipeline_for_single_query(
+                hard_list_idx=item.index,
+                target_query=item.question,
+                config=current_config,
+                embedding_model=embedding_model,
+                exemplar_data=exemplar_data,
+                api_managers=api_managers,
+                run_mode=run_mode,
+                existing_log=item.existing_log,
+                hard_solutions=hard_solutions,
+            )
 
     def commit(results: List[QuestionResult], batch_id: str, batch_number: int) -> None:
+        
+        # --- NEW: Print a clean summary to the console! ---
+        print(f"\n{'='*70}")
+        print(f"✅ BATCH {batch_number} COMPLETED [Phase: {phase_name.upper()}]")
+        for result in results:
+            q_idx = result.item.index
+            status = result.terminal_status or result.value.get("pipeline_status", "UNKNOWN")
+            elapsed = round(result.elapsed_seconds, 2)
+            
+            # Add some nice color/icons based on status
+            icon = "🟢" if "SUCCESS" in status else "🔴" if "FAILURE" in status else "🟡"
+            print(f"  {icon} [Q#{q_idx}] Status: {status} ({elapsed}s)")
+        print(f"{'='*70}\n")
+        # --------------------------------------------------
+
+        # (The rest of your original commit logic stays exactly the same)
         for result in results:
             run_log = result.value
             run_log["batch_metadata"] = {
@@ -1329,6 +1349,7 @@ def _run_pipeline_items_in_batches(
             for result in results
             if isinstance(result.value.get("layer1_base_execution_state"), dict)
         }
+        
         if layer1_states:
             top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
             n_candidates = current_config.get("LAYER1_N_CANDIDATES") or top_k

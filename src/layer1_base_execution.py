@@ -273,110 +273,12 @@ def _save_step_checkpoint(
     experiment_name: str
 ) -> bool:
     """
-    Saves a checkpoint for a single completed step atomically.
-    This enables resuming from this exact point if a kernel crash occurs.
-    
-    Args:
-        cache_path: Path to the combined cache file
-        target_query_index: The query index
-        step_name: Name of the step ("retrieval", "candidate_generation", etc.)
-        step_data: Data to checkpoint for this step
-        top_k: Top-k retrieval setting
-        n_candidates: Number of candidates setting
-        experiment_name: Name of the experiment
-    
-    Returns:
-        True if successful, False otherwise.
+    DISABLED FOR BATCH PROCESSING to prevent disk race conditions.
+    The threads hold their state in memory, and the Batch Coordinator 
+    saves everything atomically at the end of the batch.
     """
-    try:
-        query_key = str(target_query_index)
-        step_order = {
-            "retrieval": 0,
-            "candidate_generation": 1,
-            "baseline_calculation": 2,
-            "cross_evaluation": 3,
-            "ground_truth_evaluation": 4
-        }
-        
-        # Load existing combined file
-        if os.path.exists(cache_path):
-            combined_data = load_json(cache_path)
-        else:
-            combined_data = {
-                "metadata": {
-                    "created_at": time.time(),
-                    "experiment_name": experiment_name,
-                    "top_k": top_k,
-                    "n_candidates": n_candidates,
-                    "completed_queries": [],
-                    "queries_in_progress": []
-                },
-                "queries": {}
-            }
-        
-        # Initialize query if needed
-        if query_key not in combined_data["queries"]:
-            combined_data["queries"][query_key] = {
-                "metadata": {
-                    "query_index": target_query_index,
-                    "cache_version": "3.0",
-                    "last_checkpoint_timestamp": time.time(),
-                    "last_completed_step": -1
-                },
-                "step_checkpoints": {},
-                "step_statuses": {}
-            }
-        
-        # Ensure metadata has the new fields
-        if "last_completed_step" not in combined_data["queries"][query_key]["metadata"]:
-            combined_data["queries"][query_key]["metadata"]["last_completed_step"] = -1
-        if "step_checkpoints" not in combined_data["queries"][query_key]:
-            combined_data["queries"][query_key]["step_checkpoints"] = {}
-        if "step_statuses" not in combined_data["queries"][query_key]:
-            combined_data["queries"][query_key]["step_statuses"] = {}
-        
-        # Save step checkpoint
-        combined_data["queries"][query_key]["step_checkpoints"][step_name] = {
-            "status": "SUCCESS",
-            "data": step_data,
-            "completed_at": time.time()
-        }
-        combined_data["queries"][query_key]["step_statuses"][step_name] = "SUCCESS"
-        combined_data["queries"][query_key]["metadata"]["last_completed_step"] = step_order[step_name]
-        combined_data["queries"][query_key]["metadata"]["last_checkpoint_timestamp"] = time.time()
-        
-        # Update global metadata
-        completed_queries = combined_data["metadata"].get("completed_queries", [])
-        queries_in_progress = combined_data["metadata"].get("queries_in_progress", [])
-        
-        # Remove from in-progress if adding to completed (happens when all 5 steps done)
-        if target_query_index not in queries_in_progress:
-            queries_in_progress.append(target_query_index)
-        
-        combined_data["metadata"]["queries_in_progress"] = queries_in_progress
-        combined_data["metadata"]["updated_at"] = time.time()
-        combined_data["metadata"]["total_queries"] = len(combined_data["queries"])
-        
-        # Atomic write: temp file + rename
-        temp_path = cache_path + ".tmp"
-        save_json(combined_data, temp_path)
-        os.replace(temp_path, cache_path)
-        
-        logging.getLogger(__name__).debug(
-            f"Step checkpoint saved: Query #{target_query_index}, Step {step_name} "
-            f"(completed_step_index: {step_order[step_name]})"
-        )
-        return True
-    except Exception as e:
-        logging.getLogger(__name__).error(
-            f"Failed to save step checkpoint for {step_name} (query #{target_query_index}): {e}"
-        )
-        try:
-            if os.path.exists(cache_path + ".tmp"):
-                os.remove(cache_path + ".tmp")
-        except:
-            pass
-        return False
+    # Simply return True to pretend it saved, allowing the pipeline to continue
+    return True
 
 
 def _get_last_completed_step(cache_path: str, target_query_index: int) -> int:
