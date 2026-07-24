@@ -840,7 +840,7 @@ A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction 
 <Reasoning_Trace>
 *   **Trunk:** Forces Logic (Sum of opposing forces = Engine Force).
 *   **Aspects:** 1. Gravity (Incline), 2. Friction, 3. Air Resistance.
-*   **Zero-States:** Incline → 0 degrees (Flat), Friction → $\mu=0$ (Smooth), Air Resistance → 0N (Vacuum).
+*   **Zero-States:** Incline → 0 degrees (Flat), Friction → $\\mu=0$ (Smooth), Air Resistance → 0N (Vacuum).
 *   **Context Strategy:** Change "Car/Road" to "Block/Ramp", "Crate/Floor", "Sled/Track".
 </Reasoning_Trace>
 
@@ -956,7 +956,7 @@ Find the area of a circle inscribed in a square that has a side length of 4.
     "self_sampling_augmentor_simplification_shallow":"""You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical.
 
 <Instructions>
-1. Analyze the 'Base Question' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\pi$), messy units, or overly wordy variable descriptions.
+1. Analyze the 'Base Question' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\\pi$), messy units, or overly wordy variable descriptions.
 2. Create EXACTLY ONE new math question.
 3. CRITICAL CONSTRAINTS for the new question:
     - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt 3$ with 4).
@@ -1360,7 +1360,7 @@ Simplified Question:
     "self_sampling_augmentor_simplification_shallow_with_solution": """You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical, aided by the provided 'Reference Solution'.
 
 <Instructions>
-1. Analyze the 'Base Question' and 'Reference Solution' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\pi$), messy units, or overly wordy variable descriptions visible in the calculation steps.
+1. Analyze the 'Base Question' and 'Reference Solution' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\\pi$), messy units, or overly wordy variable descriptions visible in the calculation steps.
 2. Create EXACTLY ONE new math question.
 3. CRITICAL CONSTRAINTS for the new question:
     - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt 3$ with 4).

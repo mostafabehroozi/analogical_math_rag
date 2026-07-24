@@ -9,7 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from src.api_manager import api_call_context
+from src.context_logger import pipeline_context as api_call_context
 from src.utils import save_json_atomic
 
 
