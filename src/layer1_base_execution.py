@@ -56,10 +56,7 @@ def safe_thread_print(*args, **kwargs):
 print = safe_thread_print
 
 
-# ============================================================================
 # CACHE MANAGEMENT
-# ============================================================================
-
 def _get_cache_filename(
     top_k: int,
     n_candidates: int,
@@ -67,13 +64,13 @@ def _get_cache_filename(
 ) -> str:
     """
     Generates a deterministic cache filename based on configuration.
-    Format: layer1_cache_k{k}_n{n}_{experiment_name}.json
-    
-    All queries are stored in a single combined file per experiment.
     """
-    # Sanitize experiment name for filename
     safe_experiment_name = experiment_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    return f"layer1_cache_k{top_k}_n{n_candidates}_{safe_experiment_name}.json"
+    
+    from config import CONFIG
+    zs_n = CONFIG.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0)
+    
+    return f"layer1_cache_k{top_k}_n{n_candidates}_z{zs_n}_{safe_experiment_name}.json"
 
 
 def _get_cache_path(cache_dir: str, filename: str) -> str:
@@ -755,7 +752,11 @@ def run_layer1_base_execution(
     # --- Initialization ---
     cache_dir = config.get("LAYER1_CACHE_DIR", config.get("RESULTS_DIR", "local_data/outputs/results"))
     top_k = config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-    n_candidates = config.get("LAYER1_N_CANDIDATES")
+    
+    # NEW: Fetch the 1-shot limit, with fallbacks
+    n_candidates = config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+    if n_candidates is None:
+        n_candidates = config.get("LAYER1_N_CANDIDATES")
     if n_candidates is None:
         n_candidates = top_k
     
@@ -797,6 +798,7 @@ def run_layer1_base_execution(
             "last_completed_step": -1,
             "config_snapshot": {
                 "TOP_N_CANDIDATES_RETRIEVAL": config.get("TOP_N_CANDIDATES_RETRIEVAL"),
+                "LAYER1_ONE_SHOT_CANDIDATES_N": config.get("LAYER1_ONE_SHOT_CANDIDATES_N"),
                 "LAYER1_N_CANDIDATES": config.get("LAYER1_N_CANDIDATES"),
                 "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION")
             }
@@ -846,12 +848,19 @@ def run_layer1_base_execution(
     layer1_state["retrieved_set"] = retrieval_result.get("retrieval_data", [])
     layer1_state["execution_trace"].extend(retrieval_result.get("trace", []))
     
-    # --- STEP B: CANDIDATE GENERATION ---
+    # STEP B: CANDIDATE GENERATION
     print("\n[Step B] Candidate Generation (1-shot)...")
     start_time = time.time()
+    
+    indices_for_generation = retrieved_indices[:n_candidates]
+    
     candidate_result = _execute_candidate_generation(
-        target_query=target_query, retrieved_indices=retrieved_indices,
-        exemplar_data=exemplar_data, api_manager=api_manager, config=config, trace_accumulator=trace_accumulator
+        target_query=target_query, 
+        retrieved_indices=indices_for_generation,
+        exemplar_data=exemplar_data, 
+        api_manager=api_manager, 
+        config=config, 
+        trace_accumulator=trace_accumulator
     )
     layer1_state["step_statuses"]["candidate_generation"] = candidate_result["status"]
     candidates = candidate_result.get("candidates", {})

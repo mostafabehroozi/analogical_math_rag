@@ -152,7 +152,7 @@ def run_pipeline_for_single_query(
                     "DEFER_SOLVE_STEP", "TOP_N_CANDIDATES_RETRIEVAL", "N_PASS_ATTEMPTS",
                     # Layer 1 Flags
                     "APPLY_LAYER1_BASE_EXECUTION", "LAYER1_ONLY_MODE", "LAYER1_CACHE_DIR",
-                    "LAYER1_N_CANDIDATES", "LAYER1_DATASET_NAME",
+                    "LAYER1_N_CANDIDATES", "LAYER1_ONE_SHOT_CANDIDATES_N", "LAYER1_DATASET_NAME",
                     # New Feature Flags
                     "APPLY_SELF_SAMPLING", "SELF_SAMPLING_N",
                     "APPLY_ANALOGICAL_ADAPTATION", "ANALOGICAL_GROUP_SETS",
@@ -1365,7 +1365,7 @@ def _run_pipeline_items_in_batches(
         
         if layer1_states:
             top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-            n_candidates = current_config.get("LAYER1_N_CANDIDATES") or top_k
+            n_candidates = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get("LAYER1_N_CANDIDATES") or top_k
             cache_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
             cache_path = _get_cache_path(cache_dir, _get_cache_filename(top_k, n_candidates, experiment_name))
             if not _save_cached_states_batch(cache_path, layer1_states, top_k, n_candidates, experiment_name, batch_id):
@@ -1601,7 +1601,7 @@ def run_experiments(
                         if 'layer1_base_execution_state' in intermediate_log:
                             l1_state = intermediate_log['layer1_base_execution_state']
                             t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-                            n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
+                            n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get("LAYER1_N_CANDIDATES") or t_k
                             c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                             c_file = _get_cache_filename(t_k, n_cands, exp_name)
                             _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
@@ -1674,7 +1674,7 @@ def run_experiments(
                 l2_out_dir = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_layer2_analytics")
                 
                 top_k_val = current_config.get('TOP_N_CANDIDATES_RETRIEVAL', 3)
-                n_cand_val = current_config.get('LAYER1_N_CANDIDATES') or top_k_val
+                n_cand_val = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get('LAYER1_N_CANDIDATES') or top_k_val
                 
                 solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
                 eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", "gemini"))
@@ -1749,7 +1749,7 @@ def run_experiments(
                         if 'layer1_base_execution_state' in single_run_log:
                             l1_state = single_run_log['layer1_base_execution_state']
                             t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-                            n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
+                            n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get("LAYER1_N_CANDIDATES") or t_k
                             c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                             c_file = _get_cache_filename(t_k, n_cands, exp_name)
                             _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
@@ -1794,7 +1794,7 @@ def run_experiments(
                             if 'layer1_base_execution_state' in intermediate_log and intermediate_log['layer1_base_execution_state'].get('_needs_saving'):
                                 l1_state = intermediate_log['layer1_base_execution_state']
                                 t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-                                n_cands = current_config.get("LAYER1_N_CANDIDATES") or t_k
+                                n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get("LAYER1_N_CANDIDATES") or t_k
                                 c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                                 c_file = _get_cache_filename(t_k, n_cands, exp_name)
                                 _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
@@ -1850,7 +1850,7 @@ def run_experiments(
                 l2_out_dir = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_layer2_analytics")
                 
                 top_k_val = current_config.get('TOP_N_CANDIDATES_RETRIEVAL', 3)
-                n_cand_val = current_config.get('LAYER1_N_CANDIDATES') or top_k_val
+                n_cand_val = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get('LAYER1_N_CANDIDATES') or top_k_val
                 
                 # Fetch the correct API managers to pass into Layer 2
                 solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))

@@ -1665,13 +1665,20 @@ class BlockC:
                         src_eval = self.ptu_engine._resolve_source_evaluator_index(
                             self.ptu_engine.candidate_set[selected_idx], selected_idx
                         )
-                        winning_source_evals.add(src_eval)
+                        if src_eval == -1:
+                            pass # We already added it to already_selected_cands, no parent to track
+                        else:
+                            winning_source_evals.add(src_eval)
                 
-                selected_candidate_indices = [
-                    idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
-                    if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_source_evals
-                ]
-                subset_size = len(winning_source_evals)
+                # Combine children of winning parents + explicitly winning zero-shots
+                selected_candidate_indices = []
+                for idx, cand in enumerate(self.ptu_engine.candidate_set):
+                    parent_idx = self.ptu_engine._resolve_source_evaluator_index(cand, idx)
+                    if parent_idx in winning_source_evals or idx in already_selected_cands:
+                        if idx not in selected_candidate_indices: # prevent duplicates
+                            selected_candidate_indices.append(idx)
+                            
+                subset_size = len(selected_candidate_indices)
 
             elif perspective == 'Both_Centric':
                 winning_evals = set()
@@ -1701,10 +1708,20 @@ class BlockC:
                     selected_candidate_indices = list(range(subset_size))
                     logger.info(f"Block C - {mask_type} Both_Centric (NO MUTUAL AGREEMENT): Triggering Fallback.")
                 else:
-                    selected_candidate_indices = [
-                        idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
-                        if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_evals
-                    ]
+                    selected_candidate_indices = []
+                    for idx, cand in enumerate(self.ptu_engine.candidate_set):
+                        parent_idx = self.ptu_engine._resolve_source_evaluator_index(cand, idx)
+                        # Condition 1: Normal Candidate whose parent is a winning evaluator
+                        if parent_idx in winning_evals:
+                            selected_candidate_indices.append(idx)
+                        # Condition 2: Zero-Shot Candidate that voted for a winning evaluator
+                        elif parent_idx == -1:
+                            row = ptu_matrix[idx, :]
+                            if np.max(row) > threshold:
+                                best_evals = np.where(np.isclose(row, np.max(row), atol=1e-6))[0]
+                                if any(e in winning_evals for e in best_evals):
+                                    selected_candidate_indices.append(idx)
+                    
                     subset_size = len(winning_evals)
                 
             else:  # Evaluator_Centric
@@ -1732,10 +1749,19 @@ class BlockC:
                         winning_evals.add(selected_idx)
                 
                 # Collect ALL candidates associated with the optimal subset of evaluators
-                selected_candidate_indices = [
-                    idx for idx, cand in enumerate(self.ptu_engine.candidate_set)
-                    if self.ptu_engine._resolve_source_evaluator_index(cand, idx) in winning_evals
-                ]
+                selected_candidate_indices = []
+                for idx, cand in enumerate(self.ptu_engine.candidate_set):
+                    parent_idx = self.ptu_engine._resolve_source_evaluator_index(cand, idx)
+                    if parent_idx in winning_evals:
+                        selected_candidate_indices.append(idx)
+                    elif parent_idx == -1:
+                        # Zero-shot candidate
+                        row = ptu_matrix[idx, :]
+                        if np.max(row) > threshold:
+                            best_evals = np.where(np.isclose(row, np.max(row), atol=1e-6))[0]
+                            if any(e in winning_evals for e in best_evals):
+                                selected_candidate_indices.append(idx)
+                                
                 subset_size = len(winning_evals)
         
         # Evaluate

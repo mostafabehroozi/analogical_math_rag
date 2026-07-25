@@ -261,7 +261,8 @@ CONFIG = {
     "APPLY_LAYER1_BASE_EXECUTION": False,  # Enable/disable Layer 1 system
     "LAYER1_ONLY_MODE": False,             # If True, halt after Layer 1 (cache generation only)
     "LAYER1_CACHE_DIR": RESULTS_DIR,
-    "LAYER1_N_CANDIDATES": None,           # Number of candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
+    "LAYER1_N_CANDIDATES": None,           # (Legacy) Number of candidates
+    "LAYER1_ONE_SHOT_CANDIDATES_N": None,  # Number of 1-shot candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
     "LAYER1_ZERO_SHOT_CANDIDATES_N": 5,    # Number of zero-shot candidates to generate in Layer 1 (0 = OFF)
     
