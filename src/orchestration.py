@@ -1601,7 +1601,9 @@ def run_experiments(
                         if 'layer1_base_execution_state' in intermediate_log:
                             l1_state = intermediate_log['layer1_base_execution_state']
                             t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-                            n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get("LAYER1_N_CANDIDATES") or t_k
+                            n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+                            if n_cands is None: n_cands = current_config.get("LAYER1_N_CANDIDATES")
+                            if n_cands is None: n_cands = t_k
                             c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                             c_file = _get_cache_filename(t_k, n_cands, exp_name)
                             _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
@@ -1674,7 +1676,9 @@ def run_experiments(
                 l2_out_dir = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_layer2_analytics")
                 
                 top_k_val = current_config.get('TOP_N_CANDIDATES_RETRIEVAL', 3)
-                n_cand_val = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get('LAYER1_N_CANDIDATES') or top_k_val
+                n_cand_val = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+                if n_cand_val is None: n_cand_val = current_config.get("LAYER1_N_CANDIDATES")
+                if n_cand_val is None: n_cand_val = top_k_val
                 
                 solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
                 eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", "gemini"))
@@ -1749,7 +1753,9 @@ def run_experiments(
                         if 'layer1_base_execution_state' in single_run_log:
                             l1_state = single_run_log['layer1_base_execution_state']
                             t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-                            n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get("LAYER1_N_CANDIDATES") or t_k
+                            n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+                            if n_cands is None: n_cands = current_config.get("LAYER1_N_CANDIDATES")
+                            if n_cands is None: n_cands = t_k
                             c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                             c_file = _get_cache_filename(t_k, n_cands, exp_name)
                             _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
@@ -1794,7 +1800,9 @@ def run_experiments(
                             if 'layer1_base_execution_state' in intermediate_log and intermediate_log['layer1_base_execution_state'].get('_needs_saving'):
                                 l1_state = intermediate_log['layer1_base_execution_state']
                                 t_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-                                n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get("LAYER1_N_CANDIDATES") or t_k
+                                n_cands = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+                                if n_cands is None: n_cands = current_config.get("LAYER1_N_CANDIDATES")
+                                if n_cands is None: n_cands = t_k
                                 c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
                                 c_file = _get_cache_filename(t_k, n_cands, exp_name)
                                 _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
@@ -1850,7 +1858,9 @@ def run_experiments(
                 l2_out_dir = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_layer2_analytics")
                 
                 top_k_val = current_config.get('TOP_N_CANDIDATES_RETRIEVAL', 3)
-                n_cand_val = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get('LAYER1_N_CANDIDATES') or top_k_val
+                n_cand_val = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+                if n_cand_val is None: n_cand_val = current_config.get("LAYER1_N_CANDIDATES")
+                if n_cand_val is None: n_cand_val = top_k_val
                 
                 # Fetch the correct API managers to pass into Layer 2
                 solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))

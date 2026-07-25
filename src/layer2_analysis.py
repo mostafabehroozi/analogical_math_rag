@@ -844,16 +844,11 @@ class PTUMathEngine:
     def get_original_retrieved_ranking(self) -> List[str]:
         """
         Get the original (pre-reranking) candidate ranking from Layer 1 retrieved set.
-        Candidates are ordered by their retrieval index (as they appear in the retrieved set).
-        
-        Returns:
-            List of candidate IDs in original retrieval order
+        Returns ONLY the 1-shot candidates (ignores zs_ zero-shots) to form a proper baseline.
         """
-        # The original ranking is determined by the order of candidates in the retrieved set
-        # (i.e., the order they were retrieved by the embedding model)
-        # For now, we use the order of candidate_ids (which reflects the candidate_set order)
-        # In Layer 1, candidates are typically ordered by their appearance/importance in retrievals
-        return self.candidate_ids.copy()
+        # We filter out any candidate ID that starts with 'zs_' 
+        # so the baseline only compares against our retrieved 1-shot samples.
+        return [cid for cid in self.candidate_ids if not str(cid).startswith("zs_")]
     
     def compute_position_shift(self, original_indices: List[int], reranked_indices: List[int]) -> float:
         """
@@ -1123,8 +1118,8 @@ class BlockA:
         Creates ExperimentResult objects for Top-K slicing of the original list.
         """
         results = []
-        # Get the original sequence (0, 1, 2, 3...)
-        original_indices = list(range(len(self.ptu_engine.candidate_ids)))
+        # Get the original sequence (0, 1, 2, 3...), excluding zero-shots
+        original_indices = [i for i, cid in enumerate(self.ptu_engine.candidate_ids) if not str(cid).startswith("zs_")]
         original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
         
         ground_truth_labels_dict = {
@@ -1400,7 +1395,8 @@ class BlockB:
                 if ranked_list_for_boundary:
                     positive_indices = ranked_list_for_boundary[:k_dynamic]
                 else:
-                    positive_indices = list(range(k_dynamic))
+                    base_indices = [i for i, cid in enumerate(self.ptu_engine.candidate_ids) if not str(cid).startswith("zs_")]
+                    positive_indices = base_indices[:k_dynamic]
         
         # Evaluate the dynamic group
         selected_candidate_ids = self.ptu_engine.candidate_indices_to_ids(positive_indices)
@@ -1621,12 +1617,9 @@ class BlockC:
         
         if zero_score_fallback_triggered:
             # ===== FALLBACK PATH: Bypass complex coverage logic =====
-            # STRICT FALLBACK: If math is useless, return ALL members of the retrieved list
-            k_fallback = len(self.ptu_engine.candidate_set)
-            
-            # Use first K_fallback indices (original retrieval order)
-            selected_candidate_indices = list(range(k_fallback))
-            subset_size = k_fallback
+            # STRICT FALLBACK: If math is useless, return the retrieved 1-shots (ignore zero-shots)
+            selected_candidate_indices = [i for i, cid in enumerate(self.ptu_engine.candidate_ids) if not str(cid).startswith("zs_")]
+            subset_size = len(selected_candidate_indices)
             
             logger.info(
                 f"Block C - {mask_type} {perspective} (ZERO-SCORE FALLBACK): "
