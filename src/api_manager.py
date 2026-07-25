@@ -30,7 +30,12 @@ try:
     import openai
 except ModuleNotFoundError:  # pragma: no cover - depends on deployment extras
     openai = None
-
+try:
+    from google import genai
+    from google.genai import types
+    from google.genai.errors import APIError
+except ModuleNotFoundError:
+    genai = None
 
 RETRYABLE_ERROR_TYPES = {
     "APITimeoutError", "APIConnectionError", "ResourceExhausted",
@@ -252,49 +257,37 @@ class _KeyedAPIManager:
 
 
 class GeminiAPIManager(_KeyedAPIManager):
-    """Gemini manager using REST requests so every call is bound to its selected key."""
+    """Gemini manager upgraded to use the new google-genai SDK with Thinking support."""
 
     provider_name = "gemini"
 
     def __init__(self, api_keys: List[str], model_quotas: Dict[str, Any], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
         super().__init__(api_keys, model_quotas, config)
+        if genai is None:
+            raise ImportError("GeminiAPIManager requires the 'google-genai' package. Run: pip install google-genai")
+        
         self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0))
+        
+        # Pre-initialize clients for all your keys, keeping your timeout safety net
+        self.clients = {
+            key: genai.Client(
+                api_key=key, 
+                http_options={'timeout': self.timeout_seconds}
+            ) for key in self.api_keys_list
+        }
+        
         if global_delay_seconds:
             self.logger.info("GLOBAL_API_CALL_DELAY_SECONDS is ignored by the RPM scheduler.")
 
-    def _generation_config(self, model_name: str, temperature: Optional[float]) -> Dict[str, Any]:
-        max_tokens: Optional[int] = None
+    def _get_max_tokens(self, model_name: str) -> Optional[int]:
+        """Helper to get token limits based on model purpose."""
         if model_name == self.config.get("GEMINI_MODEL_NAME_FINAL_SOLVER"):
-            max_tokens = self.config.get("DEFAULT_FINAL_SOLVER_MAX_TOKENS", 8192)
+            return self.config.get("DEFAULT_FINAL_SOLVER_MAX_TOKENS", 8192)
         elif model_name == self.config.get("GEMINI_MODEL_NAME_ADAPTATION"):
-            max_tokens = self.config.get("DEFAULT_ADAPTATION_MAX_TOKENS", 2048)
+            return self.config.get("DEFAULT_ADAPTATION_MAX_TOKENS", 2048)
         elif model_name == self.config.get("GEMINI_MODEL_NAME_EVALUATOR"):
-            max_tokens = self.config.get("DEFAULT_EVALUATOR_MAX_TOKENS", 512)
-        result: Dict[str, Any] = {}
-        if temperature is not None:
-            result["temperature"] = temperature
-        if max_tokens is not None:
-            result["maxOutputTokens"] = max_tokens
-        return result
-
-    def _call_rest(self, api_key: str, prompt: str, model_name: str, generation_config: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent"
-        payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": generation_config}
-        request = Request(
-            url, data=json.dumps(payload).encode("utf-8"), method="POST",
-            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        )
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                return int(response.status), json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            body = error.read().decode("utf-8", errors="replace")
-            try:
-                return error.code, json.loads(body)
-            except json.JSONDecodeError:
-                return error.code, {"error": {"message": body}}
-        except (URLError, TimeoutError) as error:
-            return 0, {"error": {"message": str(error), "type": "ConnectionError"}}
+            return self.config.get("DEFAULT_EVALUATOR_MAX_TOKENS", 512)
+        return None
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
         self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
@@ -303,35 +296,76 @@ class GeminiAPIManager(_KeyedAPIManager):
             lease = self.scheduler.acquire(model_name)
             if lease is None:
                 return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": f"No eligible Gemini key for {model_name}.", "error_details": self.scheduler.snapshot()}
+            
             meta = self._request_meta(lease)
-            status_code, payload = self._call_rest(lease.api_key, prompt, model_name, self._generation_config(model_name, temperature))
-            if 200 <= status_code < 300:
-                candidates = payload.get("candidates", [])
-                parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-                text = "".join(part.get("text", "") for part in parts)
+            
+            # 1. Build the configuration dictionary
+            config_kwargs = {}
+            if temperature is not None:
+                config_kwargs["temperature"] = temperature
+                
+            max_tokens = self._get_max_tokens(model_name)
+            if max_tokens is not None:
+                config_kwargs["max_output_tokens"] = max_tokens
+
+            # 2. Add Thinking Config conditionally based on your new config.py flags
+            if self.config.get("GEMINI_ENABLE_THINKING", False):
+                thinking_level_str = str(self.config.get("GEMINI_THINKING_LEVEL", "minimal")).lower()
+                
+                if thinking_level_str == "high":
+                    t_level = types.ThinkingLevel.HIGH
+                else:
+                    t_level = types.ThinkingLevel.MINIMAL
+                    
+                config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=t_level)
+
+            # Create the official types config object
+            gen_config = types.GenerateContentConfig(**config_kwargs)
+
+            try:
+                # The new SDK prefers model names without the 'models/' prefix
+                clean_model_name = model_name.replace("models/", "")
+                
+                client = self.clients[lease.api_key]
+                response = client.models.generate_content(
+                    model=clean_model_name,
+                    contents=prompt,
+                    config=gen_config
+                )
+                
+                text = response.text
                 if text:
                     self._print(f"success model={model_name} key={meta['key']}")
                     return {"status": "SUCCESS", "text": text, "error_type": None, "error_message": None, "error_details": None, "request_meta": meta}
-                return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": "Gemini returned no text.", "error_details": payload.get("promptFeedback"), "request_meta": meta}
+                else:
+                    return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": "Gemini returned no text (possibly blocked).", "error_details": None, "request_meta": meta}
 
-            error = payload.get("error", {}) if isinstance(payload, dict) else {}
-            message = error.get("message", str(payload))
-            if status_code == 429:
+            except APIError as error:
+                # Map the new SDK's errors to your existing retry system
+                status_code = error.code
+                message = error.message
+
+                if status_code == 429:
+                    self.scheduler.cooldown(lease.api_key, model_name)
+                    error_type, api_status = "ResourceExhausted", "RATE_LIMITED"
+                elif status_code in (401, 403):
+                    self.scheduler.disable(lease.api_key, f"HTTP {status_code}")
+                    error_type, api_status = "AuthenticationError", "ERROR"
+                elif status_code == 400:
+                    error_type, api_status = "InvalidArgument", "ERROR"
+                else:
+                    self.scheduler.cooldown(lease.api_key, model_name)
+                    error_type, api_status = ("APIConnectionError", "ERROR")
+                    
+                self._print(f"failure model={model_name} key={meta['key']} type={error_type}")
+                return {"status": api_status, "text": None, "error_type": error_type, "error_message": message, "error_details": str(error), "request_meta": meta}
+            
+            except Exception as error:
                 self.scheduler.cooldown(lease.api_key, model_name)
-                error_type, api_status = "ResourceExhausted", "RATE_LIMITED"
-            elif status_code in (401, 403):
-                self.scheduler.disable(lease.api_key, f"HTTP {status_code}")
-                error_type, api_status = "AuthenticationError", "ERROR"
-            elif status_code == 400:
-                error_type, api_status = "InvalidArgument", "ERROR"
-            else:
-                self.scheduler.cooldown(lease.api_key, model_name)
-                error_type, api_status = ("APIConnectionError" if status_code == 0 else "UnknownError"), "ERROR"
-            self._print(f"failure model={model_name} key={meta['key']} type={error_type}")
-            return {"status": api_status, "text": None, "error_type": error_type, "error_message": message, "error_details": payload, "request_meta": meta}
+                self._print(f"failure model={model_name} key={meta['key']} type=UnknownError")
+                return {"status": "ERROR", "text": None, "error_type": "UnknownError", "error_message": str(error), "error_details": repr(error), "request_meta": meta}
 
         return execute_with_retry(self.config, attempt)
-
 
 class AvalAIAPIManager(_KeyedAPIManager):
     provider_name = "avalai"

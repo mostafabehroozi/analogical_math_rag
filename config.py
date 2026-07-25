@@ -52,8 +52,10 @@ CONFIG = {
     # Gemini API Settings
     "GEMINI_API_KEYS": [
     ],
-    # Per-model rate-limit settings. Each entry may be a dict for all keys,
-    # or a list of quota dicts with optional api_key values for key-specific settings.
+
+    "GEMINI_ENABLE_THINKING": True,          # Set to True to enable the thinking feature
+    "GEMINI_THINKING_LEVEL": "minimal",       # Options: "minimal" or "high"
+
     "GEMINI_MODEL_QUOTAS": {
         "models/gemma-3-27b-it": [{"api_key": None, "rpm": 30, "rpd": 1000}],
     },
