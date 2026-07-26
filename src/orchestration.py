@@ -204,22 +204,29 @@ def run_pipeline_for_single_query(
         }
 
     # API Manager Selection 
+    def _get_api_manager(provider_name):
+        manager = api_managers.get(provider_name)
+        if not manager:
+            raise ValueError(f"CRITICAL ERROR: API Manager '{provider_name}' is missing! Did the API cell crash or fail to initialize?")
+        return manager
+
     provider_for_adapt = config.get('API_PROVIDER_ADAPTATION', 'gemini')
-    manager_for_adapt = api_managers[provider_for_adapt]
+    manager_for_adapt = _get_api_manager(provider_for_adapt)
+    
     provider_for_solve = config.get('API_PROVIDER_SOLVER', 'gemini')
-    manager_for_solve = api_managers[provider_for_solve]
+    manager_for_solve = _get_api_manager(provider_for_solve)
     
     # Specific Manager for Augmentation
-    provider_for_aug = config.get('API_PROVIDER_AUGMENTATION', provider_for_adapt) # Fallback to adapt if not set
-    manager_for_aug = api_managers[provider_for_aug]
+    provider_for_aug = config.get('API_PROVIDER_AUGMENTATION', provider_for_adapt)
+    manager_for_aug = _get_api_manager(provider_for_aug)
     
-    # Specific Manager for Evaluation (needed for Reverse Validation loop)
+    # Specific Manager for Evaluation
     provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
-    manager_for_eval = api_managers[provider_for_eval]
+    manager_for_eval = _get_api_manager(provider_for_eval)
 
     # Specific Manager for Simplification
     provider_for_simp = config.get('API_PROVIDER_SIMPLIFICATION', provider_for_adapt)
-    manager_for_simp = api_managers[provider_for_simp]
+    manager_for_simp = _get_api_manager(provider_for_simp)
 
     # --- LAYER 1: BASE EXECUTION PHASE ---
     if config.get('APPLY_LAYER1_BASE_EXECUTION', False):
@@ -1337,10 +1344,17 @@ def _run_pipeline_items_in_batches(
             elapsed = round(result.elapsed_seconds, 2)
             
             # Add some nice color/icons based on status
-            icon = "🟢" if "SUCCESS" in status else "🔴" if "FAILURE" in status else "🟡"
+            is_error = "FAIL" in status.upper() or "ERROR" in status.upper()
+            icon = "🟢" if "SUCCESS" in status else "🔴" if is_error else "🟡"
+            
             print(f"  {icon} [Q#{q_idx}] Status: {status} ({elapsed}s)")
+            
+            # If the thread crashed, print the actual error message!
+            if is_error and "batch_error" in result.value:
+                error_msg = result.value["batch_error"].get("message", "Unknown error")
+                print(f"      ↳ ERROR DETAILS: {error_msg}")
+                
         print(f"{'='*70}\n")
-        # --------------------------------------------------
 
         # (The rest of your original commit logic stays exactly the same)
         for result in results:
