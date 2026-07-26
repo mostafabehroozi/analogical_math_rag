@@ -13,6 +13,10 @@ EMBEDDINGS_DIR = os.path.join(BASE_OUTPUT_DIR, "embeddings")
 RESULTS_DIR = os.path.join(BASE_OUTPUT_DIR, "results")
 
 CONFIG = {
+    #  Benchmark Selection 
+    # Options: "numina_hard", "math500", "gsm8k"
+    "TARGET_BENCHMARK": "numina_hard",  
+    "BENCHMARK_MAX_QUESTIONS": None, # Put a number like 10 here if you want to do a quick test
     # Execution Mode
     "OFFLINE_MODE": True,  # Set to False for Kaggle/online execution
     
