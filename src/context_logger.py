@@ -5,23 +5,44 @@ import contextvars
 import contextlib
 import os
 
-# =======================================================================
+
 # 1. CONTEXT VARIABLES (The "Nametags" for threads)
 # contextvars ensures that when Thread A sets its name to "Q#5", 
 # it doesn't accidentally overwrite Thread B which is named "Q#6".
-# =======================================================================
 ctx_query_idx = contextvars.ContextVar('ctx_query_idx', default="N/A")
 ctx_batch_id = contextvars.ContextVar('ctx_batch_id', default="N/A")
 
-# =======================================================================
+
 # 2. CONTEXT MANAGER (How threads put their nametags on)
 # We will use this in orchestration.py later.
-# =======================================================================
+import contextlib
+
 @contextlib.contextmanager
-def pipeline_context(query_idx, batch_id):
-    """Injects thread-specific identity into the execution context."""
+def pipeline_context(query_idx=None, batch_id=None, batch=None, **kwargs):
+    """
+    Injects thread-specific identity into the execution context.
+    
+    Professionally updated to handle API mismatches: accepts either a direct 
+    'batch_id' or a 'batch' dictionary/object from the orchestrator.
+    """
+    # --- 1. Defensive parsing of the batch identifier ---
+    resolved_batch_id = batch_id
+    
+    if batch is not None:
+        if isinstance(batch, dict):
+            # If batch is a dictionary, extract 'id' or 'batch_id'
+            resolved_batch_id = batch.get("id", batch.get("batch_id", "unknown_batch"))
+        elif hasattr(batch, "id"):
+            # If batch is an object (like a dataclass), get its .id attribute
+            resolved_batch_id = getattr(batch, "id")
+        else:
+            # Fallback: just cast whatever was passed to a string
+            resolved_batch_id = str(batch)
+
+    # --- 2. Set the context variables ---
     token_q = ctx_query_idx.set(query_idx)
-    token_b = ctx_batch_id.set(batch_id)
+    token_b = ctx_batch_id.set(resolved_batch_id)
+    
     try:
         # Yield passes control back to the thread to do its work
         yield
@@ -30,10 +51,9 @@ def pipeline_context(query_idx, batch_id):
         ctx_query_idx.reset(token_q)
         ctx_batch_id.reset(token_b)
 
-# =======================================================================
+
 # 3. CUSTOM LOG FORMATTER (For standard logger.info calls)
 # This intercepts normal log messages and automatically adds the prefix.
-# =======================================================================
 class ContextFormatter(logging.Formatter):
     def format(self, record):
         q_idx = ctx_query_idx.get()
@@ -68,10 +88,9 @@ def setup_context_logger(log_dir: str):
     logger.addHandler(fh)
     return logger
 
-# =======================================================================
+
 # 4. THE CUSTOM PRINT FUNCTION (tprint)
 # You will use this instead of print() in the future.
-# =======================================================================
 def tprint(message: str, level: str = "INFO"):
     """
     Thread-aware print function.
