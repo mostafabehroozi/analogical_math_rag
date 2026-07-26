@@ -14,6 +14,8 @@ import json
 import logging
 import threading
 import time
+import inspect
+import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -57,6 +59,19 @@ def _mask_key(api_key: str) -> str:
     return f"…{api_key[-4:]}" if api_key else "<missing>"
 
 
+def _get_api_caller_location() -> str:
+    """Dynamically finds the exact file and function that requested the API call for accurate error logging."""
+    try:
+        for frame_info in inspect.stack():
+            filename = os.path.basename(frame_info.filename)
+            # Skip the internal wrapper files to find the real caller (like pipeline_steps.py)
+            if filename not in ("api_manager.py", "context_logger.py", "logging.py"):
+                return f"{filename}:{frame_info.lineno} (in {frame_info.function})"
+    except Exception:
+        pass
+    return "Unknown Location"
+
+
 @dataclass(frozen=True)
 class KeyLease:
     api_key: str
@@ -95,8 +110,6 @@ class RPMKeyScheduler:
     def _rpm(self, quota: Dict[str, Any]) -> int:
         rpm = quota.get("rpm", self.config.get("DEFAULT_API_RPM"))
         if rpm is None:
-            # Legacy configurations used delay_seconds.  This conversion is only
-            # a compatibility fallback; new batch configurations should set rpm.
             delay = float(quota.get("delay_seconds", 1.0))
             rpm = max(1, int(self.WINDOW_SECONDS / max(delay, 1.0)))
         return max(1, int(rpm))
@@ -133,8 +146,6 @@ class RPMKeyScheduler:
                         waits.append(max(0.001, timestamps[0] + self.WINDOW_SECONDS - now))
                         continue
 
-                    # Favour low rolling usage first, then low daily usage. The
-                    # rotating final key prevents one identical key from winning ties.
                     tie = (position - self._tie_breaker) % max(1, len(self.api_keys))
                     ready.append((len(timestamps), self._daily[daily_key], tie, api_key, position))
 
@@ -156,8 +167,6 @@ class RPMKeyScheduler:
         with self._condition:
             key = (api_key, model_name)
             self._cooldown_until[key] = max(self._cooldown_until[key], time.monotonic() + max(0.0, delay))
-            # BUG FIX: Removed self._condition.notify_all() here. 
-            # We don't wake up threads when taking a resource away!
 
     def disable(self, api_key: str, reason: str) -> None:
         with self._condition:
@@ -177,20 +186,29 @@ class RPMKeyScheduler:
 
 
 def execute_with_retry(config: Dict[str, Any], api_call_func: Callable[[], APIResponse]) -> APIResponse:
-    """Retry without terminating the process; managers re-enter their scheduler each time."""
+    """Retry without terminating the process; manages API errors and prints them to console."""
     logger = logging.getLogger(__name__)
+    caller_loc = _get_api_caller_location()
+    
     if not config.get("ENABLE_API_RETRY", False):
-        return api_call_func()
+        response = api_call_func()
+        if response.get("status") != "SUCCESS":
+            error_type = response.get("error_type") or response.get("status", "ERROR")
+            err_msg = response.get("error_message", "Unknown API error")
+            tprint(f"[API ERROR @ {caller_loc}] Call failed (Retries Disabled). Type: {error_type} | Msg: {err_msg}", level="ERROR")
+        return response
 
     max_attempts = max(1, int(config.get("MAX_API_RETRIES", 3)))
     retry_all = config.get("RETRY_ALL_API_ERRORS", True)
     last_response: Optional[APIResponse] = None
+    
     for attempt in range(1, max_attempts + 1):
         response = api_call_func()
         if response["status"] == "SUCCESS":
             return response
 
         error_type = response.get("error_type") or response.get("status", "ERROR")
+        err_msg = response.get("error_message", "Unknown API error")
         
         if error_type in NON_RETRYABLE_ERROR_TYPES:
             retryable = False
@@ -199,13 +217,19 @@ def execute_with_retry(config: Dict[str, Any], api_call_func: Callable[[], APIRe
 
         if not retryable or attempt == max_attempts:
             response["retry_exhausted"] = attempt == max_attempts
+            tprint(f"[API ERROR @ {caller_loc}] Final failure after {attempt} attempts. Type: {error_type} | Msg: {err_msg}", level="ERROR")
             return response
 
-        tprint(f"API attempt {attempt}/{max_attempts} failed ({error_type}); retrying with next available key.", level="WARNING")
+        tprint(f"[API RETRY @ {caller_loc}] Attempt {attempt}/{max_attempts} failed ({error_type}); retrying... Msg: {err_msg}", level="WARNING")
+        
         if not config.get("BATCH_PROCESSING_ENABLED", False):
             time.sleep(float(config.get("API_RETRY_DELAY_SECONDS", 5.0)))
         last_response = response
-    return last_response or {"status": "ERROR", "text": None, "error_type": "RetryError", "error_message": "No API attempt was made", "error_details": None}
+        
+    final_resp = last_response or {"status": "ERROR", "text": None, "error_type": "RetryError", "error_message": "No API attempt was made", "error_details": None}
+    if final_resp.get("status") != "SUCCESS":
+        tprint(f"[API ERROR @ {caller_loc}] Exhausted all {max_attempts} attempts. Type: {final_resp.get('error_type')} | Msg: {final_resp.get('error_message')}", level="ERROR")
+    return final_resp
 
 
 class _KeyedAPIManager:
@@ -244,15 +268,12 @@ class _KeyedAPIManager:
             "key": _mask_key(lease.api_key),
             "rolling_requests": lease.rolling_requests,
             "daily_requests": lease.daily_requests,
-            # NEW: Grab the query ID from the context engine
             "query_idx": ctx_query_idx.get(),
             "batch_id": ctx_batch_id.get(),
         }
 
     def _print(self, message: str) -> None:
         if self.print_details:
-            # NEW: Use tprint with DEBUG level. 
-            # This hides the spam from the console but saves it to the log file!
             tprint(f"[API {self.provider_name}] {message}", level="DEBUG")
 
 
@@ -267,8 +288,6 @@ class GeminiAPIManager(_KeyedAPIManager):
             raise ImportError("GeminiAPIManager requires the 'google-genai' package. Run: pip install google-genai")
         
         self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0))
-        
-        # Pre-initialize clients for all your keys, keeping your timeout safety net
         self.clients = {
             key: genai.Client(
                 api_key=key, 
@@ -280,7 +299,6 @@ class GeminiAPIManager(_KeyedAPIManager):
             self.logger.info("GLOBAL_API_CALL_DELAY_SECONDS is ignored by the RPM scheduler.")
 
     def _get_max_tokens(self, model_name: str) -> Optional[int]:
-        """Helper to get token limits based on model purpose."""
         if model_name == self.config.get("GEMINI_MODEL_NAME_FINAL_SOLVER"):
             return self.config.get("DEFAULT_FINAL_SOLVER_MAX_TOKENS", 8192)
         elif model_name == self.config.get("GEMINI_MODEL_NAME_ADAPTATION"):
@@ -298,8 +316,6 @@ class GeminiAPIManager(_KeyedAPIManager):
                 return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": f"No eligible Gemini key for {model_name}.", "error_details": self.scheduler.snapshot()}
             
             meta = self._request_meta(lease)
-            
-            # 1. Build the configuration dictionary
             config_kwargs = {}
             if temperature is not None:
                 config_kwargs["temperature"] = temperature
@@ -308,24 +324,18 @@ class GeminiAPIManager(_KeyedAPIManager):
             if max_tokens is not None:
                 config_kwargs["max_output_tokens"] = max_tokens
 
-            # 2. Add Thinking Config conditionally based on your new config.py flags
             if self.config.get("GEMINI_ENABLE_THINKING", False):
                 thinking_level_str = str(self.config.get("GEMINI_THINKING_LEVEL", "minimal")).lower()
-                
                 if thinking_level_str == "high":
                     t_level = types.ThinkingLevel.HIGH
                 else:
                     t_level = types.ThinkingLevel.MINIMAL
-                    
                 config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=t_level)
 
-            # Create the official types config object
             gen_config = types.GenerateContentConfig(**config_kwargs)
 
             try:
-                # The new SDK prefers model names without the 'models/' prefix
                 clean_model_name = model_name.replace("models/", "")
-                
                 client = self.clients[lease.api_key]
                 response = client.models.generate_content(
                     model=clean_model_name,
@@ -341,7 +351,6 @@ class GeminiAPIManager(_KeyedAPIManager):
                     return {"status": "BLOCKED", "text": None, "error_type": "Safety", "error_message": "Gemini returned no text (possibly blocked).", "error_details": None, "request_meta": meta}
 
             except APIError as error:
-                # Map the new SDK's errors to your existing retry system
                 status_code = error.code
                 message = error.message
 
@@ -430,9 +439,8 @@ class OllamaAPIManager:
         self.client = ollama.Client(host=config.get("OLLAMA_BASE_URL", "http://localhost:11434"))
         
         import threading
-        max_concurrent = config.get("OLLAMA_MAX_CONCURRENT", 1) # Only run 1 at a time locally
+        max_concurrent = config.get("OLLAMA_MAX_CONCURRENT", 1) 
         self.semaphore = threading.Semaphore(max_concurrent)
-        # ---------------------------------------------------------------
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
         def attempt() -> APIResponse:
@@ -446,15 +454,8 @@ class OllamaAPIManager:
                     response = self.client.generate(model=model_name, prompt=prompt, options=options)
                     return {"status": "SUCCESS", "text": response["response"], "error_type": None, "error_message": None, "error_details": None}
                 except ollama.ResponseError as error:
-                    if self.config.get("BATCH_PROCESSING_ENABLED", False):
-                        time.sleep(float(self.config.get("API_RETRY_DELAY_SECONDS", 5.0)))
-                        
                     return {"status": "ERROR", "text": None, "error_type": "OllamaResponseError", "error_message": str(error), "error_details": repr(error)}
-                    
                 except Exception as error:
-                    if self.config.get("BATCH_PROCESSING_ENABLED", False):
-                        time.sleep(float(self.config.get("API_RETRY_DELAY_SECONDS", 5.0)))
-                        
                     return {"status": "ERROR", "text": None, "error_type": "OllamaConnectionError", "error_message": str(error), "error_details": repr(error)}
 
         return execute_with_retry(self.config, attempt)
