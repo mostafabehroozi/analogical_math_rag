@@ -22,13 +22,13 @@ CONFIG = {
     
     # Logging & Control
     "VERBOSE_LOGGING": True,
-    "PRINT_API_CALL_DETAILS": True,
+    "PRINT_API_CALL_DETAILS": True,  
     "PRINT_API_TIMING_CHECKPOINTS": True,
     "ENABLE_API_RETRY": True,          
     "MAX_API_RETRIES": 200,              
     "API_RETRY_DELAY_SECONDS": 20.0,
     "RETRY_ALL_API_ERRORS": True,  # If True, retry all API error types; if False, only retry RETRYABLE_ERROR_TYPES
-    "API_RESPONSE_TRUNCATION_LENGTH": 50,
+    "API_RESPONSE_TRUNCATION_LENGTH": 70,
     # Batch execution is intentionally opt-in until quotas are configured and
     # the existing experiment has been validated with a small batch.
     "BATCH_PROCESSING_ENABLED": False,

@@ -185,30 +185,61 @@ class RPMKeyScheduler:
             }
 
 
-def execute_with_retry(config: Dict[str, Any], api_call_func: Callable[[], APIResponse]) -> APIResponse:
-    """Retry without terminating the process; manages API errors and prints them to console."""
-    logger = logging.getLogger(__name__)
+def _format_api_log(provider: str, model: str, key: str, duration: float, attempt: int, max_attempts: int, status: str, prompt: str, response_text: str, config: Dict) -> str:
+    """Formats a beautiful, multi-line string for console output."""
+    trunc_len = config.get("API_RESPONSE_TRUNCATION_LENGTH", 70)
+    
+    # Safely truncate and remove newlines so it stays on one neat line
+    in_trunc = (prompt[:trunc_len] + '...') if prompt and len(prompt) > trunc_len else str(prompt)
+    in_trunc = in_trunc.replace('\n', ' ') 
+    
+    out_trunc = ""
+    if response_text:
+        out_trunc = (response_text[:trunc_len] + '...') if len(response_text) > trunc_len else str(response_text)
+        out_trunc = out_trunc.replace('\n', ' ')
+        
+    status_icon = "🟢" if status == "SUCCESS" else "🔴"
+    
+    log_str = f"⏱️ {duration:.2f}s | [{provider} | {model} | Key: {key}] | Att: {attempt}/{max_attempts} | {status_icon} {status}\n"
+    log_str += f"    ↳ IN : \"{in_trunc}\"\n"
+    log_str += f"    ↳ OUT: \"{out_trunc}\""
+    return log_str
+
+
+def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: str, prompt: str, api_call_func: Callable[[], APIResponse]) -> APIResponse:
+    """Retry logic that times the execution and prints clean logs for single and multi-thread modes."""
     caller_loc = _get_api_caller_location()
     
-    if not config.get("ENABLE_API_RETRY", False):
-        response = api_call_func()
-        if response.get("status") != "SUCCESS":
-            error_type = response.get("error_type") or response.get("status", "ERROR")
-            err_msg = response.get("error_message", "Unknown API error")
-            tprint(f"[API ERROR @ {caller_loc}] Call failed (Retries Disabled). Type: {error_type} | Msg: {err_msg}", level="ERROR")
-        return response
-
-    max_attempts = max(1, int(config.get("MAX_API_RETRIES", 3)))
+    # Determine max attempts based on config
+    max_attempts = max(1, int(config.get("MAX_API_RETRIES", 3))) if config.get("ENABLE_API_RETRY", False) else 1
     retry_all = config.get("RETRY_ALL_API_ERRORS", True)
     last_response: Optional[APIResponse] = None
     
     for attempt in range(1, max_attempts + 1):
+        # 1. Start the Timer
+        start_time = time.monotonic()
+        
+        # 2. Make the API Call
         response = api_call_func()
-        if response["status"] == "SUCCESS":
+        
+        # 3. Stop the Timer
+        duration = time.monotonic() - start_time
+        
+        # 4. Extract data for logging
+        status = response.get("status", "ERROR")
+        key = response.get("request_meta", {}).get("key", "Local")
+        response_text = response.get("text") or response.get("error_message", "No text returned")
+        
+        # 5. Format and print the beautiful log
+        log_msg = _format_api_log(provider_name, model_name, key, duration, attempt, max_attempts, status, prompt, response_text, config)
+        
+        if status == "SUCCESS":
+            tprint(log_msg, level="INFO")
             return response
 
-        error_type = response.get("error_type") or response.get("status", "ERROR")
-        err_msg = response.get("error_message", "Unknown API error")
+        # --- If we reach here, it failed ---
+        error_type = response.get("error_type") or status
+        tprint(log_msg, level="WARNING")
         
         if error_type in NON_RETRYABLE_ERROR_TYPES:
             retryable = False
@@ -217,18 +248,16 @@ def execute_with_retry(config: Dict[str, Any], api_call_func: Callable[[], APIRe
 
         if not retryable or attempt == max_attempts:
             response["retry_exhausted"] = attempt == max_attempts
-            tprint(f"[API ERROR @ {caller_loc}] Final failure after {attempt} attempts. Type: {error_type} | Msg: {err_msg}", level="ERROR")
+            tprint(f"[API ERROR] Final failure. Type: {error_type} @ {caller_loc}", level="ERROR")
             return response
-
-        tprint(f"[API RETRY @ {caller_loc}] Attempt {attempt}/{max_attempts} failed ({error_type}); retrying... Msg: {err_msg}", level="WARNING")
         
+        # Wait before retrying (unless we are in batch mode where we might want to fail fast/differently)
         if not config.get("BATCH_PROCESSING_ENABLED", False):
             time.sleep(float(config.get("API_RETRY_DELAY_SECONDS", 5.0)))
+            
         last_response = response
         
-    final_resp = last_response or {"status": "ERROR", "text": None, "error_type": "RetryError", "error_message": "No API attempt was made", "error_details": None}
-    if final_resp.get("status") != "SUCCESS":
-        tprint(f"[API ERROR @ {caller_loc}] Exhausted all {max_attempts} attempts. Type: {final_resp.get('error_type')} | Msg: {final_resp.get('error_message')}", level="ERROR")
+    final_resp = last_response or {"status": "ERROR", "text": None, "error_type": "RetryError", "error_message": "No API attempt made"}
     return final_resp
 
 
@@ -374,7 +403,7 @@ class GeminiAPIManager(_KeyedAPIManager):
                 self._print(f"failure model={model_name} key={meta['key']} type=UnknownError")
                 return {"status": "ERROR", "text": None, "error_type": "UnknownError", "error_message": str(error), "error_details": repr(error), "request_meta": meta}
 
-        return execute_with_retry(self.config, attempt)
+        return execute_with_retry(self.config, self.provider_name, model_name, prompt, attempt)
 
 class AvalAIAPIManager(_KeyedAPIManager):
     provider_name = "avalai"
@@ -423,7 +452,7 @@ class AvalAIAPIManager(_KeyedAPIManager):
                 error_type = type(error).__name__
                 return {"status": "ERROR", "text": None, "error_type": error_type, "error_message": str(error), "error_details": repr(error), "request_meta": meta}
 
-        return execute_with_retry(self.config, attempt)
+        return execute_with_retry(self.config, self.provider_name, model_name, prompt, attempt)
 
 
 class OllamaAPIManager:
@@ -458,4 +487,4 @@ class OllamaAPIManager:
                 except Exception as error:
                     return {"status": "ERROR", "text": None, "error_type": "OllamaConnectionError", "error_message": str(error), "error_details": repr(error)}
 
-        return execute_with_retry(self.config, attempt)
+        return execute_with_retry(self.config, "ollama", model_name, prompt, attempt)
