@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Union, Tuple, Optional
 import time
 from collections import deque
 from src.evaluation import evaluate_single_answer_with_llm
+import threading
 from src.prompts import PROMPT_TEMPLATES
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.utils import create_trace_entry
@@ -51,6 +52,8 @@ from src.prompts import (
     create_evaluation_prompt,
     EXEMPLAR_FORMAT
 )
+# Protects local PyTorch and Numpy resources from being overwhelmed by batch threads
+_LOCAL_COMPUTE_LOCK = threading.Lock()
 
 from src.context_logger import tprint
 import builtins
@@ -85,12 +88,13 @@ def _generate_embeddings(
     if not isinstance(embedding_model, SentenceTransformer) or not texts:
         return np.array([])
     try:
-        return embedding_model.encode(
-            texts,
-            batch_size=batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True
-        )
+        with _LOCAL_COMPUTE_LOCK: 
+            return embedding_model.encode(
+                texts,
+                batch_size=batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True
+            )
     except Exception as e:
         logging.getLogger(__name__).error(f"Failed to generate embeddings: {e}", exc_info=True)
         return np.array([])
@@ -129,55 +133,59 @@ def retrieve(
     
     cosine_similarity_start_time = time.time()
     print(f"{'  '*indent_level}Starting cosine similarity calculation (query_embedding shape: {query_embedding.shape}, embedded_exemplars shape: {embedded_exemplars.shape})...")
-    similarities = cosine_similarity(query_embedding, embedded_exemplars)[0]
-    current_diag_time = log_time_diagnostic("Calculate cosine_similarity", cosine_similarity_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}Similarities array shape: {similarities.shape}")
     
-    self_match_start_time = time.time()
-
-    if question_to_index_map is not None:
-        query_index_in_corpus = question_to_index_map.get(target_query)
-        if query_index_in_corpus is not None:
-            similarities[query_index_in_corpus] = -np.inf
-            print(f"{'  '*indent_level}Self-match found at index {query_index_in_corpus}, set to -np.inf.")
-        else:
-            print(f"{'  '*indent_level}Target query not found in corpus (no self-match to remove).")
-    else:
-        print(f"{'  '*indent_level}Warning: question_to_index_map not provided. Skipping self-match check.")
-        logger.warning("retrieve() called without question_to_index_map. Self-match detection skipped.")
-
-    current_diag_time = log_time_diagnostic("Handle self-match (O(1) lookup)", self_match_start_time, indent=indent_level)
-
-    k_retrieve_start_time = time.time()
-    k_to_retrieve = min(top_k, len(similarities))
-    current_diag_time = log_time_diagnostic("Determine k_to_retrieve", k_retrieve_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}Effective k_to_retrieve: {k_to_retrieve}")
-
-    print(f"{'  '*indent_level}Starting granular timing for top-k selection...")
+    # --- LOCKED BLOCK STARTS HERE ---
+    with _LOCAL_COMPUTE_LOCK:
+        similarities = cosine_similarity(query_embedding, embedded_exemplars)[0]
+        current_diag_time = log_time_diagnostic("Calculate cosine_similarity", cosine_similarity_start_time, indent=indent_level)
+        print(f"{'  '*indent_level}Similarities array shape: {similarities.shape}")
         
-    argpartition_start_time = time.time()
-    print(f"{'  '*indent_level}  Calling np.argpartition on similarities array (shape: {similarities.shape}) for k={k_to_retrieve}...")
-    
-    partitioned_indices = np.argpartition(similarities, -k_to_retrieve)
-    current_diag_time = log_time_diagnostic("np.argpartition (full array)", argpartition_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}  Resulting partitioned_indices shape: {partitioned_indices.shape}")
+        self_match_start_time = time.time()
 
-    slice_partitioned_start_time = time.time()
-    print(f"{'  '*indent_level}  Slicing to get the top {k_to_retrieve} indices from partitioned_indices...")
-    
-    top_k_indices_unsorted = partitioned_indices[-k_to_retrieve:]
-    current_diag_time = log_time_diagnostic("Slicing partitioned indices", slice_partitioned_start_time, indent=indent_level)
-    print(f"{'  '*indent_level}  top_k_indices_unsorted shape: {top_k_indices_unsorted.shape}, Content (first 5): {top_k_indices_unsorted[:5]}...")
+        if question_to_index_map is not None:
+            query_index_in_corpus = question_to_index_map.get(target_query)
+            if query_index_in_corpus is not None:
+                similarities[query_index_in_corpus] = -np.inf
+                print(f"{'  '*indent_level}Self-match found at index {query_index_in_corpus}, set to -np.inf.")
+            else:
+                print(f"{'  '*indent_level}Target query not found in corpus (no self-match to remove).")
+        else:
+            print(f"{'  '*indent_level}Warning: question_to_index_map not provided. Skipping self-match check.")
+            logger.warning("retrieve() called without question_to_index_map. Self-match detection skipped.")
 
-    argsort_slice_start_time = time.time()
-    print(f"{'  '*indent_level}  Calling np.argsort on the {k_to_retrieve} selected indices based on their similarities...")
-    print(f"{'  '*indent_level}  Accessing similarities values for sorting (similarities[top_k_indices_unsorted])...")
+        current_diag_time = log_time_diagnostic("Handle self-match (O(1) lookup)", self_match_start_time, indent=indent_level)
 
-    relevant_similarities = similarities[top_k_indices_unsorted]
-    
-    sorted_order_in_slice = np.argsort(relevant_similarities)[::-1] 
-    
-    top_k_indices = top_k_indices_unsorted[sorted_order_in_slice]
+        k_retrieve_start_time = time.time()
+        k_to_retrieve = min(top_k, len(similarities))
+        current_diag_time = log_time_diagnostic("Determine k_to_retrieve", k_retrieve_start_time, indent=indent_level)
+        print(f"{'  '*indent_level}Effective k_to_retrieve: {k_to_retrieve}")
+
+        print(f"{'  '*indent_level}Starting granular timing for top-k selection...")
+            
+        argpartition_start_time = time.time()
+        print(f"{'  '*indent_level}  Calling np.argpartition on similarities array (shape: {similarities.shape}) for k={k_to_retrieve}...")
+        
+        partitioned_indices = np.argpartition(similarities, -k_to_retrieve)
+        current_diag_time = log_time_diagnostic("np.argpartition (full array)", argpartition_start_time, indent=indent_level)
+        print(f"{'  '*indent_level}  Resulting partitioned_indices shape: {partitioned_indices.shape}")
+
+        slice_partitioned_start_time = time.time()
+        print(f"{'  '*indent_level}  Slicing to get the top {k_to_retrieve} indices from partitioned_indices...")
+        
+        top_k_indices_unsorted = partitioned_indices[-k_to_retrieve:]
+        current_diag_time = log_time_diagnostic("Slicing partitioned indices", slice_partitioned_start_time, indent=indent_level)
+        print(f"{'  '*indent_level}  top_k_indices_unsorted shape: {top_k_indices_unsorted.shape}, Content (first 5): {top_k_indices_unsorted[:5]}...")
+
+        argsort_slice_start_time = time.time()
+        print(f"{'  '*indent_level}  Calling np.argsort on the {k_to_retrieve} selected indices based on their similarities...")
+        print(f"{'  '*indent_level}  Accessing similarities values for sorting (similarities[top_k_indices_unsorted])...")
+
+        relevant_similarities = similarities[top_k_indices_unsorted]
+        
+        sorted_order_in_slice = np.argsort(relevant_similarities)[::-1] 
+        
+        top_k_indices = top_k_indices_unsorted[sorted_order_in_slice]
+    # --- LOCKED BLOCK ENDS HERE ---
 
     current_diag_time = log_time_diagnostic("np.argsort & final sort (on small slice)", argsort_slice_start_time, indent=indent_level)
     print(f"{'  '*indent_level}  Final top_k_indices shape: {top_k_indices.shape}, Content: {top_k_indices.tolist()}")
