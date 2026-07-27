@@ -286,7 +286,24 @@ def _generate_hypotheses(
     for cand_idx in candidate_indices:
         if cand_idx == -1:
             # R0: Zero-Shot
-            prompt = tmpl_zero.format(target_query=target_query)
+            prompt = None
+            try:
+                from src.prompts import create_mirror_hypothesis_zeroshot_prompt
+                prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
+            except Exception:
+                pass
+                
+            if prompt is None:
+                try:
+                    prompt = tmpl_zero.format(main_question_text=target_query)
+                except Exception:
+                    try:
+                        prompt = tmpl_zero.format(target_query=target_query)
+                    except Exception:
+                        try:
+                            prompt = tmpl_zero.format(question=target_query)
+                        except Exception:
+                            prompt = target_query
         else:
             # R_cand: Few-Shot
             q_ex = exemplar_data['questions'][cand_idx]

@@ -497,7 +497,24 @@ def _execute_candidate_generation(
             
             tmpl_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT", "mirror_hypothesis_gen_zero_shot_v1")
             tmpl_zero = PROMPT_TEMPLATES.get(tmpl_name, "{target_query}")
-            prompt = tmpl_zero.format(target_query=target_query)
+            prompt = None
+            try:
+                from src.prompts import create_mirror_hypothesis_zeroshot_prompt
+                prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
+            except Exception:
+                pass
+                
+            if prompt is None:
+                try:
+                    prompt = tmpl_zero.format(main_question_text=target_query)
+                except Exception:
+                    try:
+                        prompt = tmpl_zero.format(target_query=target_query)
+                    except Exception:
+                        try:
+                            prompt = tmpl_zero.format(question=target_query)
+                        except Exception:
+                            prompt = target_query
             
             for i in range(zs_n):
                 zs_id = f"zs_{i}"

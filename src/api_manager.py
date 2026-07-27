@@ -291,7 +291,6 @@ class GeminiAPIManager(_KeyedAPIManager):
         self.clients = {
             key: genai.Client(
                 api_key=key, 
-                # FIX: Multiply by 1000 because the SDK expects milliseconds
                 http_options={'timeout': int(self.timeout_seconds * 1000)}
             ) for key in self.api_keys_list
         }
