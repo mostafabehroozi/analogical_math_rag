@@ -37,6 +37,8 @@ CONFIG = {
     "BATCH_FAILURE_POLICY": "halt_after_failed_batch",
     "BATCH_WRITE_JOURNALS": True,
     "HF_SYNC_INTERVAL_BATCHES": 1,
+    "QUESTION_PARALLEL_API_ENABLED": False,  # Master switch: Set to True to enable parallel API calls inside a question's steps
+    "QUESTION_PARALLEL_MAX_WORKERS": 3,      # Max number of concurrent API calls allowed per step (e.g., batches of 3)
     "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
     "API_REQUEST_TIMEOUT_SECONDS": 180.0,
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,

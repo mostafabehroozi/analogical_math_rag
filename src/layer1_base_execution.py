@@ -33,6 +33,7 @@ import numpy as np
 
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.utils import save_json, load_json, create_trace_entry
+from src.parallel_utils import run_parallel_api_calls
 from src.pipeline_steps import (
     retrieve,
     _calculate_baseline_difficulty,
@@ -516,20 +517,27 @@ def _execute_candidate_generation(
                         except Exception:
                             prompt = target_query
             
-            for i in range(zs_n):
+            # NEW PARALLEL LOGIC 
+            def _zs_task(zs_idx, p):
+                """Task wrapper to run in parallel."""
+                resp = api_manager.generate_content(p, model_name, temperature=0.7)
+                trace_entry = create_trace_entry(
+                    "layer1_candidate_gen", f"zero_shot_{zs_idx}",
+                    {"prompt": p}, resp, {"model": model_name, "temp": 0.7}
+                )
+                return zs_idx, resp, trace_entry
+
+            tasks = [lambda i=i: _zs_task(i, prompt) for i in range(zs_n)]
+            results = run_parallel_api_calls(tasks, config)
+            
+            for i, resp, trace_entry in results:
+                trace_accumulator.append(trace_entry)
                 zs_id = f"zs_{i}"
-                resp = api_manager.generate_content(prompt, model_name, temperature=0.7)
-                
-                trace_accumulator.append(create_trace_entry(
-                    "layer1_candidate_gen", f"zero_shot_{i}",
-                    {"prompt": prompt}, resp, {"model": model_name, "temp": 0.7}
-                ))
-                
                 if resp['status'] == 'SUCCESS' and resp['text']:
                     candidates[zs_id] = {
                         "candidate_id": zs_id,
                         "candidate_text": resp['text'],
-                        "source_exemplar_idx": -1, # Special flag for No Parent
+                        "source_exemplar_idx": -1, 
                         "generation_status": "SUCCESS"
                     }
                 else:
@@ -698,25 +706,37 @@ def _execute_ground_truth_evaluation(
     failed_evals = 0
     
     try:
+        # --- NEW PARALLEL LOGIC ---
+        def _gt_eval_task(c_idx, c_text):
+            """Task wrapper to run in parallel."""
+            eval_result = evaluate_single_answer_with_llm(
+                model_answer=c_text,
+                ground_truth=ground_truth_answer,
+                api_manager=api_manager,
+                config=config
+            )
+            return c_idx, eval_result
+
+        tasks = []
+        
+        # First, handle empty candidates sequentially
         for candidate_idx, candidate_info in candidates.items():
             candidate_text = candidate_info.get("candidate_text")
-            
             if not candidate_text:
                 ground_truth_labels[candidate_idx] = {
                     "is_correct": None,
                     "evaluation_status": "EMPTY_CANDIDATE"
                 }
                 failed_evals += 1
-                continue
-            
-            # Call the existing evaluation function
-            eval_result = evaluate_single_answer_with_llm(
-                model_answer=candidate_text,
-                ground_truth=ground_truth_answer,
-                api_manager=api_manager,
-                config=config
-            )
-            
+            else:
+                # Add non-empty candidates to parallel task list
+                tasks.append(lambda c_idx=candidate_idx, c_text=candidate_text: _gt_eval_task(c_idx, c_text))
+                
+        # Execute evaluations in parallel or sequential based on config
+        results = run_parallel_api_calls(tasks, config)
+        
+        # Process results safely
+        for candidate_idx, eval_result in results:
             ground_truth_labels[candidate_idx] = {
                 "is_correct": eval_result["is_correct"],
                 "evaluation_status": eval_result["status"]

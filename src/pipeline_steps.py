@@ -41,6 +41,7 @@ from src.prompts import (
 )
 from src.utils import save_json, load_json, create_trace_entry
 from src.hf_sync import periodic_sync_check
+from src.parallel_utils import run_parallel_api_calls
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.evaluation import evaluate_single_answer_with_llm
 from collections import defaultdict
@@ -254,33 +255,51 @@ def _calculate_baseline_difficulty(
     baseline_scores = {}
     print(f"    -> [Mirror Phase 0] Calculating Baseline Difficulty for {len(retrieved_indices)} samples...")
 
-    for idx in retrieved_indices:
+    # --- NEW PARALLEL LOGIC ---
+    def _baseline_task(idx, attempt_idx):
+        """Task wrapper to run in parallel."""
         question = exemplar_data['questions'][idx]
         ground_truth = exemplar_data['solutions'][idx]
         
-        # Format the template
         prompt = base_template.format(question=question)
         
-        correct_count = 0
-        for i in range(n_mirror):
-            # Lower temp for baseline to capture "inherent" solvability
-            resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
-            
-            trace_accumulator.append(create_trace_entry(
-                "mirror_phase_0", f"baseline_idx_{idx}_attempt_{i}",
-                {"question": question, "ground_truth": ground_truth}, 
-                resp, {"model": model_name}
-            ))
-            
-            if resp['status'] == 'SUCCESS':
-                eval_res = evaluate_single_answer_with_llm(
-                    resp['text'], ground_truth, api_manager, config
-                )
-                if eval_res['is_correct']:
-                    correct_count += 1
+        resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
         
-        score = correct_count / n_mirror
-        baseline_scores[idx] = score
+        trace_entry = create_trace_entry(
+            "mirror_phase_0", f"baseline_idx_{idx}_attempt_{attempt_idx}",
+            {"question": question, "ground_truth": ground_truth}, 
+            resp, {"model": model_name}
+        )
+        
+        is_correct = False
+        if resp['status'] == 'SUCCESS':
+            eval_res = evaluate_single_answer_with_llm(
+                resp['text'], ground_truth, api_manager, config
+            )
+            if eval_res['is_correct']:
+                is_correct = True
+                
+        return idx, trace_entry, is_correct
+
+    # Flatten the nested loops into a 1D list of tasks
+    tasks = [
+        lambda idx=idx, i=i: _baseline_task(idx, i) 
+        for idx in retrieved_indices 
+        for i in range(n_mirror)
+    ]
+    
+    # Execute in parallel or sequential based on config
+    results = run_parallel_api_calls(tasks, config)
+    
+    # Tally up the results safely in the main thread
+    correct_counts = {idx: 0 for idx in retrieved_indices}
+    for idx, trace_entry, is_correct in results:
+        trace_accumulator.append(trace_entry)
+        if is_correct:
+            correct_counts[idx] += 1
+            
+    for idx in retrieved_indices:
+        baseline_scores[idx] = correct_counts[idx] / n_mirror
 
     return baseline_scores
 
@@ -310,7 +329,9 @@ def _generate_hypotheses(
 
     print(f"    -> [Mirror Phase 1] Generating Hypotheses for {len(candidate_indices)} candidates...")
 
-    for cand_idx in candidate_indices:
+    # PARALLEL LOGIC 
+    def _hypothesis_task(cand_idx):
+        """Task wrapper to run in parallel."""
         if cand_idx == -1:
             # R0: Zero-Shot
             prompt = None
@@ -341,14 +362,25 @@ def _generate_hypotheses(
                 target_query=target_query
             )
 
-        # Generate Hypothesis (Single attempt, Temp=0.7)
+        # Generate Hypothesis (Single attempt, Temp=0.0)
         resp = api_manager.generate_content(prompt, model_name, temperature=0.0)
         
-        trace_accumulator.append(create_trace_entry(
+        # Return data instead of appending to shared list
+        trace_entry = create_trace_entry(
             "mirror_phase_1", f"hypothesis_cand_{cand_idx}",
             {"prompt": prompt}, resp, {"model": model_name}
-        ))
-        
+        )
+        return cand_idx, resp, trace_entry
+
+    # Create list of tasks (using default args to prevent lambda late-binding bugs)
+    tasks = [lambda c=cand_idx: _hypothesis_task(c) for cand_idx in candidate_indices]
+    
+    # Execute in parallel or sequential based on config
+    results = run_parallel_api_calls(tasks, config)
+    
+    # Safely process results in the main thread
+    for cand_idx, resp, trace_entry in results:
+        trace_accumulator.append(trace_entry)
         if resp['status'] == 'SUCCESS':
             hypotheses[cand_idx] = resp['text']
         else:
@@ -385,48 +417,74 @@ def _evaluate_mirror_consistency(
     mirror_results = {}
     print(f"    -> [Mirror Phase 2] Running Consistency Check ({len(hypotheses)} Candidates x {len(validation_indices)} Validation Samples)...")
 
+    # --- NEW PARALLEL LOGIC ---
+    def _mirror_task(cand_id, val_idx, attempt_idx, formatted_hyp, val_q, val_gt):
+        """Task wrapper to run in parallel."""
+        prompt = tmpl_verify.format(
+            hypothesis_question=target_query, 
+            hypothesis_solution=formatted_hyp,
+            validation_question=val_q
+        )
+        
+        resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
+        
+        trace_entry = create_trace_entry(
+            "mirror_phase_2", f"cand_{cand_id}_vs_val_{val_idx}_run_{attempt_idx}",
+            {"prompt": prompt}, resp, {"model": model_name}
+        )
+        
+        is_correct = False
+        if resp['status'] == 'SUCCESS':
+            eval_res = evaluate_single_answer_with_llm(
+                resp['text'], val_gt, api_manager, config
+            )
+            if eval_res['is_correct']:
+                is_correct = True
+                
+        return cand_id, val_idx, trace_entry, is_correct
+
+    tasks = []
+    
+    # First, handle empty hypotheses (must be done sequentially to populate dict)
     for cand_id, hypothesis_text in hypotheses.items():
         if not hypothesis_text:
             mirror_results[cand_id] = {v_idx: 0.0 for v_idx in validation_indices}
             continue
             
         mirror_results[cand_id] = {}
-        formatted_hypothesis_sol = f"{hypothesis_text}"
-
+        formatted_hyp = f"{hypothesis_text}"
+        
+        # Build tasks for the non-empty hypotheses
         for val_idx in validation_indices:
-            # ALLOW self-test (Reverse Validation logic)
-            # if cand_id == val_idx:
-            #     mirror_results[cand_id][val_idx] = 0.0 
-            #     continue
-
             val_q = exemplar_data['questions'][val_idx]
             val_gt = exemplar_data['solutions'][val_idx]
             
-            # Construct Prompt
-            prompt = tmpl_verify.format(
-                hypothesis_question=target_query, 
-                hypothesis_solution=formatted_hypothesis_sol,
-                validation_question=val_q
-            )
-            
-            correct_count = 0
-            
             for i in range(n_mirror):
-                resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
+                tasks.append(
+                    lambda c=cand_id, v=val_idx, i=i, fh=formatted_hyp, vq=val_q, vgt=val_gt: 
+                    _mirror_task(c, v, i, fh, vq, vgt)
+                )
                 
-                trace_accumulator.append(create_trace_entry(
-                    "mirror_phase_2", f"cand_{cand_id}_vs_val_{val_idx}_run_{i}",
-                    {"prompt": prompt}, resp, {"model": model_name}
-                ))
-                
-                if resp['status'] == 'SUCCESS':
-                    eval_res = evaluate_single_answer_with_llm(
-                        resp['text'], val_gt, api_manager, config
-                    )
-                    if eval_res['is_correct']:
-                        correct_count += 1
+    # Execute all tasks in parallel or sequential based on config
+    results = run_parallel_api_calls(tasks, config)
+    
+    # Tally up the results safely in the main thread
+    correct_counts = {}
+    for cand_id, val_idx, trace_entry, is_correct in results:
+        trace_accumulator.append(trace_entry)
+        
+        if cand_id not in correct_counts:
+            correct_counts[cand_id] = {}
+        if val_idx not in correct_counts[cand_id]:
+            correct_counts[cand_id][val_idx] = 0
             
-            mirror_results[cand_id][val_idx] = correct_count / n_mirror
+        if is_correct:
+            correct_counts[cand_id][val_idx] += 1
+            
+    # Calculate final float scores
+    for cand_id, vals in correct_counts.items():
+        for val_idx, count in vals.items():
+            mirror_results[cand_id][val_idx] = count / n_mirror
 
     return mirror_results
 

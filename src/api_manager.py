@@ -251,9 +251,8 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
             tprint(f"[API ERROR] Final failure. Type: {error_type} @ {caller_loc}", level="ERROR")
             return response
         
-        # Wait before retrying (unless we are in batch mode where we might want to fail fast/differently)
-        if not config.get("BATCH_PROCESSING_ENABLED", False):
-            time.sleep(float(config.get("API_RETRY_DELAY_SECONDS", 5.0)))
+        # Wait before retrying (ALWAYS sleep to protect API rate limits!)
+        time.sleep(float(config.get("API_RETRY_DELAY_SECONDS", 20.0)))
             
         last_response = response
         
