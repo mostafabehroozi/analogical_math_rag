@@ -41,6 +41,10 @@ CONFIG = {
     "QUESTION_PARALLEL_MAX_WORKERS": 3,      # Max number of concurrent API calls allowed per step (e.g., batches of 3)
     "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
     "API_REQUEST_TIMEOUT_SECONDS": 180.0,
+    "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 10,            # N: Number of consecutive errors to trigger a pause (0 to disable)
+    "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 60.0,  # M: Seconds to sleep when the error limit is reached
+    "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES": 30.0,  # X: Pause every X minutes (0 to disable)
+    "GLOBAL_PERIODIC_PAUSE_DURATION_SECONDS": 15.0,  # Y: Seconds to sleep during the break
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "DATA_DIR": DATA_DIR,
     "LOGS_DIR": LOGS_DIR,

@@ -71,6 +71,58 @@ def _get_api_caller_location() -> str:
         pass
     return "Unknown Location"
 
+# Thread-safe Global API Pause & Backoff Manager
+class _GlobalAPIPauseManager:
+    """Tracks consecutive errors and periodic breaks across all threads."""
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._consecutive_errors = 0
+        self._pause_until = 0.0
+        self._last_periodic_pause = time.monotonic()
+
+    def wait_if_needed(self, config: Dict[str, Any]) -> None:
+        """Pauses the calling thread if a global break or error backoff is active."""
+        with self._condition:
+            now = time.monotonic()
+            
+            # 1. Check if a periodic break is due
+            interval_mins = config.get("GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES")
+            if interval_mins and interval_mins > 0:
+                interval_secs = interval_mins * 60.0
+                if now - self._last_periodic_pause >= interval_secs:
+                    duration = config.get("GLOBAL_PERIODIC_PAUSE_DURATION_SECONDS", 15.0)
+                    tprint(f"⏰ [GLOBAL PAUSE] Scheduled periodic break! Pausing all new API calls for {duration}s.", level="WARNING")
+                    self._pause_until = max(self._pause_until, now + duration)
+                    self._last_periodic_pause = now
+            
+            # 2. Put the thread to sleep until the pause expires
+            while True:
+                now = time.monotonic()
+                if now >= self._pause_until:
+                    break
+                wait_time = self._pause_until - now
+                self._condition.wait(timeout=wait_time)
+
+    def record_result(self, is_success: bool, config: Dict[str, Any]) -> None:
+        """Updates the consecutive error counter after an API call."""
+        with self._condition:
+            if is_success:
+                self._consecutive_errors = 0
+            else:
+                self._consecutive_errors += 1
+                limit = config.get("GLOBAL_CONSECUTIVE_ERROR_LIMIT")
+                if limit and limit > 0 and self._consecutive_errors >= limit:
+                    pause_secs = config.get("GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS", 60.0)
+                    tprint(f"🛑 [GLOBAL PAUSE] {self._consecutive_errors} consecutive errors hit! Pausing all new API calls for {pause_secs}s to recover.", level="ERROR")
+                    
+                    now = time.monotonic()
+                    self._pause_until = max(self._pause_until, now + pause_secs)
+                    self._consecutive_errors = 0  # Reset so it doesn't trigger repeatedly
+                    self._condition.notify_all()
+
+# Create the single shared manager for the whole application
+global_pause_manager = _GlobalAPIPauseManager()
 
 @dataclass(frozen=True)
 class KeyLease:
@@ -207,7 +259,7 @@ def _format_api_log(provider: str, model: str, key: str, duration: float, attemp
 
 
 def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: str, prompt: str, api_call_func: Callable[[], APIResponse]) -> APIResponse:
-    """Retry logic that times the execution and prints clean logs for single and multi-thread modes."""
+    """Retry logic that times the execution, respects global pauses, and prints clean logs."""
     caller_loc = _get_api_caller_location()
     
     # Determine max attempts based on config
@@ -216,6 +268,10 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
     last_response: Optional[APIResponse] = None
     
     for attempt in range(1, max_attempts + 1):
+        
+        # Check if the system is globally paused before making ANY request
+        global_pause_manager.wait_if_needed(config)
+        
         # 1. Start the Timer
         start_time = time.monotonic()
         
@@ -230,14 +286,18 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         key = response.get("request_meta", {}).get("key", "Local")
         response_text = response.get("text") or response.get("error_message", "No text returned")
         
+        # Record success or failure to the global pause manager
+        is_success = (status == "SUCCESS")
+        global_pause_manager.record_result(is_success, config)
+        
         # 5. Format and print the beautiful log
         log_msg = _format_api_log(provider_name, model_name, key, duration, attempt, max_attempts, status, prompt, response_text, config)
         
-        if status == "SUCCESS":
+        if is_success:
             tprint(log_msg, level="INFO")
             return response
 
-        # --- If we reach here, it failed ---
+        # If we reach here, it failed
         error_type = response.get("error_type") or status
         tprint(log_msg, level="WARNING")
         
@@ -251,7 +311,7 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
             tprint(f"[API ERROR] Final failure. Type: {error_type} @ {caller_loc}", level="ERROR")
             return response
         
-        # Wait before retrying (ALWAYS sleep to protect API rate limits!)
+        # Wait before retrying
         time.sleep(float(config.get("API_RETRY_DELAY_SECONDS", 20.0)))
             
         last_response = response
