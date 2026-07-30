@@ -30,7 +30,7 @@ import time
 from typing import List, Dict, Any, Optional, Tuple
 from sentence_transformers import SentenceTransformer
 import numpy as np
-
+import concurrent.futures 
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.utils import save_json, load_json, create_trace_entry
 from src.parallel_utils import run_parallel_api_calls
@@ -461,17 +461,68 @@ def _execute_candidate_generation(
     failed_count = 0
     
     try:
-        # 1. Standard 1-Shot Generation
-        hypotheses = _generate_hypotheses(
-            target_query=target_query,
-            candidate_indices=retrieved_indices,
-            exemplar_data=exemplar_data,
-            api_manager=api_manager,
-            config=config,
-            trace_accumulator=trace_accumulator
-        )
-        
-        # USE ORIGINAL INTEGER KEYS FOR BACKWARD COMPATIBILITY
+        # Define 1-Shot logic as a callable
+        def run_1_shots():
+            return _generate_hypotheses(
+                target_query=target_query, candidate_indices=retrieved_indices,
+                exemplar_data=exemplar_data, api_manager=api_manager,
+                config=config, trace_accumulator=trace_accumulator
+            )
+
+        # Define Zero-Shot logic as a callable
+        def run_0_shots():
+            if zs_n <= 0:
+                return []
+
+            from src.prompts import PROMPT_TEMPLATES
+            if isinstance(api_manager, GeminiAPIManager):
+                model_name = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
+            elif isinstance(api_manager, AvalAIAPIManager):
+                model_name = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
+            else:
+                model_name = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
+
+            tmpl_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT", "mirror_hypothesis_gen_zero_shot_v1")
+            tmpl_zero = PROMPT_TEMPLATES.get(tmpl_name, "{target_query}")
+            prompt = None
+            try:
+                from src.prompts import create_mirror_hypothesis_zeroshot_prompt
+                prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
+            except Exception:
+                pass
+
+            if prompt is None:
+                try:
+                    prompt = tmpl_zero.format(main_question_text=target_query)
+                except Exception:
+                    try:
+                        prompt = tmpl_zero.format(target_query=target_query)
+                    except Exception:
+                        try:
+                            prompt = tmpl_zero.format(question=target_query)
+                        except Exception:
+                            prompt = target_query
+
+            def _zs_task(zs_idx, p):
+                resp = api_manager.generate_content(p, model_name, temperature=0.7)
+                trace_entry = create_trace_entry(
+                    "layer1_candidate_gen", f"zero_shot_{zs_idx}",
+                    {"prompt": p}, resp, {"model": model_name, "temp": 0.7}
+                )
+                return zs_idx, resp, trace_entry
+
+            tasks = [lambda i=i: _zs_task(i, prompt) for i in range(zs_n)]
+            return run_parallel_api_calls(tasks, config)
+
+        # EXECUTE 1-SHOT AND 0-SHOT AT THE SAME TIME
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_1shot = executor.submit(run_1_shots)
+            future_0shot = executor.submit(run_0_shots)
+
+            hypotheses = future_1shot.result()
+            zero_shot_results = future_0shot.result()
+
+        # 1. Process 1-Shot results (USE ORIGINAL INTEGER KEYS FOR BACKWARD COMPATIBILITY)
         for exemplar_idx, hypothesis_text in hypotheses.items():
             if hypothesis_text:
                 candidates[exemplar_idx] = {
@@ -488,77 +539,37 @@ def _execute_candidate_generation(
                     "generation_status": "FAILURE"
                 }
                 failed_count += 1
-        
-        # 2. NEW: Zero-Shot Candidate Generation
-        if zs_n > 0:
-            from src.prompts import PROMPT_TEMPLATES
-            if isinstance(api_manager, GeminiAPIManager): model_name = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
-            elif isinstance(api_manager, AvalAIAPIManager): model_name = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
-            else: model_name = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
-            
-            tmpl_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT", "mirror_hypothesis_gen_zero_shot_v1")
-            tmpl_zero = PROMPT_TEMPLATES.get(tmpl_name, "{target_query}")
-            prompt = None
-            try:
-                from src.prompts import create_mirror_hypothesis_zeroshot_prompt
-                prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
-            except Exception:
-                pass
-                
-            if prompt is None:
-                try:
-                    prompt = tmpl_zero.format(main_question_text=target_query)
-                except Exception:
-                    try:
-                        prompt = tmpl_zero.format(target_query=target_query)
-                    except Exception:
-                        try:
-                            prompt = tmpl_zero.format(question=target_query)
-                        except Exception:
-                            prompt = target_query
-            
-            # NEW PARALLEL LOGIC 
-            def _zs_task(zs_idx, p):
-                """Task wrapper to run in parallel."""
-                resp = api_manager.generate_content(p, model_name, temperature=0.7)
-                trace_entry = create_trace_entry(
-                    "layer1_candidate_gen", f"zero_shot_{zs_idx}",
-                    {"prompt": p}, resp, {"model": model_name, "temp": 0.7}
-                )
-                return zs_idx, resp, trace_entry
 
-            tasks = [lambda i=i: _zs_task(i, prompt) for i in range(zs_n)]
-            results = run_parallel_api_calls(tasks, config)
-            
-            for i, resp, trace_entry in results:
-                trace_accumulator.append(trace_entry)
-                zs_id = f"zs_{i}"
-                if resp['status'] == 'SUCCESS' and resp['text']:
-                    candidates[zs_id] = {
-                        "candidate_id": zs_id,
-                        "candidate_text": resp['text'],
-                        "source_exemplar_idx": -1, 
-                        "generation_status": "SUCCESS"
-                    }
-                else:
-                    candidates[zs_id] = {
-                        "candidate_id": zs_id,
-                        "candidate_text": None,
-                        "source_exemplar_idx": -1,
-                        "generation_status": "FAILURE"
-                    }
-                    failed_count += 1
-        
+        # 2. Process Zero-Shot results
+        for i, resp, trace_entry in zero_shot_results:
+            trace_accumulator.append(trace_entry)
+            zs_id = f"zs_{i}"
+            if resp['status'] == 'SUCCESS' and resp['text']:
+                candidates[zs_id] = {
+                    "candidate_id": zs_id,
+                    "candidate_text": resp['text'],
+                    "source_exemplar_idx": -1,
+                    "generation_status": "SUCCESS"
+                }
+            else:
+                candidates[zs_id] = {
+                    "candidate_id": zs_id,
+                    "candidate_text": None,
+                    "source_exemplar_idx": -1,
+                    "generation_status": "FAILURE"
+                }
+                failed_count += 1
+
         total_expected = len(retrieved_indices) + zs_n
         status = "SUCCESS" if failed_count == 0 else ("PARTIAL" if failed_count < total_expected else "FAILURE")
-        
+
         return {
             "status": status,
             "candidates": candidates,
             "generated_count": total_expected - failed_count,
             "failed_count": failed_count
         }
-    
+
     except Exception as e:
         logger.error(f"Candidate generation failed: {e}", exc_info=True)
         return {"status": "FAILURE", "error": str(e), "candidates": {}}
@@ -888,58 +899,65 @@ def run_layer1_base_execution(
     layer1_state["retrieved_set"] = retrieval_result.get("retrieval_data", [])
     layer1_state["execution_trace"].extend(retrieval_result.get("trace", []))
     
-    # STEP B: CANDIDATE GENERATION
-    print("\n[Step B] Candidate Generation (1-shot)...")
-    start_time = time.time()
-    
+    # --- PARALLEL BLOCK 1: STEP B (CANDIDATES) & STEP C (BASELINES) ---
+    print("\n[Steps B & C] Running Candidate Generation and Baseline Calculation in parallel...")
+    start_time_bc = time.time()
+
     indices_for_generation = retrieved_indices[:n_candidates]
-    
-    candidate_result = _execute_candidate_generation(
-        target_query=target_query, 
-        retrieved_indices=indices_for_generation,
-        exemplar_data=exemplar_data, 
-        api_manager=api_manager, 
-        config=config, 
-        trace_accumulator=trace_accumulator
-    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        future_b = executor.submit(
+            _execute_candidate_generation, target_query, indices_for_generation,
+            exemplar_data, api_manager, config, trace_accumulator
+        )
+        future_c = executor.submit(
+            _execute_baseline_calculation, retrieved_indices, exemplar_data,
+            api_manager, config, trace_accumulator
+        )
+
+        candidate_result = future_b.result()
+        baseline_result = future_c.result()
+
+    # Save Step B results
     layer1_state["step_statuses"]["candidate_generation"] = candidate_result["status"]
     candidates = candidate_result.get("candidates", {})
-    print(f"  ✓ Generated {candidate_result.get('generated_count', 0)} candidates in {time.time() - start_time:.2f}s")
+    print(f"  ✓ Step B: Generated {candidate_result.get('generated_count', 0)} candidates.")
     layer1_state["candidate_set"] = candidates
-    
-    # --- STEP C: BASELINE CALCULATION ---
-    print("\n[Step C] Intrinsic Baseline Calculation...")
-    start_time = time.time()
-    baseline_result = _execute_baseline_calculation(
-        retrieved_indices=retrieved_indices, exemplar_data=exemplar_data,
-        api_manager=api_manager, config=config, trace_accumulator=trace_accumulator
-    )
+
+    # Save Step C results
     layer1_state["step_statuses"]["baseline_calculation"] = baseline_result["status"]
     baselines = baseline_result.get("intrinsic_baselines", {})
-    print(f"  ✓ Calculated baselines for {len(baselines)} samples in {time.time() - start_time:.2f}s")
+    print(f"  ✓ Step C: Calculated baselines for {len(baselines)} samples.")
     layer1_state["intrinsic_baselines"] = baselines
-    
-    # --- STEP D: CROSS-EVALUATION MATRIX ---
-    print("\n[Step D] Cross-Evaluation Matrix...")
-    start_time = time.time()
-    cross_eval_result = _execute_cross_evaluation(
-        target_query=target_query, candidates=candidates, retrieved_indices=retrieved_indices,
-        exemplar_data=exemplar_data, api_manager=api_manager, config=config, trace_accumulator=trace_accumulator
-    )
+    print(f"  -> Steps B & C finished in {time.time() - start_time_bc:.2f}s")
+
+    # --- PARALLEL BLOCK 2: STEP D (CROSS-EVAL) & STEP E (GROUND TRUTH) ---
+    print("\n[Steps D & E] Running Cross-Evaluation and Ground Truth Eval in parallel...")
+    start_time_de = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        future_d = executor.submit(
+            _execute_cross_evaluation, target_query, candidates, retrieved_indices,
+            exemplar_data, api_manager, config, trace_accumulator
+        )
+        future_e = executor.submit(
+            _execute_ground_truth_evaluation, target_query, ground_truth_answer,
+            candidates, api_manager, config
+        )
+
+        cross_eval_result = future_d.result()
+        gt_result = future_e.result()
+
+    # Save Step D results
     layer1_state["step_statuses"]["cross_evaluation"] = cross_eval_result["status"]
     layer1_state["cross_evaluation_matrix"] = cross_eval_result.get("cross_evaluation_matrix", {})
-    print(f"  ✓ Cross-evaluated matrix in {time.time() - start_time:.2f}s")
-    
-    # --- STEP E: GROUND-TRUTH EVALUATION ---
-    print("\n[Step E] Ground-Truth Correctness Evaluation...")
-    start_time = time.time()
-    gt_result = _execute_ground_truth_evaluation(
-        target_query=target_query, ground_truth_answer=ground_truth_answer,
-        candidates=candidates, api_manager=api_manager, config=config
-    )
+    print(f"  ✓ Step D: Cross-evaluation complete.")
+
+    # Save Step E results
     layer1_state["step_statuses"]["ground_truth_evaluation"] = gt_result["status"]
     layer1_state["ground_truth_labels"] = gt_result.get("ground_truth_labels", {})
-    print(f"  ✓ Evaluated {gt_result.get('successful_evals', 0)} candidates against ground truth in {time.time() - start_time:.2f}s")
+    print(f"  ✓ Step E: Evaluated {gt_result.get('successful_evals', 0)} candidates against ground truth.")
+    print(f"  -> Steps D & E finished in {time.time() - start_time_de:.2f}s")
     
 # --- FINALIZE ---
     all_statuses = layer1_state["step_statuses"].values()
