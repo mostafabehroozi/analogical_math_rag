@@ -124,6 +124,54 @@ class _GlobalAPIPauseManager:
 # Create the single shared manager for the whole application
 global_pause_manager = _GlobalAPIPauseManager()
 
+# Per-provider rate pacer — enforces a minimum time gap between
+#       consecutive API calls to the same provider, across all threads.
+class _ProviderRatePacer:
+    """Thread-safe minimum-interval enforcer for API calls per provider."""
+
+    def __init__(self) -> None:
+        self._creation_lock = threading.Lock()
+        self._locks: Dict[str, threading.Lock] = {}
+        self._last_call_time: Dict[str, float] = {}
+
+    def _get_lock(self, provider_name: str) -> threading.Lock:
+        """Double-checked-locking creation of a per-provider lock."""
+        if provider_name not in self._locks:
+            with self._creation_lock:
+                if provider_name not in self._locks:
+                    self._locks[provider_name] = threading.Lock()
+        return self._locks[provider_name]
+
+    def pace(self, provider_name: str, min_seconds: float) -> None:
+        """Block until it is safe to make the next API call to *provider_name*."""
+        if min_seconds <= 0:
+            return
+            
+        lock = self._get_lock(provider_name)
+        
+        # Acquire the lock so only one thread per provider can check/wait at a time
+        with lock:
+            now = time.monotonic()
+            last = self._last_call_time.get(provider_name, 0.0)
+            elapsed = now - last
+            
+            if elapsed < min_seconds:
+                wait_time = min_seconds - elapsed
+                tprint(
+                    f"⏳ [PACER] Provider '{provider_name}' pacing: "
+                    f"sleeping {wait_time:.2f}s "
+                    f"(min gap={min_seconds}s, elapsed={elapsed:.2f}s).",
+                    level="DEBUG",
+                )
+                time.sleep(wait_time)
+                
+            # Record the time we release the lock (when the API call is about to start)
+            self._last_call_time[provider_name] = time.monotonic()
+
+# Global pacer instance shared across all threads / all API managers
+provider_pacer = _ProviderRatePacer()
+
+
 @dataclass(frozen=True)
 class KeyLease:
     api_key: str
@@ -271,6 +319,12 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         
         # Check if the system is globally paused before making ANY request
         global_pause_manager.wait_if_needed(config)
+        
+        # --- NEW: Enforce minimum time between consecutive API calls per provider ---
+        if config.get("ENABLE_MIN_TIME_BETWEEN_API_CALLS", False):
+            _min_gap = float(config.get("MIN_TIME_BETWEEN_API_CALLS_SECONDS", 0.0))
+            if _min_gap > 0:
+                provider_pacer.pace(provider_name, _min_gap)
         
         # 1. Start the Timer
         start_time = time.monotonic()

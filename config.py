@@ -45,6 +45,8 @@ CONFIG = {
     "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 60.0,  # M: Seconds to sleep when the error limit is reached
     "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES": 30.0,  # X: Pause every X minutes (0 to disable)
     "GLOBAL_PERIODIC_PAUSE_DURATION_SECONDS": 15.0,  # Y: Seconds to sleep during the break
+    "ENABLE_MIN_TIME_BETWEEN_API_CALLS": False,      # Master switch: Set to True to enforce minimum time between calls
+    "MIN_TIME_BETWEEN_API_CALLS_SECONDS": 1.0,       # Minimum seconds between consecutive API calls to the same provider
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "DATA_DIR": DATA_DIR,
     "LOGS_DIR": LOGS_DIR,
