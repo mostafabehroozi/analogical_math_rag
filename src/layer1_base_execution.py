@@ -843,7 +843,10 @@ def run_layer1_base_execution(
     # --- STEP A: RETRIEVAL ---
     print("\n[Step A] Retrieval...")
     start_time = time.time()
-    question_to_index_map = {q: i for i, q in enumerate(exemplar_questions)}
+    if exemplar_data and 'question_to_index' in exemplar_data:
+        question_to_index_map = exemplar_data['question_to_index']
+    else:
+        question_to_index_map = {q: i for i, q in enumerate(exemplar_questions)}
     
     retrieval_result = _execute_retrieval(
         target_query=target_query,

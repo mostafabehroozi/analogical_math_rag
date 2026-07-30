@@ -52,6 +52,8 @@ from src.prompts import (
     create_evaluation_prompt,
     EXEMPLAR_FORMAT
 )
+# Global cache for embedding norms to massively speed up retrieval and save RAM
+_NORMS_CACHE = {}
 # Protects local PyTorch and Numpy resources from being overwhelmed by batch threads
 _LOCAL_COMPUTE_LOCK = threading.Lock()
 
@@ -133,10 +135,27 @@ def retrieve(
     
     cosine_similarity_start_time = time.time()
     print(f"{'  '*indent_level}Starting cosine similarity calculation (query_embedding shape: {query_embedding.shape}, embedded_exemplars shape: {embedded_exemplars.shape})...")
-    
-    # --- LOCKED BLOCK STARTS HERE ---
+
+    # LOCKED BLOCK STARTS HERE
     with _LOCAL_COMPUTE_LOCK:
-        similarities = cosine_similarity(query_embedding, embedded_exemplars)[0]
+        q_vec = np.asarray(query_embedding[0], dtype=np.float32)
+        q_norm = np.linalg.norm(q_vec)
+        
+        if q_norm < 1e-10:
+            similarities = np.zeros(embedded_exemplars.shape[0], dtype=np.float32)
+        else:
+            q_vec_normalized = q_vec / q_norm
+            # Fast dot product (much more memory efficient than sklearn)
+            dot_prods = np.dot(embedded_exemplars, q_vec_normalized)
+            
+            # Cache the norms of the huge embedded_exemplars matrix
+            arr_id = id(embedded_exemplars)
+            if arr_id not in _NORMS_CACHE:
+                logger.info("Computing and caching L2 norms for embedded_exemplars...")
+                norms = np.linalg.norm(embedded_exemplars, axis=1)
+                _NORMS_CACHE[arr_id] = np.maximum(norms, 1e-10).astype(np.float32)
+                
+            similarities = dot_prods / _NORMS_CACHE[arr_id]
         current_diag_time = log_time_diagnostic("Calculate cosine_similarity", cosine_similarity_start_time, indent=indent_level)
         print(f"{'  '*indent_level}Similarities array shape: {similarities.shape}")
         
