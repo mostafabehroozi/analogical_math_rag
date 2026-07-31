@@ -232,7 +232,8 @@ def retrieve(
 def _calculate_baseline_difficulty(
     retrieved_indices: List[int],
     exemplar_data: Dict[str, Any],
-    api_manager: Any,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
     config: Dict[str, Any],
     trace_accumulator: List[Dict]
 ) -> Dict[int, float]:
@@ -263,7 +264,7 @@ def _calculate_baseline_difficulty(
         
         prompt = base_template.format(question=question)
         
-        resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
+        resp = api_manager_solve.generate_content(prompt, model_name, temperature=1.0)
         
         trace_entry = create_trace_entry(
             "mirror_phase_0", f"baseline_idx_{idx}_attempt_{attempt_idx}",
@@ -274,7 +275,7 @@ def _calculate_baseline_difficulty(
         is_correct = False
         if resp['status'] == 'SUCCESS':
             eval_res = evaluate_single_answer_with_llm(
-                resp['text'], ground_truth, api_manager, config
+                resp['text'], ground_truth, api_manager_eval, config
             )
             if eval_res['is_correct']:
                 is_correct = True
@@ -393,7 +394,8 @@ def _evaluate_mirror_consistency(
     hypotheses: Dict[int, str],
     validation_indices: List[int],
     exemplar_data: Dict[str, Any],
-    api_manager: Any,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
     config: Dict[str, Any],
     trace_accumulator: List[Dict]
 ) -> Dict[int, Dict[int, float]]:
@@ -426,7 +428,7 @@ def _evaluate_mirror_consistency(
             validation_question=val_q
         )
         
-        resp = api_manager.generate_content(prompt, model_name, temperature=1.0)
+        resp = api_manager_solve.generate_content(prompt, model_name, temperature=1.0)
         
         trace_entry = create_trace_entry(
             "mirror_phase_2", f"cand_{cand_id}_vs_val_{val_idx}_run_{attempt_idx}",
@@ -436,7 +438,7 @@ def _evaluate_mirror_consistency(
         is_correct = False
         if resp['status'] == 'SUCCESS':
             eval_res = evaluate_single_answer_with_llm(
-                resp['text'], val_gt, api_manager, config
+                resp['text'], val_gt, api_manager_eval, config
             )
             if eval_res['is_correct']:
                 is_correct = True
@@ -1696,7 +1698,8 @@ def optimize_demonstrations_via_mirroring(
     target_query: str,
     retrieved_indices: List[int],
     exemplar_data: Dict[str, Any],
-    api_manager: Any,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
@@ -1725,7 +1728,8 @@ def optimize_demonstrations_via_mirroring(
         baseline_scores = _calculate_baseline_difficulty(
             retrieved_indices=validation_set_indices,
             exemplar_data=exemplar_data,
-            api_manager=api_manager,
+            api_manager_solve=api_manager_solve,
+            api_manager_eval=api_manager_eval,
             config=config,
             trace_accumulator=trace_accumulator
         )
@@ -1735,7 +1739,7 @@ def optimize_demonstrations_via_mirroring(
             target_query=target_query,
             candidate_indices=active_candidates,
             exemplar_data=exemplar_data,
-            api_manager=api_manager,
+            api_manager=api_manager_solve,
             config=config,
             trace_accumulator=trace_accumulator
         )
@@ -1747,7 +1751,8 @@ def optimize_demonstrations_via_mirroring(
             hypotheses=hypotheses,
             validation_indices=validation_set_indices,
             exemplar_data=exemplar_data,
-            api_manager=api_manager,
+            api_manager_solve=api_manager_solve,
+            api_manager_eval=api_manager_eval,
             config=config,
             trace_accumulator=trace_accumulator
         )
@@ -1810,7 +1815,8 @@ def apply_mirror_reranking(
     target_query: str,
     indices_to_rerank: List[int],
     exemplar_data: Dict[str, Any],
-    api_manager: Any,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
@@ -1898,7 +1904,8 @@ def apply_mirror_reranking(
         baseline_scores = _calculate_baseline_difficulty(
             retrieved_indices=validation_indices,
             exemplar_data=exemplar_data,
-            api_manager=api_manager,
+            api_manager_solve=api_manager_solve,
+            api_manager_eval=api_manager_eval,
             config=config,
             trace_accumulator=trace_accumulator
         )
@@ -1908,7 +1915,7 @@ def apply_mirror_reranking(
             target_query=target_query,
             candidate_indices=active_candidates,
             exemplar_data=exemplar_data,
-            api_manager=api_manager,
+            api_manager=api_manager_solve,
             config=config,
             trace_accumulator=trace_accumulator
         )
@@ -1919,7 +1926,8 @@ def apply_mirror_reranking(
             hypotheses=hypotheses,
             validation_indices=validation_indices,
             exemplar_data=exemplar_data,
-            api_manager=api_manager,
+            api_manager_solve=api_manager_solve,
+            api_manager_eval=api_manager_eval,
             config=config,
             trace_accumulator=trace_accumulator
         )

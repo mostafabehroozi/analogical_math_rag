@@ -276,7 +276,8 @@ def run_pipeline_for_single_query(
                 exemplar_solutions=exemplar_data.get('solutions', []),
                 embedded_exemplars=exemplar_data['embeddings'],
                 exemplar_data=exemplar_data,
-                api_manager=manager_for_solve,  # Use the solve manager for consistency
+                api_manager_solve=manager_for_solve,  # CHANGED: Use Solver for generation
+                api_manager_eval=manager_for_eval,    # ADDED: Use Evaluator for judgments
                 config=config,
                 experiment_name=experiment_name,  # Pass experiment name for combined cache
                 force_reexecution=do_force_layer1_reexecution  # Force re-execution if retry
@@ -548,7 +549,8 @@ def run_pipeline_for_single_query(
                             target_query=target_query,
                             indices_to_rerank=candidate_indices_for_reranking,
                             exemplar_data=exemplar_data,
-                            api_manager=manager_for_eval,
+                            api_manager_solve=manager_for_solve, # CHANGED
+                            api_manager_eval=manager_for_eval,   # CHANGED
                             config=config
                         )
                         
@@ -623,7 +625,8 @@ def run_pipeline_for_single_query(
                     target_query=target_query,
                     indices_to_rerank=retrieved_indices,
                     exemplar_data=exemplar_data,
-                    api_manager=manager_for_eval,
+                    api_manager_solve=manager_for_solve,
+                    api_manager_eval=manager_for_eval, 
                     config=config
                 )
                 
@@ -923,7 +926,8 @@ def run_pipeline_for_single_query(
                         target_query=target_query,
                         retrieved_indices=retrieved_indices_initial,
                         exemplar_data=exemplar_data,
-                        api_manager=manager_for_solve, # Uses Solver/Reasoning model
+                        api_manager_solve=manager_for_solve, # CHANGED
+                        api_manager_eval=manager_for_eval,   # ADDED
                         config=config
                     )
 

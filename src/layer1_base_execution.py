@@ -580,7 +580,8 @@ def _execute_candidate_generation(
 def _execute_baseline_calculation(
     retrieved_indices: List[int],
     exemplar_data: Dict[str, Any],
-    api_manager: Any,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
     config: Dict[str, Any],
     trace_accumulator: List[Dict]
 ) -> Dict[str, Any]:
@@ -606,7 +607,8 @@ def _execute_baseline_calculation(
         baselines = _calculate_baseline_difficulty(
             retrieved_indices=retrieved_indices,
             exemplar_data=exemplar_data,
-            api_manager=api_manager,
+            api_manager_solve=api_manager_solve,
+            api_manager_eval=api_manager_eval,
             config=config,
             trace_accumulator=trace_accumulator
         )
@@ -630,7 +632,8 @@ def _execute_cross_evaluation(
     candidates: Dict[int, Dict[str, Any]],
     retrieved_indices: List[int],
     exemplar_data: Dict[str, Any],
-    api_manager: Any,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
     config: Dict[str, Any],
     trace_accumulator: List[Dict]
 ) -> Dict[str, Any]:
@@ -662,7 +665,8 @@ def _execute_cross_evaluation(
             hypotheses={idx: candidates[idx]["candidate_text"] for idx in candidates if candidates[idx]["generation_status"] == "SUCCESS"},
             validation_indices=retrieved_indices,
             exemplar_data=exemplar_data,
-            api_manager=api_manager,
+            api_manager_solve=api_manager_solve,
+            api_manager_eval=api_manager_eval,
             config=config,
             trace_accumulator=trace_accumulator
         )
@@ -689,7 +693,7 @@ def _execute_ground_truth_evaluation(
     target_query: str,
     ground_truth_answer: str,
     candidates: Dict[int, Dict[str, Any]],
-    api_manager: Any,
+    api_manager_eval: Any,
     config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
@@ -723,7 +727,7 @@ def _execute_ground_truth_evaluation(
             eval_result = evaluate_single_answer_with_llm(
                 model_answer=c_text,
                 ground_truth=ground_truth_answer,
-                api_manager=api_manager,
+                api_manager=api_manager_eval,
                 config=config
             )
             return c_idx, eval_result
@@ -785,7 +789,8 @@ def run_layer1_base_execution(
     exemplar_solutions: List[str],
     embedded_exemplars: np.ndarray,
     exemplar_data: Dict[str, Any],
-    api_manager: Any,
+    api_manager_solve: Any,
+    api_manager_eval: Any,
     config: Dict[str, Any],
     experiment_name: str = "default_experiment",
     force_reexecution: bool = False
@@ -908,12 +913,12 @@ def run_layer1_base_execution(
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_b = executor.submit(
             _execute_candidate_generation, target_query, indices_for_generation,
-            exemplar_data, api_manager, config, trace_accumulator
+            exemplar_data, api_manager_solve, config, trace_accumulator
         )
         future_c = executor.submit(
             _execute_baseline_calculation, retrieved_indices, exemplar_data,
-            api_manager, config, trace_accumulator
-        )
+            api_manager_solve, api_manager_eval, config, trace_accumulator
+        )   
 
         candidate_result = future_b.result()
         baseline_result = future_c.result()
@@ -938,12 +943,12 @@ def run_layer1_base_execution(
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_d = executor.submit(
             _execute_cross_evaluation, target_query, candidates, retrieved_indices,
-            exemplar_data, api_manager, config, trace_accumulator
+            exemplar_data, api_manager_solve, api_manager_eval, config, trace_accumulator
         )
         future_e = executor.submit(
             _execute_ground_truth_evaluation, target_query, ground_truth_answer,
-            candidates, api_manager, config
-        )
+            candidates, api_manager_eval, config
+        )   
 
         cross_eval_result = future_d.result()
         gt_result = future_e.result()
