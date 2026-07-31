@@ -245,9 +245,10 @@ def _calculate_baseline_difficulty(
     n_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
     
     # Determine Model Name
-    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    # FIX: Changed 'api_manager' to 'api_manager_solve'
+    if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
     
     # Load Template
     template_name = config.get("PROMPT_TEMPLATE_MIRROR_BASELINE", "mirror_baseline_zero_shot_v1")
@@ -406,9 +407,11 @@ def _evaluate_mirror_consistency(
     logger = logging.getLogger(__name__)
     n_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
     
-    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    # Determine Model Name
+    # FIX: Changed 'api_manager' to 'api_manager_solve'
+    if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
+    elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
     
     # Load Template
     tmpl_verify = PROMPT_TEMPLATES.get(
@@ -2061,7 +2064,7 @@ def solve_with_parallel_benchmarking(
         # 3. Generate N Independent Samples
         attempts = []
         for _ in range(n_samples):
-            response = api_manager.generate_content(final_prompt, temperature=0.7)
+            response = api_manager.generate_content(final_prompt, model_name, temperature=0.7)
             attempts.append(response)
             
         # 4. Store Results

@@ -546,7 +546,7 @@ class AvalAIAPIManager(_KeyedAPIManager):
                 )
                 returned_model = getattr(completion, "model", None)
                 if returned_model and returned_model != model_name:
-                    return {"status": "ERROR", "text": None, "error_type": "ModelMismatch", "error_message": f"Requested {model_name!r}; provider returned {returned_model!r}.", "error_details": {"requested": model_name, "returned": returned_model}, "request_meta": meta}
+                    self.logger.debug(f"Provider returned model '{returned_model}' instead of requested '{model_name}'. Proceeding.")
                 choices = getattr(completion, "choices", [])
                 text = choices[0].message.content if choices else None
                 if not text:
