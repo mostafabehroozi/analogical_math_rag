@@ -8,7 +8,7 @@ import traceback
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
-
+from tqdm import tqdm  
 from src.context_logger import pipeline_context as api_call_context
 from src.utils import save_json_atomic
 
@@ -70,44 +70,52 @@ class BatchCoordinator:
     ) -> List[QuestionResult]:
         """Execute every question in a batch before one coordinator-owned commit."""
         all_results: List[QuestionResult] = []
-        for batch_number, start in enumerate(range(0, len(items), self.batch_size), start=1):
-            batch_items = list(items[start:start + self.batch_size])
-            batch_id = f"{self.phase_name}-{batch_number:04d}-{batch_items[0].index}-{batch_items[-1].index}"
-            print(f"\n[BATCH {batch_id}] started: {len(batch_items)} question(s), workers={min(self.max_workers, len(batch_items))}")
-            self._write_journal(batch_id, "RUNNING", batch_items)
+        
+        # Wrap the execution loop in a tqdm progress bar
+        with tqdm(total=len(items), desc=f"{self.experiment_name} | {self.phase_name}", unit="q") as pbar:
+            for batch_number, start in enumerate(range(0, len(items), self.batch_size), start=1):
+                batch_items = list(items[start:start + self.batch_size])
+                batch_id = f"{self.phase_name}-{batch_number:04d}-{batch_items[0].index}-{batch_items[-1].index}"
+                print(f"\n[BATCH {batch_id}] started: {len(batch_items)} question(s), workers={min(self.max_workers, len(batch_items))}")
+                self._write_journal(batch_id, "RUNNING", batch_items)
 
-            results: List[QuestionResult] = []
-            def execute(item: QuestionWorkItem) -> QuestionResult:
-                started = time.monotonic()
-                try:
-                    with api_call_context(batch=batch_id, question=item.index):
-                        value = worker(item)
-                    return QuestionResult(item, value, _terminal_status(value), time.monotonic() - started)
-                except BaseException as exc:  # Keep other questions running even after an unexpected worker crash.
-                    value = {
-                        "target_query_original_hard_list_idx": item.index,
-                        "target_query_text": item.question,
-                        "pipeline_status": "FAILED_WORKER_EXCEPTION",
-                        "batch_error": {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()},
-                    }
-                    return QuestionResult(item, value, "FAILED", time.monotonic() - started)
+                results: List[QuestionResult] = []
+                def execute(item: QuestionWorkItem) -> QuestionResult:
+                    started = time.monotonic()
+                    try:
+                        with api_call_context(batch=batch_id, question=item.index):
+                            value = worker(item)
+                        return QuestionResult(item, value, _terminal_status(value), time.monotonic() - started)
+                    except BaseException as exc:  # Keep other questions running even after an unexpected worker crash.
+                        value = {
+                            "target_query_original_hard_list_idx": item.index,
+                            "target_query_text": item.question,
+                            "pipeline_status": "FAILED_WORKER_EXCEPTION",
+                            "batch_error": {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()},
+                        }
+                        return QuestionResult(item, value, "FAILED", time.monotonic() - started)
 
-            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(batch_items)), thread_name_prefix="question") as executor:
-                futures: Dict[Future[QuestionResult], QuestionWorkItem] = {executor.submit(execute, item): item for item in batch_items}
-                for completed, future in enumerate(as_completed(futures), start=1):
-                    result = future.result()
-                    results.append(result)
-                    print(f"[BATCH {batch_id} {completed}/{len(batch_items)}] Q#{result.item.index} {result.terminal_status} ({result.elapsed_seconds:.1f}s)")
+                with ThreadPoolExecutor(max_workers=min(self.max_workers, len(batch_items)), thread_name_prefix="question") as executor:
+                    futures: Dict[Future[QuestionResult], QuestionWorkItem] = {executor.submit(execute, item): item for item in batch_items}
+                    for completed, future in enumerate(as_completed(futures), start=1):
+                        result = future.result()
+                        results.append(result)
+                        print(f"[BATCH {batch_id} {completed}/{len(batch_items)}] Q#{result.item.index} {result.terminal_status} ({result.elapsed_seconds:.1f}s)")
 
-            results.sort(key=lambda result: result.item.index)
-            failed = [result for result in results if result.terminal_status != "SUCCESS"]
-            self._write_journal(batch_id, "READY_TO_COMMIT", batch_items, terminal_statuses={str(result.item.index): result.terminal_status for result in results})
-            commit(results, batch_id, batch_number)
-            self._write_journal(batch_id, "COMMITTED", batch_items, terminal_statuses={str(result.item.index): result.terminal_status for result in results})
-            print(f"[BATCH {batch_id}] committed: success={len(results) - len(failed)} failed={len(failed)}")
-            all_results.extend(results)
+                results.sort(key=lambda result: result.item.index)
+                failed = [result for result in results if result.terminal_status != "SUCCESS"]
+                self._write_journal(batch_id, "READY_TO_COMMIT", batch_items, terminal_statuses={str(result.item.index): result.terminal_status for result in results})
+                
+                commit(results, batch_id, batch_number)
+                
+                self._write_journal(batch_id, "COMMITTED", batch_items, terminal_statuses={str(result.item.index): result.terminal_status for result in results})
+                print(f"[BATCH {batch_id}] committed: success={len(results) - len(failed)} failed={len(failed)}")
+                all_results.extend(results)
 
-            if failed and self.failure_policy == "halt_after_failed_batch":
-                print(f"[BATCH {batch_id}] stopping before next batch due to BATCH_FAILURE_POLICY={self.failure_policy}")
-                break
+                pbar.update(len(batch_items))
+
+                if failed and self.failure_policy == "halt_after_failed_batch":
+                    print(f"[BATCH {batch_id}] stopping before next batch due to BATCH_FAILURE_POLICY={self.failure_policy}")
+                    break
+                    
         return all_results
