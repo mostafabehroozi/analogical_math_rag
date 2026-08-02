@@ -40,7 +40,7 @@ CONFIG = {
     "QUESTION_PARALLEL_API_ENABLED": False,  # Master switch: Set to True to enable parallel API calls inside a question's steps
     "QUESTION_PARALLEL_MAX_WORKERS": 3,      # Max number of concurrent API calls allowed per step (e.g., batches of 3)
     "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
-    "API_REQUEST_TIMEOUT_SECONDS": 180.0,
+    "API_REQUEST_TIMEOUT_SECONDS": 60.0,
     "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 1,            # N: Number of consecutive errors to trigger a pause (0 to disable)
     "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 100.0,  # M: Seconds to sleep when the error limit is reached
     "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES": 30.0,  # X: Pause every X minutes (0 to disable)
