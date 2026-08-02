@@ -528,7 +528,16 @@ class AvalAIAPIManager(_KeyedAPIManager):
         if not base_url:
             raise ValueError("base_url cannot be empty for AvalAIAPIManager.")
         super().__init__(keys, model_quotas, config)
-        self.clients = {key: openai.OpenAI(api_key=key, base_url=base_url) for key in self.api_keys_list}
+        
+        timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0))
+        self.clients = {
+            key: openai.OpenAI(
+                api_key=key, 
+                base_url=base_url,
+                timeout=timeout_seconds 
+            ) for key in self.api_keys_list
+        }
+        
         if global_delay_seconds:
             self.logger.info("GLOBAL_API_CALL_DELAY_SECONDS is ignored by the RPM scheduler.")
 
