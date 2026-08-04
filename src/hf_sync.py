@@ -136,16 +136,6 @@ def sync_workspace_to_hub(config: dict):
         # 1. Instantiate the API client with the token.
         api = HfApi(token=hf_token)
 
-        # --- NEW CODE TO FIX LAYER-2 SYNCING ---
-        # Find the hidden Hugging Face cache folder inside your outputs directory
-        cache_dir = os.path.join(local_outputs_dir, ".cache", "huggingface")
-        
-        # If the cache exists, delete it! This forces Hugging Face to scan the 
-        # folder from scratch and discover your brand new Layer-2 directories.
-        if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir)
-        # ---------------------------------------
-
         # 2. Upload only the specific folders using an allowlist to prevent leaks
         api.upload_large_folder(
             folder_path=local_outputs_dir,

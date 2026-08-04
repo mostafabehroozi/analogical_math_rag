@@ -944,6 +944,10 @@ class ActiveInferenceEngine:
                 if resp['status'] == 'SUCCESS':
                     eval_res = evaluate_single_answer_with_llm(raw_text, ground_truth, self.api_manager_eval, self.global_config)
                     
+                    # SAFEGUARD: If the evaluator accidentally returns a list, extract the dictionary
+                    if isinstance(eval_res, list):
+                        eval_res = eval_res[0] if len(eval_res) > 0 else {}
+                    
                     # NEW: Did the evaluator API fail? If yes, trigger a retry!
                     if eval_res.get('status') != 'SUCCESS':
                         time.sleep(backoff)
