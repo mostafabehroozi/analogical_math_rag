@@ -942,13 +942,22 @@ class ActiveInferenceEngine:
                 error_msg = resp.get('error_message', '')
                 
                 if resp['status'] == 'SUCCESS':
-                    eval_res = evaluate_single_answer_with_llm(raw_text, ground_truth, self.api_manager_eval, self.global_config)
                     
-                    # SAFEGUARD: If the evaluator accidentally returns a list, extract the dictionary
-                    if isinstance(eval_res, list):
-                        eval_res = eval_res[0] if len(eval_res) > 0 else {}
+                    # WRAP IN TRY-EXCEPT TO CATCH INTERNAL PARSING CRASHES
+                    try:
+                        eval_res = evaluate_single_answer_with_llm(raw_text, ground_truth, self.api_manager_eval, self.global_config)
+                        
+                        # Extreme safeguard against deeply nested lists
+                        while isinstance(eval_res, list):
+                            eval_res = eval_res[0] if len(eval_res) > 0 else {}
+                        if not isinstance(eval_res, dict):
+                            eval_res = {}
+                            
+                    except Exception as e:
+                        # If evaluate_single_answer_with_llm crashes internally (e.g. 'list' object has no attribute 'get')
+                        eval_res = {"status": "FAILURE", "error": f"Internal eval crash: {str(e)}"}
                     
-                    # NEW: Did the evaluator API fail? If yes, trigger a retry!
+                    # Did the evaluator API fail or crash? If yes, trigger a retry!
                     if eval_res.get('status') != 'SUCCESS':
                         time.sleep(backoff)
                         backoff *= 2
