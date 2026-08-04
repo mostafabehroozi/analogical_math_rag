@@ -41,9 +41,12 @@ from src.utils import save_json, load_json, convert_numpy_for_json
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.evaluation import evaluate_single_answer_with_llm
 from src.hf_sync import periodic_sync_check
+from src.parallel_utils import run_parallel_api_calls
 from tqdm import tqdm
 from src.prompts import create_final_reasoning_prompt, create_final_reasoning_prompt_simple, EXEMPLAR_FORMAT, PROMPT_TEMPLATES
 from config import CONFIG as GLOBAL_CONFIG
+import threading
+import concurrent.futures
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +291,7 @@ class PTUMathEngine:
         self.layer1_state = layer1_state
         self.exemplar_data = exemplar_data or {}
         self.hard_questions = hard_questions or []
-        self.hard_solutions = hard_solutions or []  # <--- ADDED THIS LINE
+        self.hard_solutions = hard_solutions or []
         
         # =========================================================
         # BUG 1 FIX: BULLETPROOF INDEX EXTRACTION
@@ -985,14 +988,18 @@ class ActiveInferenceEngine:
                 "api_success": False  # Mark as API failure so we don't count it in the math
             }
 
-        # 3. Execute N Independent Inferences Sequentially (One by one)
-        for i in range(n_attempts):
-            # Print a tiny log so you know it's working sequentially
-            print(f"      -> Running LLM inference attempt {i+1} of {n_attempts}...")
-            
-            # Run the attempt and wait for it to finish before moving to the next
-            result = run_attempt(i)
-            executions.append(result)
+        # 3. Execute N Independent Inferences in Parallel
+        if self.global_config.get("QUESTION_PARALLEL_API_ENABLED", False):
+            print(f"      -> Running {n_attempts} LLM inference attempts in PARALLEL...")
+            # Create a list of tasks for the parallel runner
+            tasks = [lambda idx=i: run_attempt(idx) for i in range(n_attempts)]
+            # Execute them concurrently using your global config settings
+            executions = run_parallel_api_calls(tasks, self.global_config)
+        else:
+            # Fallback to sequential if you turn the setting off in config.py
+            for i in range(n_attempts):
+                print(f"      -> Running LLM inference attempt {i+1} of {n_attempts} sequentially...")
+                executions.append(run_attempt(i))
         
         executions.sort(key=lambda x: x["attempt_index"])
 
@@ -1984,6 +1991,7 @@ class Layer2Orchestrator:
         self.hard_solutions = hard_solutions or []     
         self.inference_engine = ActiveInferenceEngine(api_manager_solve, api_manager_eval, self.global_config)
         self.all_results = []
+        self._results_lock = threading.Lock()
         os.makedirs(output_dir, exist_ok=True)
     
     def _map_dynamic_method_to_block_a_strategy(self, dynamic_method: str) -> Optional[str]:
@@ -2100,32 +2108,48 @@ class Layer2Orchestrator:
         
         # ACTIVE INFERENCE EXECUTION
         logger.info(f"\n[ACTIVE INFERENCE] Executing LLM for {len(query_results)} configurations...")
+        
+        # 1. Separate precalculated results (Block Zero) from those needing live inference
+        live_configs = []
         for result in query_results:
-            # BYPASS LLM FOR PRECALCULATED RESULTS (Like Block Zero) 
             if getattr(result, 'is_precalculated', False):
                 logger.info(f"  -> Skipping LLM for {result.application} (Result Precalculated from Layer 1)")
-                continue
+            else:
+                live_configs.append(result)
 
-            logger.info(f"  -> Running LLM for: {result.application} (Pass@{self.config.global_pass_at_N})")
-            
-            # THE PROXY PRINCIPLE FIX: Pass the Source Exemplars to the Solver, NOT the drafted Candidates!
+        # 2. Define the worker function for processing a single configuration
+        def process_config(res):
+            logger.info(f"  -> Running LLM for: {res.application} (Pass@{self.config.global_pass_at_N})")
             prompt, executions, pass_at_k = self.inference_engine.execute_and_evaluate(
-                target_query=result.target_query_text,
-                ground_truth=result.ground_truth_answer,
-                context_texts=result.selected_exemplar_texts, 
+                target_query=res.target_query_text,
+                ground_truth=res.ground_truth_answer,
+                context_texts=res.selected_exemplar_texts, 
                 n_attempts=self.config.global_pass_at_N,
-                use_mirror_baseline_template=getattr(result, 'is_zero_shot_fallback', False) # <--- ADD THIS LINE
+                use_mirror_baseline_template=getattr(res, 'is_zero_shot_fallback', False)
             )
             
-            # Attach live payloads to the result object
-            result.final_prompt_text = prompt
-            result.executions = executions
-            result.pass_at_k_metrics = pass_at_k
-            
-            # For backward compatibility with the legacy summary function
-            result.group_pass_at_n = pass_at_k.get(self.config.global_pass_at_N, 0.0)
+            res.final_prompt_text = prompt
+            res.executions = executions
+            res.pass_at_k_metrics = pass_at_k
+            res.group_pass_at_n = pass_at_k.get(self.config.global_pass_at_N, 0.0)
+            return res
 
-        self.all_results.extend(query_results)
+        # 3. Execute live configs in parallel or sequentially based on global config
+        if self.global_config.get("QUESTION_PARALLEL_API_ENABLED", False) and live_configs:
+            max_workers = self.global_config.get("QUESTION_PARALLEL_MAX_WORKERS", 3)
+            print(f"  -> Processing {len(live_configs)} configurations CONCURRENTLY (Max Workers: {max_workers})")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # map() runs the function over the list concurrently and waits for all to finish
+                list(executor.map(process_config, live_configs))
+        else:
+            # Fallback to sequential
+            for res in live_configs:
+                process_config(res)
+
+        with self._results_lock:
+            self.all_results.extend(query_results)
+            
         return query_results
     
     def generate_master_report(self) -> Dict[str, Any]:
@@ -2422,21 +2446,75 @@ def run_layer2_experiments(
     print("="*60)
     
     if pending_count > 0:
-        for loop_idx, layer1_state in enumerate(tqdm(pending_states, desc="Layer 2 Progress")):
+        # --- NEW: Check if Batching is Enabled in Config ---
+        if run_config.get("BATCH_PROCESSING_ENABLED", False):
+            print(f"\n🚀 Running Layer 2 in BATCH MODE (Batch Size: {run_config.get('BATCH_SIZE', 5)})")
             
-            # Run the actual question
-            orchestrator.run_single_query(layer1_state)
+            # Import necessary batching tools safely
+            from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
+            from src.context_logger import pipeline_context
+            from src.hf_sync import periodic_batch_sync_check
             
-            # --- ITERATIVE SAVING (Happens after EVERY question) ---
-            # 1. Save memory checkpoint (.pkl)
-            orchestrator.save_checkpoint()
-            
-            # 2. Overwrite JSON and CSV files on disk so you can watch them update live
-            report = orchestrator.generate_master_report()
-            orchestrator.save_reports(report)
-            
-            # Trigger HuggingFace Sync if it's time!
-            periodic_sync_check(loop_idx, run_config)
+            # 1. Package the pending questions into Work Items
+            items = []
+            for state in pending_states:
+                # Safely extract query ID and text for logging
+                q_idx = state.get('target_query_idx')
+                if q_idx is None and 'target_query_data' in state:
+                    q_idx = state['target_query_data'].get('query_index', 0)
+                    
+                q_text = state.get('target_query_text', 'Unknown Query')
+                if not q_text and 'target_query_data' in state:
+                    q_text = state['target_query_data'].get('query_text', 'Unknown Query')
+                    
+                items.append(QuestionWorkItem(index=int(q_idx), question=q_text, existing_log=state))
+
+            # 2. Define the worker that runs a single question
+            def worker(item: QuestionWorkItem):
+                # Using pipeline_context ensures console logs display the correct Q#
+                with pipeline_context(query_idx=item.index, batch_id="layer2_analysis"):
+                    # This internally runs the question and appends to orchestrator.all_results
+                    return orchestrator.run_single_query(item.existing_log)
+
+            # 3. Define the commit function that saves data after each batch finishes
+            def commit(results: List[QuestionResult], batch_id: str, batch_number: int) -> None:
+                print(f"\n{'='*70}")
+                print(f"✅ BATCH {batch_number} COMPLETED [Phase: Layer 2 Analysis]")
+                
+                # Print a clean summary for the questions in this batch
+                for result in results:
+                    q_idx = result.item.index
+                    if result.terminal_status:
+                        print(f"  🔴 [Q#{q_idx}] Status: {result.terminal_status} ({round(result.elapsed_seconds, 2)}s)")
+                        if isinstance(result.value, dict) and "batch_error" in result.value:
+                            error_msg = result.value["batch_error"].get("message", "Unknown error")
+                            print(f"      ↳ ERROR DETAILS: {error_msg}")
+                    else:
+                        print(f"  🟢 [Q#{q_idx}] Status: SUCCESS ({round(result.elapsed_seconds, 2)}s)")
+                print(f"{'='*70}\n")
+                
+                # --- ITERATIVE SAVING (Happens after EVERY batch) ---
+                orchestrator.save_checkpoint()
+                report = orchestrator.generate_master_report()
+                orchestrator.save_reports(report)
+                periodic_batch_sync_check(batch_number - 1, run_config)
+
+            # 4. Run the Batch Coordinator!
+            BatchCoordinator(run_config, config.layer2_config_name, "layer2_analysis").run(items, worker, commit)
+
+        else:
+            # --- ORIGINAL FALLBACK: Sequential processing if BATCH is turned off ---
+            for loop_idx, layer1_state in enumerate(tqdm(pending_states, desc="Layer 2 Progress")):
+                
+                # Run the actual question
+                orchestrator.run_single_query(layer1_state)
+                
+                # --- ITERATIVE SAVING (Happens after EVERY question) ---
+                orchestrator.save_checkpoint()
+                report = orchestrator.generate_master_report()
+                orchestrator.save_reports(report)
+                
+                periodic_sync_check(loop_idx, run_config)
     
     print("\n" + "="*60)
     print("✅ LAYER 2 ANALYSIS COMPLETELY FINISHED!")
