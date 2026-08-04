@@ -111,14 +111,13 @@ def create_layer2_config_from_dict(config_dict: Dict[str, Any]) -> Layer2Config:
         config.layer2_config_name = config_dict['layer2_config_name']
     
     # Block toggles
-    # --- NEW ZERO-SHOT TOGGLES ---
+    # ZERO-SHOT TOGGLES
     if 'run_block_zero_baseline' in config_dict:
         config.run_block_zero_baseline = config_dict['run_block_zero_baseline']
     if 'run_block_zero' in config_dict:
         config.run_block_zero = config_dict['run_block_zero']
     if 'block_zero_strategies' in config_dict:
         config.block_zero_strategies = config_dict['block_zero_strategies']
-    # -----------------------------
     
     if 'run_block_A_baseline' in config_dict:
         config.run_block_A_baseline = config_dict['run_block_A_baseline'] 
@@ -185,7 +184,7 @@ def run_layer2_complete_pipeline(
     global_config: Optional[Dict[str, Any]] = None,
     exemplar_data: Optional[Dict[str, Any]] = None,
     hard_questions: Optional[List[str]] = None,
-    hard_solutions: Optional[List[str]] = None       # <--- ADDED THIS LINE
+    hard_solutions: Optional[List[str]] = None
 ) -> Tuple[List[Any], Dict[str, Any]]:
     """
     Complete end-to-end Layer 2 execution:

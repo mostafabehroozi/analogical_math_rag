@@ -51,9 +51,7 @@ import concurrent.futures
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
 # DATA STRUCTURES & CONFIGURATION
-# ============================================================================
 
 @dataclass
 class ExperimentResult:
@@ -63,7 +61,7 @@ class ExperimentResult:
     ground_truth_answer: str
     
     # Base Conditions
-    utility_calibration: str  # <-- I REMOVED the default value here
+    utility_calibration: str  
     evaluator_setting: str  # 'Self', 'Others', 'All'
     scoring_strategy: str   # 'ScoreTake', 'ScoreMake', 'Holistic'
     application: str = ""  # 'Block_A_Reranking', 'Block_A_TopK', 'Block_B_Dynamic', etc.
@@ -72,15 +70,15 @@ class ExperimentResult:
     subset_size: int = 0
     selected_candidates: List[str] = None 
     selected_evaluators: List[int] = None  
-    selected_scores: List[float] = None  # NEW: Store the scores of chosen samples
-    selected_exemplar_ids: List[str] = None    # NEW: Store the Parent Source IDs
-    selected_exemplar_texts: List[str] = None  # NEW: Store the Parent Source Texts
+    selected_scores: List[float] = None  
+    selected_exemplar_ids: List[str] = None    
+    selected_exemplar_texts: List[str] = None  
     is_precalculated: bool = False # Flag to bypass LLM inference (used for Block_Zero)
     # Evaluation Metrics (Legacy)
     list_ap_score: Optional[float] = None  
     group_pass_at_n: Optional[float] = None  
     
-# --- ACTIVE INFERENCE PAYLOADS (NEW) ---
+# ACTIVE INFERENCE PAYLOADS 
     selected_candidate_texts: List[str] = None
     final_prompt_text: Optional[str] = None
     zero_score_fallback_triggered: bool = False
@@ -88,7 +86,7 @@ class ExperimentResult:
     executions: List[Dict[str, Any]] = None  
     pass_at_k_metrics: Dict[int, float] = None
     
-    # === NEW: RANKING METRICS (BLOCK A ONLY) ===
+    # RANKING METRICS (BLOCK A ONLY) 
     ap_score_reranked: Optional[float] = None  # AP on reranked list
     ap_score_original: Optional[float] = None  # AP on original retrieved list
     ap_improvement: Optional[float] = None  # Delta: reranked - original
@@ -176,10 +174,7 @@ class Layer2Config:
             self.coverage_perspectives = ['Candidate_Centric', 'Evaluator_Centric', 'Both_Centric']
 
 
-# ============================================================================
-# RANKING METRICS CALCULATOR (NEW)
-# ============================================================================
-
+# RANKING METRICS CALCULATOR
 class RankingMetricsCalculator:
     """
     Computes ranking-based metrics for evaluating retrieved and reranked lists.
@@ -249,10 +244,7 @@ class RankingMetricsCalculator:
         return metrics
 
 
-# ============================================================================
 # PTU MATH ENGINE
-# ============================================================================
-
 class PTUMathEngine:
     """
     Computes Pairwise Transaction Utility (PTU) matrices and score aggregations
@@ -275,7 +267,6 @@ class PTUMathEngine:
             ValueError: If layer1_state is invalid or contains required empty structures
             RuntimeError: If PTU matrix dimensions do not match expected sizes
         """
-        # === BUG FIX 3: STRICT LAYER 1 STATE VALIDATION ===
         # Validate that layer1_state is provided and is a dictionary
         if layer1_state is None:
             raise ValueError(
@@ -293,9 +284,6 @@ class PTUMathEngine:
         self.hard_questions = hard_questions or []
         self.hard_solutions = hard_solutions or []
         
-        # =========================================================
-        # BUG 1 FIX: BULLETPROOF INDEX EXTRACTION
-        # =========================================================
         idx = layer1_state.get('target_query_idx') # 1. Try root
         
         if idx is None and 'target_query_data' in layer1_state:
@@ -314,7 +302,7 @@ class PTUMathEngine:
             
         self.target_query_idx = int(idx)
         
-        # === FETCH TEXT DIRECTLY FROM RAM ===
+        # FETCH TEXT DIRECTLY FROM RAM
         self.target_query_text = self.hard_questions[self.target_query_idx]
         
         # Safely fetch ground truth with strict alignment checks
@@ -343,7 +331,6 @@ class PTUMathEngine:
         self.evaluator_ids, self.retrieved_set = self._normalize_retrieved_set(self.raw_retrieved_set)
         self.candidate_ids, self.candidate_set = self._normalize_candidate_set(self.raw_candidate_set)
         
-        # === BUG FIX 3: STRICT DIMENSIONAL VALIDATION AFTER NORMALIZATION ===
         # Validate that normalization produced non-empty structures
         if not self.evaluator_ids or len(self.evaluator_ids) == 0:
             raise ValueError(
@@ -516,7 +503,6 @@ class PTUMathEngine:
         Raises:
             RuntimeError: If dimensional validation fails
         """
-        # === BUG FIX 3: STRICT DIMENSIONAL VALIDATION BEFORE COMPUTATION ===
         # Validate that n_candidates and n_evaluators are properly set and consistent
         if self.n_candidates <= 0:
             raise RuntimeError(
@@ -558,7 +544,7 @@ class PTUMathEngine:
                 f"len(evaluator_ids)={len(self.evaluator_ids)} but n_evaluators={self.n_evaluators}."
             )
         
-        # === COMPUTE PTU MATRIX ===
+        # COMPUTE PTU MATRIX
         # Initialize the PTU matrix with dimensions (n_candidates, n_evaluators)
         ptu = np.zeros((self.n_candidates, self.n_evaluators), dtype=np.float32)
         
@@ -628,7 +614,6 @@ class PTUMathEngine:
         Returns:
             Masked PTU matrix
         """
-        # === BUG FIX 3: VALIDATE MASK APPLICATION ===
         # Validate mask_type
         valid_masks = ['Self', 'Others', 'All']
         if mask_type not in valid_masks:
@@ -741,7 +726,7 @@ class PTUMathEngine:
         if source_id is None:
             raise ValueError(f"Fatal structural error: Candidate is missing 'source_exemplar_idx'. Data: {candidate}")
             
-        # === NEW: SAFEGUARD FOR ZERO-SHOT CANDIDATES ===
+        # SAFEGUARD FOR ZERO-SHOT CANDIDATES
         if source_id == -1 or str(source_id) == "-1":
             return -1  # Indicates this candidate has no parent
             
@@ -900,10 +885,7 @@ def _get_ground_truth_label(ground_truth_labels: Dict[Any, Any], cand_idx: Any) 
     raise ValueError(f"Fatal API missing-data error: No ground truth label found for candidate index {cand_idx}.")
 
 
-# ============================================================================
 # ACTIVE INFERENCE ENGINE (LIVE LLM EVALUATION)
-# ============================================================================
-
 class ActiveInferenceEngine:
     """
     Executes live API calls to the LLM using the contexts chosen by Layer 2 Blocks.
@@ -985,7 +967,7 @@ class ActiveInferenceEngine:
                 "raw_llm_generation": "",
                 "error": error_msg,
                 "is_correct": False,
-                "api_success": False  # Mark as API failure so we don't count it in the math
+                "api_success": False  
             }
 
         # 3. Execute N Independent Inferences in Parallel
@@ -1019,17 +1001,6 @@ class ActiveInferenceEngine:
 
         return prompt, executions, pass_at_k
 
-
-# ============================================================================
-# BLOCK A: BASELINE RERANKING & STATIC GROUPING
-# ============================================================================
-
-# ============================================================================
-# BLOCK ZERO: ZERO-SHOT BASELINE & BEST-OF-N (NEW)
-# ============================================================================
-# ============================================================================
-# BLOCK ZERO: ZERO-SHOT BASELINE & BEST-OF-N (NEW)
-# ============================================================================
 class BlockZero:
     """
     Evaluates purely zero-shot candidates generated in Layer 1.
@@ -1138,7 +1109,7 @@ class BlockA:
             for i in range(len(self.ptu_engine.candidate_ids))
         }
 
-        # === AP SCORE FIX: Calculate AP once using the FULL list ===
+        # Calculate AP once using the FULL list
         full_original_metrics = RankingMetricsCalculator.compute_all_metrics(
             original_ranking_ids, # Full list
             original_ranking_ids, # Full list
@@ -1209,7 +1180,7 @@ class BlockA:
         results = []
         threshold = self.config.activation_threshold
         
-        # ---> FIX: Fetch the original ranking IDs for the AP metrics calculator <---
+        # Fetch the original ranking IDs for the AP metrics calculator
         original_ranking_ids = self.ptu_engine.get_original_retrieved_ranking()
         
         # Get scores for this strategy
@@ -1218,7 +1189,7 @@ class BlockA:
         )
         
         # Experiment A.1: Reranking & Average Precision with Two-Tier Sorting
-        # ===== TWO-TIER SORTING SYSTEM =====
+        # TWO-TIER SORTING SYSTEM 
         # Tier 1: Candidates with score > threshold (sorted descending)
         tier1_mask = scores > threshold
         tier1_indices = np.where(tier1_mask)[0]
@@ -1241,7 +1212,7 @@ class BlockA:
         cache_key = (mask_type, strategy)
         self.ranked_indices_cache[cache_key] = ranked_indices.tolist()
         
-        # --- PRESERVE CORE VARIABLES NEEDED FOR TOP-K ---
+        # PRESERVE CORE VARIABLES NEEDED FOR TOP-K
         ground_truth_labels_dict = {
             self.ptu_engine.candidate_ids[i]: _get_ground_truth_label(
                 self.ptu_engine.ground_truth_labels, 
@@ -1298,7 +1269,6 @@ class BlockA:
                 zero_score_fallback_triggered=(len(cand_texts_a2) == 0),
                 list_ap_score=None,
                 group_pass_at_n=pass_at_n,
-                # === NEW: Block A TopK metrics ===
                 ap_score_reranked=full_ranking_metrics['ap_reranked'],
                 ap_score_original=full_ranking_metrics['ap_original'],
                 ap_improvement=full_ranking_metrics['ap_improvement'],
@@ -1390,7 +1360,7 @@ class BlockB:
             zero_score_fallback_triggered = True
             
             if self.config.block_B_zero_shot_fallback:
-                # --- NEW FEATURE: Zero-Shot Fallback (K=0) ---
+                # Zero-Shot Fallback (K=0)
                 k_dynamic = 0
                 positive_indices = []
                 is_zero_shot_fallback = True
@@ -1618,12 +1588,12 @@ class BlockC:
         results = []
         threshold = self.config.activation_threshold
         
-        # ===== CHECK FOR ZERO-SCORE FALLBACK CONDITION =====
+        # CHECK FOR ZERO-SCORE FALLBACK CONDITION 
         max_ptu_value = np.max(ptu_matrix) if ptu_matrix.size > 0 else 0.0
         zero_score_fallback_triggered = (max_ptu_value <= threshold)
         
         if zero_score_fallback_triggered:
-            # ===== FALLBACK PATH: Bypass complex coverage logic =====
+            # FALLBACK PATH: Bypass complex coverage logic
             # STRICT FALLBACK: If math is useless, return the retrieved 1-shots (ignore zero-shots)
             selected_candidate_indices = [i for i, cid in enumerate(self.ptu_engine.candidate_ids) if not str(cid).startswith("zs_")]
             subset_size = len(selected_candidate_indices)
@@ -1819,8 +1789,7 @@ class BlockC:
 
 
 
-# THREAD AGGREGATOR (NEW)
-
+# THREAD AGGREGATOR
 class ThreadAggregator:
     """
     Aggregates ExperimentResult objects into per-configuration-thread statistics.
@@ -2249,7 +2218,6 @@ class Layer2Orchestrator:
         
         max_k = 0
         for r in self.all_results:
-            # FIX: Prevent aggregating different calibrations and masks into the same row
             # 1. Start with the application name, append strategy if missing
             base_app = r.application
             if r.scoring_strategy and r.scoring_strategy not in base_app:
@@ -2294,9 +2262,7 @@ class Layer2Orchestrator:
         """
         Generate and save the comprehensive analysis CSV with AP metrics, ranking metrics, and hierarchical organization.
         """
-        # --- ADD THIS LINE TO MAKE THE NAME DYNAMIC ---
         csv_filename = f"layer2_comprehensive_analysis_{self.config.layer2_config_name}.csv"
-        # ----------------------------------------------
 
         comprehensive_data = self.generate_comprehensive_report()
         csv_filepath = os.path.join(self.output_dir, csv_filename)
@@ -2409,10 +2375,7 @@ class Layer2Orchestrator:
                 print(f"⚠️ Failed to load checkpoint: {e}. Starting fresh.")
         return False
 
-# ============================================================================
 # PUBLIC API
-# ============================================================================
-
 def run_layer2_experiments(
     layer1_states: List[Dict[str, Any]],
     config: Layer2Config,
@@ -2446,7 +2409,7 @@ def run_layer2_experiments(
     print("="*60)
     
     if pending_count > 0:
-        # --- NEW: Check if Batching is Enabled in Config ---
+        # Check if Batching is Enabled in Config
         if run_config.get("BATCH_PROCESSING_ENABLED", False):
             print(f"\n🚀 Running Layer 2 in BATCH MODE (Batch Size: {run_config.get('BATCH_SIZE', 5)})")
             

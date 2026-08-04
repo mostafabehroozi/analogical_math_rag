@@ -365,10 +365,7 @@ def _load_step_checkpoint(
         return None
 
 
-# ============================================================================
 # STEP A: RETRIEVAL
-# ============================================================================
-
 def _execute_retrieval(
     target_query: str,
     embedding_model: SentenceTransformer,
@@ -436,10 +433,7 @@ def _execute_retrieval(
         return {"status": "FAILURE", "error": str(e)}
 
 
-# ============================================================================
 # STEP B: CANDIDATE GENERATION (1-Shot Constraint)
-# ============================================================================
-
 def _execute_candidate_generation(
     target_query: str,
     retrieved_indices: List[int],
@@ -573,10 +567,8 @@ def _execute_candidate_generation(
     except Exception as e:
         logger.error(f"Candidate generation failed: {e}", exc_info=True)
         return {"status": "FAILURE", "error": str(e), "candidates": {}}
-# ============================================================================
-# STEP C: BASELINE & EVALUATOR CONSTRUCTION
-# ============================================================================
 
+# STEP C: BASELINE & EVALUATOR CONSTRUCTION
 def _execute_baseline_calculation(
     retrieved_indices: List[int],
     exemplar_data: Dict[str, Any],
@@ -623,10 +615,7 @@ def _execute_baseline_calculation(
         return {"status": "FAILURE", "error": str(e), "intrinsic_baselines": {}}
 
 
-# ============================================================================
 # STEP D: CROSS-EVALUATION MATRIX
-# ============================================================================
-
 def _execute_cross_evaluation(
     target_query: str,
     candidates: Dict[int, Dict[str, Any]],
@@ -685,10 +674,7 @@ def _execute_cross_evaluation(
         return {"status": "FAILURE", "error": str(e), "cross_evaluation_matrix": {}}
 
 
-# ============================================================================
 # STEP E: GROUND-TRUTH EVALUATION
-# ============================================================================
-
 def _execute_ground_truth_evaluation(
     target_query: str,
     ground_truth_answer: str,
@@ -721,7 +707,7 @@ def _execute_ground_truth_evaluation(
     failed_evals = 0
     
     try:
-        # --- NEW PARALLEL LOGIC ---
+        # PARALLEL LOGIC 
         def _gt_eval_task(c_idx, c_text):
             """Task wrapper to run in parallel."""
             eval_result = evaluate_single_answer_with_llm(
@@ -776,10 +762,7 @@ def _execute_ground_truth_evaluation(
         return {"status": "FAILURE", "error": str(e), "ground_truth_labels": {}}
 
 
-# ============================================================================
 # MAIN LAYER 1 EXECUTION
-# ============================================================================
-
 def run_layer1_base_execution(
     target_query_index: int,
     target_query: str,
@@ -802,11 +785,11 @@ def run_layer1_base_execution(
     """
     logger = logging.getLogger(__name__)
     
-    # --- Initialization ---
+    # Initialization
     cache_dir = config.get("LAYER1_CACHE_DIR", config.get("RESULTS_DIR", "local_data/outputs/results"))
     top_k = config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
     
-    # NEW: Fetch the 1-shot limit, with fallbacks
+    # Fetch the 1-shot limit, with fallbacks
     n_candidates = config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
     if n_candidates is None:
         n_candidates = config.get("LAYER1_N_CANDIDATES")
@@ -825,7 +808,7 @@ def run_layer1_base_execution(
     
     logger.info(f"[Layer 1] Starting base execution for Query #{target_query_index} (Experiment: {experiment_name})")
     
-    # --- CACHE-FIRST CHECK ---
+    # CACHE-FIRST CHECK
     cache_filename = _get_cache_filename(top_k, n_candidates, experiment_name)
     cache_path = _get_cache_path(cache_dir, cache_filename)
     
@@ -842,7 +825,7 @@ def run_layer1_base_execution(
                 print(f"[LAYER 1 CACHE MISS / INCOMPLETE] Query #{target_query_index} will execute full pipeline in memory.")
                 cached_state = None
     
-    # --- INITIALIZE RESULT STRUCTURE ---
+    # INITIALIZE RESULT STRUCTURE
     layer1_state = {
         "metadata": {
             "query_index": target_query_index,
@@ -876,7 +859,7 @@ def run_layer1_base_execution(
         }
     }
     
-    # --- STEP A: RETRIEVAL ---
+    # STEP A: RETRIEVAL
     print("\n[Step A] Retrieval...")
     start_time = time.time()
     if exemplar_data and 'question_to_index' in exemplar_data:
@@ -904,7 +887,7 @@ def run_layer1_base_execution(
     layer1_state["retrieved_set"] = retrieval_result.get("retrieval_data", [])
     layer1_state["execution_trace"].extend(retrieval_result.get("trace", []))
     
-    # --- PARALLEL BLOCK 1: STEP B (CANDIDATES) & STEP C (BASELINES) ---
+    # PARALLEL BLOCK 1: STEP B (CANDIDATES) & STEP C (BASELINES)
     print("\n[Steps B & C] Running Candidate Generation and Baseline Calculation in parallel...")
     start_time_bc = time.time()
 
@@ -964,7 +947,7 @@ def run_layer1_base_execution(
     print(f"  ✓ Step E: Evaluated {gt_result.get('successful_evals', 0)} candidates against ground truth.")
     print(f"  -> Steps D & E finished in {time.time() - start_time_de:.2f}s")
     
-# --- FINALIZE ---
+# FINALIZE 
     all_statuses = layer1_state["step_statuses"].values()
     if all(s == "SUCCESS" for s in all_statuses):
         layer1_state["overall_status"] = "SUCCESS"
@@ -977,7 +960,6 @@ def run_layer1_base_execution(
         layer1_state["overall_status"] = "FAILURE"
         print("  ✗ Critical failure; check step_statuses for details")
     
-    # NEW: Always flag for saving if we executed the pipeline (Success or Failure)
     layer1_state["_needs_saving"] = True 
     
     print(f"{'='*80}\n")
