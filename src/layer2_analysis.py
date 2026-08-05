@@ -2462,7 +2462,13 @@ def run_layer2_experiments(
                 # Using pipeline_context ensures console logs display the correct Q#
                 with pipeline_context(query_idx=item.index, batch_id="layer2_analysis"):
                     # This internally runs the question and appends to orchestrator.all_results
-                    return orchestrator.run_single_query(item.existing_log)
+                    results = orchestrator.run_single_query(item.existing_log)
+                    
+                    # Return a dict instead of a list so the batch coordinator doesn't crash
+                    return {
+                        "pipeline_status": "SUCCESS" if results else "SKIPPED",
+                        "results_count": len(results) if results else 0
+                    }
 
             # 3. Define the commit function that saves data after each batch finishes
             def commit(results: List[QuestionResult], batch_id: str, batch_number: int) -> None:
@@ -2472,13 +2478,22 @@ def run_layer2_experiments(
                 # Print a clean summary for the questions in this batch
                 for result in results:
                     q_idx = result.item.index
+                    
+                    # Safely get status without crashing if value is a list
+                    if isinstance(result.value, dict):
+                        status_from_value = result.value.get("pipeline_status", "SUCCESS")
+                    else:
+                        status_from_value = "SUCCESS"
+                        
+                    status = result.terminal_status or status_from_value
+                    
                     if result.terminal_status:
-                        print(f"  🔴 [Q#{q_idx}] Status: {result.terminal_status} ({round(result.elapsed_seconds, 2)}s)")
+                        print(f"  🔴 [Q#{q_idx}] Status: {status} ({round(result.elapsed_seconds, 2)}s)")
                         if isinstance(result.value, dict) and "batch_error" in result.value:
                             error_msg = result.value["batch_error"].get("message", "Unknown error")
                             print(f"      ↳ ERROR DETAILS: {error_msg}")
                     else:
-                        print(f"  🟢 [Q#{q_idx}] Status: SUCCESS ({round(result.elapsed_seconds, 2)}s)")
+                        print(f"  🟢 [Q#{q_idx}] Status: {status} ({round(result.elapsed_seconds, 2)}s)")
                 print(f"{'='*70}\n")
                 
                 # --- ITERATIVE SAVING (Happens after EVERY batch) ---

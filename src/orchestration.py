@@ -1344,7 +1344,14 @@ def _run_pipeline_items_in_batches(
         print(f"✅ BATCH {batch_number} COMPLETED [Phase: {phase_name.upper()}]")
         for result in results:
             q_idx = result.item.index
-            status = result.terminal_status or result.value.get("pipeline_status", "UNKNOWN")
+            
+            # Safely get status without crashing
+            if isinstance(result.value, dict):
+                status_from_value = result.value.get("pipeline_status", "UNKNOWN")
+            else:
+                status_from_value = "UNKNOWN"
+                
+            status = result.terminal_status or status_from_value
             elapsed = round(result.elapsed_seconds, 2)
             
             # Add some nice color/icons based on status
@@ -1354,7 +1361,7 @@ def _run_pipeline_items_in_batches(
             print(f"  {icon} [Q#{q_idx}] Status: {status} ({elapsed}s)")
             
             # If the thread crashed, print the actual error message!
-            if is_error and "batch_error" in result.value:
+            if is_error and isinstance(result.value, dict) and "batch_error" in result.value:
                 error_msg = result.value["batch_error"].get("message", "Unknown error")
                 print(f"      ↳ ERROR DETAILS: {error_msg}")
                 
