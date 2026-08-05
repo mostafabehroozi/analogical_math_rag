@@ -868,6 +868,10 @@ class PTUMathEngine:
 
 def _normalize_ground_truth_label(label_obj: Any) -> bool:
     """Normalize a ground truth label value into a boolean is_correct flag."""
+    # Safely unpack lists in case the API or cache returned a nested list
+    while isinstance(label_obj, list):
+        label_obj = label_obj[0] if len(label_obj) > 0 else {}
+        
     if isinstance(label_obj, dict):
         return bool(label_obj.get('is_correct', False))
     return bool(label_obj)
@@ -938,10 +942,18 @@ class ActiveInferenceEngine:
             
             for attempt in range(max_retries):
                 resp = self.api_manager_solve.generate_content(prompt, self.model_name, temp)
+                
+                # Extreme safeguard against APIs returning raw lists on timeout/error
+                while isinstance(resp, list):
+                    resp = resp[0] if len(resp) > 0 else {"status": "FAILURE", "error_message": "Empty list returned"}
+                if not isinstance(resp, dict):
+                    resp = {"status": "FAILURE", "error_message": f"Unexpected type: {type(resp)}"}
+                # ---------------------
+                
                 raw_text = resp.get('text', '')
                 error_msg = resp.get('error_message', '')
                 
-                if resp['status'] == 'SUCCESS':
+                if resp.get('status') == 'SUCCESS':
                     
                     # WRAP IN TRY-EXCEPT TO CATCH INTERNAL PARSING CRASHES
                     try:

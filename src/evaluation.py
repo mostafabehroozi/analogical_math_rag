@@ -120,11 +120,17 @@ def evaluate_single_answer_with_llm(
     # print(f"      [API Context] Calling LLM for: Evaluation")
     response = api_manager.generate_content(prompt, evaluator_model, evaluator_temp)
 
+    # Unpack unexpected lists returned by API providers
+    while isinstance(response, list):
+        response = response[0] if len(response) > 0 else {"status": "FAILURE", "error_message": "Empty list returned"}
+    if not isinstance(response, dict):
+        response = {"status": "FAILURE", "error_message": f"Unexpected type: {type(response)}"}
+
     # Handle API call failures
-    if response['status'] != 'SUCCESS':
+    if response.get('status') != 'SUCCESS':
         error_msg = response.get('error_message', 'Unknown API failure')
-        logger.warning(f"LLM evaluation API call failed with status '{response['status']}': {error_msg}")
-        return {"is_correct": None, "status": f"API_{response['status']}", "error_details": response}
+        logger.warning(f"LLM evaluation API call failed with status '{response.get('status')}': {error_msg}")
+        return {"is_correct": None, "status": f"API_{response.get('status')}", "error_details": response}
 
     # Handle successful API call, but potentially malformed response
     raw_text = response.get('text', '').strip()
