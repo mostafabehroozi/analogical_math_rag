@@ -1141,6 +1141,37 @@ class BlockA:
             ground_truth_labels_dict
         )
 
+        # Report-only mode (no grouping, no LLM calls, just AP numbers)
+        if not self.config.top_ks_group:
+            result = ExperimentResult(
+                target_query_idx=self.ptu_engine.target_query_idx,
+                target_query_text=self.ptu_engine.target_query_text,
+                ground_truth_answer=self.ptu_engine.ground_truth_answer,
+                utility_calibration="Baseline",
+                evaluator_setting="Baseline",
+                scoring_strategy="Original_Retrieval",
+                weight_taker=1.0,
+                weight_maker=1.0,
+                application="Block_A_Baseline_FullList",
+                subset_size=len(original_indices),
+                selected_candidates=self.ptu_engine.candidate_indices_to_ids(original_indices),
+                selected_scores=[0.0 for _ in original_indices], 
+                selected_exemplar_ids=[],
+                selected_exemplar_texts=[],
+                selected_candidate_texts=[],
+                zero_score_fallback_triggered=False,
+                is_precalculated=True,        # <-- Skips the LLM stage entirely
+                list_ap_score=None,
+                group_pass_at_n=None,
+                ap_score_reranked=full_original_metrics['ap_original'],
+                ap_score_original=full_original_metrics['ap_original'],
+                ap_improvement=0.0,
+                candidate_coverage_rate=1.0,
+                avg_rerank_position_shift=0.0,
+            )
+            self.results.append(result)
+            return [result]
+
         for k in self.config.top_ks_group:
             if k > len(original_indices):
                 continue
@@ -1248,7 +1279,7 @@ class BlockA:
         original_indices = [i for i in range(len(self.ptu_engine.candidate_ids))]
         total_candidates = len(self.ptu_engine.candidate_ids)
         
-        # === AP SCORE FIX: Calculate AP once using the FULL Reranked list ===
+        # Calculate AP once using the FULL Reranked list
         full_ranked_candidate_ids = self.ptu_engine.candidate_indices_to_ids(ranked_indices.tolist())
         
         full_ranking_metrics = RankingMetricsCalculator.compute_all_metrics(
@@ -1257,6 +1288,40 @@ class BlockA:
             ground_truth_labels_dict
         )
         
+        # NEW: Report-only mode (no grouping, no LLM calls, just AP numbers)
+        if not self.config.top_ks_group:
+            result_full = ExperimentResult(
+                target_query_idx=self.ptu_engine.target_query_idx,
+                target_query_text=self.ptu_engine.target_query_text,
+                ground_truth_answer=self.ptu_engine.ground_truth_answer,
+                utility_calibration=utility_calibration,
+                evaluator_setting=mask_type,
+                scoring_strategy=strategy,
+                weight_taker=weight_taker,
+                weight_maker=weight_maker,
+                application=f"Block_A_FullList_{strategy}",
+                subset_size=total_candidates,
+                selected_candidates=full_ranked_candidate_ids,
+                selected_scores=[float(scores[idx]) for idx in ranked_indices.tolist()],
+                selected_exemplar_ids=[],
+                selected_exemplar_texts=[],
+                selected_candidate_texts=[],
+                zero_score_fallback_triggered=False,
+                is_precalculated=True,        # <-- Skips the LLM stage entirely
+                list_ap_score=None,
+                group_pass_at_n=None,
+                ap_score_reranked=full_ranking_metrics['ap_reranked'],
+                ap_score_original=full_ranking_metrics['ap_original'],
+                ap_improvement=full_ranking_metrics['ap_improvement'],
+                candidate_coverage_rate=1.0,
+                avg_rerank_position_shift=self.ptu_engine.compute_position_shift(
+                    original_indices, ranked_indices.tolist()
+                ),
+            )
+            results.append(result_full)
+            self.results.extend(results)
+            return results
+
         # Experiment A.2: Static Top-K Grouping
         for k in self.config.top_ks_group:
             if k > len(ranked_indices):
@@ -2340,9 +2405,12 @@ class Layer2Orchestrator:
                 ]
                 
                 # Group 6: Pass@N Metrics
+                pass_metrics = thread_data.get("pass_at_metrics", {})
                 for k in range(1, expected_n + 1):
-                    pass_k_val = thread_data.get("pass_at_metrics", {}).get(k, 0.0)
-                    row.append(round(pass_k_val, 4))
+                    if k in pass_metrics:
+                        row.append(round(pass_metrics[k], 4))
+                    else:
+                        row.append("-")
                 
                 # Group 7: AP Analysis (Block A only; "-" for others)
                 ap_reranked = thread_data.get("avg_ap_reranked")
