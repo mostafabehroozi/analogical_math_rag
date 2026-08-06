@@ -93,6 +93,7 @@ CONFIG = {
     "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_AUGMENTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_SIMPLIFICATION": "openai.gpt-oss-20b-1:0",
+    "AVALAI_REASONING_EFFORT": None,  # Options: "low", "medium", "high" (if supported)
 
     # Ollama (Local LLM) Settings
     "OLLAMA_BASE_URL": "http://127.0.0.1:11434",

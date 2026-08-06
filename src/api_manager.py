@@ -550,9 +550,16 @@ class AvalAIAPIManager(_KeyedAPIManager):
                 return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": f"No eligible AvalAI key for {model_name}.", "error_details": self.scheduler.snapshot()}
             meta = self._request_meta(lease)
             try:
-                completion = self.clients[lease.api_key].chat.completions.create(
-                    model=model_name, messages=[{"role": "user", "content": prompt}], temperature=temperature
-                )
+                kwargs = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature
+                }
+                reasoning_effort = self.config.get("AVALAI_REASONING_EFFORT")
+                if reasoning_effort:
+                    kwargs["reasoning_effort"] = reasoning_effort
+                
+                completion = self.clients[lease.api_key].chat.completions.create(**kwargs)
                 returned_model = getattr(completion, "model", None)
                 if returned_model and returned_model != model_name:
                     self.logger.debug(f"Provider returned model '{returned_model}' instead of requested '{model_name}'. Proceeding.")
