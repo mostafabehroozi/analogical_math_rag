@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
 
@@ -605,7 +605,31 @@ Ground Truth:
 {ground_truth}
 
 """,
+"evaluator_v2": """Your task is to evaluate if the final answer in 'Model Output' is equivalent to the 'Ground Truth'.
+The 'Model Output' may contain intermediate steps (Chain-of-Thought), but the 'Ground Truth' provides the exact final answer.
 
+Follow these two steps precisely:
+
+Step 1: Extract Final Answer
+Extract only the final numerical or definitive answer expression from the 'Model Output', writing "Extraction Failed" if you cannot confidently extract an answer.
+
+Step 2: Evaluate Equivalence
+- Compare your 'Extracted Model Final Answer' directly with the 'Ground Truth'.
+- If extraction failed, the evaluation must be 'false'.
+- Consider common mathematical equivalences (e.g., "1/2" vs "0.5", "1,000" vs "1000", "$5" vs "5").
+- Respond ONLY with the single word 'true' or 'false' for the evaluation.
+
+Output Format (Strictly follow this format):
+Extracted Model Final Answer: [Your extracted Final answer from Model Output]
+Evaluation: [true OR false]
+
+Model Output:
+{model_answer}
+
+Ground Truth:
+{ground_truth}
+
+""",
     "duplicate_question_check_v1": """You are a text comparison assistant. Your task is to determine if the 'Main Question' is identical to ANY of the questions in the 'Retrieved Questions' list.
 
 **Rules:**
@@ -2284,8 +2308,13 @@ def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[s
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question_text)
 
-def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any]) -> str:
-    template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
+def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any], template_name: Optional[str] = None) -> str:
+    if not template_name:
+        target_benchmark = str(config.get("TARGET_BENCHMARK", "")).lower().strip()
+        if target_benchmark in ["math500", "math_500", "math-500"]:
+            template_name = "evaluator_v2"
+        else:
+            template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(model_answer=model_answer, ground_truth=ground_truth)
 

@@ -52,22 +52,22 @@ class EvaluationResult(TypedDict):
     error_details: Optional[APIResponse]
 
 
-def _extract_last_boxed_line(solution_text: str) -> str:
+def _extract_last_boxed_line(solution_text: str) -> Tuple[str, bool]:
     """
-    Parses the NuminaMath solution to find the last line containing a '\boxed{}' answer.
-    If found, returns only that line. Otherwise, returns the original full solution.
+    Parses the solution text to find the last line containing a '\boxed{}' answer.
+    If found, returns (line.strip(), True). Otherwise, returns (original_solution, False).
     """
     if not solution_text or not isinstance(solution_text, str):
-        return solution_text
+        return solution_text, False
         
     lines = solution_text.split('\n')
     # Search backwards to find the LAST occurrence of 'boxed'
     for line in reversed(lines):
         if 'boxed' in line:
-            return line.strip()
+            return line.strip(), True
             
     # Fallback to the whole text if 'boxed' is not found
-    return solution_text
+    return solution_text, False
 
 
 def evaluate_single_answer_with_llm(
@@ -97,9 +97,24 @@ def evaluate_single_answer_with_llm(
     if not model_answer or not isinstance(model_answer, str):
         return {"is_correct": None, "status": "EMPTY_ANSWER", "error_details": None}
 
-    # Parse the boxed ground truth line if the config flag is enabled
-    if config.get("EVAL_PARSE_BOXED_GROUND_TRUTH", False):
-        ground_truth = _extract_last_boxed_line(ground_truth)
+    target_benchmark = str(config.get("TARGET_BENCHMARK", "")).lower().strip()
+    is_math500 = target_benchmark in ["math500", "math_500", "math-500"]
+
+    if is_math500:
+        # MATH500 ground truth does not have CoT; it is already the final answer.
+        # In all situations of MATH500, use evaluator_v2.
+        template_name = "evaluator_v2"
+    else:
+        # For datasets with CoT + final answer (e.g. NuminaMath, GSM8K)
+        if config.get("EVAL_PARSE_BOXED_GROUND_TRUTH", False):
+            ground_truth, parse_success = _extract_last_boxed_line(ground_truth)
+        else:
+            parse_success = False
+
+        if parse_success:
+            template_name = "evaluator_v2"
+        else:
+            template_name = "evaluator_v1"
 
     # MODIFIED: Determine which LLM model to use based on the type of the active manager
     if isinstance(api_manager, GeminiAPIManager):
@@ -115,7 +130,7 @@ def evaluate_single_answer_with_llm(
 
     # Lazy import to avoid circular dependencies
     from src.prompts import create_evaluation_prompt
-    prompt = create_evaluation_prompt(model_answer, ground_truth, config)
+    prompt = create_evaluation_prompt(model_answer, ground_truth, config, template_name=template_name)
     
     # print(f"      [API Context] Calling LLM for: Evaluation")
     response = api_manager.generate_content(prompt, evaluator_model, evaluator_temp)
