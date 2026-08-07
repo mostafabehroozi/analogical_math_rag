@@ -1448,6 +1448,45 @@ def run_experiments(
         experiment_configs = normal_configs
         if not experiment_configs:
             return all_results
+
+    # SPECIAL CASE: Transformation Dataset Construction
+    transformation_ds_configs = [
+        exp for exp in experiment_configs
+        if exp.get("APPLY_TRANSFORMATION_DATASET_CONSTRUCTION")
+    ]
+    experiment_configs = [
+        exp for exp in experiment_configs
+        if not exp.get("APPLY_TRANSFORMATION_DATASET_CONSTRUCTION")
+    ]
+
+    if transformation_ds_configs:
+        logger.info(
+            "Found %s Transformation Dataset Construction config(s); running them now.",
+            len(transformation_ds_configs),
+        )
+        from src.transformation_dataset_builder import build_transformation_dataset
+
+        for exp_overrides in transformation_ds_configs:
+            current_config = global_config.copy()
+            current_config.update(exp_overrides)
+            exp_name = current_config.get(
+                "experiment_name", "transformation_dataset_construction"
+            )
+            logger.info("--- Transformation Dataset Construction '%s' starting ---", exp_name)
+
+            ds_results = build_transformation_dataset(
+                hard_questions=hard_questions,
+                hard_solutions=hard_solutions,
+                exemplar_data=exemplar_data,
+                embedding_model=embedding_model,
+                api_managers=api_managers,
+                config=current_config,
+            )
+            all_results[exp_name] = ds_results
+            logger.info("--- Transformation Dataset Construction '%s' finished ---", exp_name)
+
+    if not experiment_configs:
+        return all_results
         
     # SPECIAL CASE: Core-Preserving Simplification Phase 1 & Phase 2
     phase1_configs = [exp for exp in experiment_configs if exp.get("APPLY_CORE_SIMP_PHASE1")]

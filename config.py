@@ -410,6 +410,20 @@ CONFIG = {
     "MERGING_DS_CCS_N": 5,                       # N attempts for calculating Correctness Consistency Score
     "MERGING_DS_TEMPERATURE": 0.7,               # Temperature for sampling multiple reasoning paths
     "MERGING_DS_OUTPUT_FILENAME": "merging_fine_tuning_dataset.json",
+
+    # --- TRANSFORMATION DATASET CONSTRUCTION FLAGS ---
+    "APPLY_TRANSFORMATION_DATASET_CONSTRUCTION": False,
+    "TRANSFORMATION_DS_TARGET_SOURCE": "hard_questions",  # "hard_questions" or "exemplar_corpus"
+    "TRANSFORMATION_DS_DETERMINISTIC": True,
+    "TRANSFORMATION_DS_RANDOM_SEED": None,
+    "TRANSFORMATION_DS_MAX_TARGETS": None,
+    "TRANSFORMATION_DS_MAX_MEMBERS": None,
+    "TRANSFORMATION_DS_N_CANDIDATES": 3,
+    "TRANSFORMATION_DS_PROMPT_TEMPLATE": "transformation_shallow-&-moderately-deep",
+    "TRANSFORMATION_DS_TEMPERATURE": 0.0,
+    "TRANSFORMATION_DS_CCS_N": 5,
+    "TRANSFORMATION_DS_SOLVER_TEMPERATURE": 1.0,
+    "TRANSFORMATION_DS_OUTPUT_FILENAME": "transformation_dataset.json",
 }
 
 # Initialize derived paths on module load (before any functions are called)
