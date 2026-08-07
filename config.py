@@ -31,12 +31,16 @@ CONFIG = {
     "API_RESPONSE_TRUNCATION_LENGTH": 70,
     # Batch execution is intentionally opt-in until quotas are configured and
     # the existing experiment has been validated with a small batch.
+    # Question-level parallelism. Applies to the standard Layer 1/2 pipeline,
+    # Core Simplification phases, and Merging dataset construction.
     "BATCH_PROCESSING_ENABLED": False,
     "BATCH_SIZE": 5,
     "BATCH_MAX_WORKERS": 5,
     "BATCH_FAILURE_POLICY": "halt_after_failed_batch",
     "BATCH_WRITE_JOURNALS": True,
     "HF_SYNC_INTERVAL_BATCHES": 1,
+    # In-question parallelism, including repeated solve/evaluate attempts in
+    # Core Simplification and independent calls in Merging workflows.
     "QUESTION_PARALLEL_API_ENABLED": False,  # Master switch: Set to True to enable parallel API calls inside a question's steps
     "QUESTION_PARALLEL_MAX_WORKERS": 3,      # Max number of concurrent API calls allowed per step (e.g., batches of 3)
     "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,

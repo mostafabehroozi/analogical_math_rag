@@ -1,16 +1,21 @@
 # src/core_simplification.py
 
 import logging
+import os
 import re
 from typing import Dict, Any, List, Tuple
+from tqdm import tqdm
 from src.prompts import (
     create_core_simp_zero_shot_prompt,
     create_core_simp_augmented_solver_prompt,
     create_final_reasoning_prompt_simple
 )
 from src.evaluation import evaluate_single_answer_with_llm
-from src.utils import create_trace_entry
+from src.utils import create_trace_entry, load_json, save_json, save_json_atomic
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
+from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
+from src.parallel_utils import run_parallel_api_calls
 
 logger = logging.getLogger(__name__)
 
@@ -58,41 +63,65 @@ def _solve_and_evaluate(
     else:
         raise TypeError(f"Unsupported API manager type for solving: {type(api_manager_solve)}")
     
-    attempts = []
+    attempts: List[str] = []
     correct_count = 0
-    
-    for i in range(n_attempts):
+
+    def run_attempt(i: int) -> Dict[str, Any]:
+        """Run one independent generation/evaluation pair."""
         resp = api_manager_solve.generate_content(prompt, model_solve, temp)
-        
-        local_trace.append(create_trace_entry(
+        trace_entry = create_trace_entry(
             "core_simplification", f"{trace_name_prefix}_attempt_{i+1}",
             {"prompt": prompt}, resp, {"model": model_solve, "temp": temp}
-        ))
-        
+        )
+
         if resp['status'] == 'SUCCESS':
             ans_text = resp['text']
-            attempts.append(ans_text)
-            
-            # On-the-fly evaluation
             eval_res = evaluate_single_answer_with_llm(ans_text, ground_truth, api_manager_eval, config)
-            if eval_res.get('status') == 'SUCCESS' and eval_res.get('is_correct'):
-                correct_count += 1
+            is_correct = bool(eval_res.get('status') == 'SUCCESS' and eval_res.get('is_correct'))
         else:
-            attempts.append(f"[GENERATION FAILED: {resp.get('error_message')}]")
-            
-        # --- NEW FEATURE: EARLY STOP IF MATHEMATICALLY IMPOSSIBLE TO BEAT BASELINE ---
+            ans_text = f"[GENERATION FAILED: {resp.get('error_message')}]"
+            is_correct = False
+
+        return {
+            "attempt_index": i,
+            "answer": ans_text,
+            "is_correct": is_correct,
+            "trace_entry": trace_entry,
+        }
+
+    parallel_enabled = bool(config.get("QUESTION_PARALLEL_API_ENABLED", False))
+    max_workers = max(1, int(config.get("QUESTION_PARALLEL_MAX_WORKERS", 3)))
+
+    # With early stopping active, submit at most one worker-sized wave at a
+    # time. This retains that optimization at wave boundaries while still
+    # parallelizing API calls inside the question.
+    wave_size = max_workers if parallel_enabled else 1
+    for wave_start in range(0, n_attempts, wave_size):
+        wave_indices = range(wave_start, min(wave_start + wave_size, n_attempts))
+        tasks = [lambda attempt_idx=i: run_attempt(attempt_idx) for i in wave_indices]
+        if parallel_enabled and len(tasks) > 1:
+            wave_results = run_parallel_api_calls(tasks, config)
+        else:
+            wave_results = [task() for task in tasks]
+
+        # Preserve attempt/trace order even when calls complete out of order.
+        for attempt_result in wave_results:
+            local_trace.append(attempt_result["trace_entry"])
+            attempts.append(attempt_result["answer"])
+            if attempt_result["is_correct"]:
+                correct_count += 1
+
+        # --- EARLY STOP IF MATHEMATICALLY IMPOSSIBLE TO BEAT BASELINE ---
         if target_correct_to_beat >= 0:
-            remaining_attempts = n_attempts - (i + 1)
+            remaining_attempts = n_attempts - len(attempts)
             max_possible_correct = correct_count + remaining_attempts
-            # If the maximum we can possibly get is less than or equal to what we need to beat...
             if max_possible_correct <= target_correct_to_beat:
                 print(f"       => [EARLY STOP] Max possible score ({max_possible_correct}/{n_attempts}) cannot beat baseline ({target_correct_to_beat}/{n_attempts}). Halting loop.")
                 break
-        # ----------------------------------------------------------------------------
-            
+
     if not attempts:
         return 0.0, attempts
-        
+
     accuracy = correct_count / n_attempts
     return accuracy, attempts
 
@@ -245,3 +274,143 @@ def run_core_simplification_phase1(
     }
     
     return result_data
+
+
+def execute_core_simplification_phase1(
+    hard_questions: List[str],
+    hard_solutions: List[str],
+    exemplar_data: Dict[str, Any],
+    api_manager_solve: Any,
+    api_manager_eval: Any,
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Build the Phase-1 donor dataset with resumable sequential or batch execution."""
+    experiment_name = config.get("experiment_name", "core_simp_phase1")
+    dataset_filename = config.get("CORE_SIMP_DATASET_NAME", "core_simp_dataset.json")
+    dataset_path = os.path.join(config["RESULTS_DIR"], dataset_filename)
+    log_file_path = os.path.join(config["RESULTS_DIR"], f"{experiment_name}_run_log.json")
+
+    successful_samples = load_json(dataset_path) or []
+    full_logs = load_json(log_file_path) or []
+    completed_indices = {
+        log.get("original_index") for log in full_logs if "original_index" in log
+    }
+
+    def resolve_ground_truth(index: int) -> Any:
+        if hard_solutions and index < len(hard_solutions):
+            return hard_solutions[index]
+        if "ground_truths" in exemplar_data and index < len(exemplar_data["ground_truths"]):
+            return exemplar_data["ground_truths"][index]
+        if (
+            "solutions" in exemplar_data
+            and len(exemplar_data["solutions"]) == len(hard_questions)
+        ):
+            return exemplar_data["solutions"][index]
+        return None
+
+    ground_truth_by_index = {
+        index: resolve_ground_truth(index)
+        for index in range(len(hard_questions))
+        if index not in completed_indices
+    }
+    ground_truth_by_index = {
+        index: ground_truth
+        for index, ground_truth in ground_truth_by_index.items()
+        if ground_truth
+    }
+    items = [
+        QuestionWorkItem(index=index, question=hard_questions[index])
+        for index in sorted(ground_truth_by_index)
+    ]
+
+    if not items:
+        logger.info(
+            "All eligible queries for Phase 1 '%s' are already processed. Skipping.",
+            experiment_name,
+        )
+        return full_logs
+
+    def run_item(item: QuestionWorkItem) -> Dict[str, Any]:
+        result = run_core_simplification_phase1(
+            target_query=item.question,
+            ground_truth=ground_truth_by_index[item.index],
+            api_manager_solve=api_manager_solve,
+            api_manager_eval=api_manager_eval,
+            config=config,
+        )
+        result["original_index"] = item.index
+        return result
+
+    if config.get("BATCH_PROCESSING_ENABLED", False):
+        # Index maps make retries idempotent if one checkpoint file was
+        # committed before an interruption.
+        unindexed_logs = [entry for entry in full_logs if "original_index" not in entry]
+        logs_by_index = {
+            entry["original_index"]: entry for entry in full_logs if "original_index" in entry
+        }
+        unindexed_samples = [
+            entry for entry in successful_samples if "original_index" not in entry
+        ]
+        samples_by_index = {
+            entry["original_index"]: entry
+            for entry in successful_samples
+            if "original_index" in entry
+        }
+
+        def ordered_logs() -> List[Dict[str, Any]]:
+            return unindexed_logs + [logs_by_index[index] for index in sorted(logs_by_index)]
+
+        def ordered_samples() -> List[Dict[str, Any]]:
+            return unindexed_samples + [
+                samples_by_index[index] for index in sorted(samples_by_index)
+            ]
+
+        def commit(
+            results: List[QuestionResult], _batch_id: str, batch_number: int
+        ) -> None:
+            for question_result in results:
+                value = question_result.value
+                value.setdefault("original_index", question_result.item.index)
+                value.setdefault("original_question", question_result.item.question)
+                logs_by_index[question_result.item.index] = value
+                if value.get("status") == "SUCCESS":
+                    samples_by_index[question_result.item.index] = value
+
+            # Save donors first. If the second write is interrupted, index-based
+            # de-duplication prevents duplicate donors when the batch is retried.
+            if not save_json_atomic(ordered_samples(), dataset_path):
+                raise RuntimeError(
+                    "Failed to commit core simplification Phase 1 donor dataset"
+                )
+            if not save_json_atomic(ordered_logs(), log_file_path):
+                raise RuntimeError("Failed to commit core simplification Phase 1 run log")
+
+            print(
+                f"\n   [MILESTONE] Total verified donors collected so far: "
+                f"{len(ordered_samples())}"
+            )
+            periodic_batch_sync_check(batch_number - 1, config)
+
+        BatchCoordinator(config, experiment_name, "core_simp_phase1").run(
+            items, run_item, commit
+        )
+        return ordered_logs()
+
+    for loop_index, item in enumerate(
+        tqdm(items, desc=f"Phase 1: {experiment_name}")
+    ):
+        result = run_item(item)
+        full_logs.append(result)
+        save_json(full_logs, log_file_path)
+
+        if result.get("status") == "SUCCESS":
+            successful_samples.append(result)
+            save_json(successful_samples, dataset_path)
+            print(
+                f"\n   [MILESTONE] Total verified donors collected so far: "
+                f"{len(successful_samples)}"
+            )
+
+        periodic_sync_check(loop_index, config)
+
+    return full_logs

@@ -813,34 +813,103 @@ def merge(
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
     
     iteration = 0
-    while len(current_texts) > target_count and len(current_texts) >= 2:
-        iteration += 1
-        logger.info(f"Merge iteration {iteration}: Merging from {len(current_texts)} samples.")
-        print(f"    -> Merging {len(current_texts)} samples down...")
-        
-        pair_to_merge = [current_texts.pop(0), current_texts.pop(0)]
-        
+    parallel_enabled = bool(config.get("QUESTION_PARALLEL_API_ENABLED", False))
+    max_workers = max(1, int(config.get("QUESTION_PARALLEL_MAX_WORKERS", 3)))
+
+    def run_merge_call(pair_to_merge: List[str], merge_iteration: int) -> Dict[str, Any]:
         prompt = create_merging_prompt(target_query, pair_to_merge)
         if "Error:" in prompt:
-            logger.error(f"Failed to create merging prompt: {prompt}")
-            failed_merges.append({"pair_to_merge": pair_to_merge, "error_info": {"error_message": "Prompt creation failed."}})
-            continue
-            
-        print(f"      [API Context] Calling LLM for: Merging (Iteration #{iteration})")
+            return {
+                "iteration": merge_iteration,
+                "pair_to_merge": pair_to_merge,
+                "prompt": prompt,
+                "response": None,
+                "prompt_error": True,
+            }
+
+        print(f"      [API Context] Calling LLM for: Merging (Iteration #{merge_iteration})")
         response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "merge", f"iteration_{iteration}",
-            {"input_pair_count": 2, "prompt": prompt},
-            response,
-            {"model": model_name, "temp": temperature}
-        ))
-        
-        if response['status'] == 'SUCCESS':
-            current_texts.append(response['text'])
+        return {
+            "iteration": merge_iteration,
+            "pair_to_merge": pair_to_merge,
+            "prompt": prompt,
+            "response": response,
+            "prompt_error": False,
+        }
+
+    while len(current_texts) > target_count and len(current_texts) >= 2:
+        logger.info(f"Merge iteration {iteration + 1}: Merging from {len(current_texts)} samples.")
+        print(f"    -> Merging {len(current_texts)} samples down...")
+
+        merges_needed = len(current_texts) - target_count
+        wave_size = min(len(current_texts) // 2, merges_needed)
+        if parallel_enabled:
+            wave_size = min(wave_size, max_workers)
         else:
-            logger.warning(f"Merging failed: {response['error_message']}. Discarding pair.")
-            failed_merges.append({"pair_to_merge": pair_to_merge, "error_info": response})
+            wave_size = 1
+
+        wave_pairs = [
+            current_texts[offset:offset + 2]
+            for offset in range(0, wave_size * 2, 2)
+        ]
+        tasks = []
+        for pair_offset, pair_to_merge in enumerate(wave_pairs, start=1):
+            merge_iteration = iteration + pair_offset
+            tasks.append(
+                lambda pair=pair_to_merge, number=merge_iteration: run_merge_call(
+                    pair, number
+                )
+            )
+
+        outcomes = run_parallel_api_calls(tasks, config)
+        iteration += len(wave_pairs)
+
+        # Apply outcomes in the same pair order as the former sequential loop.
+        # A prior failure can reach target_count early; later calls in that
+        # already-running wave are retained in the trace but not applied.
+        for outcome in outcomes:
+            if len(current_texts) <= target_count or len(current_texts) < 2:
+                response = outcome.get("response")
+                if response is not None:
+                    local_trace.append(create_trace_entry(
+                        "merge", f"iteration_{outcome['iteration']}_unused",
+                        {
+                            "input_pair_count": 2,
+                            "prompt": outcome["prompt"],
+                            "note": "Call completed but was not applied because an earlier failure reached the target count.",
+                        },
+                        response,
+                        {"model": model_name, "temp": temperature}
+                    ))
+                continue
+
+            pair_to_merge = [current_texts.pop(0), current_texts.pop(0)]
+            if outcome["prompt_error"]:
+                logger.error(f"Failed to create merging prompt: {outcome['prompt']}")
+                failed_merges.append({
+                    "pair_to_merge": pair_to_merge,
+                    "error_info": {"error_message": "Prompt creation failed."},
+                })
+                continue
+
+            response = outcome["response"]
+            local_trace.append(create_trace_entry(
+                "merge", f"iteration_{outcome['iteration']}",
+                {"input_pair_count": 2, "prompt": outcome["prompt"]},
+                response,
+                {"model": model_name, "temp": temperature}
+            ))
+
+            if response['status'] == 'SUCCESS':
+                current_texts.append(response['text'])
+            else:
+                logger.warning(
+                    f"Merging failed: {response.get('error_message')}. Discarding pair."
+                )
+                failed_merges.append({
+                    "pair_to_merge": pair_to_merge,
+                    "error_info": response,
+                })
 
     return {"status": "SUCCESS", "merged_texts": current_texts, "failed_merges": failed_merges, "trace": local_trace}
 

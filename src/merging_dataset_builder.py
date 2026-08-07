@@ -16,6 +16,7 @@ from src.prompts import (
 )
 from src.evaluation import evaluate_single_answer_with_llm
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.parallel_utils import run_parallel_api_calls
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ def process_single_question(
     model_name = _get_model_name(api_manager_solve, config)
     
     # Load specific configs
-    ccs_n = config.get("MERGING_DS_CCS_N", 5)
+    ccs_n = max(1, int(config.get("MERGING_DS_CCS_N", 5)))
     temperature = config.get("MERGING_DS_TEMPERATURE", 0.7)
     use_base_check = config.get("MERGING_DS_BASE_CHECK", True)
 
@@ -86,14 +87,57 @@ def process_single_question(
     # 1A. Calculate Few-Shot CCS
     prompt_target = create_final_reasoning_prompt(target_query, [r1_text, r2_text], config)
     
-    few_shot_correct_answers = []
-    
-    for _ in range(ccs_n):
-        resp = api_manager_solve.generate_content(prompt_target, model_name, temperature)
-        if resp['status'] == 'SUCCESS':
-            eval_res = evaluate_single_answer_with_llm(resp['text'], ground_truth, api_manager_eval, config)
-            if eval_res['is_correct']:
-                few_shot_correct_answers.append(resp['text'])
+    prompt_base = (
+        create_final_reasoning_prompt_simple(target_query, config)
+        if use_base_check
+        else None
+    )
+
+    def run_ccs_attempt(prompt: str, group: str, attempt_index: int) -> Dict[str, Any]:
+        """Run one independent generation/evaluation pair for a CCS group."""
+        resp = api_manager_solve.generate_content(prompt, model_name, temperature)
+        is_correct = False
+        if resp.get('status') == 'SUCCESS':
+            eval_res = evaluate_single_answer_with_llm(
+                resp.get('text', ''), ground_truth, api_manager_eval, config
+            )
+            is_correct = bool(
+                eval_res.get('status') == 'SUCCESS' and eval_res.get('is_correct')
+            )
+        return {
+            "group": group,
+            "attempt_index": attempt_index,
+            "response": resp,
+            "is_correct": is_correct,
+        }
+
+    # Few-shot and base CCS attempts are mutually independent. Running them in
+    # one shared task list keeps QUESTION_PARALLEL_MAX_WORKERS as the cap for
+    # the complete acceptance-check stage rather than multiplying worker pools.
+    ccs_tasks = [
+        lambda attempt_index=i: run_ccs_attempt(
+            prompt_target, "few_shot", attempt_index
+        )
+        for i in range(ccs_n)
+    ]
+    if use_base_check:
+        ccs_tasks.extend(
+            lambda attempt_index=i: run_ccs_attempt(
+                prompt_base, "base", attempt_index
+            )
+            for i in range(ccs_n)
+        )
+
+    ccs_results = run_parallel_api_calls(ccs_tasks, config)
+    few_shot_results = [
+        result for result in ccs_results if result["group"] == "few_shot"
+    ]
+    base_results = [result for result in ccs_results if result["group"] == "base"]
+    few_shot_correct_answers = [
+        result["response"].get("text", "")
+        for result in few_shot_results
+        if result["is_correct"]
+    ]
 
     few_shot_ccs = len(few_shot_correct_answers) / ccs_n
     result_log['few_shot_ccs'] = few_shot_ccs
@@ -101,16 +145,7 @@ def process_single_question(
     # 1B. Calculate Base CCS (if required)
     base_ccs = 0.0
     if use_base_check:
-        prompt_base = create_final_reasoning_prompt_simple(target_query, config)
-        base_correct_count = 0
-        
-        for _ in range(ccs_n):
-            resp = api_manager_solve.generate_content(prompt_base, model_name, temperature)
-            if resp['status'] == 'SUCCESS':
-                eval_res = evaluate_single_answer_with_llm(resp['text'], ground_truth, api_manager_eval, config)
-                if eval_res['is_correct']:
-                    base_correct_count += 1
-                    
+        base_correct_count = sum(result["is_correct"] for result in base_results)
         base_ccs = base_correct_count / ccs_n
         result_log['base_ccs'] = base_ccs
 
@@ -134,13 +169,21 @@ def process_single_question(
     # =========================================================================
     # PHASE 2: INPUT CONTEXT GENERATION (Q_R1 and Q_R2)
     # =========================================================================
-    # Generate Q_R1
+    # Q_R1 and Q_R2 have no dependency on each other, so use the same
+    # in-question parallel runner (which remains sequential when disabled).
     prompt_r1 = create_final_reasoning_prompt(target_query, [r1_text], config)
-    resp_r1 = api_manager_solve.generate_content(prompt_r1, model_name, temperature)
-    
-    # Generate Q_R2
     prompt_r2 = create_final_reasoning_prompt(target_query, [r2_text], config)
-    resp_r2 = api_manager_solve.generate_content(prompt_r2, model_name, temperature)
+    resp_r1, resp_r2 = run_parallel_api_calls(
+        [
+            lambda: api_manager_solve.generate_content(
+                prompt_r1, model_name, temperature
+            ),
+            lambda: api_manager_solve.generate_content(
+                prompt_r2, model_name, temperature
+            ),
+        ],
+        config,
+    )
 
     if resp_r1['status'] != 'SUCCESS' or resp_r2['status'] != 'SUCCESS':
         result_log['status'] = "FAILURE"
@@ -225,7 +268,33 @@ def build_merging_dataset(
             else:
                 logger.warning("Skipping index %s: No ground truth available.", original_idx)
 
-        logs_by_index = {log.get("original_index"): log for log in full_logs if "original_index" in log}
+        unindexed_logs = [log for log in full_logs if "original_index" not in log]
+        logs_by_index = {
+            log["original_index"]: log
+            for log in full_logs
+            if "original_index" in log
+        }
+        unindexed_dataset = [
+            entry
+            for entry in successful_dataset
+            if "original_index" not in entry.get("metadata", {})
+        ]
+        dataset_by_index = {
+            entry["metadata"]["original_index"]: entry
+            for entry in successful_dataset
+            if "original_index" in entry.get("metadata", {})
+        }
+
+        def ordered_logs() -> List[Dict[str, Any]]:
+            return unindexed_logs + [
+                logs_by_index[index] for index in sorted(logs_by_index)
+            ]
+
+        def ordered_dataset() -> List[Dict[str, Any]]:
+            return unindexed_dataset + [
+                dataset_by_index[index] for index in sorted(dataset_by_index)
+            ]
+
         def worker(item: QuestionWorkItem) -> Dict[str, Any]:
             result = process_single_question(
                 target_query=item.question, ground_truth=ground_truths[item.index], exemplar_data=exemplar_data,
@@ -235,21 +304,26 @@ def build_merging_dataset(
             return result
         def commit(results: List[QuestionResult], _batch_id: str, batch_number: int) -> None:
             for result in results:
-                logs_by_index[result.item.index] = result.value
                 value = result.value
+                value.setdefault("original_index", result.item.index)
+                value.setdefault("target_query", result.item.question)
+                logs_by_index[result.item.index] = value
                 if value.get("status") == "SUCCESS" and value.get("dataset_entry"):
                     entry = value["dataset_entry"]
                     entry["metadata"] = {"original_index": result.item.index, "few_shot_ccs": value.get("few_shot_ccs"), "base_ccs": value.get("base_ccs")}
-                    successful_dataset.append(entry)
-            if not save_json_atomic([logs_by_index[index] for index in sorted(logs_by_index)], log_file_path):
-                raise RuntimeError("Failed to commit merging run logs")
-            if not save_json_atomic(successful_dataset, dataset_path):
+                    dataset_by_index[result.item.index] = entry
+
+            # Save the dataset first. If the log commit is interrupted, the
+            # index map de-duplicates successful entries when that batch retries.
+            if not save_json_atomic(ordered_dataset(), dataset_path):
                 raise RuntimeError("Failed to commit merging dataset")
+            if not save_json_atomic(ordered_logs(), log_file_path):
+                raise RuntimeError("Failed to commit merging run logs")
             periodic_batch_sync_check(batch_number - 1, config)
         BatchCoordinator(config, exp_name, "merging").run(
             [QuestionWorkItem(index=index, question=query) for index, query in queries_to_process if index in ground_truths], worker, commit
         )
-        return [logs_by_index[index] for index in sorted(logs_by_index)]
+        return ordered_logs()
 
     for loop_idx, (original_idx, query) in enumerate(tqdm(queries_to_process, desc=f"Merging DS: {exp_name}")):
         

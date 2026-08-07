@@ -1460,57 +1460,31 @@ def run_experiments(
     # EXECUTE PHASE 1: Build the Donor Dataset
     if phase1_configs:
         logger.info(f"Found {len(phase1_configs)} Core Simplification Phase 1 config(s); running them now.")
-        from src.core_simplification import run_core_simplification_phase1
+        from src.core_simplification import execute_core_simplification_phase1
         
         for exp_overrides in phase1_configs:
             current_config = global_config.copy()
             current_config.update(exp_overrides)
             exp_name = current_config.get("experiment_name", "core_simp_phase1")
             
-            dataset_filename = current_config.get("CORE_SIMP_DATASET_NAME", "core_simp_dataset.json")
-            dataset_path = os.path.join(current_config['RESULTS_DIR'], dataset_filename)
-            log_file_path = os.path.join(current_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
-            
             logger.info(f"--- Core Simplification Phase 1 '{exp_name}' starting ---")
             
             solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
             eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", "gemini"))
             
+            full_logs = execute_core_simplification_phase1(
+                hard_questions=hard_questions,
+                hard_solutions=hard_solutions,
+                exemplar_data=exemplar_data,
+                api_manager_solve=solver_mgr,
+                api_manager_eval=eval_mgr,
+                config=current_config,
+            )
+
+            dataset_filename = current_config.get("CORE_SIMP_DATASET_NAME", "core_simp_dataset.json")
+            dataset_path = os.path.join(current_config['RESULTS_DIR'], dataset_filename)
             successful_samples = load_json(dataset_path) or []
-            full_logs = load_json(log_file_path) or []
-            completed_indices = {log.get('original_index') for log in full_logs if 'original_index' in log}
-            
-            # Filter out completed questions BEFORE starting the progress bar 
-            queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_indices]
-            
-            if not queries_to_process:
-                logger.info(f"All queries for Phase 1 '{exp_name}' are already processed. Skipping.")
-            else:
-                for loop_idx, (original_idx, query) in enumerate(tqdm(queries_to_process, desc=f"Phase 1: {exp_name}")):
-                    gt = None
-                    if hard_solutions and original_idx < len(hard_solutions): gt = hard_solutions[original_idx]
-                    elif 'ground_truths' in exemplar_data and original_idx < len(exemplar_data['ground_truths']): gt = exemplar_data['ground_truths'][original_idx]
-                    elif 'solutions' in exemplar_data and len(exemplar_data['solutions']) == len(hard_questions): gt = exemplar_data['solutions'][original_idx]
-                        
-                    if not gt:
-                        continue
-                        
-                    res = run_core_simplification_phase1(
-                        target_query=query, ground_truth=gt,
-                        api_manager_solve=solver_mgr, api_manager_eval=eval_mgr, config=current_config
-                    )
-                    
-                    res['original_index'] = original_idx
-                    full_logs.append(res)
-                    save_json(full_logs, log_file_path)
-                    
-                    if res.get('status') == 'SUCCESS':
-                        successful_samples.append(res)
-                        save_json(successful_samples, dataset_path)
-                        print(f"\n   🌟 [MILESTONE] Total verified donors collected so far: {len(successful_samples)}")
-                        
-                    periodic_sync_check(loop_idx, current_config)
-                
+
             all_results[exp_name] = full_logs
             logger.info(f"--- Phase 1 '{exp_name}' finished. Saved {len(successful_samples)} verified samples. ---")
 

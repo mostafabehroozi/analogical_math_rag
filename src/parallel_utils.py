@@ -5,6 +5,7 @@ Utility for running independent API calls in parallel batches within a single qu
 This respects the existing RPM limits and retry logic by simply wrapping the calls.
 """
 import concurrent.futures
+import contextvars
 from typing import Any, Callable, Dict, List
 
 # --- FIX: Import the custom thread-aware logger! ---
@@ -28,7 +29,7 @@ def run_parallel_api_calls(tasks: List[Callable[[], Any]], config: Dict[str, Any
     total_batches = (len(tasks) + max_workers - 1) // max_workers
     
     # FIX: Use tprint so it attaches the [Q#] context tag and saves to the log file!
-    tprint(f"    🚀 [PARALLEL] Starting {len(tasks)} API calls in {total_batches} batch(es) (Max Workers: {max_workers})", level="INFO")
+    tprint(f"    [PARALLEL] Starting {len(tasks)} API calls in {total_batches} batch(es) (Max Workers: {max_workers})", level="INFO")
     
     # Split tasks into chunks based on max_workers
     for batch_num, i in enumerate(range(0, len(tasks), max_workers), start=1):
@@ -38,8 +39,11 @@ def run_parallel_api_calls(tasks: List[Callable[[], Any]], config: Dict[str, Any
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch_tasks)) as executor:
             
             # Submit tasks and map each future back to its original index
+            # ThreadPoolExecutor does not propagate contextvars automatically.
+            # Copy the current question/batch context into every API-call worker
+            # so nested parallelism keeps accurate logs and API metadata.
             future_to_index = {
-                executor.submit(task): batch_idx 
+                executor.submit(contextvars.copy_context().run, task): batch_idx
                 for batch_idx, task in enumerate(batch_tasks)
             }
             
@@ -56,6 +60,6 @@ def run_parallel_api_calls(tasks: List[Callable[[], Any]], config: Dict[str, Any
                     raise RuntimeError(f"A parallel task crashed unexpectedly: {exc}") from exc
                     
         # FIX: Use tprint here too!
-        tprint(f"    ✅ [PARALLEL] Batch {batch_num}/{total_batches} completed. All {len(batch_tasks)} calls returned.", level="INFO")
+        tprint(f"    [PARALLEL] Batch {batch_num}/{total_batches} completed. All {len(batch_tasks)} calls returned.", level="INFO")
         
     return all_results
