@@ -559,6 +559,16 @@ class AvalAIAPIManager(_KeyedAPIManager):
                 if reasoning_effort:
                     kwargs["reasoning_effort"] = reasoning_effort
                 
+                enable_thinking = self.config.get("AVALAI_ENABLE_THINKING")
+                if enable_thinking is None:
+                    enable_thinking = self.config.get("AVALAI_CHAT_TEMPLATE_KWARGS_ENABLE_THINKING")
+                if enable_thinking is not None:
+                    kwargs["extra_body"] = {
+                        "chat_template_kwargs": {
+                            "enable_thinking": enable_thinking
+                        }
+                    }
+                
                 completion = self.clients[lease.api_key].chat.completions.create(**kwargs)
                 returned_model = getattr(completion, "model", None)
                 if returned_model and returned_model != model_name:

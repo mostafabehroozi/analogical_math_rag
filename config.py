@@ -98,6 +98,7 @@ CONFIG = {
     "AVALAI_MODEL_NAME_AUGMENTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_SIMPLIFICATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_REASONING_EFFORT": None,  # Options: "low", "medium", "high" (if supported)
+    "AVALAI_ENABLE_THINKING": None,  # Options: None (default), True, False (controls chat_template_kwargs enable_thinking in extra_body)
 
     # Ollama (Local LLM) Settings
     "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
