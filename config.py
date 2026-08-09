@@ -245,31 +245,6 @@ CONFIG = {
     "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL": False,  # Use mirror evaluation to score candidates
     "BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS": 3,  # Quick validation attempts per candidate
 
-    
-    "APPLY_MULTIBRANCH_TRANSFORMATION": False,  # Master control flag
-    
-    # Branch Control: Which scenarios to execute
-    "RUN_TX1_BASELINE": False,          # Scenario 1: Single transformation baseline
-    "RUN_BOT_N_ONLY": True,            # Scenario 2: Best-of-N (exclusive)
-    "RUN_BOT_N_PLUS_R": True,          # Scenario 3: Best-of-N+R (inclusive)
-    
-    # Centralized Pool Configuration
-    "MULTIBRANCH_N_TRANSFORMATIONS": 3,                    # N: number of transformations
-    "MULTIBRANCH_TRANSFORMATION_TEMPLATE": "transformation_shallow-&-moderately-deep",
-    "MULTIBRANCH_TRANSFORMATION_TEMPERATURE": 0.0,         # Temperature for transformation step
-    
-    # Unified Scoring Configuration
-    "MULTIBRANCH_ENABLE_MIRROR_SCORING": True,            # Use mirror-style evaluation
-    "MULTIBRANCH_MIRROR_SCORING_ATTEMPTS": 3,             # Attempts per candidate scoring
-    
-    # Deterministic Tie-Breaking
-    "MULTIBRANCH_TIEBREAK_FAVOR_ORIGINAL": True,          # On ties, prefer R_main (safety principle)
-    "MULTIBRANCH_TIEBREAK_EPSILON": 1e-6,                # Threshold for considering scores "tied"
-    
-    # Solver Configuration (per branch)
-    "MULTIBRANCH_SOLVER_TEMPERATURE": 1.0,                # Temperature for final solving
-    "MULTIBRANCH_SOLVER_ATTEMPTS_PER_BRANCH": 3,          # Pass@K attempts per branch
-    
 # Pass@N & Evaluation
     "N_PASS_ATTEMPTS": 3,
     "APPLY_FULL_PIPELINE_RETRY": False,
@@ -296,14 +271,6 @@ CONFIG = {
         "experimental_blocks": ["Block_A", "Block_B", "Block_C"],
         "scoring_strategies": ["Candidate_Centric", "Evaluator_Centric"]
     },
-
-    "APPLY_DATASET_CONSTRUCTION": False,
-    "DATASET_CONSTRUCTION_MAX_SEARCH": 1000,    # how many random queries to examine
-    "DATASET_CONSTRUCTION_MAX_MEMBERS": 100,    # stop when this many valid entries are gathered
-    "DATASET_CONSTRUCTION_RANDOM_SEED": None,   # seed for reproducibility (optional)
-    "DATASET_CONSTRUCTION_PROMPT_TEMPLATE": None,  # overrides PROMPT_TEMPLATE_FINAL_SOLVER
-    "DATASET_CONSTRUCTION_SOLVER_TEMPERATURE": 1.0,
-    "DATASET_CONSTRUCTION_EVALUATOR_TEMPERATURE": 0.0,
 
     # Prompt Templates
     "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",

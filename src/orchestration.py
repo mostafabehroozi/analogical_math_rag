@@ -68,7 +68,6 @@ from src.pipeline_steps import (
     select_best_transformations
 )
 
-from src.multibranch_transformation import multibranch_transformation_experiment
 from src.layer1_base_execution import (
     run_layer1_base_execution, 
     _save_cached_state, 
@@ -94,6 +93,22 @@ def safe_thread_print(*args, **kwargs):
     tprint(message, level="INFO")
 
 print = safe_thread_print
+
+
+_REMOVED_FEATURE_FLAGS = {
+    "APPLY_MULTIBRANCH_TRANSFORMATION": "Multi-Branch Transformation experiment",
+    "APPLY_DATASET_CONSTRUCTION": "legacy validated two-shot dataset construction",
+}
+
+
+def _reject_removed_feature_flags(config: Dict[str, Any]) -> None:
+    """Fail clearly when a configuration tries to enable a removed feature."""
+    for flag_name, feature_name in _REMOVED_FEATURE_FLAGS.items():
+        if config.get(flag_name):
+            raise ValueError(
+                f"{flag_name}=True requests the removed {feature_name}. "
+                "Remove this stale activation from the configuration."
+            )
 
 
 def run_pipeline_for_single_query(
@@ -123,6 +138,7 @@ def run_pipeline_for_single_query(
                                         Useful for surgical/manual retries where you want fresh Layer 1 data.
                                         Can also be set via CONFIG['FORCE_LAYER1_REEXECUTION'].
     """
+    _reject_removed_feature_flags(config)
     logger = logging.getLogger(__name__)
     
     # --- Log Initialization ---
@@ -174,11 +190,6 @@ def run_pipeline_for_single_query(
                     # Best-of-Transformation Flags
                     "APPLY_BEST_OF_TRANSFORMATION", "BEST_OF_TRANSFORMATION_N_SAMPLES",
                     "BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE", "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL",
-                    # Multi-Branch Transformation Flags
-                    "APPLY_MULTIBRANCH_TRANSFORMATION", "RUN_TX1_BASELINE", "RUN_BOT_N_ONLY",
-                    "RUN_BOT_N_PLUS_R", "MULTIBRANCH_N_TRANSFORMATIONS",
-                    "MULTIBRANCH_TRANSFORMATION_TEMPLATE", "MULTIBRANCH_ENABLE_MIRROR_SCORING",
-                    "MULTIBRANCH_SOLVER_ATTEMPTS_PER_BRANCH", "MULTIBRANCH_TIEBREAK_FAVOR_ORIGINAL",
                     # NEW: Unified Mirror Re-Ranking Flags
                     "APPLY_MIRROR_RERANKING", "MIRROR_RERANKING_APPLY_AFTER",
                     "MIRROR_RERANKING_N_OPTIMIZATION", "MIRROR_RERANKING_ENABLE_R0",
@@ -300,165 +311,6 @@ def run_pipeline_for_single_query(
             
             # Otherwise, continue with the main pipeline (if LAYER1_ONLY_MODE is False)
             logger.info(f"Layer 1 completed. Status: {layer1_state.get('overall_status')}. Proceeding with main pipeline.")
-
-    # MULTI-BRANCH TRANSFORMATION EXPERIMENTS 
-    if config.get('APPLY_MULTIBRANCH_TRANSFORMATION', False):
-        print("\n[PRE-PROCESSING] MULTI-BRANCH TRANSFORMATION EXPERIMENTS ENABLED")
-        print("  Architecture: Centralized pool with three parallel selection strategies")
-        print("  Scenarios: Tx1 | BoT-N | BoT-N+R")
-        
-        # Step 1: Retrieve initial samples
-        if config.get('USE_RETRIEVAL', True):
-            retrieval_result = retrieve(
-                target_query, embedding_model,
-                exemplar_data['questions'], exemplar_data['embeddings'],
-                top_k=config.get('TOP_N_CANDIDATES_RETRIEVAL', 3),
-                question_to_index_map=exemplar_data.get('question_to_index')
-            )
-            
-            if 'trace' in retrieval_result:
-                run_log['execution_trace'].extend(retrieval_result.pop('trace'))
-            
-            if retrieval_result['status'] == 'SUCCESS':
-                retrieved_indices = retrieval_result['retrieved_indices']
-                
-                # Step 2: Run multi-branch transformation experiment
-                multibranch_result = multibranch_transformation_experiment(
-                    target_query=target_query,
-                    retrieved_indices=retrieved_indices,
-                    exemplar_data=exemplar_data,
-                    api_manager_adapt=manager_for_adapt,
-                    api_manager_solve=manager_for_solve,
-                    api_manager_eval=manager_for_eval,
-                    config=config
-                )
-                
-                if 'trace' in multibranch_result:
-                    run_log['execution_trace'].extend(multibranch_result.pop('trace'))
-                
-                run_log['steps_alternatives']['multibranch_transformation'] = multibranch_result
-                
-                if multibranch_result['status'] == 'SUCCESS':
-                    # Store results
-                    evaluation_contexts = multibranch_result.get('evaluation_contexts', {})
-                    telemetry = multibranch_result.get('telemetry', {})
-                    
-                    run_log['multibranch_evaluation_contexts'] = evaluation_contexts
-                    run_log['multibranch_telemetry'] = telemetry
-                    
-                    logger.info(
-                        f"Multi-branch transformation experiment completed successfully. "
-                        f"Branches enabled: {telemetry.get('branches_enabled', {})}"
-                    )
-                    
-                    # Log selection summaries per branch
-                    selections = telemetry.get('selections', {})
-                    for sample_idx, selection_data in selections.items():
-                        logger.info(
-                            f"  Sample #{sample_idx}: Pool size={selection_data.get('pool_size', 'N/A')}, "
-                            f"BoT-N→idx {selection_data.get('bot_n_idx', 'N/A')}, "
-                            f"BoT-N+R→idx {selection_data.get('bot_n_plus_r_idx', 'N/A')} "
-                            f"({selection_data.get('bot_n_plus_r_source', 'N/A')})"
-                        )
-                    
-                    # Set up downstream pipeline with multi-branch contexts
-                    # The solve step will iterate over contexts and generate solutions for each
-                    print("  [STATUS] Multi-branch contexts prepared for downstream solving")
-                    print(f"  [CONTEXTS] Branches enabled: {telemetry.get('branches_enabled', {})}")
-                    
-                    # Early return if we're only doing multi-branch (no standard pipeline after)
-                    if config.get('DEFER_SOLVE_STEP', False):
-                        logger.info("Deferred solve mode: Intermediate steps completed, solve will run later")
-                        run_log['pipeline_status'] = "INTERMEDIATE_COMPLETE"
-                        return run_log
-                    
-                    # Otherwise, proceed to extract and aggregate solutions from each context
-                    logger.info("Starting solution aggregation for multi-branch contexts...")
-                    
-                    # === EXTRACT & AGGREGATE SOLUTIONS FROM ALL BRANCHES ===
-                    generated_answers = {}
-                    multibranch_branch_solutions = {}
-                    
-                    for branch_name, context in evaluation_contexts.items():
-                        branch_scenario = context.get('scenario', 'unknown')
-                        branch_selections = context.get('selections', {})
-                        branch_solutions_raw = context.get('solutions', {})
-                        intervention_rate = context.get('intervention_rate', None)
-                        
-                        # Flatten solutions: {retrieved_idx: [sol1, sol2, ...]} → [sol1, sol2, ...]
-                        all_solutions = []
-                        for retrieved_idx in sorted(branch_selections.keys()):
-                            solutions_for_sample = branch_solutions_raw.get(retrieved_idx, [])
-                            if isinstance(solutions_for_sample, list):
-                                all_solutions.extend(solutions_for_sample)
-                            else:
-                                all_solutions.append(solutions_for_sample)
-                        
-                        # Store aggregated solutions for this branch
-                        generated_answers[branch_name] = all_solutions
-                        multibranch_branch_solutions[branch_name] = {
-                            "scenario": branch_scenario,
-                            "solution_attempts": all_solutions,
-                            "num_samples": len(branch_selections),
-                            "intervention_rate": intervention_rate,
-                            "selections": branch_selections
-                        }
-                        
-                        logger.info(
-                            f"Branch '{branch_name}' ({branch_scenario}): "
-                            f"Extracted {len(all_solutions)} solutions from {len(branch_selections)} samples"
-                        )
-                    
-                    # Store results in run_log
-                    run_log['multibranch_generated_answers'] = generated_answers
-                    run_log['multibranch_branch_solutions'] = multibranch_branch_solutions
-                    
-                    logger.info(
-                        f"Solution aggregation complete. "
-                        f"Branches processed: {list(generated_answers.keys())}"
-                    )
-                    
-
-                    # OPTIONAL: Set primary solving results to the strongest branch (bot_n_plus_r)
-                    # This allows downstream evaluation to work transparently
-                    if 'bot_n_plus_r' in generated_answers:
-                        primary_solutions = generated_answers['bot_n_plus_r']
-                        primary_branch = 'bot_n_plus_r'
-                    elif 'bot_n' in generated_answers:
-                        primary_solutions = generated_answers['bot_n']
-                        primary_branch = 'bot_n'
-                    elif 'tx1' in generated_answers:
-                        primary_solutions = generated_answers['tx1']
-                        primary_branch = 'tx1'
-                    else:
-                        primary_solutions = []
-                        primary_branch = None
-                    
-                    # Populate the location the evaluator expects
-                    run_log['steps']['solving'] = {
-                        "status": "SUCCESS" if primary_solutions else "FAILURE",
-                        "solution_attempts": primary_solutions
-                    }
-                    run_log['llm_final_solution_attempts_texts'] = primary_solutions
-                    run_log['multibranch_primary_branch'] = primary_branch
-                    
-                    logger.info(
-                        f"Set primary solutions from branch '{primary_branch}': "
-                        f"{len(primary_solutions)} solution attempts"
-                    )
-                    
-                else:
-                    logger.error(f"Multi-branch transformation failed: {multibranch_result.get('phase_failed', 'unknown phase')}")
-                    run_log['pipeline_status'] = "FAILURE"
-                    return run_log
-            else:
-                logger.error("Retrieval failed, cannot run multi-branch transformation")
-                run_log['pipeline_status'] = "FAILURE"
-                return run_log
-        else:
-            logger.warning("USE_RETRIEVAL is False, cannot apply multi-branch transformation")
-            run_log['pipeline_status'] = "FAILURE"
-            return run_log
 
     # BEST-OF-TRANSFORMATION Pre-processing (Enhancement to best-of-N) 
     if config.get('APPLY_BEST_OF_TRANSFORMATION', False):
@@ -1416,37 +1268,14 @@ def run_experiments(
     """
     logger = logging.getLogger(__name__)
     all_results = {}
+
+    for exp_overrides in experiment_configs:
+        effective_config = global_config.copy()
+        effective_config.update(exp_overrides)
+        _reject_removed_feature_flags(effective_config)
     
     # ADDED THIS LINE TO MAKE THE SAFEGUARD WORK 
     global_config['hard_questions_length'] = len(hard_questions)
-
-    # special case: dataset construction experiments 
-    dataset_configs = [exp for exp in experiment_configs if exp.get("APPLY_DATASET_CONSTRUCTION")]
-    normal_configs = [exp for exp in experiment_configs if not exp.get("APPLY_DATASET_CONSTRUCTION")]
-
-    if dataset_configs:
-        logger.info(f"Found {len(dataset_configs)} dataset construction config(s); running them first.")
-        from src.dataset_builder import construct_two_shot_dataset
-        for exp_overrides in dataset_configs:
-            current_config = global_config.copy()
-            current_config.update(exp_overrides)
-            exp_name = current_config.get("experiment_name", "dataset_construction")
-            logger.info(f"--- Dataset experiment '{exp_name}' starting ---")
-            solver_mgr = api_managers.get(current_config.get("API_PROVIDER_SOLVER", "gemini"))
-            eval_mgr = api_managers.get(current_config.get("API_PROVIDER_EVALUATOR", current_config.get("API_PROVIDER_SOLVER", "gemini")))
-            ds_result = construct_two_shot_dataset(
-                exemplar_data=exemplar_data,
-                embedding_model=embedding_model,
-                api_manager_solver=solver_mgr,
-                api_manager_eval=eval_mgr,
-                config=current_config
-            )
-            all_results[exp_name] = ds_result
-            logger.info(f"--- Dataset experiment '{exp_name}' finished ---")
-        # replace list for the remaining pipeline with the normal ones
-        experiment_configs = normal_configs
-        if not experiment_configs:
-            return all_results
 
     # SPECIAL CASE: Transformation Dataset Construction
     transformation_ds_configs = [
