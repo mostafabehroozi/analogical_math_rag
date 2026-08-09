@@ -1386,21 +1386,6 @@ Simplified Question:
 </Output Format>
 """,
 
-    "mirror_baseline_zero_shot_v1_old": """You are an expert mathematician. Solve the following problem step-by-step.
-
-<Main Question to Solve>
-{question}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Formal step-by-step derivation]
-
-Final Answer:
-[Your final answer]
-</Your Answer/Output Format>
-""",
-
     "mirror_baseline_zero_shot_v1": """Objective:
 Your task is to solve the Main Question by generating a clear, step-by-step Rationale and the Final Answer.
 
@@ -1424,29 +1409,6 @@ Main Question:
 Your Solution:
 """,
 
-
-    "mirror_hypothesis_gen_v1_old": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
-
-<True Solved Example>
-question:
-{exemplar_question}
-
-Solution:
-{exemplar_solution}
-</True Solved Example>
-
-<Main Question to Solve>
-{target_query}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Your step-by-step rationale for the Main Question]
-
-Final Answer:
-[Your final answer to the Main Question]
-</Your  Answer/Output Format>
-""",
 
     "mirror_hypothesis_gen_v1": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
@@ -1488,29 +1450,6 @@ Rationale:
 Final Answer:
 [Your final answer] 
 </Your Answer/Output Format>
-""",
-
-    "mirror_verification_v1_old": """You are an expert mathematician. Use the provided True Solved Example to solve the new problem.
-
-<True Solved Example>
-question:
-{hypothesis_question}
-
-Solution:
-{hypothesis_solution}
-</True Solved Example>
-
-<Main Question to Solve>
-{validation_question}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Your step-by-step rationale for the Main Question]
-
-Final Answer:
-[Your final answer to the Main Question]
-</Your  Answer/Output Format>
 """,
 
     "mirror_verification_v1": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
@@ -2343,30 +2282,6 @@ def create_augmentation_with_solution_prompt(main_question: str, generated_solut
     return template.format(main_question_text=main_question, generated_solution=generated_solution, n_samples=n_samples)
 
 
-def create_mirror_baseline_prompt(question: str, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt to solve a retrieved sample zero-shot (Phase 0: Baseline).
-    """
-    template_name = config.get("PROMPT_TEMPLATE_MIRROR_BASELINE", "mirror_baseline_zero_shot_v1")
-    if template_name not in PROMPT_TEMPLATES:
-        return f"Error: Template {template_name} not found."
-    template = PROMPT_TEMPLATES[template_name]
-    return template.format(question=question)
-
-def create_mirror_hypothesis_prompt(target_query: str, exemplar_question: str, exemplar_solution: str, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt to solve the Target Query using a retrieved sample as a 1-shot exemplar (Phase 1).
-    """
-    template_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS", "mirror_hypothesis_gen_v1")
-    if template_name not in PROMPT_TEMPLATES:
-        return f"Error: Template {template_name} not found."
-    template = PROMPT_TEMPLATES[template_name]
-    return template.format(
-        target_query=target_query,
-        exemplar_question=exemplar_question,
-        exemplar_solution=exemplar_solution
-    )
-
 def create_mirror_hypothesis_zeroshot_prompt(target_query: str, config: Dict[str, Any]) -> str:
     """
     Creates a prompt to solve the Target Query zero-shot (for the R0 candidate).
@@ -2376,21 +2291,6 @@ def create_mirror_hypothesis_zeroshot_prompt(target_query: str, config: Dict[str
         return f"Error: Template {template_name} not found."
     template = PROMPT_TEMPLATES[template_name]
     return template.format(target_query=target_query)
-
-def create_mirror_verification_prompt(validation_question: str, hypothesis_question: str, hypothesis_solution: str, config: Dict[str, Any]) -> str:
-    """
-    Creates a prompt to solve an original retrieved sample using the generated Hypothesis as a 1-shot exemplar (Phase 2: Mirroring).
-    """
-    template_name = config.get("PROMPT_TEMPLATE_MIRROR_VERIFICATION", "mirror_verification_v1")
-    if template_name not in PROMPT_TEMPLATES:
-        return f"Error: Template {template_name} not found."
-    template = PROMPT_TEMPLATES[template_name]
-    return template.format(
-        validation_question=validation_question,
-        hypothesis_question=hypothesis_question,
-        hypothesis_solution=hypothesis_solution
-    )
-
 
 def create_core_simp_zero_shot_prompt(original_question: str) -> str:
     template = PROMPT_TEMPLATES["core_simplification_zero_shot_v1"]

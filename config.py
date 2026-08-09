@@ -21,9 +21,7 @@ CONFIG = {
     "OFFLINE_MODE": True,  # Set to False for Kaggle/online execution
     
     # Logging & Control
-    "VERBOSE_LOGGING": True,
     "PRINT_API_CALL_DETAILS": True,  
-    "PRINT_API_TIMING_CHECKPOINTS": True,
     "ENABLE_API_RETRY": True,          
     "MAX_API_RETRIES": 200,              
     "API_RETRY_DELAY_SECONDS": 20.0,
@@ -126,9 +124,6 @@ CONFIG = {
     # === HuggingFace Paths (used when downloading) ===
     "EMBEDDING_MODEL_PATH_HF": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',
     "EXEMPLAR_CORPUS_NAME_HF": "AI-MO/NuminaMath-CoT",
-    "EXEMPLAR_CORPUS_HF_TOKEN": None,
-    "EXEMPLAR_EMBEDDINGS_HF_REPO_ID": "mostafabehroozi/embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath",
-    "EXEMPLAR_EMBEDDINGS_HF_FILENAME": "embeddings.npy",
     
     # === Local Paths (used when running offline) ===
     "EMBEDDING_MODEL_PATH": 'math-similarity/Bert-MLM_arXiv-MP-class_zbMath',  # Will be updated in notebook
@@ -145,25 +140,18 @@ CONFIG = {
 
     # Pipeline Control Flags
     "USE_RETRIEVAL": True,
-    "PIPELINE_SEQUENCE": ["retrieve", "adapt", "merge", "solve"],
     "DEFER_SOLVE_STEP": False,
     "TOP_N_CANDIDATES_RETRIEVAL": 1,
-    "FINAL_K_SELECTION_ADAPTATION": 1,
     "TARGET_ADAPTED_SAMPLES_MERGING": 1,
 
     # --- Reverse Transformation Flags ---
     "APPLY_REVERSE_TRANSFORMATION": False,  
-    "REVERSE_TRANSFORMATION_ORDER": "after_retrieve",  # "after_retrieve" or "after_adapt"
-    "REVERSE_TRANSFORMATION_COMBINED_WITH_ADAPT": "sequential",  # "sequential", "integrated", or "replace_adapt"
-    "REVERSE_TRANSFORMATION_USE_TRANSFORMED_R": True,  # Use transformed R when other steps are combined with reverse transformation
     "REVERSE_TRANSFORMATION_TEMPERATURE": 0.3,  # Temperature for transformation step
     "REVERSE_TRANSFORMATION_SOLVER_TEMPERATURE": 1.0,  # Temperature for solving transformed questions
-    "REVERSE_TRANSFORMATION_FINAL_SOLVER_TEMPLATE": "reverse_transformation_final_solve",  # Template for final solve
     "REVERSE_TRANSFORMATION_SKIP_MERGE": True,  # Skip merge step when reverse transformation is used (since RT provides complete solution)
 
     # Adaptation Steps
     "APPLY_NORMALIZATION": False,
-    "APPLY_TRANSFORMATION": False,
     "APPLY_TRANSFORMATION_1": False,
     "APPLY_TRANSFORMATION_2": False,
     "APPLY_TRANSFORMATION_3": False,
@@ -176,7 +164,6 @@ CONFIG = {
 
     # Analogical Adaptation
     "APPLY_ANALOGICAL_ADAPTATION": False,
-    "ANALOGICAL_ADAPTATION_SAMPLING_N": 3,
 
     # Augmentation & Selection
     "APPLY_SELF_SAMPLING_AUGMENTATION": False,
@@ -195,18 +182,12 @@ CONFIG = {
     "CONSISTENCY_LAYER_1_TEMPERATURE": 1.0,
     "CONSISTENCY_SAMPLES_PER_PATHWAY_N": 3,
     "CONSISTENCY_LAYER_2_TEMPERATURE": 1.0,
-    "CONSISTENCY_VOTING_THRESHOLD": 0.6,
 
     "APPLY_GROUP_CONSISTENCY_SELECTION": False,
 
     "GROUP_CONSISTENCY_CANDIDATES": [(0,), (0, 1), (0, 1, 2)],
 
     "GROUP_CONSISTENCY_SAMPLES_N": 10,
-
-    # These legacy scoring flags can be ignored or set to None as we are 
-    # now doing independent Pass@K benchmarking, not internal voting.
-    "CONSISTENCY_SCORING_METHOD": "benchmark_report", 
-    "SEMANTIC_CONSISTENCY_WEIGHT": 0.0,
 
     # Hierarchical Augmentation 
     "APPLY_HIERARCHICAL_AUGMENTATION": False,
@@ -240,7 +221,6 @@ CONFIG = {
 
     "APPLY_BEST_OF_TRANSFORMATION": False,
     "BEST_OF_TRANSFORMATION_N_SAMPLES": 3,  # N: transformations per retrieved sample
-    "BEST_OF_TRANSFORMATION_ATTEMPTS_PER_TRANSFORMATION": 1,  # M: candidate attempts per transformation
     "BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE": "transformation_shallow-&-moderately-deep",
     "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL": False,  # Use mirror evaluation to score candidates
     "BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS": 3,  # Quick validation attempts per candidate
@@ -273,15 +253,10 @@ CONFIG = {
     },
 
     # Prompt Templates
-    "PROMPT_TEMPLATE_NORMALIZATION": "standardization_v1",
-    "PROMPT_TEMPLATE_STANDARDIZATION": "standardization_v1",
-    
-    "PROMPT_TEMPLATE_TRANSFORMATION": "transformation_v1",
     "PROMPT_TEMPLATE_TRANSFORMATION_1": "transformation_shallow",
     "PROMPT_TEMPLATE_TRANSFORMATION_2": "transformation_shallow-&-moderately-deep",
     "PROMPT_TEMPLATE_TRANSFORMATION_3": "transformation_complete",
     
-    "PROMPT_TEMPLATE_MERGING": "merging_v1",
     "PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v2",
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
@@ -289,7 +264,6 @@ CONFIG = {
     "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator",
     "PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR": "self_sampling_augmentor_v1",
     "PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION": "analogical_adaptation_v1",
-    "PROMPT_TEMPLATE_CONSISTENCY_SOLVER": "analogical_adaptation_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER": "analogical_adaptation_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_BASELINE": "mirror_baseline_zero_shot_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_ZERO_SHOT_SOLVER": "final_solver_simple_v1",
@@ -305,11 +279,6 @@ CONFIG = {
     "PROMPT_TEMPLATE_SIMPLIFICATION_GENERATOR": "simplification_generator_v1",
     "PROMPT_TEMPLATE_SIMPLIFIED_SAMPLE_SOLVER": "simplified_sample_solver_v1",
     "PROMPT_TEMPLATE_SIMPLIFIED_MAIN_PROXY_SOLVER": "main_from_simplified_proxy_v1",
-
-    # Reverse Transformation Prompts
-    "PROMPT_TEMPLATE_REVERSE_TRANSFORMATION_MAIN_TO_EXEMPLAR": "reverse_transformation_main_to_exemplar",
-    "PROMPT_TEMPLATE_REVERSE_TRANSFORMATION_SOLVE_TRANSFORMED": "reverse_transformation_solve_transformed",
-    "PROMPT_TEMPLATE_REVERSE_TRANSFORMATION_FINAL_SOLVE": "reverse_transformation_final_solve",
 
     # Hugging Face Hub
     "PERSIST_RESULTS_ONLINE": True,
@@ -389,20 +358,6 @@ CONFIG = {
     "TRANSFORMATION_DS_OUTPUT_FILENAME": "transformation_dataset.json",
 }
 
-# Initialize derived paths on module load (before any functions are called)
-def _initialize_derived_paths():
-    """Internal function to initialize derived paths when module is loaded."""
-    CONFIG["LOCAL_EMBEDDING_MODEL_PATH"] = os.path.join(CONFIG["DATA_DIR"], "Bert-MLM_arXiv-MP-class_zbMath")
-    CONFIG["LOCAL_EXEMPLAR_CORPUS_PATH"] = os.path.join(CONFIG["DATA_DIR"], "NuminaMath-CoT")
-    CONFIG["HARD_QUESTIONS_INDICES_PATH"] = os.path.join(CONFIG["DATA_DIR"], "hard_question_indices.json")
-    CONFIG["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"] = os.path.join(CONFIG["EMBEDDINGS_DIR"], 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy')
-    CONFIG["ADVANCED_RAG_FULL_LOG_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_pipeline_full_log.json")
-    CONFIG["ADVANCED_RAG_EVALUATION_RESULTS_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_evaluation_results.pkl")
-    CONFIG["LAYER1_CACHE_DIR"] = CONFIG["RESULTS_DIR"]
-
-_initialize_derived_paths()
-
-
 def rebuild_derived_paths():
     """
     Rebuilds all derived paths based on current CONFIG directory settings.
@@ -419,6 +374,10 @@ def rebuild_derived_paths():
     CONFIG["ADVANCED_RAG_FULL_LOG_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_pipeline_full_log.json")
     CONFIG["ADVANCED_RAG_EVALUATION_RESULTS_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_evaluation_results.pkl")
     CONFIG["LAYER1_CACHE_DIR"] = CONFIG["RESULTS_DIR"]
+
+
+# Initialize derived paths on module load.
+rebuild_derived_paths()
 
 
 def setup_directories():
