@@ -162,7 +162,7 @@ def run_core_simplification_phase1(
     print(f"  -> [Step A] Running Baseline Control (N={n_attempts})...")
     base_prompt = create_final_reasoning_prompt_simple(target_query, config)
     
-    base_score, base_attempts = _solve_and_evaluate(
+    base_score, _ = _solve_and_evaluate(
         target_query, ground_truth, base_prompt, 
         api_manager_solve, api_manager_eval, config, 
         n_attempts, temp_solve, "baseline_solve", local_trace
@@ -242,7 +242,7 @@ def run_core_simplification_phase1(
     # Calculate exactly how many correct answers we need to beat the baseline
     base_correct_count = int(base_score * n_attempts)
     
-    aug_score, aug_attempts = _solve_and_evaluate(
+    aug_score, _ = _solve_and_evaluate(
         target_query, ground_truth, aug_prompt, 
         api_manager_solve, api_manager_eval, config, 
         n_attempts, temp_solve, "augmented_solve", local_trace,

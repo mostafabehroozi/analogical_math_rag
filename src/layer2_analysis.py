@@ -554,7 +554,7 @@ class PTUMathEngine:
             )
         
         # Populate the matrix
-        for cand_idx, candidate in enumerate(self.candidate_set):
+        for cand_idx, _ in enumerate(self.candidate_set):
             if cand_idx >= self.n_candidates:
                 raise RuntimeError(
                     f"PTU matrix computation failed: Candidate index {cand_idx} exceeds "
@@ -562,7 +562,7 @@ class PTUMathEngine:
                 )
             
             cand_id = self.candidate_ids[cand_idx]
-            for eval_idx, evaluator in enumerate(self.retrieved_set):
+            for eval_idx, _ in enumerate(self.retrieved_set):
                 if eval_idx >= self.n_evaluators:
                     raise RuntimeError(
                         f"PTU matrix computation failed: Evaluator index {eval_idx} exceeds "
@@ -938,7 +938,7 @@ class ActiveInferenceEngine:
             max_retries = 3
             backoff = 2.0
             
-            for attempt in range(max_retries):
+            for _ in range(max_retries):
                 resp = self.api_manager_solve.generate_content(prompt, self.model_name, temp)
                 
                 # Extreme safeguard against APIs returning raw lists on timeout/error
@@ -2016,7 +2016,7 @@ class ThreadAggregator:
         block_order = {"Block_Zero": 0, "Block_A": 1, "Block_B": 2, "Block_C": 3}
         
         def sort_key(item):
-            thread_name, data = item
+            _, data = item
             calib_idx = calib_order.get(data.get("calibration"), 2)
             mask_idx = mask_order.get(data["mask"], 3)
             block_idx = block_order.get(data["block"], 3)
@@ -2350,7 +2350,8 @@ class Layer2Orchestrator:
         """
         Generate and save the comprehensive analysis CSV with AP metrics, ranking metrics, and hierarchical organization.
         """
-        csv_filename = f"layer2_comprehensive_analysis_{self.config.layer2_config_name}.csv"
+        if csv_filename is None:
+            csv_filename = f"layer2_comprehensive_analysis_{self.config.layer2_config_name}.csv"
 
         comprehensive_data = self.generate_comprehensive_report()
         csv_filepath = os.path.join(self.output_dir, csv_filename)
@@ -2377,7 +2378,7 @@ class Layer2Orchestrator:
         headers.extend(["AP_Score_Reranked", "AP_Score_Original", "AP_Improvement"])
         
         # Group 9: Additional Analysis
-        headers.extend(["Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Avg_Boundary_Encapsulation", "Avg_Rerank_Position_Shift"])
+        headers.extend(["Fallback_Rate", "Candidate_Coverage_Rate", "Avg_Rerank_Position_Shift", "Avg_Boundary_Encapsulation"])
         
         # Write to CSV (Atomically)
         temp_csv_filepath = csv_filepath + ".tmp"
@@ -2386,7 +2387,7 @@ class Layer2Orchestrator:
             writer.writerow(headers)
             
             # Data rows (already sorted hierarchically)
-            for thread_name, thread_data in comprehensive_data.items():
+            for _, thread_data in comprehensive_data.items():
                 row = [
                     # Group 1: Configuration Identity
                     thread_data.get("calibration", ""),

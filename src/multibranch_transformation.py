@@ -137,7 +137,7 @@ def _build_centralized_candidate_pool(
     
     pools_per_sample = {}
     
-    for sample_idx, retrieved_idx in enumerate(retrieved_indices):
+    for retrieved_idx in retrieved_indices:
         original_q = exemplar_data['questions'][retrieved_idx]
         original_sol = exemplar_data['solutions'][retrieved_idx]
         original_combined = f"Question: {original_q}\nSolution: {original_sol}"
