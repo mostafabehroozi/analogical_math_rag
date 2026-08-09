@@ -26,7 +26,6 @@ Key Design Principles:
 
 import logging
 import os
-import json
 import csv
 import pickle
 import numpy as np
@@ -37,16 +36,15 @@ from datetime import datetime
 from collections import defaultdict
 import concurrent.futures
 
-from src.utils import save_json, load_json, convert_numpy_for_json
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.utils import save_json
+from src.api_manager import GeminiAPIManager, AvalAIAPIManager
 from src.evaluation import evaluate_single_answer_with_llm
 from src.hf_sync import periodic_sync_check
 from src.parallel_utils import run_parallel_api_calls
 from tqdm import tqdm
-from src.prompts import create_final_reasoning_prompt, create_final_reasoning_prompt_simple, EXEMPLAR_FORMAT, PROMPT_TEMPLATES
+from src.prompts import create_final_reasoning_prompt, create_final_reasoning_prompt_simple, PROMPT_TEMPLATES
 from config import CONFIG as GLOBAL_CONFIG
 import threading
-import concurrent.futures
 
 logger = logging.getLogger(__name__)
 
@@ -1673,14 +1671,14 @@ class BlockC:
         
         Implements Bypass & Fallback:
         - If np.max(ptu_matrix) <= threshold: bypass complex coverage logic
-        - Fallback to first K_fallback candidates in original order
+        - Keep all retrieved one-shot candidates in their original order
         """
         results = []
         threshold = self.config.activation_threshold
         
         # CHECK FOR ZERO-SCORE FALLBACK CONDITION 
         max_ptu_value = np.max(ptu_matrix) if ptu_matrix.size > 0 else 0.0
-        zero_score_fallback_triggered = (max_ptu_value <= threshold)
+        zero_score_fallback_triggered = bool(max_ptu_value <= threshold)
         
         if zero_score_fallback_triggered:
             # FALLBACK PATH: Bypass complex coverage logic
@@ -1691,7 +1689,7 @@ class BlockC:
             logger.info(
                 f"Block C - {mask_type} {perspective} (ZERO-SCORE FALLBACK): "
                 f"Max PTU = {max_ptu_value:.4f} <= {threshold:.4f}, "
-                f"Using first {k_fallback} candidates in original order"
+                f"Using {subset_size} retrieved one-shot candidates in original order"
             )
         else:
             # ===== NORMAL PATH: Execute coverage logic =====
@@ -2073,14 +2071,14 @@ class Layer2Orchestrator:
         
         # RUN ORIGINAL BASELINE EXACTLY ONCE PER QUESTION
         if self.config.run_block_A and getattr(self.config, 'run_block_A_baseline', False):
-            logger.info(f"\n[BLOCK A BASELINE] Executing Original Retrieval Baseline")
+            logger.info("\n[BLOCK A BASELINE] Executing Original Retrieval Baseline")
             block_a_baseline = BlockA(ptu_engine, self.config)
             baseline_results = block_a_baseline.run_original_baseline()
             query_results.extend(baseline_results)
 
         # RUN ZERO-SHOT BASELINE EXACTLY ONCE PER QUESTION
         if getattr(self.config, 'run_block_zero_baseline', False):
-            logger.info(f"\n[BLOCK ZERO BASELINE] Executing Zero-Shot Baseline")
+            logger.info("\n[BLOCK ZERO BASELINE] Executing Zero-Shot Baseline")
             block_zero = BlockZero(ptu_engine, self.config)
             query_results.extend(block_zero.run_baseline())
 
@@ -2497,7 +2495,7 @@ def run_layer2_experiments(
     pending_count = len(pending_states)
     
     print("\n" + "="*60)
-    print(f"🚀 STARTING LAYER 2 ANALYSIS")
+    print("🚀 STARTING LAYER 2 ANALYSIS")
     print(f"Total questions: {total_queries} | Already done: {total_queries - pending_count} | Remaining: {pending_count}")
     print("="*60)
     

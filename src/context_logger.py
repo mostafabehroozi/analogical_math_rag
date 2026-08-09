@@ -14,9 +14,6 @@ ctx_batch_id = contextvars.ContextVar('ctx_batch_id', default="N/A")
 
 
 # 2. CONTEXT MANAGER (How threads put their nametags on)
-# We will use this in orchestration.py later.
-import contextlib
-
 @contextlib.contextmanager
 def pipeline_context(query_idx=None, batch_id=None, batch=None, **kwargs):
     """

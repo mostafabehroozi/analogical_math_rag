@@ -171,7 +171,7 @@ def run_core_simplification_phase1(
 
     # --- NEW FEATURE: EARLY EXIT FOR PERFECT BASELINE ---
     if base_score >= 1.0:
-        print(f"     => [EARLY EXIT] Baseline is already perfect (1.0). Skipping simplification to save API costs.")
+        print("     => [EARLY EXIT] Baseline is already perfect (1.0). Skipping simplification to save API costs.")
         return {
             "status": "SKIPPED_PERFECT_BASELINE", 
             "base_score": base_score,
@@ -181,7 +181,7 @@ def run_core_simplification_phase1(
         }
 
     # STEP B: Proxy Generation & Failsafe Check
-    print(f"  -> [Step B] Generating Proxy Question...")
+    print("  -> [Step B] Generating Proxy Question...")
     gen_prompt = create_core_simp_zero_shot_prompt(target_query)
     
     gen_resp = api_manager_solve.generate_content(gen_prompt, model_gen, temp_gen)
@@ -208,7 +208,7 @@ def run_core_simplification_phase1(
     def clean_text(t): return re.sub(r'\W+', '', t.lower())
     
     if clean_text(proxy_q) == clean_text(target_query):
-        print(f"     => [FAILSAFE TRIGGERED] Model returned identical question. Aborting.")
+        print("     => [FAILSAFE TRIGGERED] Model returned identical question. Aborting.")
         return {"status": "SKIPPED_FAILSAFE", "trace": local_trace}
     # ------------------------------------------------------
         
@@ -217,7 +217,7 @@ def run_core_simplification_phase1(
     # ---------------------------------------------------------
     # STEP C: Solve the Proxy
     # ---------------------------------------------------------
-    print(f"  -> [Step C] Solving the Proxy Question...")
+    print("  -> [Step C] Solving the Proxy Question...")
     proxy_solve_prompt = create_final_reasoning_prompt_simple(proxy_q, config)
     
     # We only need 1 good attempt for the proxy solution to use as context

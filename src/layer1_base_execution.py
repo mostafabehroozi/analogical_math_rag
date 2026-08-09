@@ -25,13 +25,12 @@ Key Design Principles:
 
 import logging
 import os
-import json
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import concurrent.futures 
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.api_manager import GeminiAPIManager, AvalAIAPIManager
 from src.utils import save_json, load_json, create_trace_entry
 from src.parallel_utils import run_parallel_api_calls
 from src.pipeline_steps import (
@@ -803,7 +802,7 @@ def run_layer1_base_execution(
     print(f"Query: {target_query[:80]}...")
     print(f"Experiment: {experiment_name}")
     if force_reexecution:
-        print(f"🔄 FORCE REEXECUTION MODE - Bypassing cache")
+        print("🔄 FORCE REEXECUTION MODE - Bypassing cache")
     print(f"{'='*80}")
     
     logger.info(f"[Layer 1] Starting base execution for Query #{target_query_index} (Experiment: {experiment_name})")
@@ -939,7 +938,7 @@ def run_layer1_base_execution(
     # Save Step D results
     layer1_state["step_statuses"]["cross_evaluation"] = cross_eval_result["status"]
     layer1_state["cross_evaluation_matrix"] = cross_eval_result.get("cross_evaluation_matrix", {})
-    print(f"  ✓ Step D: Cross-evaluation complete.")
+    print("  ✓ Step D: Cross-evaluation complete.")
 
     # Save Step E results
     layer1_state["step_statuses"]["ground_truth_evaluation"] = gt_result["status"]

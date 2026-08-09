@@ -87,17 +87,6 @@ def construct_two_shot_dataset(
         solver_model = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER")
     solver_temp = config.get("DATASET_CONSTRUCTION_SOLVER_TEMPERATURE", config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE"))
 
-    # evaluator selections
-    if isinstance(api_manager_eval, GeminiAPIManager):
-        eval_model = config.get("GEMINI_MODEL_NAME_EVALUATOR")
-    elif isinstance(api_manager_eval, AvalAIAPIManager):
-        eval_model = config.get("AVALAI_MODEL_NAME_EVALUATOR")
-    elif isinstance(api_manager_eval, OllamaAPIManager):
-        eval_model = config.get("OLLAMA_MODEL_NAME_EVALUATOR")
-    else:
-        eval_model = config.get("GEMINI_MODEL_NAME_EVALUATOR")
-    eval_temp = config.get("DATASET_CONSTRUCTION_EVALUATOR_TEMPERATURE", config.get("DEFAULT_EVALUATOR_TEMPERATURE"))
-
     questions: List[str] = exemplar_data.get("questions", [])
     solutions: List[str] = exemplar_data.get("solutions", [])
     embeddings = exemplar_data.get("embeddings")

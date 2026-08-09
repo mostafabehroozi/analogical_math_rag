@@ -152,7 +152,7 @@ def run_parallel_evaluation_branches(
     local_trace = []
     results = {"test_idx": test_item["test_idx"], "donor_idx": test_item["linked_donor_original_idx"]}
     
-    print(f"\n" + "="*70)
+    print("\n" + "="*70)
     print(f"  [LAYER 2] Evaluating Test Q#{test_item['test_idx']} (Linked to Donor #{test_item['linked_donor_original_idx']})")
     print("="*70)
 
@@ -192,7 +192,7 @@ def run_parallel_evaluation_branches(
         if resp_gen['status'] != 'SUCCESS':
             is_fallback = True
             fallback_reason = "API_FAILED"
-            print(f"     => Proxy generation API failed. Triggering Fallback.")
+            print("     => Proxy generation API failed. Triggering Fallback.")
         else:
             parsed = _parse_simplification_trace(resp_gen['text'])
             proxy_q = parsed.get("proxy_question", "")
@@ -203,12 +203,12 @@ def run_parallel_evaluation_branches(
             if not proxy_q or clean_text(proxy_q) == clean_text(t_q):
                 is_fallback = True
                 fallback_reason = "FAILSAFE_IDENTICAL_OR_EMPTY"
-                print(f"     => Failsafe triggered or parsing failed. Triggering Fallback.")
+                print("     => Failsafe triggered or parsing failed. Triggering Fallback.")
                 
             # === CONVERGENCE OPTIMIZATION ===
             elif match_proxy and clean_text(proxy_q) == clean_text(match_proxy):
-                print(f"     => [CONVERGENCE] Branch generated the exact same proxy as a previous branch!")
-                print(f"     => Recycling previous solve and evaluation results to save API costs.")
+                print("     => [CONVERGENCE] Branch generated the exact same proxy as a previous branch!")
+                print("     => Recycling previous solve and evaluation results to save API costs.")
                 local_trace.append({
                     "step": "layer2", 
                     "sub_step": f"{branch_name}_convergence", 
@@ -220,7 +220,7 @@ def run_parallel_evaluation_branches(
 
             # === NEW: BIDIRECTIONAL MIRROR FILTER (Steps 4 & 5) ===
             elif config.get("CORE_SIMP_ENABLE_MIRROR_FILTER", False) and "Few-Shot" in branch_name:
-                print(f"     => [Mirror Filter] Verifying analogical symmetry (Test B -> Donor A)...")
+                print("     => [Mirror Filter] Verifying analogical symmetry (Test B -> Donor A)...")
                 
                 # A. Inverted Demo Creation
                 inverted_demo = f"Original Question:\n{t_q}\n\nSimplified Question:\n{proxy_q}"
@@ -231,7 +231,7 @@ def run_parallel_evaluation_branches(
                 local_trace.append(create_trace_entry("layer2", f"{branch_name}_mirror_gen", {"prompt": prompt_mirror_gen}, resp_mirror_gen, {"model": m_gen}))
                 
                 if resp_mirror_gen['status'] != 'SUCCESS':
-                    print(f"        -> Mirror generation failed. Rejecting.")
+                    print("        -> Mirror generation failed. Rejecting.")
                     is_fallback = True
                     fallback_reason = "REJECTED_MIRROR_GEN_FAIL"
                 else:
@@ -244,7 +244,7 @@ def run_parallel_evaluation_branches(
                     local_trace.append(create_trace_entry("layer2", f"{branch_name}_mirror_solve", {"prompt": prompt_mirror_solve}, resp_mirror_solve, {"model": m_solve}))
                     
                     if resp_mirror_solve['status'] != 'SUCCESS' or not resp_mirror_solve['text'].strip():
-                        print(f"        -> Mirror solve failed. Rejecting.")
+                        print("        -> Mirror solve failed. Rejecting.")
                         is_fallback = True
                         fallback_reason = "REJECTED_MIRROR_SOLVE_FAIL"
                     else:
@@ -264,12 +264,12 @@ def run_parallel_evaluation_branches(
                         # E. The Filter Gate
                         print(f"        -> CCS_mirrored(A) = {ccs_mirrored:.2f} | CCS_base(A) = {d_base_score:.2f}")
                         if ccs_mirrored <= d_base_score:
-                            print(f"     => [Mirror Filter] REJECTED. Symmetry broken (CCS_m <= CCS_b). Falling back to Branch A.")
+                            print("     => [Mirror Filter] REJECTED. Symmetry broken (CCS_m <= CCS_b). Falling back to Branch A.")
                             local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_mirror_filter", "note": f"Rejected: {ccs_mirrored:.2f} <= {d_base_score:.2f}"})
                             is_fallback = True
                             fallback_reason = "REJECTED_BY_MIRROR_FILTER"
                         else:
-                            print(f"     => [Mirror Filter] PASSED! Analogical symmetry confirmed.")
+                            print("     => [Mirror Filter] PASSED! Analogical symmetry confirmed.")
                             local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_mirror_filter", "note": f"Passed: {ccs_mirrored:.2f} > {d_base_score:.2f}"})
             # ========================================================
 
@@ -277,12 +277,12 @@ def run_parallel_evaluation_branches(
         if is_fallback:
             if attempts_a:
                 # OPTIMIZATION: Branch A ran, recycle its results
-                print(f"     => Re-using Branch A baseline results to save API costs.")
+                print("     => Re-using Branch A baseline results to save API costs.")
                 local_trace.append({"step": "layer2", "sub_step": f"{branch_name}_fallback_solve", "note": f"Recycled Branch A results due to: {fallback_reason}"})
                 return score_a, attempts_a, resp_gen.get('text', 'API_FAILED'), fallback_reason, proxy_q
             else:
                 # SAFEGUARD: Branch A was OFF. We must perform a fresh baseline solve.
-                print(f"     => Branch A was OFF. Performing a fresh direct solve for fallback...")
+                print("     => Branch A was OFF. Performing a fresh direct solve for fallback...")
                 prompt_fallback = create_final_reasoning_prompt_simple(t_q, config)
                 fb_score, fb_attempts = _solve_and_evaluate(
                     t_q, t_gt, prompt_fallback, api_manager_solve, api_manager_eval, config,
@@ -422,7 +422,7 @@ def execute_core_simplification_phase2(
     tests_to_process = [item for item in test_suite if item['test_idx'] not in completed_test_indices]
     
     if not tests_to_process:
-        logger.info(f"All test items for Phase 2 are already processed. Skipping.")
+        logger.info("All test items for Phase 2 are already processed. Skipping.")
         return all_results
 
     if config.get("BATCH_PROCESSING_ENABLED", False):

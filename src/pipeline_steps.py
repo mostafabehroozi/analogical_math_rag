@@ -6,19 +6,13 @@ import numpy as np
 import uuid
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Union, Tuple, Optional
+from typing import List, Dict, Any, Union, Optional
 import time
 from collections import deque
-from src.evaluation import evaluate_single_answer_with_llm
 import threading
-from src.prompts import PROMPT_TEMPLATES
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
-from src.utils import create_trace_entry
-from src.evaluation import evaluate_single_answer_with_llm
-from src.prompts import PROMPT_TEMPLATES
 
-from config import CONFIG
 from src.prompts import (
+    PROMPT_TEMPLATES,
     EXEMPLAR_FORMAT,
     create_normalization_prompt,
     create_transformation_prompt,
@@ -37,22 +31,13 @@ from src.prompts import (
     create_augmentation_with_solution_prompt,
     create_reverse_transformation_main_to_exemplar_prompt,
     create_reverse_transformation_solve_transformed_prompt,
-    create_reverse_transformation_final_solve_prompt
+    create_reverse_transformation_final_solve_prompt,
+    create_mirror_hypothesis_zeroshot_prompt,
 )
-from src.utils import save_json, load_json, create_trace_entry
-from src.hf_sync import periodic_sync_check
+from src.utils import create_trace_entry
 from src.parallel_utils import run_parallel_api_calls
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.evaluation import evaluate_single_answer_with_llm
-from collections import defaultdict
-from src.prompts import (
-    create_mirror_baseline_prompt,
-    create_mirror_hypothesis_prompt,
-    create_mirror_hypothesis_zeroshot_prompt,
-    create_mirror_verification_prompt,
-    create_evaluation_prompt,
-    EXEMPLAR_FORMAT
-)
 # Global cache for embedding norms to massively speed up retrieval and save RAM
 _NORMS_CACHE = {}
 # Protects local PyTorch and Numpy resources from being overwhelmed by batch threads
@@ -115,7 +100,6 @@ def retrieve(
     
     local_trace = []
     
-    current_diag_time = time.time() 
     indent_level = 3
     
     print(f"{'  '*indent_level}--- STARTING DETAILED RETRIEVAL DIAGNOSTICS ---")
@@ -126,7 +110,7 @@ def retrieve(
 
     query_embedding_start_time = time.time()
     query_embedding = _generate_embeddings([target_query], embedding_model)
-    current_diag_time = log_time_diagnostic("Generate query embedding", query_embedding_start_time, indent=indent_level)
+    log_time_diagnostic("Generate query embedding", query_embedding_start_time, indent=indent_level)
     print(f"{'  '*indent_level}Query embedding shape: {query_embedding.shape}")
     
     if query_embedding.size == 0:
@@ -157,7 +141,7 @@ def retrieve(
                 _NORMS_CACHE[arr_id] = np.maximum(norms, 1e-10).astype(np.float32)
                 
             similarities = dot_prods / _NORMS_CACHE[arr_id]
-        current_diag_time = log_time_diagnostic("Calculate cosine_similarity", cosine_similarity_start_time, indent=indent_level)
+        log_time_diagnostic("Calculate cosine_similarity", cosine_similarity_start_time, indent=indent_level)
         print(f"{'  '*indent_level}Similarities array shape: {similarities.shape}")
         
         self_match_start_time = time.time()
@@ -173,11 +157,11 @@ def retrieve(
             print(f"{'  '*indent_level}Warning: question_to_index_map not provided. Skipping self-match check.")
             logger.warning("retrieve() called without question_to_index_map. Self-match detection skipped.")
 
-        current_diag_time = log_time_diagnostic("Handle self-match (O(1) lookup)", self_match_start_time, indent=indent_level)
+        log_time_diagnostic("Handle self-match (O(1) lookup)", self_match_start_time, indent=indent_level)
 
         k_retrieve_start_time = time.time()
         k_to_retrieve = min(top_k, len(similarities))
-        current_diag_time = log_time_diagnostic("Determine k_to_retrieve", k_retrieve_start_time, indent=indent_level)
+        log_time_diagnostic("Determine k_to_retrieve", k_retrieve_start_time, indent=indent_level)
         print(f"{'  '*indent_level}Effective k_to_retrieve: {k_to_retrieve}")
 
         print(f"{'  '*indent_level}Starting granular timing for top-k selection...")
@@ -186,14 +170,14 @@ def retrieve(
         print(f"{'  '*indent_level}  Calling np.argpartition on similarities array (shape: {similarities.shape}) for k={k_to_retrieve}...")
         
         partitioned_indices = np.argpartition(similarities, -k_to_retrieve)
-        current_diag_time = log_time_diagnostic("np.argpartition (full array)", argpartition_start_time, indent=indent_level)
+        log_time_diagnostic("np.argpartition (full array)", argpartition_start_time, indent=indent_level)
         print(f"{'  '*indent_level}  Resulting partitioned_indices shape: {partitioned_indices.shape}")
 
         slice_partitioned_start_time = time.time()
         print(f"{'  '*indent_level}  Slicing to get the top {k_to_retrieve} indices from partitioned_indices...")
         
         top_k_indices_unsorted = partitioned_indices[-k_to_retrieve:]
-        current_diag_time = log_time_diagnostic("Slicing partitioned indices", slice_partitioned_start_time, indent=indent_level)
+        log_time_diagnostic("Slicing partitioned indices", slice_partitioned_start_time, indent=indent_level)
         print(f"{'  '*indent_level}  top_k_indices_unsorted shape: {top_k_indices_unsorted.shape}, Content (first 5): {top_k_indices_unsorted[:5]}...")
 
         argsort_slice_start_time = time.time()
@@ -207,7 +191,7 @@ def retrieve(
         top_k_indices = top_k_indices_unsorted[sorted_order_in_slice]
     # --- LOCKED BLOCK ENDS HERE ---
 
-    current_diag_time = log_time_diagnostic("np.argsort & final sort (on small slice)", argsort_slice_start_time, indent=indent_level)
+    log_time_diagnostic("np.argsort & final sort (on small slice)", argsort_slice_start_time, indent=indent_level)
     print(f"{'  '*indent_level}  Final top_k_indices shape: {top_k_indices.shape}, Content: {top_k_indices.tolist()}")
     print(f"{'  '*indent_level}--- ENDING DETAILED RETRIEVAL DIAGNOSTICS ---")
 
@@ -241,7 +225,6 @@ def _calculate_baseline_difficulty(
     Phase 0: Calculates S_base for each retrieved sample (Zero-Shot).
     Returns a dict mapping {index: baseline_score}.
     """
-    logger = logging.getLogger(__name__)
     n_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
     
     # Determine Model Name
@@ -317,8 +300,6 @@ def _generate_hypotheses(
     Phase 1: Generates a Hypothesis (H) for the target query using each candidate.
     Returns a dict mapping {candidate_index: hypothesis_text}.
     """
-    logger = logging.getLogger(__name__)
-    
     if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
     elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
     elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
@@ -338,7 +319,6 @@ def _generate_hypotheses(
             # R0: Zero-Shot
             prompt = None
             try:
-                from src.prompts import create_mirror_hypothesis_zeroshot_prompt
                 prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
             except Exception:
                 pass
@@ -404,7 +384,6 @@ def _evaluate_mirror_consistency(
     Phase 2: Mirror Evaluation (Backward Pass).
     Tests if the Hypothesis (H) can solve the Validation Samples (R_val).
     """
-    logger = logging.getLogger(__name__)
     n_mirror = config.get("MIRROR_N_OPTIMIZATION", 3)
     
     # Determine Model Name
@@ -633,7 +612,7 @@ def simplify_retrieved_samples(
         
         new_exemplar_text = f"Question: {simple_q}\nRationale and Answer: {simple_solution}"
         successful_simplifications.append(new_exemplar_text)
-        print(f"      -> Success. New simplified exemplar created.")
+        print("      -> Success. New simplified exemplar created.")
 
     status = "SUCCESS" if successful_simplifications else "FAILURE"
     if successful_simplifications and failed_indices: status = "PARTIAL_SUCCESS"
@@ -1038,7 +1017,7 @@ def solve_via_main_simplification(
         model_simp = config.get('OLLAMA_MODEL_NAME_SIMPLIFICATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
         model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
     else:
-        raise TypeError(f"Unsupported API manager type.")
+        raise TypeError("Unsupported API manager type.")
 
     temp_simp = config.get("DEFAULT_SIMPLIFICATION_TEMPERATURE", 0.3)
     temp_solve = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
@@ -1349,7 +1328,7 @@ def augment_question(
         step1_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = step1_template
         
         prompt_s1 = create_final_reasoning_prompt_simple(target_query, step1_config)
-        print(f"    -> [Augment Step 1] Solving base question...")
+        print("    -> [Augment Step 1] Solving base question...")
         resp_s1 = api_manager.generate_content(prompt_s1, model_name, temperature)
         
         local_trace.append(create_trace_entry(
@@ -1364,7 +1343,7 @@ def augment_question(
 
         # Step 2: Augment using Context
         prompt_s2 = create_augmentation_with_solution_prompt(target_query, solution_text, n_augmentations, config)
-        print(f"    -> [Augment Step 2] Generating simplified question using solution context...")
+        print("    -> [Augment Step 2] Generating simplified question using solution context...")
         response = api_manager.generate_content(prompt_s2, model_name, temperature)
         
         local_trace.append(create_trace_entry(
@@ -1923,7 +1902,7 @@ def apply_mirror_reranking(
     logger.info(f"Starting unified mirror re-ranking for {len(indices_to_rerank)} samples")
     
     print(f"\n{'='*80}")
-    print(f"  [MIRROR RE-RANKING] Unified Analogical Consistency Re-Ranking")
+    print("  [MIRROR RE-RANKING] Unified Analogical Consistency Re-Ranking")
     print(f"  Input: {len(indices_to_rerank)} samples | Target Query: {target_query[:60]}...")
     print(f"{'='*80}")
     
@@ -2026,7 +2005,7 @@ def apply_mirror_reranking(
             candidate_scores[cand_idx] = total_utility
             candidate_contributions[cand_idx] = contribs
         
-        logger.info(f"Candidate utility scores calculated")
+        logger.info("Candidate utility scores calculated")
         for cand_idx in active_candidates:
             logger.info(f"  Index {cand_idx}: utility={candidate_scores[cand_idx]:.3f}")
         
@@ -2090,6 +2069,15 @@ def solve_with_parallel_benchmarking(
     """
     strategies = config.get("GROUP_CONSISTENCY_CANDIDATES", [(0,)]) # Default to 1-shot
     n_samples = config.get("GROUP_CONSISTENCY_SAMPLES_N", 1)
+
+    if isinstance(api_manager, GeminiAPIManager):
+        model_name = config["GEMINI_MODEL_NAME_FINAL_SOLVER"]
+    elif isinstance(api_manager, AvalAIAPIManager):
+        model_name = config["AVALAI_MODEL_NAME_FINAL_SOLVER"]
+    elif isinstance(api_manager, OllamaAPIManager):
+        model_name = config["OLLAMA_MODEL_NAME_FINAL_SOLVER"]
+    else:
+        raise TypeError(f"Unsupported solver API manager: {type(api_manager).__name__}")
     
     benchmark_results = {}
     
@@ -2112,16 +2100,6 @@ def solve_with_parallel_benchmarking(
         if not valid_strategy:
             print(f"   [Benchmark] Skipping {strategy_name} (Not enough retrieved samples)")
             continue
-
-        examples_block = ""
-        for i, idx in enumerate(current_indices):
-            ex_q = exemplar_data[idx]['question']
-            ex_a = exemplar_data[idx]['solution']
-            # Format using standard exemplar format
-            examples_block += f"<Example {i+1}>\nQuestion: {ex_q}\nRationale and Answer: {ex_a}\n</Example {i+1}>\n\n"
-            
-
-        from src.prompts import create_final_reasoning_prompt
 
         formatted_examples = [
              f"Question: {exemplar_data[idx]['question']}\nRationale and Answer: {exemplar_data[idx]['solution']}"
@@ -2725,8 +2703,8 @@ def solve_with_analogical_consistency(
     
     # NEW FALLBACK LOGIC 
     if enable_baseline_check and best_candidate_stat['consistency_score'] <= 0.0:
-        print(f"\n  [Selection] ALL candidates failed to beat the baseline on all validators.")
-        print(f"  [Selection] Triggering FALLBACK to Candidate #1.")
+        print("\n  [Selection] ALL candidates failed to beat the baseline on all validators.")
+        print("  [Selection] Triggering FALLBACK to Candidate #1.")
         selected_text = candidates[0]
         selected_score = 0.0
     else:
@@ -2827,8 +2805,8 @@ def select_best_transformations(
     logger.info(f"Starting Best-of-Transformation with centralized pool for {len(retrieved_indices)} retrieved samples")
     
     print(f"\n{'='*80}")
-    print(f"  [BEST-OF-TRANSFORMATION] Centralized Candidate Pool Architecture")
-    print(f"  Phase 1: Pool Construction | Phase 2: Unified Scoring | Phase 3: Selection")
+    print("  [BEST-OF-TRANSFORMATION] Centralized Candidate Pool Architecture")
+    print("  Phase 1: Pool Construction | Phase 2: Unified Scoring | Phase 3: Selection")
     print(f"{'='*80}")
     
     local_trace = []
@@ -2878,7 +2856,7 @@ def select_best_transformations(
         print(f"  Original Q: {original_q[:60]}...")
         
         # PHASE 1: CENTRALIZED POOL CONSTRUCTION
-        print(f"  [PHASE 1] Building centralized candidate pool...")
+        print("  [PHASE 1] Building centralized candidate pool...")
         
         pool = []
         
@@ -2934,7 +2912,7 @@ def select_best_transformations(
         print(f"  Pool size: {pool_size} (1 original + {n_transformations} transformations)")
         
         # PHASE 2: UNIFIED MIRROR SCORING (ONCE PER POOL)
-        print(f"  [PHASE 2] Running unified mirror scoring over entire pool...")
+        print("  [PHASE 2] Running unified mirror scoring over entire pool...")
         
         scores = []
         candidate_texts = []
@@ -3003,7 +2981,7 @@ def select_best_transformations(
         print(f"  Scored all {len(pool)} candidates: {scores}")
         
         # PHASE 3: DETERMINISTIC SELECTION WITH TIE-BREAKING
-        print(f"  [PHASE 3] Applying deterministic selection with tie-breaking...")
+        print("  [PHASE 3] Applying deterministic selection with tie-breaking...")
         
         best_idx = argmax_tiebreak(scores)
         best_candidate = pool[best_idx]
@@ -3037,7 +3015,7 @@ def select_best_transformations(
     
     # BUILD OUTPUT
     print(f"\n{'='*80}")
-    print(f"  [BEST-OF-TRANSFORMATION] Centralized Pool Processing Complete")
+    print("  [BEST-OF-TRANSFORMATION] Centralized Pool Processing Complete")
     print(f"  Total Retrieved Samples: {len(retrieved_indices)}")
     print(f"  Total Transformations Generated: {len(retrieved_indices) * n_transformations}")
     print(f"  Total Candidates Evaluated: {len(retrieved_indices) * (1 + n_transformations)}")

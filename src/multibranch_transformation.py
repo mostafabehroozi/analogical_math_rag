@@ -22,9 +22,7 @@ KEY PRINCIPLES:
 """
 
 import logging
-import numpy as np
-from typing import List, Dict, Any, Tuple, Optional
-from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Any
 
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.prompts import (
@@ -376,8 +374,6 @@ def _select_candidates_by_branch(
         }
     """
     logger = logging.getLogger(__name__)
-    
-    tiebreak_epsilon = config.get("MULTIBRANCH_TIEBREAK_EPSILON", 1e-6)
     
     selections = {
         "tx1": {},

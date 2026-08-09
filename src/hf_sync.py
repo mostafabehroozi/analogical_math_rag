@@ -17,8 +17,8 @@ Functions:
 - periodic_sync_check: A helper to trigger synchronization during long loops.
 """
 
-import os
 import logging
+import threading
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HfHubHTTPError
 
@@ -131,8 +131,6 @@ def sync_workspace_to_hub(config: dict):
     logger.info(f"Starting synchronization of '{local_outputs_dir}' to HF Hub repo: {repo_id}")
 
     try:
-        import shutil  # <--- Added import to handle deleting folders safely
-        
         # 1. Instantiate the API client with the token.
         api = HfApi(token=hf_token)
 
@@ -173,8 +171,6 @@ def periodic_sync_check(loop_counter: int, config: dict):
         sync_workspace_to_hub(config)
         print("--- Sync complete. ---\n")
 
-
-import threading 
 
 _sync_lock = threading.Lock()
 _active_sync_thread = None  

@@ -1,0 +1,16 @@
+# Core data, retrieval, and notebook dependencies
+datasets
+huggingface-hub
+numpy
+pandas
+scikit-learn
+sentence-transformers
+tqdm
+
+# LLM provider clients used by config.py
+google-genai
+ollama
+openai
+
+# Optional experiment tracking used when available
+wandb

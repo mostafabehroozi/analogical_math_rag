@@ -47,7 +47,6 @@ ARCHITECTURAL REFACTOR: "Acquire-Optimize-Fork".
 """
 
 import logging
-from fastapi import logger
 from tqdm import tqdm
 import os
 from typing import List, Dict, Any, Optional
@@ -995,7 +994,7 @@ def run_pipeline_for_single_query(
             # Logic: Use whole list.
             
             if validation_strategies:
-                print(f"\n[TRACK B] FEATURE VALIDATION (N=1)")
+                print("\n[TRACK B] FEATURE VALIDATION (N=1)")
                 
                 if config.get("MIRROR_EVALUATE_BASE_FILTERING", False):
                     indices = validation_strategies.get("base_filtering", [])
@@ -1190,7 +1189,7 @@ def run_pipeline_for_single_query(
                     rt_log = local_step_log.get('reverse_transformation', {})
                     if rt_log.get('status') == 'SUCCESS':
                         # Reverse transformation already solved the problem, use its result directly
-                        print(f"  -> Using solution from Reverse Transformation step (skipping regular solve)...")
+                        print("  -> Using solution from Reverse Transformation step (skipping regular solve)...")
                         solve_result = {
                             'status': 'SUCCESS',
                             'solution_attempts': rt_log.get('solution_attempts', []),

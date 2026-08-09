@@ -15,10 +15,9 @@ import logging
 import os
 from typing import List, Dict, Any, Optional, Tuple
 
-from src.utils import load_json, save_json
+from src.utils import load_json
 from src.layer2_analysis import (
-    Layer2Config, Layer2Orchestrator, PTUMathEngine,
-    run_layer2_experiments
+    Layer2Config, run_layer2_experiments
 )
 
 
@@ -207,7 +206,7 @@ def run_layer2_complete_pipeline(
         return None, None
     
     # Step 2: Extract Layer 1 states
-    logger.info(f"\nStep 2: Extracting Layer 1 states for Layer 2")
+    logger.info("\nStep 2: Extracting Layer 1 states for Layer 2")
     layer1_states = extract_layer1_states_for_layer2(combined_cache, query_indices)
     
     if not layer1_states:
@@ -215,7 +214,7 @@ def run_layer2_complete_pipeline(
         return None, None
     
     # Step 3: Prepare Layer 2 configuration
-    logger.info(f"\nStep 3: Preparing Layer 2 configuration")
+    logger.info("\nStep 3: Preparing Layer 2 configuration")
     if layer2_config_dict is None:
         layer2_config_dict = {}
     
@@ -223,7 +222,7 @@ def run_layer2_complete_pipeline(
     logger.info(f"Layer 2 Config: {layer2_config}")
     
     # Step 4: Run Layer 2 experiments
-    logger.info(f"\nStep 4: Running Layer 2 experiments")
+    logger.info("\nStep 4: Running Layer 2 experiments")
     all_results, master_report = run_layer2_experiments(
         layer1_states, layer2_config, layer2_output_dir, api_manager_solve, api_manager_eval,
         global_config=global_config,

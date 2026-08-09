@@ -1,0 +1,24 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Notebook/editor state
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# Runtime outputs and local model/data caches
+local_data/
+
+# Test/lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pylint.d/
+
+# Local secrets
+.env
+.env.*
+!.env.example

@@ -406,53 +406,6 @@ Final Answer:
 **Your Solution:**
 """,
 
-    "final_solver_v3": """You are an expert solver. Solve the Main Question, using the Solved Examples as inspiration for your methodology.
-    
-<Instructions>
-Look for patterns in the Solved Examples that might help solve the Main Question. Adopt these strategies where they fit, but feel free to deviate from them if the new question requires a different logic. Treat the examples as suggestions, not strict rules.
-</Instructions>
-
-<Solved Examples>
-{examples_block}
-</Solved Examples>
-
-<Main Question to Solve>
-{main_question_text}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Your step-by-step rationale for the Main Question]
-
-Final Answer:
-[Your final answer to the Main Question]
-</Your  Answer/Output Format>
-""",
-
-"final_solver_v4": """Use the Solved Examples as a blueprint to solve the Main Question.
-<Instructions>
-- Study the examples to understand the logical method used to reach the solution.
-- Extract the key reasoning pattern.
-- Apply this pattern to the Main Question.
-- Provide the solution as a concise, technical derivation. Focus strictly on the mathematical steps and logic, avoiding conversational language.
-</Instructions>
-
-<Solved Examples>
-{examples_block}
-</Solved Examples>
-
-<Main Question to Solve>
-{main_question_text}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Formal step-by-step derivation]
-Final Answer:
-[Your final answer]
-</Your Answer/Output Format>
-""",
-    
     "final_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
 <Instructions>
@@ -1415,25 +1368,6 @@ Calculate the kinetic energy of an object with a mass of 2kg moving at a velocit
 {generated_solution}
 </Reference Solution>
 </Task>
-""",
-
-    "self_sampling_augmentor_simplification_simple_shallow_with_solution": """Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements, using the provided Reference Solution as a guide.
-<Instructions>
-1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
-2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
-3. Reduce the number of steps or constraints slightly, as long as the underlying relationship (as shown in the solution) remains the same.
-4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
-</Instructions>
-<Main Question>
-{main_question_text}
-</Main Question>
-<Reference Solution>
-{generated_solution}
-</Reference Solution>
-<Output Format>
-Simplified Question:
-[Your simplified version]
-</Output Format>
 """,
 
      "self_sampling_augmentor_simplification_simple_shallow_with_solution":"""Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.

@@ -8,9 +8,6 @@ interface remains compatible with the rest of the pipeline.
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
-import json
 import logging
 import threading
 import time
@@ -19,9 +16,7 @@ import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Tuple, TypedDict, Union
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, TypedDict, Union
 from src.context_logger import ctx_query_idx, ctx_batch_id, tprint
 
 try:  # Keep scheduler/batch tests importable without optional provider SDKs.
@@ -36,8 +31,10 @@ try:
     from google import genai
     from google.genai import types
     from google.genai.errors import APIError
-except ModuleNotFoundError:
+except ImportError:  # The legacy ``google`` namespace may exist without google-genai.
     genai = None
+    types = None
+    APIError = Exception
 
 RETRYABLE_ERROR_TYPES = {
     "APITimeoutError", "APIConnectionError", "ResourceExhausted",
@@ -606,7 +603,6 @@ class OllamaAPIManager:
         self.truncation_length = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
         self.client = ollama.Client(host=config.get("OLLAMA_BASE_URL", "http://localhost:11434"))
         
-        import threading
         max_concurrent = config.get("OLLAMA_MAX_CONCURRENT", 1) 
         self.semaphore = threading.Semaphore(max_concurrent)
 

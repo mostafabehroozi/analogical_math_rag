@@ -41,7 +41,6 @@ except ImportError:
     wandb = None
 
 from src.utils import save_json, load_json
-from src.hf_sync import periodic_sync_check
 from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
 # Define a structured type for the result of a single LLM-based evaluation
@@ -149,8 +148,6 @@ def evaluate_single_answer_with_llm(
 
     # Handle successful API call, but potentially malformed response
     raw_text = response.get('text', '').strip()
-    trunc_len = config.get("API_RESPONSE_TRUNCATION_LENGTH", 50)
-    # print(f"      Evaluator LLM Raw Output (truncated): {raw_text[:trunc_len]}{'...' if len(raw_text) > trunc_len else ''}") 
     logger.debug(f"Evaluator raw response: '{raw_text}'")
 
     # Parse the 'Evaluation: [true/false]' line from the response
@@ -160,7 +157,7 @@ def evaluate_single_answer_with_llm(
         # logger.info(f"Parsed evaluation result: {result_str}")
         return {"is_correct": result_str == 'true', "status": "SUCCESS", "error_details": None}
     else:
-        logger.warning(f"Could not parse 'Evaluation:' line from LLM response. Treating as parsing failure.")
+        logger.warning("Could not parse 'Evaluation:' line from LLM response. Treating as parsing failure.")
         return {"is_correct": None, "status": "PARSING_FAILED", "error_details": None}
 
 
@@ -203,9 +200,6 @@ def analyze_experiment_logs(
             logger.info(f"Experiment '{exp_name}' is a Pathway Consistency Check run. Skipping standard analysis.")
             continue
             
-        # Determine global N attempts to set valid Pass@K checks for the PRIMARY strategy
-        n_attempts_primary = exp_config.get("N_PASS_ATTEMPTS", 1)
-        
         # --- Phase 1: State Management & Resumption ---
         eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
         detailed_evaluations = load_json(eval_file_path) or []
