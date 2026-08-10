@@ -14,7 +14,7 @@ occur, preventing data loss and enabling targeted retries.
 MODIFIED: This version now supports a deferred execution mode via the
 `DEFER_SOLVE_STEP` config flag.
 When enabled, it runs all intermediate steps
-(retrieve, adapt, merge) for all queries first, then runs the final solve
+(retrieve and adapt) for all queries first, then runs the final solve
 step for all queries in a second phase.
 REWRITTEN: The `run_experiments` function now implements a global, cross-experiment
 deferred execution.
@@ -23,14 +23,11 @@ entire run switches to a two-phase model:
 1. Phase 1: All intermediate steps for ALL experiments are completed.
 2. Phase 2: All final solving steps for ALL experiments are completed.
 This optimizes API usage by batching all expensive 'solve' calls together.
-This version also integrates new, optional pipeline steps for self-sampling,
-augmentation, analogical adaptation, the NEW Analogical Consistency check,
-the Group-Based Self-Consistency Selection, and the NEW Hierarchical Augmentation.
 PERFORMANCE FIX: The call to the `retrieve` function has been updated to pass
 a pre-computed hash map, enabling O(1) self-match detection and resolving a
 major performance bottleneck.
 NEW FEATURE: Added `APPLY_FULL_PIPELINE_RETRY`. If True, the entire pipeline
-(Retrieval -> Adaptation -> Merging -> Solving) is re-run N times, rather than
+(Retrieval -> Adaptation -> Solving) is re-run N times, rather than
 just retrying the final Solver step N times.
 NEW FEATURE: Added Pipeline Simplification.
 - Workflow A: Simplification of Retrieved Samples (replaces standard adaptation).
@@ -55,10 +52,7 @@ from src.context_logger import pipeline_context, tprint
 
 
 from src.pipeline_steps import (
-    retrieve, adapt, merge, solve,
-    self_sample, augment_question, select_augmented_questions, analogical_adapt,
-    generate_reasoning_pathways, 
-    solve_hierarchical_tree, 
+    retrieve, adapt, solve,
     solve_with_analogical_consistency, 
     simplify_retrieved_samples,
     solve_via_main_simplification,
@@ -80,7 +74,6 @@ from src.layer2_integration import run_layer2_complete_pipeline
 from src.utils import save_json, save_json_atomic, load_json
 from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
-from src.prompts import EXEMPLAR_FORMAT, create_analogical_adaptation_prompt
 
 import builtins
 def safe_thread_print(*args, **kwargs):
@@ -125,12 +118,12 @@ def run_pipeline_for_single_query(
 ) -> Dict[str, Any]:
     """
     Executes the RAG pipeline for a single query, supporting different execution modes
-    and new features like self-sampling, analogical adaptation, and parallel benchmarking.
+    and parallel mirror benchmarking.
     Args:
         ... (standard arguments) ...
         run_mode (str): Controls execution flow.
             - 'full': Runs the entire pipeline from start to finish.
-            - 'intermediate': Runs only retrieve, adapt, and merge steps.
+            - 'intermediate': Runs only retrieve and adapt steps.
             - 'solve_only': Runs only the solve step, using pre-computed intermediate results.
         existing_log (Optional[Dict]): A pre-existing log from the intermediate phase,
                                        required for 'solve_only' mode.
@@ -163,26 +156,11 @@ def run_pipeline_for_single_query(
                 key: config.get(key) for key in [
                     # Core flags
                     "USE_RETRIEVAL", "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
-                    "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3", "APPLY_MERGING",
+                    "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3",
                     "DEFER_SOLVE_STEP", "TOP_N_CANDIDATES_RETRIEVAL", "N_PASS_ATTEMPTS",
                     # Layer 1 Flags
                     "APPLY_LAYER1_BASE_EXECUTION", "LAYER1_ONLY_MODE", "LAYER1_CACHE_DIR",
                     "LAYER1_N_CANDIDATES", "LAYER1_ONE_SHOT_CANDIDATES_N", "LAYER1_DATASET_NAME",
-                    # New Feature Flags
-                    "APPLY_SELF_SAMPLING", "SELF_SAMPLING_N",
-                    "APPLY_ANALOGICAL_ADAPTATION", "ANALOGICAL_GROUP_SETS",
-                    "APPLY_SELF_SAMPLING_AUGMENTATION", "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION",
-                    "ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION", 
-                    "SELECTIVE_AUGMENTATION_SAMPLING", "AUGMENT_K", "AUGMENT_N",
-                    # Consistency Flags
-                    "APPLY_CONSISTENCY_ANALOGICAL_CHECK", "CONSISTENCY_GENERATION_MODE",
-                    "CONSISTENCY_PATHWAYS_K", "CONSISTENCY_SAMPLES_PER_PATHWAY_N",
-                    # Parallel Benchmarking & Group Flags
-                    "APPLY_GROUP_CONSISTENCY_SELECTION", "GROUP_CONSISTENCY_CANDIDATES",
-                    "GROUP_CONSISTENCY_SAMPLES_N",
-                    # Hierarchical Augmentation Flags
-                    "APPLY_HIERARCHICAL_AUGMENTATION", "HIERARCHICAL_TREE_DEPTH",
-                    "HIERARCHICAL_BRANCHING_FACTOR", "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED",
                     # Reverse Validation Flags
                     "APPLY_REVERSE_VALIDATION", "REVERSE_VALIDATION_CANDIDATES_N",
                     "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N",
@@ -200,7 +178,8 @@ def run_pipeline_for_single_query(
                     # Mirroring Flags (Original)
                     "APPLY_MIRROR_AS_EVALUATOR", "MIRROR_EVALUATE_BASE_FILTERING",
                     "MIRROR_ENABLE_R0", "MIRROR_ACTIVE_CANDIDATE_LIMIT",
-                    "MIRROR_ENABLE_REDUNDANCY_FILTER",
+                    "MIRROR_ENABLE_REDUNDANCY_FILTER", "MIRROR_BENCHMARK_GROUPS",
+                    "MIRROR_BENCHMARK_SAMPLES_N",
                     # Full Pipeline Retry Flag
                     "APPLY_FULL_PIPELINE_RETRY",
                     "EVAL_PARSE_BOXED_GROUND_TRUTH"
@@ -225,10 +204,6 @@ def run_pipeline_for_single_query(
     
     provider_for_solve = config.get('API_PROVIDER_SOLVER', 'gemini')
     manager_for_solve = _get_api_manager(provider_for_solve)
-    
-    # Specific Manager for Augmentation
-    provider_for_aug = config.get('API_PROVIDER_AUGMENTATION', provider_for_adapt)
-    manager_for_aug = _get_api_manager(provider_for_aug)
     
     # Specific Manager for Evaluation
     provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
@@ -533,172 +508,7 @@ def run_pipeline_for_single_query(
             
         return run_log
 
-    # MODE: Hierarchical Augmentation (Tree-Based) 
-    if config.get('APPLY_HIERARCHICAL_AUGMENTATION', False):
-        print("\n[MODE] HIERARCHICAL AUGMENTATION ACTIVATED")
-        
-        # Determine retry behavior
-        is_full_retry = config.get('APPLY_FULL_PIPELINE_RETRY', False)
-        n_passes = config.get("N_PASS_ATTEMPTS", 1)
-        
-        all_root_attempts = []
-        last_hierarchical_result = None
-        
-        # SCENARIO A: Full Pipeline Retry (N Distinct Trees) 
-        if is_full_retry and n_passes > 1:
-            logger.info(f"Full Pipeline Retry Enabled for Hierarchical Mode: Generating {n_passes} distinct trees.")
-            
-            # CRITICAL: Create a config copy that forces the INTERNAL solver 
-            # to run only once per tree. We handle the looping here externally.
-            single_pass_config = config.copy()
-            single_pass_config['N_PASS_ATTEMPTS'] = 1
-            
-            full_pipeline_iterations_data = []
-
-            for i in range(n_passes):
-                print(f"\n[HIERARCHICAL ITERATION] {i+1}/{n_passes} (Building fresh tree)")
-                
-                # Run the full tree pipeline (Build -> Leaf Solve -> Root Solve)
-                hierarchical_result = solve_hierarchical_tree(
-                    target_query=target_query,
-                    exemplar_data=exemplar_data,
-                    embedding_model=embedding_model,
-                    api_manager_adapt=manager_for_adapt,
-                    api_manager_solve=manager_for_solve,
-                    api_manager_augment=manager_for_aug,
-                    config=single_pass_config 
-                )
-                
-                # Aggregation: Extract trace
-                if 'trace' in hierarchical_result:
-                    run_log['execution_trace'].extend(hierarchical_result.pop('trace'))
-                
-                # Aggregate the single solution from this tree
-                if hierarchical_result['status'] == 'SUCCESS':
-                    sol = hierarchical_result.get('root_solution')
-                    if sol:
-                        all_root_attempts.append(sol)
-                
-                # Store debug data for this tree
-                full_pipeline_iterations_data.append({
-                    "iteration": i,
-                    "tree_structure": hierarchical_result.get('tree_structure'),
-                    "root_solution": hierarchical_result.get('root_solution')
-                })
-                
-                last_hierarchical_result = hierarchical_result
-            
-            # Store iteration data
-            run_log['full_pipeline_iterations_data'] = full_pipeline_iterations_data
-
-        # SCENARIO B: Standard Pass@N (1 Tree, N Root Solves) 
-        else:
-            # If retry is False, we pass the original config. 
-            # The internal logic in propagate_solutions_upward handles the N loops.
-            logger.info(f"Standard Hierarchical Mode: 1 Tree, Pass@{n_passes} on Root.")
-            
-            last_hierarchical_result = solve_hierarchical_tree(
-                target_query=target_query,
-                exemplar_data=exemplar_data,
-                embedding_model=embedding_model,
-                api_manager_adapt=manager_for_adapt,
-                api_manager_solve=manager_for_solve,
-                api_manager_augment=manager_for_aug,
-                config=config
-            )
-            
-            # Aggregation: Extract trace
-            if 'trace' in last_hierarchical_result:
-                run_log['execution_trace'].extend(last_hierarchical_result.pop('trace'))
-            
-            if last_hierarchical_result['status'] == 'SUCCESS':
-                # Grab the list generated internally
-                all_root_attempts = last_hierarchical_result.get('root_solution_attempts', [])
-                # Fallback if the list is empty but solution exists
-                if not all_root_attempts and last_hierarchical_result.get('root_solution'):
-                    all_root_attempts = [last_hierarchical_result['root_solution']]
-
-        # Final Log Construction
-        run_log['steps']['hierarchical_process'] = last_hierarchical_result
-        
-        # Populate the location the Evaluator looks for
-        run_log['steps']['solving'] = {
-            "status": "SUCCESS" if all_root_attempts else "FAILURE",
-            "solution_attempts": all_root_attempts
-        }
-        
-        # Also populate the top-level text list for the analysis script
-        run_log['llm_final_solution_attempts_texts'] = all_root_attempts
-        
-        if all_root_attempts:
-            run_log['pipeline_status'] = "SUCCESS"
-        else:
-            run_log['pipeline_status'] = "FAILURE: Hierarchical process failed to produce solutions."
-        return run_log
-
-    # MODE: Analogical Consistency Check (The "Pathway" approach - OLD VERSION)
-    if config.get('APPLY_CONSISTENCY_ANALOGICAL_CHECK', False):
-        print("\n[MODE] ANALOGICAL CONSISTENCY CHECK (PATHWAY) ACTIVATED")
-        
-        # 1. Generate Layer 1 (Reasoning Pathways / Exemplars)
-        print(f"[LAYER 1] Generating {config.get('CONSISTENCY_PATHWAYS_K')} Reasoning Pathways...")
-        pathways_result = generate_reasoning_pathways(target_query, manager_for_aug, config)
-        
-        # Aggregation: Extract trace
-        if 'trace' in pathways_result:
-            run_log['execution_trace'].extend(pathways_result.pop('trace'))
-        
-        if pathways_result['status'] == 'FAILURE':
-            run_log['pipeline_status'] = "FAILURE: Pathway generation failed."
-            run_log['consistency_analysis_data'] = {"error": pathways_result.get("error_info")}
-            return run_log
-            
-        generated_pathways = pathways_result['pathway_exemplars']
-        print(f"  -> Generated {len(generated_pathways)} pathways.")
-        
-        # 2. Generate Layer 2 (Sampling Main Question using each Pathway)
-        layer_1_data = []
-        n_samples = config.get("CONSISTENCY_SAMPLES_PER_PATHWAY_N", 3)
-        temp_layer_2 = config.get("CONSISTENCY_LAYER_2_TEMPERATURE", 0.7)
-        model_name = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER') 
-        if config.get('API_PROVIDER_SOLVER') == 'avalai': model_name = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
-        if config.get('API_PROVIDER_SOLVER') == 'ollama': model_name = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
-
-        for i, pathway_text in enumerate(generated_pathways):
-            print(f"\n[LAYER 2] Stress Testing Pathway #{i+1} ({n_samples} samples)...")
-            
-            prompt = create_analogical_adaptation_prompt(target_query, [pathway_text], config)
-            
-            samples = []
-            for j in range(n_samples):
-                print(f"    -> Generating Sample {j+1}/{n_samples}")
-                resp = manager_for_solve.generate_content(prompt, model_name, temp_layer_2)
-                
-                # Manually log trace for this explicit loop
-                from src.utils import create_trace_entry
-                run_log['execution_trace'].append(create_trace_entry(
-                    "pathway_consistency", f"layer_2_pathway_{i}_sample_{j}",
-                    {"pathway_text": pathway_text, "prompt": prompt}, resp, {"model": model_name, "temp": temp_layer_2}
-                ))
-
-                if resp['status'] == 'SUCCESS':
-                    samples.append(resp['text'])
-                else:
-                    samples.append({"error": resp})
-            
-            layer_1_data.append({
-                "pathway_id": i,
-                "exemplar_text": pathway_text,
-                "layer_2_results": samples
-            })
-            
-        run_log['consistency_analysis_data'] = {
-            "layer_1_pathways": layer_1_data
-        }
-        run_log['pipeline_status'] = "SUCCESS"
-        return run_log
-
-    # Standard Pipeline Execution (with Parallel Benchmarking & Mirroring) 
+    # Standard Pipeline Execution (with Parallel Benchmarking & Mirroring)
     
     # SETUP FULL PIPELINE RETRY LOGIC 
     full_retry_mode = config.get('APPLY_FULL_PIPELINE_RETRY', False)
@@ -729,7 +539,9 @@ def run_pipeline_for_single_query(
         
         # Local container for this iteration's logs
         # Structure: { "primary": {step: val}, "group_0": {step: val}, ... }
-        iter_log_strategies = {} 
+        iter_log_strategies = {}
+        master_sorted_indices = []
+        validation_strategies = {}
 
 
         # PHASE 1: ACQUIRE & OPTIMIZE (Retrieve + Mirror)
@@ -805,15 +617,14 @@ def run_pipeline_for_single_query(
         # PHASE 2: FORK (Track A & Track B)
         execution_tasks = []
 
-        if not pipeline_halted:
+        if not pipeline_halted and run_mode != 'solve_only':
             
             # TRACK A: BENCHMARKING (Ranking Robustness) 
 
             
-            if config.get("APPLY_MIRROR_AS_EVALUATOR", False) or config.get("APPLY_GROUP_CONSISTENCY_SELECTION", False):
-                # We use the group candidates config to drive Track A
-                benchmark_groups = config.get("GROUP_CONSISTENCY_CANDIDATES", [])
-                benchmark_n = config.get("GROUP_CONSISTENCY_SAMPLES_N", 10)
+            if config.get("APPLY_MIRROR_AS_EVALUATOR", False):
+                benchmark_groups = config.get("MIRROR_BENCHMARK_GROUPS", [])
+                benchmark_n = config.get("MIRROR_BENCHMARK_SAMPLES_N", 10)
                 
                 print(f"\n[TRACK A] BENCHMARKING (N={benchmark_n})")
                 
@@ -886,16 +697,20 @@ def run_pipeline_for_single_query(
         if run_mode == 'solve_only':
              # In solve_only mode, we assume the log contains the necessary keys.
              # We reconstruct the task list based on available data in the existing log.
-             if 'steps' in run_log and 'adaptation' in run_log['steps']:
+             if 'steps' in run_log and 'final_exemplars' in run_log['steps']:
                  execution_tasks.append({'name': 'primary', 'type': 'primary', 'indices': [], 'n_samples': n_solver_attempts_per_pass})
              
              if 'benchmarks' in run_log:
-                 for name in run_log['benchmarks']:
+                 for name, benchmark_data in run_log['benchmarks'].items():
+                     if not isinstance(benchmark_data, dict) or 'final_exemplars' not in benchmark_data:
+                         continue
                      # Attempt to recover N from the stored log or config
-                     execution_tasks.append({'name': name, 'type': 'benchmark', 'indices': [], 'n_samples': config.get("GROUP_CONSISTENCY_SAMPLES_N", 10)})
+                     execution_tasks.append({'name': name, 'type': 'benchmark', 'indices': [], 'n_samples': config.get("MIRROR_BENCHMARK_SAMPLES_N", 10)})
             
              if 'steps_alternatives' in run_log:
-                 for name in run_log['steps_alternatives']:
+                 for name, alternative_data in run_log['steps_alternatives'].items():
+                     if not isinstance(alternative_data, dict) or 'final_exemplars' not in alternative_data:
+                         continue
                      execution_tasks.append({'name': name, 'type': 'validation', 'indices': [], 'n_samples': 1})
 
         for task in execution_tasks:
@@ -970,52 +785,15 @@ def run_pipeline_for_single_query(
                                     for sol in rt_result.get('solution_attempts', [])
                                 ])
                                 
-                                # If reverse transformation already provides solutions, we might skip the merge step
-                                if config.get('REVERSE_TRANSFORMATION_SKIP_MERGE', False):
-                                    # directly use these as final exemplars
-                                    current_exemplars_for_step = rt_result.get('solution_attempts', [])
-                        
-                        # Analogical Adapt
-                        if config.get('APPLY_ANALOGICAL_ADAPTATION', False):
-                             # (Existing logic for AA setup...)
-                             augmented_qs_for_aa = None
-                             if config.get('APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION') and not config.get('ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION', False):
-                                k = config.get('AUGMENT_K', 10)
-                                aug_result = augment_question(target_query, k, manager_for_aug, config)
-                                if 'trace' in aug_result: run_log['execution_trace'].extend(aug_result.pop('trace'))
-                                if aug_result['status'] == 'SUCCESS': augmented_qs_for_aa = aug_result['augmented_questions']
-                                if config.get('SELECTIVE_AUGMENTATION_SAMPLING'):
-                                    retrieved_texts = [EXEMPLAR_FORMAT.format(question=exemplar_data['questions'][i], solution=exemplar_data['solutions'][i]) for i in indices]
-                                    augmented_qs_for_aa = select_augmented_questions(augmented_qs_for_aa, config, embedding_model, retrieved_texts)
-
-                             aa_result = analogical_adapt(
-                                target_query, indices, exemplar_data, 
-                                api_manager=manager_for_adapt, api_manager_augment=manager_for_aug,
-                                config=config, embedding_model=embedding_model, augmented_questions=augmented_qs_for_aa
-                             )
-                             if 'trace' in aa_result: run_log['execution_trace'].extend(aa_result.pop('trace'))
-                             local_step_log['analogical_adaptation'] = aa_result
-                             if aa_result.get('analogically_adapted_texts'): current_exemplars_for_step = aa_result['analogically_adapted_texts']
-
-                        # Self-Sampling
-                        if config.get('APPLY_SELF_SAMPLING', False):
-                            ss_result = self_sample(target_query, manager_for_adapt, config)
-                            if 'trace' in ss_result: run_log['execution_trace'].extend(ss_result.pop('trace'))
-                            local_step_log['self_sampling'] = ss_result
-                            current_exemplars_for_step.extend(ss_result.get('self_sampled_texts', []))
-                        
-                        # Merge
-                        merge_result = merge(
-                            target_query=target_query, adapted_texts=current_exemplars_for_step,
-                            embedding_model=embedding_model, api_manager=manager_for_adapt, config=config
-                        )
-                        if 'trace' in merge_result: run_log['execution_trace'].extend(merge_result.pop('trace'))
-                        local_step_log['merging'] = merge_result
-                        current_exemplars_for_step = merge_result['merged_texts']
-
                 # Store Intermediate
                 iter_log_strategies[strat_name] = local_step_log
                 iter_log_strategies[strat_name]['final_exemplars'] = current_exemplars_for_step
+
+                if run_mode == 'intermediate':
+                    if task_type == 'benchmark':
+                        run_log['benchmarks'][strat_name] = local_step_log.copy()
+                    elif task_type == 'validation':
+                        run_log['steps_alternatives'][strat_name] = local_step_log.copy()
 
             #  SOLVE PHASE 
             if run_mode in ['full', 'solve_only']:
@@ -1024,12 +802,12 @@ def run_pipeline_for_single_query(
                     if strat_name in iter_log_strategies:
                         current_exemplars_for_step = iter_log_strategies[strat_name]['final_exemplars']
                     elif strat_name == 'primary' and 'steps' in run_log:
-                        current_exemplars_for_step = run_log['steps'].get('merging', {}).get('merged_texts', [])
+                        current_exemplars_for_step = run_log['steps'].get('final_exemplars', [])
                     elif task_type == 'benchmark' and 'benchmarks' in run_log:
                          # Attempt to recover from benchmarks log if structured correctly
-                         current_exemplars_for_step = run_log['benchmarks'].get(strat_name, {}).get('merging', {}).get('merged_texts', [])
+                         current_exemplars_for_step = run_log['benchmarks'].get(strat_name, {}).get('final_exemplars', [])
                     elif task_type == 'validation' and 'steps_alternatives' in run_log:
-                         current_exemplars_for_step = run_log['steps_alternatives'].get(strat_name, {}).get('merging', {}).get('merged_texts', [])
+                         current_exemplars_for_step = run_log['steps_alternatives'].get(strat_name, {}).get('final_exemplars', [])
 
                 current_solver_config = config.copy()
                 current_solver_config['N_PASS_ATTEMPTS'] = n_samples_for_task
@@ -1088,18 +866,25 @@ def run_pipeline_for_single_query(
                 # STORAGE LOGIC 
                 if task_type == 'benchmark':
                     if 'benchmarks' not in run_log: run_log['benchmarks'] = {}
-                    # Merge intermediate log with solve result for completeness
-                    combined_data = local_step_log.copy()
+                    # Preserve deferred intermediate data while adding solve results.
+                    if run_mode == 'solve_only':
+                        combined_data = run_log['benchmarks'].get(strat_name, {}).copy()
+                    else:
+                        combined_data = local_step_log.copy()
                     combined_data.update(solve_result)
                     run_log['benchmarks'][strat_name] = combined_data
                     
                 elif task_type == 'validation':
                     if 'steps_alternatives' not in run_log: run_log['steps_alternatives'] = {}
-                    run_log['steps_alternatives'][strat_name] = {}
-                    run_log['steps_alternatives'][strat_name]['solving'] = solve_result
+                    if run_mode == 'solve_only':
+                        combined_data = run_log['steps_alternatives'].get(strat_name, {}).copy()
+                    else:
+                        combined_data = {}
+                    combined_data['solving'] = solve_result
                     # Also copy intermediate steps
                     if strat_name in iter_log_strategies:
-                        run_log['steps_alternatives'][strat_name].update(iter_log_strategies[strat_name])
+                        combined_data.update(iter_log_strategies[strat_name])
+                    run_log['steps_alternatives'][strat_name] = combined_data
                         
                 elif task_type == 'primary':
                     # Store in main 'steps'
@@ -1130,6 +915,9 @@ def run_pipeline_for_single_query(
                 run_log['steps'].update(iter_log_strategies["redundancy_filtering"])
 
     # Final Aggregation
+    if run_mode == 'intermediate' and final_pipeline_status == 'PENDING':
+        final_pipeline_status = 'INTERMEDIATE_COMPLETE'
+
     run_log['pipeline_status'] = final_pipeline_status
     if full_retry_mode:
         run_log['full_pipeline_iterations_data'] = iteration_details

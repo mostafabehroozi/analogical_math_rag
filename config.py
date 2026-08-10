@@ -60,7 +60,6 @@ CONFIG = {
     "API_PROVIDER_ADAPTATION": "gemini",
     "API_PROVIDER_SOLVER": "gemini",
     "API_PROVIDER_EVALUATOR": "gemini",
-    "API_PROVIDER_AUGMENTATION": "gemini",
     "API_PROVIDER_SIMPLIFICATION": "gemini",
 
     # Gemini API Settings
@@ -78,7 +77,6 @@ CONFIG = {
     "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-3-27b-it",
     "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-3-27b-it",
     "GEMINI_MODEL_NAME_EVALUATOR": "models/gemma-3-27b-it",
-    "GEMINI_MODEL_NAME_AUGMENTATION": "models/gemma-3-27b-it",
     "GEMINI_MODEL_NAME_SIMPLIFICATION": "models/gemma-3-27b-it",
 
     # --- AvalAI (OpenAI-Compatible) API Settings ---
@@ -93,7 +91,6 @@ CONFIG = {
     "AVALAI_MODEL_NAME_ADAPTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_FINAL_SOLVER": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
-    "AVALAI_MODEL_NAME_AUGMENTATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_SIMPLIFICATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_REASONING_EFFORT": None,  # Options: "low", "medium", "high" (if supported)
     "AVALAI_ENABLE_THINKING": None,  # Options: None (default), True, False (controls chat_template_kwargs enable_thinking in extra_body)
@@ -104,16 +101,13 @@ CONFIG = {
     "OLLAMA_MODEL_NAME_ADAPTATION": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_FINAL_SOLVER": "gpt-oss:20b",
     "OLLAMA_MODEL_NAME_EVALUATOR": "gpt-oss:20b",
-    "OLLAMA_MODEL_NAME_AUGMENTATION": "llama3:8b",
     "OLLAMA_MODEL_NAME_SIMPLIFICATION": "llama3:8b",
 
     # Generic LLM Generation Settings
     "DEFAULT_ADAPTATION_TEMPERATURE": 0.0,
-    "DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE": 1.0,
     "DEFAULT_FINAL_SOLVER_TEMPERATURE": 1.0,
     "DEFAULT_PASS_N_SOLVER_TEMPERATURE": 1.0,
     "DEFAULT_EVALUATOR_TEMPERATURE": 0.0,
-    "DEFAULT_AUGMENTATION_TEMPERATURE": 1.0,
     "DEFAULT_SIMPLIFICATION_TEMPERATURE": 0.3,
 
     "DEFAULT_ADAPTATION_MAX_TOKENS": 10000,
@@ -142,64 +136,17 @@ CONFIG = {
     "USE_RETRIEVAL": True,
     "DEFER_SOLVE_STEP": False,
     "TOP_N_CANDIDATES_RETRIEVAL": 1,
-    "TARGET_ADAPTED_SAMPLES_MERGING": 1,
 
     # --- Reverse Transformation Flags ---
     "APPLY_REVERSE_TRANSFORMATION": False,  
     "REVERSE_TRANSFORMATION_TEMPERATURE": 0.3,  # Temperature for transformation step
     "REVERSE_TRANSFORMATION_SOLVER_TEMPERATURE": 1.0,  # Temperature for solving transformed questions
-    "REVERSE_TRANSFORMATION_SKIP_MERGE": True,  # Skip merge step when reverse transformation is used (since RT provides complete solution)
 
     # Adaptation Steps
     "APPLY_NORMALIZATION": False,
     "APPLY_TRANSFORMATION_1": False,
     "APPLY_TRANSFORMATION_2": False,
     "APPLY_TRANSFORMATION_3": False,
-    "APPLY_MERGING": False,
-
-    # Self-Sampling
-    "APPLY_SELF_SAMPLING": False,
-    "SELF_SAMPLING_N": 3,
-    "SELF_SAMPLING_TEMPERATURE": 1.0,
-
-    # Analogical Adaptation
-    "APPLY_ANALOGICAL_ADAPTATION": False,
-
-    # Augmentation & Selection
-    "APPLY_SELF_SAMPLING_AUGMENTATION": False,
-    "APPLY_ANALOGICAL_ADAPTATION_AUGMENTATION": False,
-    "ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION": False,
-    "SELECTIVE_AUGMENTATION_SAMPLING": False,
-    "AUGMENTATION_SCHEDULE": None,
-    "AUGMENT_K": 10,
-    "AUGMENT_N": 3,
-    "SELECTIVE_AUGMENTATION_SAMPLING_MODE": "auto",
-
-    # Consistency Check (Pathway)
-    "APPLY_CONSISTENCY_ANALOGICAL_CHECK": False,
-    "CONSISTENCY_GENERATION_MODE": "distinct_augmentations",
-    "CONSISTENCY_PATHWAYS_K": 3,
-    "CONSISTENCY_LAYER_1_TEMPERATURE": 1.0,
-    "CONSISTENCY_SAMPLES_PER_PATHWAY_N": 3,
-    "CONSISTENCY_LAYER_2_TEMPERATURE": 1.0,
-
-    "APPLY_GROUP_CONSISTENCY_SELECTION": False,
-
-    "GROUP_CONSISTENCY_CANDIDATES": [(0,), (0, 1), (0, 1, 2)],
-
-    "GROUP_CONSISTENCY_SAMPLES_N": 10,
-
-    # Hierarchical Augmentation 
-    "APPLY_HIERARCHICAL_AUGMENTATION": False,
-    "HIERARCHICAL_AUGMENTATION_MODE": "decomposition", # "decomposition" or "simplification"
-    "HIERARCHICAL_TREE_DEPTH": 2,
-    "HIERARCHICAL_BRANCHING_FACTOR": 3,
-    "HIERARCHICAL_LEAF_RETRIEVAL_ENABLED": True,
-    "HIERARCHICAL_LEAF_RETRIEVAL_TOP_K": 3,
-    "HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE": "leaf", # "leaf" or "root"
-    
-    # Two-Step Augmentation 
-    "HIERARCHICAL_AUGMENTATION_TWO_STEP": False,
 
     # Simplification Mode 
     "APPLY_SIMPLIFICATION": False,
@@ -215,6 +162,8 @@ CONFIG = {
 
     "REVERSE_VALIDATION_USE_RAG_GENERATION": True,  # Turns ON the new helper/analogical generation
     "REVERSE_VALIDATION_GENERATION_K": 3,           # How many past examples to fetch to help generate the candidates
+    "REVERSE_VALIDATION_CANDIDATE_TEMPERATURE": 1.0,
+    "REVERSE_VALIDATION_SOLVER_TEMPERATURE": 1.0,
 
     "REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES": False,
     "REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N": 3,
@@ -224,6 +173,7 @@ CONFIG = {
     "BEST_OF_TRANSFORMATION_TRANSFORMATION_TEMPLATE": "transformation_shallow-&-moderately-deep",
     "BEST_OF_TRANSFORMATION_ENABLE_MIRROR_EVAL": False,  # Use mirror evaluation to score candidates
     "BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS": 3,  # Quick validation attempts per candidate
+    "BEST_OF_TRANSFORMATION_SOLVER_TEMPERATURE": 1.0,
 
 # Pass@N & Evaluation
     "N_PASS_ATTEMPTS": 3,
@@ -261,20 +211,11 @@ CONFIG = {
     "PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v1",
     "PROMPT_TEMPLATE_EVALUATOR": "evaluator_v1",
 
-    "PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR": "self_sampling_generator",
-    "PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR": "self_sampling_augmentor_v1",
-    "PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION": "analogical_adaptation_v1",
+    "PROMPT_TEMPLATE_BEST_OF_TRANSFORMATION_SOLVER": "analogical_adaptation_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER": "analogical_adaptation_v1",
+    "PROMPT_TEMPLATE_REVERSE_VALIDATION_CANDIDATE_GENERATOR": "reverse_validation_candidate_generator_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_BASELINE": "mirror_baseline_zero_shot_v1",
     "PROMPT_TEMPLATE_REVERSE_VALIDATION_ZERO_SHOT_SOLVER": "final_solver_simple_v1",
-
-    "PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR": "self_sampling_augmentor_decomposition_2",
-    "PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER": "hierarchical_parent_solver_v1",
-    "PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER": "final_solver_simple_v1",
-
-    # Two-Step Augmentation Prompts
-    "PROMPT_TEMPLATE_AUGMENTATION_STEP1_SOLVER": "final_solver_simple_v2",
-    "PROMPT_TEMPLATE_AUGMENTATION_STEP2_GENERATOR": "self_sampling_augmentor_simplification_with_solution",
 
     "PROMPT_TEMPLATE_SIMPLIFICATION_GENERATOR": "simplification_generator_v1",
     "PROMPT_TEMPLATE_SIMPLIFIED_SAMPLE_SOLVER": "simplified_sample_solver_v1",
@@ -309,6 +250,8 @@ CONFIG = {
     "MIRROR_ENABLE_REDUNDANCY_FILTER": True,
     "MIRROR_ACTIVE_CANDIDATE_LIMIT": 10,
     "MIRROR_EVALUATE_BASE_FILTERING": True,
+    "MIRROR_BENCHMARK_GROUPS": [(0,), (0, 1), (0, 1, 2)],
+    "MIRROR_BENCHMARK_SAMPLES_N": 10,
     "PROMPT_TEMPLATE_MIRROR_BASELINE": "mirror_baseline_zero_shot_v1",
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS": "mirror_hypothesis_gen_v1",
     "PROMPT_TEMPLATE_MIRROR_VERIFICATION": "mirror_verification_v1",

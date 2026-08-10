@@ -298,89 +298,7 @@ Rationale and Answer: [Merged Rationale and Answer]
 </Task>
 """ ,
 
-    "merging_v1": """You are provided with a main question and two samples, each consisting of a question and its rationale plus answer. Your task is to merge these samples into a single, more potent sample. Combine their rationales into a cohesive and concise rationale that is highly relevant to solving the main question. The merged sample must retain the same format and preserve critical reasoning.
 
-**Main Question:**
-{target_query}
-
-**Sample 1:**
-{sample_1}
-
-**Sample 2:**
-{sample_2}
-
-**Instructions:**
-- Analyze both samples' rationales in the context of the main question.
-- Combine the rationales, integrating complementary reasoning steps, facts, and knowledge.
-- Ensure the merged rationale is concise, clear, and directly relevant to the main question.
-- Preserve all critical patterns and logical steps useful for the main question.
-- Resolve inconsistencies or redundancies, selecting the most accurate and relevant information.
-- Create a new question for the merged sample that reflects the combined focus and aligns with the main question's domain.
-- Use an answer from one sample if identical; if different, select the most consistent or combine logically. Ensure the final answer part is preserved.
-- Ensure the output format matches the input samples format.
-
-**Output Format (Strictly follow this format):**
-Question: [New Merged Question]
-Rationale and Answer: [Merged Rationale and Answer]
-""",
-
-    "merging_v2" : """You are an expert in analogical reasoning for mathematical problem-solving.  
-Your task is to merge two solved math problems into a single new, synthesized problem-solution pair that will serve as a strong exemplar for solving a target question.  
-
-These two input samples are called Parent Sample A and Parent Sample B, because they will be merged to form one new "child" example.   
-The child example should combine the most relevant and valuable reasoning patterns from its parents in a coherent, context-aware manner.
-
-<Your Objective> 
-Create a new merged example that:
-1. Retains the core reasoning structures and mathematical logic from both Parent A and Parent B.
-2. Selectively integrates only the parts most relevant to the Target Question. 
-3. Produces a new, logically consistent and useful exemplar that the LLM can learn from for analogical reasoning.
-</Your Objective> 
-
-<Core Guidelines> 
-1. Principled Construction from Parent Materials   
-- Use the reasoning chains, strategies, and key steps from both parents.  
-- Avoid inventing completely new mathematical methods.  
-- Preserve the internal logic and structure of the parent materials.
-
-2. Guided by the Target Question   
-- The merge must be performed in the context of the Target Question.   
-- Keep and emphasize the parts of each parent that are most helpful for solving the target question.   
-- If one parent is much more relevant, prioritize it — the merge does not need to be symmetrical.
-
-3. Coherence and Controlled Generation  
-- You may add minor connective text to make the final reasoning smooth and clear.  
-- The merged result must be mathematically correct, coherent, and self-contained.
-
-4. Superficial Re-contextualization 
-- Adapt the merged sample's phrasing and structure so it stylistically resembles the Target Question.  
-- Do not alter the core mathematics — only adjust presentation and framing.
-
-5. Relevance-Driven Asymmetry 
-- It is acceptable if the final merged sample resembles one parent more than the other.  
-- Discard irrelevant parts. The goal is maximum usefulness, not balance. 
-</Core Guidelines> 
-
-</Input Materials>  
-Parent Sample A: 
-{sample_1}
-
-Parent Sample B:
-{sample_2}
-
-Target Question: 
-{target_query}
-</Input Materials> 
-
-<Output Instructions> 
-You must output ONLY in the following format.   
-Do not include any explanations, comments, or text outside this format.  
-
-Output Format (Strictly follow this format):  
-Question: [New Merged Question]
-Rationale and Answer: [Merged Rationale and Answer]
-</Output Instructions> 
-""",
 
     "final_solver_v1": """**Objective:**
 Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
@@ -601,7 +519,7 @@ Ground Truth:
 **Is there an exact match? (yes/no):**
 """,
 
-    "self_sampling_generator": """Objective:
+    "reverse_validation_candidate_generator_v1": """Objective:
 Your task is to solve the Main Question by providing a formal, step-by-step solution and a final answer. The solution should be presented in an academic, textbook-style format.
     
 Style Guidelines:
@@ -623,389 +541,13 @@ Main Question:
 Your Solution:
 """,
 
-    "self_sampling_augmentor_v1": """You are an expert math problem creator. Your task is to generate {n_samples} new, distinct math problems that are conceptually similar to the provided 'Base Question'.
-
-<Instructions>
-1. Read the 'Base Question' to understand its core mathematical concept, structure, and context.
-2. Create {n_samples} new questions s that are relevant to the base question. Your new questions should be distinct from each other and from the base question (e.g., involving different numbers and names).
-3. Crucially, you must NOT provide any rationale or answer. Your output should consist ONLY of the generated question statements.
-4. Ensure the generated questions are unique from each other and from the base question.
-5. Present your output as a numbered list, as shown in the example.
-</Instructions>
-
-<Example>
-<Base Question>
-An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
-</Base Question>
-
-<Your Output (for n_samples = 2)>
-1. In a bag, there are 5 red balls and 3 blue balls. If two balls are drawn at random without replacement, what is the probability that both balls are red?
-2. A box contains 10 red marbles and 5 blue marbles. If three marbles are drawn at random without replacement, what is the probability that all three marbles are red?
-</Your Output>
-</Example>
-
-<Task>
-<Base Question>
-{main_question_text}
-</Base Question>
-</Task>
-""",
 
 
-    "self_sampling_augmentor_decomposition":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
 
-<Instructions>
-1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
-2. Create {n_samples} new math questions.
-3. CRITICAL CONSTRAINTS for the new questions:
-    - Simpler: They must be somewhat easier than the Base Question.
-    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
-    - Distinct: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
-4. Do NOT provide any rationale, steps, or solutions.
-5. Output ONLY the numbered list of question statements.
-</Instructions>
 
-<Example>
-<Base Question>
-An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
-</Base Question>
-
-<Your Output (for n_samples = 2)>
-1. How many distinct ways can you arrange 3 red balls and 3 blue balls in a row of 6 slots?
-2. There are 6 seats numbered 1 to 6. If we choose 2 seats at random to be the "Captain's seats", what is the probability that we chose specifically seat #1 and seat #2?
-</Your Output>
-</Example>
-
-<Task>
-<Base Question>
-{main_question_text}
-</Base Question>
-</Task>
-""",
-
-    "self_sampling_augmentor_decomposition_2":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
-
-<Instructions>
-1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
-2. Create {n_samples} new math questions.
-3. CRITICAL CONSTRAINTS for the new questions:
-    - Simpler: They must be somewhat easier than the Base Question.
-    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
-    - Distinct: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
-4. Do NOT provide any rationale, steps, or solutions.
-5. Output ONLY the numbered list of question statements.
-</Instructions>
-
-<Example>
-<Base Question>
-An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
-</Base Question>
-
-<Your Output (for n_samples = 2)>
-1. A flight attendant has 3 steak meals and 3 fish meals on a cart. In how many distinct ways can these 6 meals be distributed to 6 specific crew members?
-2. A crew of 6 people includes exactly 2 pilots. If we randomly select a group of 3 crew members to receive the fish meals, what is the probability that the group chosen includes both pilots?
-</Your Output>
-</Example>
-
-<Task>
-<Base Question>
-{main_question_text}
-</Base Question>
-</Task>
-""",
-    "self_sampling_augmentor_decomposition_3":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
-
-<Instructions>
-1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
-2. Create {n_samples} new math questions.
-3. CRITICAL CONSTRAINTS for the new questions:
-    - Simpler: They must be moderately simpler than the Base Question and conceptually isolated to reduce overall difficulty.
-    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
-    - Distinct: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
-4. Do NOT provide any rationale, steps, or solutions.
-5. Output ONLY the numbered list of question statements.
-</Instructions>
-
-<Example>
-<Base Question>
-An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
-</Base Question>
-
-<Your Output (for n_samples = 2)>
-1. A flight attendant has 3 steak meals and 3 fish meals on a cart. In how many distinct ways can these 6 meals be distributed to 6 specific crew members?
-2. A crew of 6 people includes exactly 2 pilots. If we randomly select a group of 3 crew members to receive the fish meals, what is the probability that the group chosen includes both pilots?
-</Your Output>
-</Example>
-
-<Task>
-<Base Question>
-{main_question_text}
-</Base Question>
-</Task>
-""",
-    "self_sampling_augmentor_decomposition_4":"""You are an expert mathematical reasoning assistant. Your task is to decompose a complex 'Base Question' into {n_samples} simpler, distinct sub-problems that isolate specific mathematical concepts or logical steps found in the base question.
-<Instructions>
-1. Analyze the 'Base Question' to identify its underlying distinct mathematical components (e.g., the counting method, the probability rule, the geometric property, or the arithmetic relationship).
-2. Create {n_samples} new math questions.
-3. CRITICAL CONSTRAINTS for the new questions:
-    - Moderately Simpler & Reduced Complexity: The new questions must be distinctly easier than the Base Question. Reduce the cognitive load by lowering numerical magnitudes or removing multi-step logic layers, ensuring the core concept remains but the execution is more straightforward.
-    - Decomposed Perspectives: Each generated question should focus on a *different* mechanism or aspect of the Base Question. (For example, if the base question involves probability with combinations, Problem 1 might strictly test calculating combinations, while Problem 2 tests the specific probability logic with smaller numbers).
-    - Distinct Contexts: They must employ entirely different scenarios, contexts, or objects compared to the Base Question, ensuring the new problems differ significantly in setting (not just changing the numbers).
-4. Do NOT provide any rationale, steps, or solutions.
-5. Output ONLY the numbered list of question statements.
-</Instructions>
-
-<Example>
-<Base Question>
-An airline serves a dinner to all the passengers on an airplane. They get their choice of steak or fish. Three steak meals and three fish meals are set aside for the six-member crew. If the meals are distributed to the crew members randomly, what is the probability that both pilots get the fish?
-</Base Question>
-<Your Output (for n_samples = 2)>
-1. A flight attendant has 3 steak meals and 3 fish meals on a cart. In how many distinct ways can these 6 meals be distributed to 6 specific crew members?
-2. A crew of 6 people includes exactly 2 pilots. If we randomly select a group of 3 crew members to receive the fish meals, what is the probability that the group chosen includes both pilots?
-</Your Output>
-</Example>
-
-<Task>
-<Base Question>
-{main_question_text}
-</Base Question>
-</Task>
-""",
-    "self_sampling_augmentor_decomposition_complex":"""You are an expert Logical Decomposition Specialist and Mathematical Architect. Your objective is not merely to simplify a problem, but to deconstruct a complex 'Base Question' into {n_samples} distinct, orthogonal sub-problems using the method of **Variable Isolation via Zero-State Application**.
-
-<Core_Philosophy>
-You must view the Base Question as a system composed of a **Trunk** and multiple **Aspects**.
-1.  **The Trunk (The Skeleton):** The fundamental reasoning pathway, physical law, or algorithmic structure that defines the problem type. This MUST exist in every sub-question. You effectively "freeze" the core logic.
-2.  **The Aspects (The Variables):** The specific constraints, complexities, or forces acting upon the Trunk (e.g., friction, tax rates, conditional probabilities).
-3.  **Orthogonality:** Each sub-question must focus on exactly ONE active Aspect while the others are dormant.
-4.  **The Zero-State Rule:** You do not *delete* the other aspects; you set them to their "Identity Value" or "Ideal State" so they no longer contribute to the difficulty but the Trunk remains valid.
-</Core_Philosophy>
-
-<Instructions>
-1.  **Analyze the Base Question:**
-    *   Identify the **Trunk**. (e.g., "Newton's Second Law" or "Compound Interest Formula").
-    *   List all distinct **Aspects** (complexities) present in the prompt.
-    *   Determine the **Zero-State** for each aspect (e.g., Friction → 0, Efficiency → 100%, Delay → 0 seconds).
-
-2.  **Generate {n_samples} Sub-Questions:**
-    *   For each sub-question, select **ONE** target Aspect to highlight.
-    *   Apply the **Zero-State Rule** to all *other* non-target aspects.
-    *   **Preserve the Trunk:** Ensure the core solving method remains identical to the Base Question, even if the values are simplified.
-
-3.  **Strict Constraints:**
-    *   **No Logic Deletion:** Do not remove the Trunk. If the Base Question is about calculating speed, every sub-question must still be about calculating speed/motion, not just "counting objects."
-    *   **Independence:** The specific challenge in Question 1 must not overlap with the specific challenge in Question 2. They must be orthogonal.
-    *   **Contextual Divergence (CRITICAL):** To prevent analogical hallucination, the sub-questions must NOT use the same setting or objects as the Base Question. If the Base Question is about "Cars," the sub-questions must be about "Blocks," "Particles," or "Widgets." Change the *Skin*, keep the *Math*.
-
-4.  **Verification:**
-    *   Ensure that if a student solves all {n_samples} questions, they have practiced every mechanism required to solve the Base Question.
-</Instructions>
-
-<Zero_State_Protocol>
-When deactivating an Aspect, use these canonical values:
-*   **Additive constraints** (e.g., wind speed, fees): Set to **0**.
-*   **Multiplicative constraints** (e.g., coefficients, efficiency): Set to **1** (or 100%).
-*   **Logic gates** (e.g., "if it is raining"): Set to the **Simplest Valid Truth Value** (e.g., "It is sunny/dry").
-*   *Warning:* Do not set values that cause division by zero or logical paradoxes.
-</Zero_State_Protocol>
-
-<One_Shot_Example>
-<Base_Question>
-A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction is 0.1, and air resistance acts against the car with a force of 200N. Calculate the total engine force required to maintain a constant velocity.
-</Base_Question>
-
-<Reasoning_Trace>
-*   **Trunk:** Forces Logic (Sum of opposing forces = Engine Force).
-*   **Aspects:** 1. Gravity (Incline), 2. Friction, 3. Air Resistance.
-*   **Zero-States:** Incline → 0 degrees (Flat), Friction → $\\mu=0$ (Smooth), Air Resistance → 0N (Vacuum).
-*   **Context Strategy:** Change "Car/Road" to "Block/Ramp", "Crate/Floor", "Sled/Track".
-</Reasoning_Trace>
-
-<Your_Output (for n_samples = 3)>
-1. A heavy stone block of mass 1000kg is being pushed up a smooth, frictionless ramp angled at 30 degrees. Assuming a vacuum (no air resistance), calculate the pushing force required to keep the block moving at a constant velocity.
-2. A large wooden crate (1000kg) slides across a flat, horizontal warehouse floor (0-degree incline). The floor is rough with a kinetic friction coefficient of 0.1, and we assume air resistance is negligible. Calculate the horizontal force needed to maintain constant velocity.
-3. A 1000kg test sled moves along a flat, smooth horizontal track (no friction). However, a parachute attached to the back creates a drag force of 200N. Calculate the propulsion force required to maintain constant velocity.
-</Your_Output>
-</One_Shot_Example>
-
-<Task>
-<Base_Question>
-{main_question_text}
-</Base_Question>
-</Task>
-
-<Output_Requirement>
-Output ONLY the numbered list of question statements. Do not include your reasoning trace or target labels in the final output.
-</Output_Requirement>
-""",
-
-    "self_sampling_augmentor_decomposition_complex_2":"""You are an expert Logical Decomposition Specialist and Mathematical Architect. Your objective is to deconstruct a complex 'Base Question' into {n_samples} distinct, orthogonal sub-problems using the method of **Variable Isolation via Zero-State Application**.
-
-<Core_Philosophy>
-You must view the Base Question as a system composed of a **Trunk** and multiple **Aspects**.
-1.  **The Trunk (The Skeleton):** The fundamental reasoning pathway or formula. This MUST exist in every sub-question.
-2.  **The Aspects (The Variables):** The specific constraints acting upon the Trunk.
-3.  **Orthogonality:** Each sub-question must focus on exactly ONE active Aspect while the others are dormant (Zero-State).
-4.  **The Zero-State Rule:** Do not delete aspects; set them to their "Identity Value" or "Ideal State" so the Trunk remains executable but the aspect is trivialized.
-</Core_Philosophy>
-
-<Instructions>
-1.  **Analyze the Base Question:** Identify the Trunk (logic), the Aspects (complexities), and the Zero-State for each aspect.
-2.  **Generate {n_samples} Sub-Questions:**
-    *   Select **ONE** target Aspect to highlight per question.
-    *   Apply the **Zero-State Rule** to all *other* non-target aspects.
-    *   **Preserve the Trunk:** Ensure the core solving method remains identical.
-3.  **Strict Constraints:**
-    *   **No Logic Deletion:** Do not remove the Trunk. The underlying equation/logic must remain isomorphic.
-    *   **Contextual Divergence (CRITICAL):** To prevent analogical hallucination, the sub-questions must NOT use the same setting or objects as the Base Question. If the Base Question is about "Cars," the sub-questions must be about "Blocks," "Particles," or "Widgets." Change the *Skin*, keep the *Math*.
-    *   **Independence:** The specific challenge in Question 1 must not overlap with Question 2.
-
-<Zero_State_Protocol>
-*   **Additive constraints** (e.g., wind, fees): Set to **0**.
-*   **Multiplicative constraints** (e.g., efficiency): Set to **1** (or 100%).
-*   **Logic gates**: Set to the **Simplest Valid Truth Value**.
-</Zero_State_Protocol>
-
-<One_Shot_Example>
-<Base_Question>
-A 1000kg car drives up a 30-degree incline. The coefficient of kinetic friction is 0.1, and air resistance acts against the car with a force of 200N. Calculate the total engine force required to maintain a constant velocity.
-</Base_Question>
-
-<Reasoning_Trace>
-*   **Trunk:** Forces Logic (Sum of opposing forces = Forward Force).
-*   **Aspects:** Gravity (Incline), Friction, Drag.
-*   **Context Strategy:** Base is "Car/Road". Sub-questions must use different scenarios like "Block/Ramp" or "Sled/Ice".
-</Reasoning_Trace>
-
-<Your_Output (for n_samples = 3)>
-1. A heavy stone block of mass 1000kg is being pushed up a smooth, frictionless ramp angled at 30 degrees. Assuming a vacuum (no air resistance), what is the pushing force required to keep the block moving at a constant velocity?
-2. A large wooden crate (1000kg) slides across a flat, horizontal warehouse floor. The floor is rough with a kinetic friction coefficient of 0.1. Ignoring air resistance, calculate the horizontal force needed to maintain constant velocity.
-3. A 1000kg test sled moves along a flat, frictionless magnetic track. A parachute attached to the back creates a drag force of 200N. Calculate the propulsion force required to maintain constant velocity.
-</Your_Output>
-</One_Shot_Example>
-
-<Task>
-<Base_Question>
-{main_question_text}
-</Base_Question>
-</Task>
-
-<Output_Requirement>
-Output ONLY the numbered list of question statements. Do not include your reasoning trace.
-</Output_Requirement>
-""",
     
-    "self_sampling_augmentor_simplification":"""You are an expert mathematical simplification assistant. Your task is to take a 'Base Question' and produce a ONE-STEP SIMPLIFIED version of it. This simplified version will be used as a stepping stone to solve the original problem.
 
-<Instructions>
-1. Analyze the 'Base Question' to identify the "Core Logic" (the main rule or formula needed) and the "Complexity Layers" (large numbers, extra arithmetic steps, or difficult variables).
-2. Create EXACTLY ONE new math question.
-3. CRITICAL CONSTRAINTS for the new question:
-    - Lite Simplification: Make the question ONLY slightly easier. Do not make it trivial.
-    - Prune One Leaf: Remove exactly one layer of complexity. For example:
-        *   If the numbers are large, make them smaller integers.
-        *   If there is a pre-calculation required (e.g., "radius is 2+3"), change it to the direct value ("radius is 5").
-        *   If there are many variables, remove one variable.
-    - Preserve the Trunk: The main mathematical logic required to solve the simplified question MUST remain the same as the Base Question.
-    - Standalone: The new question must be a complete sentence and solvable.
-4. Do NOT provide any rationale, steps, or solutions.
-5. Output ONLY the simplified question statement.
-</Instructions>
 
-<Example>
-<Base Question>
-Find the area of a circle inscribed in a square that has a diagonal length of 8.
-</Base Question>
-
-<Your Output>
-Find the area of a circle inscribed in a square that has a side length of 4.
-</Your Output>
-(Note: The simplification removed the step of calculating the side from the diagonal, but kept the core logic of the circle-square relationship.)
-</Example>
-
-<Task>
-<Base Question>
-{main_question_text}
-</Base Question>
-</Task>
-""",
-
-    "self_sampling_augmentor_simplification_shallow":"""You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical.
-
-<Instructions>
-1. Analyze the 'Base Question' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\\pi$), messy units, or overly wordy variable descriptions.
-2. Create EXACTLY ONE new math question.
-3. CRITICAL CONSTRAINTS for the new question:
-    - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt 3$ with 4).
-    - Syntactic Cleanup: If the question uses complex units or wordy names for variables, standardize them (e.g., change "nautical miles" to "meters", change "the number of apples John holds" to "x").
-    - Logic Lock: Do NOT remove any reasoning steps, formulas, or intermediate derivations. The path to the solution must remain exactly the same, only the arithmetic should become effortless.
-    - Standalone: The new question must be a complete sentence and solvable.
-4. Do NOT provide any rationale, steps, or solutions.
-5. Output ONLY the simplified question statement.
-</Instructions>
-
-<Example>
-<Base Question>
-Calculate the kinetic energy of an object with a mass of 4.5kg moving at a velocity of $12.2 m/s$.
-</Base Question>
-
-<Your Output>
-Calculate the kinetic energy of an object with a mass of 2kg moving at a velocity of $4 m/s$.
-</Your Output>
-(Note: The decimal values were replaced with simple integers to make the calculation trivial, but the physics formula required remains exactly the same.)
-</Example>
-
-<Task>
-<Base Question>
-{main_question_text}
-</Base Question>
-</Task>
-""",
-    "self_sampling_augmentor_simplification_simple_shallow":"""Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
-<Instructions>
-1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
-2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
-3. Reduce the number of steps or constraints slightly, as long as the underlying relationship remains the same.
-4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
-</Instructions>
-<Main Question>
-{main_question_text}
-</Main Question>
-<Output Format>
-Simplified Question:
-[Your simplified version]
-</Output Format>
-""",
-
-    "self_sampling_augmentor_simplification_safe":"""You are a Logic Preservation Engine. Your goal is to analyze the <Main Question> to determine if it can be "Safely Simplified" for an Analogical Reasoning task.
-
-<Definition of Safe Simplification>
-A "Safe f" creates an easier version of the problem to solve as a reference, BUT it must adhere to these strict rules:
-1. PRESERVE LOGIC: The mathematical formulas, logical relationships, and required solution steps must remain identical to the original.
-2. REDUCE NOISE: You may replace large numbers with small integers (e.g., 5,392 -> 3), or remove narrative fluff (names, backstory).
-3. DO NO HARM: If changing a number or removing a sentence alters the fundamental question type or logic, it is UNSAFE.
-</Definition of Safe Simplification>
-
-<Evaluation Protocol>
-Before generating an output, analyze the question for these conditions:
-- Condition A (Simplifiable): The question uses large numbers or distracting text that are NOT essential to the logic.
-- Condition B (Unsafe/Core Only): The question is already short, abstract, or every number/constraint is structurally vital (e.g., specific constants, core puzzle constraints).
-
-<Instructions>
-- IF Condition A is met: Rewrite the question using small numbers and plain language. Keep the core logic exactly the same.
-- IF Condition B is met (or if you are unsure): Do NOT simplify. Output the <Main Question> exactly as it appears word-for-word.
-- WARNING: Better to output the original complex question than a simplified version with broken logic.
-</Instructions>
-
-<Main Question>
-{main_question_text}
-</Main Question>
-
-<Output Format>
-Simplified Question:
-[Your Output Here]
-</Output Format>
-""",
 
     "analogical_adaptation_v1": """You are an expert in analogical reasoning for mathematical problem-solving.
 
@@ -1087,127 +629,7 @@ Final Answer:
 </Your Answer/Output Format>
 """,
     
-    "hierarchical_parent_solver_v1": """You are an expert mathematical problem solver.
-You are tasked with solving a **Main Question**.
-To assist you, we have broken this problem down into several related sub-problems or variations, and provided their solutions below.
 
-<Instructions>
-1. Analyze the 'Solved Variations'. Identify the underlying mathematical principles, formulas, or logic used to solve them.
-2. Apply these principles to the 'Main Question'. The Main Question is the parent problem of these variations, so the logic should be directly applicable or composable.
-3. Provide a clear, step-by-step rationale for the Main Question.
-4. State the Final Answer clearly.
-</Instructions>
-
-<Solved Examples>
-{child_solutions_block}
-</Solved Examples>
-
-<Main Question to Solve>
-{main_question_text}
-</Main Question to Solve>
-
-<Output Format>
-Rationale:
-[Step-by-step derivation]
-
-Final Answer:
-[The final result]
-</Output Format>
-""",
-    "hierarchical_parent_solver_v2": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved variations.
-
-<Instructions>
-Carefully analyze each variation: pinpoint common reasoning steps, patterns (including structural similarities, logical sequences, mathematical transformations, conceptual mappings, or recurring problem-solving techniques), and effective strategies that led to the final answers. Focus on extracting only the most useful and relevant elements from these variations as supportive guides. Adapt them flexibly to fit the unique aspects of the main question, even when surface details differ, while prioritizing your own independent reasoning to develop a robust solution.
-</Instructions>
-
-<Solved Variations>
-{child_solutions_block}
-</Solved Variations>
-
-<Main Question to Solve>
-{main_question_text}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Your step-by-step rationale for the Main Question]
-
-Final Answer:
-[Your final answer to the Main Question]
-</Your  Answer/Output Format>
-""",
-
-    "hierarchical_parent_solver_v3": """Use the Solved Examples as a blueprint to solve the Main Question.
-<Instructions>
-- Study the examples to understand the logical method used to reach the solution.
-- Extract the key reasoning pattern.
-- Apply this pattern to the Main Question.
-- Provide the solution as a concise, technical derivation. Focus strictly on the mathematical steps and logic, avoiding conversational language.
-</Instructions>
-
-<Solved Variations>
-{child_solutions_block}
-</Solved Variations>
-
-<Main Question to Solve>
-{main_question_text}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Your step-by-step rationale for the Main Question]
-
-Final Answer:
-[Your final answer to the Main Question]
-</Your  Answer/Output Format>
-""",
-    "hierarchical_parent_solver_v4": """Use the Solved Examples as a blueprint to solve the Main Question.
-<Instructions>
-- Study the examples to understand the logical method used to reach the solution.
-- Extract the key reasoning pattern.
-- Apply this pattern to the Main Question.
-</Instructions>
-
-<Solved Variations>
-{child_solutions_block}
-</Solved Variations>
-
-<Main Question to Solve>
-{main_question_text}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Your step-by-step rationale for the Main Question]
-
-Final Answer:
-[Your final answer to the Main Question]
-</Your  Answer/Output Format>
-""",
-    "hierarchical_parent_solver_v5": """Use the method from the Simplified Reference to solve the Main Question.
-
-<Instructions>
-1. The Simplified Reference solves the same problem with easier numbers/logic.
-2. Follow the exact same sequence of steps used in the Reference, but apply them to the Main Question's values.
-3. Perform the calculations carefully. The logic is identical, but the arithmetic is more complex.
-</Instructions>
-
-<Simplified Reference>
-{child_solutions_block}
-</Simplified Reference>
-
-<Main Question to Solve>
-{main_question_text}
-</Main Question to Solve>
-
-<Your Answer/Output Format>
-Rationale:
-[Your step-by-step rationale for the Main Question]
-
-Final Answer:
-[Your final answer]
-</Your Answer/Output Format>
-""",
 
 
     "reverse_validation_v1": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved variations.
@@ -1300,91 +722,8 @@ Final Answer:
 </Output Format>
 """,
 
-    "self_sampling_augmentor_simplification_with_solution": """You are a Logic Preservation Engine. Your goal is to analyze the <Main Question> and its <Reference Solution> to determine if it can be "Safely Simplified" for an Analogical Reasoning task.
 
-<Definition of Safe Simplification>
-A "Safe Simplification" creates an easier version of the problem to solve as a reference, BUT it must adhere to these strict rules:
-1. PRESERVE LOGIC: The mathematical formulas, logical relationships, and required solution steps must remain identical to the original.
-2. REDUCE NOISE: You may replace large numbers with small integers (e.g., 5,392 -> 3), or remove narrative fluff (names, backstory).
-3. DO NO HARM: If changing a number or removing a sentence alters the fundamental question type or logic, it is UNSAFE.
-</Definition of Safe Simplification>
 
-<Evaluation Protocol>
-Before generating an output, analyze the question and solution for these conditions:
-- Condition A (Simplifiable): The question uses large numbers or distracting text that are NOT essential to the logic (as confirmed by the Reference Solution).
-- Condition B (Unsafe/Core Only): The question is already short, abstract, or every number/constraint is structurally vital (e.g., specific constants, core puzzle constraints).
-
-<Instructions>
-- IF Condition A is met: Rewrite the question using small numbers and plain language. Keep the core logic exactly the same.
-- IF Condition B is met (or if you are unsure): Do NOT simplify. Output the <Main Question> exactly as it appears word-for-word.
-- WARNING: Better to output the original complex question than a simplified version with broken logic.
-</Instructions>
-
-<Main Question>
-{main_question_text}
-</Main Question>
-
-<Reference Solution>
-{generated_solution}
-</Reference Solution>
-
-<Output Format>
-Simplified Question:
-[Your Output Here]
-</Output Format>
-""",
-
-    "self_sampling_augmentor_simplification_shallow_with_solution": """You are an expert mathematical simplification assistant specializing in Shallow Simplification. Your task is to take a 'Base Question' and produce a version that is computationally trivial but logically identical, aided by the provided 'Reference Solution'.
-
-<Instructions>
-1. Analyze the 'Base Question' and 'Reference Solution' to identify "Surface Noise." This includes complex numbers (decimals, fractions, large integers, irrationals like $\\pi$), messy units, or overly wordy variable descriptions visible in the calculation steps.
-2. Create EXACTLY ONE new math question.
-3. CRITICAL CONSTRAINTS for the new question:
-    - Numerical Smoothing: Replace ALL difficult values with "Toy Integers" (e.g., replace 4.87 with 5, replace 137 with 10, replace $2\sqrt 3$ with 4).
-    - Syntactic Cleanup: If the question uses complex units or wordy names for variables, standardize them (e.g., change "nautical miles" to "meters", change "the number of apples John holds" to "x").
-    - Logic Lock: Do NOT remove any reasoning steps, formulas, or intermediate derivations found in the Reference Solution. The path to the solution must remain exactly the same, only the arithmetic should become effortless.
-    - Standalone: The new question must be a complete sentence and solvable.
-4. Do NOT provide any rationale, steps, or solutions.
-5. Output ONLY the simplified question statement.
-</Instructions>
-
-<Example>
-<Base Question>
-Calculate the kinetic energy of an object with a mass of 4.5kg moving at a velocity of $12.2 m/s$.
-</Base Question>
-
-<Your Output>
-Calculate the kinetic energy of an object with a mass of 2kg moving at a velocity of $4 m/s$.
-</Your Output>
-(Note: The decimal values were replaced with simple integers to make the calculation trivial, but the physics formula required remains exactly the same.)
-</Example>
-
-<Task>
-<Base Question>
-{main_question_text}
-</Base Question>
-
-<Reference Solution>
-{generated_solution}
-</Reference Solution>
-</Task>
-""",
-
-     "self_sampling_augmentor_simplification_simple_shallow_with_solution":"""Your task is to create a simplified version of the Main Question that retains the core logical problem but simplifies the shallow or non-core elements.
-<Instructions>
-1. Replace large numbers or complex values with small, single-digit integers to make the math easier.
-2. Rewrite complex scenarios or wordy descriptions into a plain, direct statement to remove distractions.
-3. Reduce the number of steps or constraints slightly, as long as the underlying relationship remains the same.
-4. CRITICAL: If the question is already simple or cannot be simplified without breaking the core logic, or if the simplification results in a drastic change rather than a shallow adjustment, do NOT change it; just repeat the Main Question exactly.
-</Instructions>
-<Main Question>
-{main_question_text}
-</Main Question>
-<Output Format>
-Simplified Question:
-[Your simplified version]
-</Output Format>
-""",
 
     "mirror_baseline_zero_shot_v1": """Objective:
 Your task is to solve the Main Question by generating a clear, step-by-step Rationale and the Final Answer.
@@ -2147,11 +1486,6 @@ def create_transformation_prompt(target_query: str, text_to_transform: str, conf
     return template.format(target_query=target_query, text_to_transform=text_to_transform)
 
 
-def create_merging_prompt(target_query: str, samples_to_merge: List[str]) -> str:
-    if len(samples_to_merge) != 2:
-        return "Error: create_merging_prompt requires exactly two samples."
-    template = PROMPT_TEMPLATES["merging_v1"]
-    return template.format(target_query=target_query, sample_1=samples_to_merge[0], sample_2=samples_to_merge[1])
 
 def create_final_reasoning_prompt(main_question_text: str, final_examples: List[str], config: Dict[str, Any]) -> str:
     if not final_examples:
@@ -2197,55 +1531,60 @@ def create_duplicate_check_prompt(main_question_text: str, retrieved_questions: 
     return template.format(main_question_text=main_question_text, retrieved_questions_block=retrieved_block.strip())
 
 
-def create_self_sampling_prompt(main_question: str, config: Dict[str, Any]) -> str:
-    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_GENERATOR", "self_sampling_generator")
+def _create_single_example_analogical_prompt(
+    main_question: str,
+    candidate_text: str,
+    template_name: str,
+) -> str:
+    """Format one retained-feature exemplar with a shared analogical template."""
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    template = PROMPT_TEMPLATES[template_name]
-    return template.format(main_question_text=main_question)
-
-
-def create_augmentation_prompt(main_question: str, n_samples: int, config: Dict[str, Any]) -> str:
-    template_name = config.get("PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR", "self_sampling_augmentor_v1")
-    if template_name not in PROMPT_TEMPLATES:
-        return f"Error: Prompt template '{template_name}' not found in registry."
-    template = PROMPT_TEMPLATES[template_name]
-    return template.format(main_question_text=main_question, n_samples=n_samples)
-
-
-def create_analogical_adaptation_prompt(main_question: str, sample_group: List[str], config: Dict[str, Any]) -> str:
-    template_name = config.get("PROMPT_TEMPLATE_ANALOGICAL_ADAPTATION", "analogical_adaptation_v1")
-    if template_name not in PROMPT_TEMPLATES:
-        return f"Error: Prompt template '{template_name}' not found in registry."
-    template = PROMPT_TEMPLATES[template_name]
-    samples_block = "\n\n".join([f"<Sample {i+1}>\n{s}\n</Sample {i+1}>" for i, s in enumerate(sample_group)])
-    return template.format(
-        main_question_text=main_question, 
-        samples_block=samples_block,
-        examples_block=samples_block
+    sample_block = f"<Sample 1>\n{candidate_text}\n</Sample 1>"
+    return PROMPT_TEMPLATES[template_name].format(
+        main_question_text=main_question,
+        samples_block=sample_block,
+        examples_block=sample_block,
     )
 
-def create_hierarchical_parent_solver_prompt(main_question: str, child_nodes_data: List[Dict[str, str]], config: Dict[str, Any]) -> str:
-    template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_PARENT_SOLVER", "hierarchical_parent_solver_v1")
+
+def create_best_of_transformation_solver_prompt(
+    main_question: str,
+    candidate_text: str,
+    config: Dict[str, Any],
+) -> str:
+    template_name = config.get(
+        "PROMPT_TEMPLATE_BEST_OF_TRANSFORMATION_SOLVER",
+        "analogical_adaptation_v1",
+    )
+    return _create_single_example_analogical_prompt(
+        main_question, candidate_text, template_name
+    )
+
+
+def create_reverse_validation_candidate_prompt(
+    main_question: str,
+    config: Dict[str, Any],
+) -> str:
+    template_name = config.get(
+        "PROMPT_TEMPLATE_REVERSE_VALIDATION_CANDIDATE_GENERATOR",
+        "reverse_validation_candidate_generator_v1",
+    )
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
-    template = PROMPT_TEMPLATES[template_name]
-    child_block = ""
-    for i, child in enumerate(child_nodes_data):
-        child_block += f"<Variation {i+1}>\nQuestion: {child.get('question', '')}\nSolution: {child.get('solution', '')}\n</Variation {i+1}>\n\n"
-    return template.format(main_question_text=main_question, child_solutions_block=child_block.strip())
+    return PROMPT_TEMPLATES[template_name].format(main_question_text=main_question)
+
+
+
+
+
+
+
 
 def create_reverse_validation_prompt(validator_question: str, candidate_text: str, config: Dict[str, Any]) -> str:
     template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_SOLVER", "reverse_validation_v1")
     if template_name == "analogical_adaptation_v1" or template_name == "analogical_adaptation_v2":
-        if template_name not in PROMPT_TEMPLATES:
-            return f"Error: Template {template_name} not found."
-        samples_block = f"<Sample>\n{candidate_text}\n</Sample>"
-        template = PROMPT_TEMPLATES[template_name]
-        return template.format(
-            main_question_text=validator_question,
-            samples_block=samples_block,
-            examples_block=samples_block
+        return _create_single_example_analogical_prompt(
+            validator_question, candidate_text, template_name
         )
     if template_name not in PROMPT_TEMPLATES:
         return f"Error: Prompt template '{template_name}' not found in registry."
@@ -2274,12 +1613,6 @@ def create_main_from_simplified_proxy_prompt(original_main_question: str, simpli
     template = PROMPT_TEMPLATES[template_name]
     return template.format(original_main_question=original_main_question, simplified_solution=simplified_solution)
 
-def create_augmentation_with_solution_prompt(main_question: str, generated_solution: str, n_samples: int, config: Dict[str, Any]) -> str:
-    template_name = config.get("PROMPT_TEMPLATE_AUGMENTATION_STEP2_GENERATOR", "self_sampling_augmentor_simplification_with_solution")
-    if template_name not in PROMPT_TEMPLATES:
-        return f"Error: Template {template_name} not found."
-    template = PROMPT_TEMPLATES[template_name]
-    return template.format(main_question_text=main_question, generated_solution=generated_solution, n_samples=n_samples)
 
 
 def create_mirror_hypothesis_zeroshot_prompt(target_query: str, config: Dict[str, Any]) -> str:

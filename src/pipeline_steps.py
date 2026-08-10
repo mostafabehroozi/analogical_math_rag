@@ -3,12 +3,10 @@
 import logging
 import re
 import numpy as np
-import uuid
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Union, Optional
 import time
-from collections import deque
 import threading
 
 from src.prompts import (
@@ -16,19 +14,15 @@ from src.prompts import (
     EXEMPLAR_FORMAT,
     create_normalization_prompt,
     create_transformation_prompt,
-    create_merging_prompt,
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple,
     create_duplicate_check_prompt,
-    create_self_sampling_prompt,
-    create_augmentation_prompt,
-    create_analogical_adaptation_prompt,
-    create_hierarchical_parent_solver_prompt,
+    create_best_of_transformation_solver_prompt,
+    create_reverse_validation_candidate_prompt,
     create_reverse_validation_prompt,
     create_simplification_prompt,
     create_simplified_sample_solver_prompt,
     create_main_from_simplified_proxy_prompt,
-    create_augmentation_with_solution_prompt,
     create_reverse_transformation_main_to_exemplar_prompt,
     create_reverse_transformation_solve_transformed_prompt,
     create_reverse_transformation_final_solve_prompt,
@@ -761,136 +755,6 @@ def adapt(
         "trace": local_trace
     }
 
-def merge(
-    target_query: str,
-    adapted_texts: List[str],
-    embedding_model: SentenceTransformer,
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    target_count = config.get('TARGET_ADAPTED_SAMPLES_MERGING', 1)
-
-    if not config.get('APPLY_MERGING', False):
-        logger.info("APPLY_MERGING is False. Skipping merge step.")
-        return {"status": "SKIPPED", "merged_texts": adapted_texts[:target_count], "failed_merges": [], "trace": []}
-
-    logger.info("Starting merging step.")
-    local_trace = []
-    current_texts = list(adapted_texts)
-    failed_merges = []
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-    else:
-        raise TypeError(f"Unsupported API manager type for merging: {type(api_manager)}")
-        
-    temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
-    
-    iteration = 0
-    parallel_enabled = bool(config.get("QUESTION_PARALLEL_API_ENABLED", False))
-    max_workers = max(1, int(config.get("QUESTION_PARALLEL_MAX_WORKERS", 3)))
-
-    def run_merge_call(pair_to_merge: List[str], merge_iteration: int) -> Dict[str, Any]:
-        prompt = create_merging_prompt(target_query, pair_to_merge)
-        if "Error:" in prompt:
-            return {
-                "iteration": merge_iteration,
-                "pair_to_merge": pair_to_merge,
-                "prompt": prompt,
-                "response": None,
-                "prompt_error": True,
-            }
-
-        print(f"      [API Context] Calling LLM for: Merging (Iteration #{merge_iteration})")
-        response = api_manager.generate_content(prompt, model_name, temperature)
-        return {
-            "iteration": merge_iteration,
-            "pair_to_merge": pair_to_merge,
-            "prompt": prompt,
-            "response": response,
-            "prompt_error": False,
-        }
-
-    while len(current_texts) > target_count and len(current_texts) >= 2:
-        logger.info(f"Merge iteration {iteration + 1}: Merging from {len(current_texts)} samples.")
-        print(f"    -> Merging {len(current_texts)} samples down...")
-
-        merges_needed = len(current_texts) - target_count
-        wave_size = min(len(current_texts) // 2, merges_needed)
-        if parallel_enabled:
-            wave_size = min(wave_size, max_workers)
-        else:
-            wave_size = 1
-
-        wave_pairs = [
-            current_texts[offset:offset + 2]
-            for offset in range(0, wave_size * 2, 2)
-        ]
-        tasks = []
-        for pair_offset, pair_to_merge in enumerate(wave_pairs, start=1):
-            merge_iteration = iteration + pair_offset
-            tasks.append(
-                lambda pair=pair_to_merge, number=merge_iteration: run_merge_call(
-                    pair, number
-                )
-            )
-
-        outcomes = run_parallel_api_calls(tasks, config)
-        iteration += len(wave_pairs)
-
-        # Apply outcomes in the same pair order as the former sequential loop.
-        # A prior failure can reach target_count early; later calls in that
-        # already-running wave are retained in the trace but not applied.
-        for outcome in outcomes:
-            if len(current_texts) <= target_count or len(current_texts) < 2:
-                response = outcome.get("response")
-                if response is not None:
-                    local_trace.append(create_trace_entry(
-                        "merge", f"iteration_{outcome['iteration']}_unused",
-                        {
-                            "input_pair_count": 2,
-                            "prompt": outcome["prompt"],
-                            "note": "Call completed but was not applied because an earlier failure reached the target count.",
-                        },
-                        response,
-                        {"model": model_name, "temp": temperature}
-                    ))
-                continue
-
-            pair_to_merge = [current_texts.pop(0), current_texts.pop(0)]
-            if outcome["prompt_error"]:
-                logger.error(f"Failed to create merging prompt: {outcome['prompt']}")
-                failed_merges.append({
-                    "pair_to_merge": pair_to_merge,
-                    "error_info": {"error_message": "Prompt creation failed."},
-                })
-                continue
-
-            response = outcome["response"]
-            local_trace.append(create_trace_entry(
-                "merge", f"iteration_{outcome['iteration']}",
-                {"input_pair_count": 2, "prompt": outcome["prompt"]},
-                response,
-                {"model": model_name, "temp": temperature}
-            ))
-
-            if response['status'] == 'SUCCESS':
-                current_texts.append(response['text'])
-            else:
-                logger.warning(
-                    f"Merging failed: {response.get('error_message')}. Discarding pair."
-                )
-                failed_merges.append({
-                    "pair_to_merge": pair_to_merge,
-                    "error_info": response,
-                })
-
-    return {"status": "SUCCESS", "merged_texts": current_texts, "failed_merges": failed_merges, "trace": local_trace}
 
 def solve(
     target_query: str,
@@ -1242,502 +1106,15 @@ def reverse_transform_and_solve(
         "trace": local_trace
     }
 
-def self_sample(
-    target_query: str,
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting self-sampling step.")
-    local_trace = []
-    
-    n_samples = config.get("SELF_SAMPLING_N", 3)
-    temperature = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-    else:
-        raise TypeError(f"Unsupported API manager type for self-sampling: {type(api_manager)}")
 
-    prompt = create_self_sampling_prompt(target_query, config)
-    
-    successful_texts = []
-    failed_samples = []
-    
-    for i in range(n_samples):
-        print(f"    -> Generating self-sample {i+1}/{n_samples} for query '{target_query[:50]}...'")
-        response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "self_sample", f"sample_{i+1}",
-            {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-        ))
-        
-        if response['status'] == 'SUCCESS':
-            formatted_text = f"Question: {target_query}\nRationale and Answer: {response['text']}"
-            successful_texts.append(formatted_text)
-        else:
-            failed_samples.append({"sample_index": i, "error_info": response})
-    
-    if not successful_texts and failed_samples: status = "FAILURE"
-    elif successful_texts and failed_samples: status = "PARTIAL_SUCCESS"
-    else: status = "SUCCESS"
-    
-    return {"status": status, "self_sampled_texts": successful_texts, "failed_samples": failed_samples, "trace": local_trace}
 
-def parse_numbered_questions(text: str) -> List[str]:
-    questions = []
-    matches = re.findall(r'^\s*\d+\.\s*(.*)', text, re.MULTILINE)
-    for match in matches:
-        questions.append(match.strip())
-    return questions
 
-def augment_question(
-    target_query: str,
-    n_augmentations: int,
-    api_manager: Any,
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    local_trace = []
 
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config.get('GEMINI_MODEL_NAME_AUGMENTATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config.get('AVALAI_MODEL_NAME_AUGMENTATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config.get('OLLAMA_MODEL_NAME_AUGMENTATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
-    else:
-        raise TypeError(f"Unsupported API manager type for augmentation: {type(api_manager)}")
-    
-    temperature = config.get("DEFAULT_AUGMENTATION_TEMPERATURE", 0.7)
-    aug_mode = config.get("HIERARCHICAL_AUGMENTATION_MODE", "decomposition")
-    schedule = config.get("AUGMENTATION_SCHEDULE")
 
-    # Two-Step Augmentation Mode (Solve -> Simplify)
-    if config.get("HIERARCHICAL_AUGMENTATION_TWO_STEP", False):
-        logger.info("Running Two-Step Augmentation (Solve -> Simplify).")
-        
-        # Step 1: Solve Base Question
-        step1_template = config.get("PROMPT_TEMPLATE_AUGMENTATION_STEP1_SOLVER", "final_solver_simple_v2")
-        step1_config = config.copy()
-        step1_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = step1_template
-        
-        prompt_s1 = create_final_reasoning_prompt_simple(target_query, step1_config)
-        print("    -> [Augment Step 1] Solving base question...")
-        resp_s1 = api_manager.generate_content(prompt_s1, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "augment", "step1_solve_base",
-            {"prompt": prompt_s1}, resp_s1, {"model": model_name, "temp": temperature}
-        ))
 
-        if resp_s1['status'] != 'SUCCESS':
-            return {"status": "FAILURE", "error_info": resp_s1, "trace": local_trace} 
-        
-        solution_text = resp_s1['text']
 
-        # Step 2: Augment using Context
-        prompt_s2 = create_augmentation_with_solution_prompt(target_query, solution_text, n_augmentations, config)
-        print("    -> [Augment Step 2] Generating simplified question using solution context...")
-        response = api_manager.generate_content(prompt_s2, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "augment", "step2_generate_augmented",
-            {"prompt": prompt_s2}, response, {"model": model_name, "temp": temperature}
-        ))
 
-        if response['status'] != 'SUCCESS':
-            return {"status": "FAILURE", "augmented_questions": [], "error_info": response, "trace": local_trace}
-        
-        if aug_mode == "simplification":
-            augmented_questions = [response['text'].strip()]
-        else:
-            augmented_questions = parse_numbered_questions(response['text'])
-        
-        return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None, "trace": local_trace}
 
-    # Existing Schedule-based Logic
-    if isinstance(schedule, list) and len(schedule) == 2:
-        num_calls, questions_per_call = schedule
-        logger.info(f"Using augmentation schedule: {num_calls} calls, {questions_per_call} questions per call.")
-        
-        all_augmented_questions = []
-        failed_calls = []
-
-        for i in range(num_calls):
-            print(f"    -> Generating augmented questions (Call {i+1}/{num_calls})...")
-            prompt = create_augmentation_prompt(target_query, questions_per_call, config)
-            response = api_manager.generate_content(prompt, model_name, temperature)
-            
-            local_trace.append(create_trace_entry(
-                "augment", f"schedule_call_{i+1}",
-                {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-            ))
-
-            if response['status'] == 'SUCCESS':
-                if aug_mode == "simplification":
-                    parsed_qs = [response['text'].strip()]
-                else:
-                    parsed_qs = parse_numbered_questions(response['text'])
-
-                if len(parsed_qs) < questions_per_call and aug_mode == "decomposition":
-                    logger.warning(f"Augmentation call {i+1} expected {questions_per_call} questions, but only parsed {len(parsed_qs)}.")
-                all_augmented_questions.extend(parsed_qs)
-            else:
-                logger.error(f"Augmentation call {i+1}/{num_calls} failed: {response['error_message']}")
-                failed_calls.append({"call_index": i + 1, "error_info": response})
-
-        status = "SUCCESS"
-        if failed_calls and not all_augmented_questions:
-            status = "FAILURE"
-        elif failed_calls:
-            status = "PARTIAL_SUCCESS"
-            
-        return {
-            "status": status, 
-            "augmented_questions": all_augmented_questions, 
-            "failed_calls": failed_calls,
-            "trace": local_trace
-        }
-
-    # --- Existing Single-Call Logic ---
-    else:
-        logger.info(f"Generating {n_augmentations} augmented questions in a single call.")
-        prompt = create_augmentation_prompt(target_query, n_augmentations, config)
-        
-        print(f"    -> Generating {n_augmentations} augmented questions...")
-        response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
-            "augment", "single_call",
-            {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-        ))
-        
-        if response['status'] != 'SUCCESS':
-            return {"status": "FAILURE", "augmented_questions": [], "error_info": response, "trace": local_trace}
-        
-        if aug_mode == "simplification":
-            augmented_questions = [response['text'].strip()]
-        else:
-            augmented_questions = parse_numbered_questions(response['text'])
-        
-        if len(augmented_questions) < n_augmentations and aug_mode == "decomposition":
-            logger.warning(f"Augmentation expected {n_augmentations} questions, but only parsed {len(augmented_questions)}.")
-        
-        return {"status": "SUCCESS", "augmented_questions": augmented_questions, "error_info": None, "trace": local_trace}
-
-def _select_diverse_questions(questions: List[str], embeddings: np.ndarray, n: int) -> List[str]:
-    if embeddings.shape[0] < n: return questions
-    
-    similarity_matrix = cosine_similarity(embeddings)
-    np.fill_diagonal(similarity_matrix, 0)
-    avg_similarities = similarity_matrix.mean(axis=1)
-    selected_indices = np.argsort(avg_similarities)[:n]
-    return [questions[i] for i in selected_indices]
-
-def _select_relevant_questions(aug_questions: List[str], aug_embeddings: np.ndarray, sample_embeddings: np.ndarray, n: int) -> List[str]:
-    if aug_embeddings.shape[0] < n: return aug_questions
-    
-    cross_similarity = cosine_similarity(aug_embeddings, sample_embeddings)
-    max_similarities = cross_similarity.max(axis=1)
-    selected_indices = np.argsort(max_similarities)[-n:][::-1] 
-    return [aug_questions[i] for i in selected_indices]
-
-def select_augmented_questions(
-    augmented_questions: List[str],
-    config: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    retrieved_sample_texts: Optional[List[str]] = None
-) -> List[str]:
-    logger = logging.getLogger(__name__)
-    target_n = config['AUGMENT_N']
-    mode = config['SELECTIVE_AUGMENTATION_SAMPLING_MODE']
-
-    if len(augmented_questions) <= target_n:
-        return augmented_questions
-
-    aug_embeddings = _generate_embeddings(augmented_questions, embedding_model)
-    if aug_embeddings.size == 0:
-        logger.error("Failed to generate embeddings for augmented questions. Cannot perform selection.")
-        return augmented_questions[:target_n]
-    
-    if mode == "diversity" or (mode == "auto" and retrieved_sample_texts is None):
-        logger.info(f"Selecting {target_n} most DIVERSE augmented questions.")
-        return _select_diverse_questions(augmented_questions, aug_embeddings, target_n)
-    
-    elif mode == "relevance" or (mode == "auto" and retrieved_sample_texts is not None):
-        logger.info(f"Selecting {target_n} most RELEVANT augmented questions.")
-        sample_embeddings = _generate_embeddings(retrieved_sample_texts, embedding_model)
-        if sample_embeddings.size == 0:
-            logger.error("Failed to generate embeddings for samples. Falling back to diversity selection.")
-            return _select_diverse_questions(augmented_questions, aug_embeddings, target_n)
-        return _select_relevant_questions(augmented_questions, aug_embeddings, sample_embeddings, target_n)
-    
-    return augmented_questions[:target_n]
-
-def _count_processing_nodes(structure: Any) -> int:
-    count = 0
-    if isinstance(structure, (list, tuple)):
-        count = 1 
-        for item in structure:
-            count += _count_processing_nodes(item)
-    return count
-
-def _process_node_recursively(
-    node: Any,
-    aug_q_queue: deque,
-    retrieved_texts_map: Dict[int, str],
-    api_manager: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict], # Passed down to capture recursion
-    depth: int = 0
-) -> Union[str, None]:
-    indent = "  " * (depth + 2)
-    
-    if isinstance(node, int):
-        text = retrieved_texts_map.get(node)
-        if not text:
-            logging.getLogger(__name__).warning(f"{indent}Index {node} not found in retrieved map.")
-            return None
-        return text
-
-    elif isinstance(node, (list, tuple)):
-        child_exemplars = []
-        for child in node:
-            child_result = _process_node_recursively(child, aug_q_queue, retrieved_texts_map, api_manager, config, trace_accumulator, depth + 1)
-            if child_result:
-                child_exemplars.append(child_result)
-            else:
-                logging.getLogger(__name__).warning(f"{indent}Child node {child} failed or returned None.")
-
-        if not aug_q_queue:
-            error_msg = "Augmented question queue exhausted! Check AUGMENT_K vs Structure complexity."
-            logging.getLogger(__name__).error(error_msg)
-            return None
-        
-        current_aug_q = aug_q_queue.popleft()
-        print(f"{indent}-> Processing Node at depth {depth}. Context: {len(child_exemplars)} samples. solving AugQ: '{current_aug_q[:30]}...'")
-
-        if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-        elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-        elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-        else: return None
-        
-        if not child_exemplars:
-            prompt = create_self_sampling_prompt(current_aug_q, config)
-            temp = config.get("SELF_SAMPLING_TEMPERATURE", 0.7)
-        else:
-            prompt = create_analogical_adaptation_prompt(current_aug_q, child_exemplars, config)
-            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
-            
-        response = api_manager.generate_content(prompt, model_name, temp)
-        
-        # Append to the accumulator instead of a local list, effectively flattening the trace
-        trace_accumulator.append(create_trace_entry(
-            "analogical_adapt_recursion", f"depth_{depth}",
-            {"aug_q": current_aug_q, "child_count": len(child_exemplars), "prompt": prompt},
-            response, {"model": model_name, "temp": temp}
-        ))
-        
-        if response['status'] == 'SUCCESS':
-            return f"Question: {current_aug_q}\nRationale and Answer: {response['text']}"
-        else:
-            logging.getLogger(__name__).warning(f"{indent}Generation failed for node at depth {depth}.")
-            return None
-
-    return None
-
-def analogical_adapt(
-    target_query: str,
-    retrieved_indices: List[int],
-    exemplar_data: Dict[str, Any],
-    api_manager: Any,
-    api_manager_augment: Any, 
-    config: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    augmented_questions: Optional[List[str]] = None
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting recursive analogical adaptation step.")
-    local_trace = []
-    
-    group_sets = config.get("ANALOGICAL_GROUP_SETS", [])
-    if not group_sets:
-        logger.warning("ANALOGICAL_GROUP_SETS is empty. Skipping.")
-        return {"status": "SKIPPED", "reason": "No groups defined.", "trace": local_trace}
-
-    retrieved_texts_map = {}
-    for i, idx in enumerate(retrieved_indices):
-        q = exemplar_data['questions'][idx]
-        s = exemplar_data['solutions'][idx]
-        retrieved_texts_map[i + 1] = EXEMPLAR_FORMAT.format(question=q, solution=s)
-
-    total_nodes_needed = 0
-    for group in group_sets:
-        total_nodes_needed += _count_processing_nodes(group)
-    
-    logger.info(f"Structure requires {total_nodes_needed} augmented questions total.")
-
-    if config.get("ANALOGICAL_USE_MAIN_QUERY_AS_AUGMENTATION", False):
-        logger.info("Identity Augmentation Mode ENABLED. Injecting Main Question into all nodes.")
-        final_aug_qs = [target_query] * total_nodes_needed
-    else:
-        if augmented_questions and len(augmented_questions) >= total_nodes_needed:
-            final_aug_qs = augmented_questions[:total_nodes_needed]
-        else:
-            logger.info(f"Generating {total_nodes_needed} new augmented questions to satisfy structure demand.")
-            aug_res = augment_question(target_query, total_nodes_needed, api_manager_augment, config)
-            # Capture trace from augmentation call
-            if aug_res.get('trace'):
-                local_trace.extend(aug_res['trace'])
-                
-            if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
-                return {"status": "FAILURE", "error_info": aug_res.get('error_info'), "trace": local_trace}
-            
-            final_aug_qs = aug_res['augmented_questions']
-            
-            if config.get('SELECTIVE_AUGMENTATION_SAMPLING') and len(final_aug_qs) > total_nodes_needed:
-                 final_aug_qs = select_augmented_questions(final_aug_qs, config, embedding_model)
-                 if len(final_aug_qs) < total_nodes_needed:
-                     logger.warning("Selection reduced pool below required size. Using unselected pool.")
-                     final_aug_qs = aug_res['augmented_questions'][:total_nodes_needed]
-
-    if len(final_aug_qs) < total_nodes_needed:
-        msg = f"Not enough augmented questions generated. Needed {total_nodes_needed}, got {len(final_aug_qs)}."
-        logger.error(msg)
-        return {"status": "FAILURE", "error_message": msg, "trace": local_trace}
-
-    aug_q_queue = deque(final_aug_qs)
-    
-    successful_adaptations = []
-    failed_adaptations = []
-    
-    for group_idx, group_structure in enumerate(group_sets):
-        print(f"    -> Processing Top-Level Group #{group_idx + 1}: {group_structure}")
-        
-        result_text = _process_node_recursively(
-            node=group_structure, 
-            aug_q_queue=aug_q_queue,
-            retrieved_texts_map=retrieved_texts_map,
-            api_manager=api_manager, 
-            config=config,
-            trace_accumulator=local_trace, # Pass the local trace to gather recursive events
-            depth=0
-        )
-        
-        if result_text:
-            successful_adaptations.append(result_text)
-        else:
-            failed_adaptations.append({
-                "group_structure": str(group_structure),
-                "error": "Recursive processing failed"
-            })
-
-    status = "SUCCESS" if successful_adaptations else "FAILURE"
-    if successful_adaptations and failed_adaptations: status = "PARTIAL_SUCCESS"
-
-    return {
-        "status": status, 
-        "analogically_adapted_texts": successful_adaptations, 
-        "failed_adaptations": failed_adaptations,
-        "trace": local_trace
-    }
-
-def generate_reasoning_pathways(
-    target_query: str,
-    api_manager: Any, 
-    config: Dict[str, Any]
-) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    local_trace = []
-    mode = config.get("CONSISTENCY_GENERATION_MODE", "distinct_augmentations")
-    k_pathways = config.get("CONSISTENCY_PATHWAYS_K", 3)
-    
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config.get('GEMINI_MODEL_NAME_AUGMENTATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config.get('AVALAI_MODEL_NAME_AUGMENTATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config.get('OLLAMA_MODEL_NAME_AUGMENTATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
-    else:
-        raise TypeError(f"Unsupported API manager type: {type(api_manager)}")
-        
-    temp = config.get("CONSISTENCY_LAYER_1_TEMPERATURE", 0.7)
-    
-    pathways = []
-    errors = []
-
-    logger.info(f"Generating reasoning pathways in mode: {mode} (K={k_pathways})")
-
-    if mode == "distinct_augmentations":
-        aug_res = augment_question(target_query, k_pathways, api_manager, config)
-        if aug_res.get('trace'):
-            local_trace.extend(aug_res['trace'])
-
-        if aug_res['status'] == 'FAILURE':
-            return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info'), "trace": local_trace}
-        
-        aug_qs = aug_res['augmented_questions']
-        
-        if len(aug_qs) < k_pathways:
-            logger.warning(f"Augmentation only returned {len(aug_qs)} questions, requested {k_pathways}.")
-            
-        for i, q in enumerate(aug_qs[:k_pathways]):
-            print(f"    -> Solving Pathway {i+1} (Augmented Q): '{q[:50]}...'")
-            prompt = create_self_sampling_prompt(q, config)
-            resp = api_manager.generate_content(prompt, model_name, temp)
-            
-            local_trace.append(create_trace_entry(
-                "pathways", f"solve_pathway_{i+1}",
-                {"pathway_q": q, "prompt": prompt}, resp, {"model": model_name, "temp": temp}
-            ))
-            
-            if resp['status'] == 'SUCCESS':
-                exemplar = f"Question: {q}\nRationale and Answer: {resp['text']}"
-                pathways.append(exemplar)
-            else:
-                errors.append(resp)
-
-    elif mode == "single_augmentation_sampling":
-        aug_res = augment_question(target_query, 1, api_manager, config)
-        if aug_res.get('trace'):
-            local_trace.extend(aug_res['trace'])
-            
-        if aug_res['status'] != 'SUCCESS' or not aug_res['augmented_questions']:
-             return {"status": "FAILURE", "pathway_exemplars": [], "error_info": aug_res.get('error_info'), "trace": local_trace}
-        
-        q = aug_res['augmented_questions'][0]
-        logger.info(f"Using single augmented question for sampling: '{q[:50]}...'")
-        
-        prompt = create_self_sampling_prompt(q, config)
-        for i in range(k_pathways):
-            print(f"    -> Solving Pathway Sample {i+1} for Single AugQ.")
-            resp = api_manager.generate_content(prompt, model_name, temp)
-            
-            local_trace.append(create_trace_entry(
-                "pathways", f"solve_sample_{i+1}",
-                {"base_aug_q": q, "prompt": prompt}, resp, {"model": model_name, "temp": temp}
-            ))
-
-            if resp['status'] == 'SUCCESS':
-                exemplar = f"Question: {q}\nRationale and Answer: {resp['text']}"
-                pathways.append(exemplar)
-            else:
-                errors.append(resp)
-
-    else:
-        return {"status": "FAILURE", "error_message": f"Unknown consistency mode: {mode}", "trace": local_trace}
-
-    status = "SUCCESS"
-    if not pathways: status = "FAILURE"
-    elif errors: status = "PARTIAL_SUCCESS"
-
-    return {"status": status, "pathway_exemplars": pathways, "errors": errors, "trace": local_trace}
 
 
 
@@ -2055,263 +1432,56 @@ def apply_mirror_reranking(
             "trace": trace_accumulator
         }
 
-class ReasoningNode:
-    def __init__(self, question: str, depth: int):
-        self.id = str(uuid.uuid4())
-        self.question = question
-        self.depth = depth
-        self.children: List['ReasoningNode'] = []
-        self.retrieved_context: List[str] = [] 
-        self.solution: Optional[str] = None    
-        self.solution_attempts: List[str] = [] 
-        self.status: str = "PENDING"           
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "question": self.question,
-            "depth": self.depth,
-            "children": [child.to_dict() for child in self.children],
-            "retrieved_context_count": len(self.retrieved_context),
-            "solution_preview": (self.solution[:100] + "...") if self.solution else None,
-            "solution_attempts_count": len(self.solution_attempts),
-            "status": self.status
-        }
-
-def build_hierarchical_tree(
-    current_question: str,
-    current_depth: int,
-    max_depth: int,
-    branching_factor: int,
-    api_manager_augment: Any, 
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> ReasoningNode:
-    logger = logging.getLogger(__name__)
-    node = ReasoningNode(current_question, current_depth)
-    
-    if current_depth >= max_depth:
-        return node
-    
-    print(f"  -> [Tree Build] Expanding Node at Depth {current_depth} (Branching: {branching_factor})...")
-    
-    local_config = config.copy()
-    if config.get("PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"):
-        local_config["PROMPT_TEMPLATE_SELF_SAMPLING_AUGMENTOR"] = config["PROMPT_TEMPLATE_HIERARCHICAL_AUGMENTOR"]
-        
-    aug_res = augment_question(current_question, branching_factor, api_manager_augment, local_config)
-    
-    # Capture the trace from the augmentation call
-    if aug_res.get('trace'):
-        trace_accumulator.extend(aug_res['trace'])
-    
-    if aug_res['status'] != 'SUCCESS' and not aug_res.get('augmented_questions'):
-        logger.warning(f"Failed to expand node at depth {current_depth}. Stopping this branch.")
-        return node
-        
-    child_questions = aug_res['augmented_questions']
-    
-    for child_q in child_questions:
-        child_node = build_hierarchical_tree(child_q, current_depth + 1, max_depth, branching_factor, api_manager_augment, config, trace_accumulator)
-        node.children.append(child_node)
-        
-    return node
-
-def _process_leaves(
-    root: ReasoningNode,
-    target_query: str, 
-    exemplar_data: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    api_manager_adapt: Any,
-    api_manager_solve: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> None:
-    if not root.children:
-        print(f"    -> Processing Leaf Node (Depth {root.depth})...")
-        
-        if config.get("HIERARCHICAL_LEAF_RETRIEVAL_ENABLED", True):
-            top_k = config.get("HIERARCHICAL_LEAF_RETRIEVAL_TOP_K", 3)
-            query_mode = config.get("HIERARCHICAL_LEAF_RETRIEVAL_QUERY_MODE", "leaf")
-            
-            if query_mode == "root":
-                search_query = target_query
-                print(f"      [Retrieval] Mode: ROOT (Using Main Question: '{search_query[:50]}...')")
-            else:
-                search_query = root.question
-                print(f"      [Retrieval] Mode: LEAF (Using Simplified Question: '{search_query[:50]}...')")
-            
-            ret_res = retrieve(
-                search_query, 
-                embedding_model, 
-                exemplar_data['questions'], exemplar_data['embeddings'], 
-                top_k, exemplar_data.get('question_to_index')
-            )
-            # Capture retrieval trace
-            if ret_res.get('trace'):
-                trace_accumulator.extend(ret_res['trace'])
-            
-            if ret_res['status'] == 'SUCCESS':
-                adapt_res = adapt(
-                    root.question, ret_res['retrieved_indices'], 
-                    exemplar_data['questions'], exemplar_data['solutions'], 
-                    api_manager_adapt, config
-                )
-                # Capture adaptation trace
-                if adapt_res.get('trace'):
-                    trace_accumulator.extend(adapt_res['trace'])
-                
-                if adapt_res.get('adapted_texts'):
-                    root.retrieved_context = adapt_res['adapted_texts']
-                    print(f"      -> Leaf retrieved {len(root.retrieved_context)} samples.")
-        
-        template_name = config.get("PROMPT_TEMPLATE_HIERARCHICAL_LEAF_SOLVER", "final_solver_simple_v1")
-        
-        if root.retrieved_context:
-            local_config = config.copy()
-            local_config["PROMPT_TEMPLATE_FINAL_SOLVER"] = template_name 
-            prompt = create_final_reasoning_prompt(root.question, root.retrieved_context, local_config)
-        else:
-            local_config = config.copy()
-            local_config["PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE"] = template_name
-            prompt = create_final_reasoning_prompt_simple(root.question, local_config)
-            
-        model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") 
-        if isinstance(api_manager_solve, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
-        elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
-        
-        temp = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-        
-        resp = api_manager_solve.generate_content(prompt, model_name, temp)
-        
-        trace_accumulator.append(create_trace_entry(
-            "hierarchical_tree", "solve_leaf",
-            {"question": root.question, "prompt": prompt}, resp, {"model": model_name, "temp": temp}
-        ))
-        
-        if resp['status'] == 'SUCCESS':
-            root.solution = resp['text']
-            root.status = "SOLVED"
-        else:
-            root.status = "FAILED"
-            
-    else:
-        for child in root.children:
-            _process_leaves(child, target_query, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config, trace_accumulator)
-
-def propagate_solutions_upward(
-    node: ReasoningNode,
-    api_manager: Any,
-    config: Dict[str, Any],
-    trace_accumulator: List[Dict]
-) -> None:
-    for child in node.children:
-        propagate_solutions_upward(child, api_manager, config, trace_accumulator)
-    
-    if node.status == "SOLVED":
-        return
-
-    child_data = []
-    for child in node.children:
-        if child.status == "SOLVED" and child.solution:
-            child_data.append({"question": child.question, "solution": child.solution})
-            
-    if not child_data:
-        logging.getLogger(__name__).warning(f"Node at depth {node.depth} has no solved children. Cannot propagate.")
-        node.status = "FAILED_PROPAGATION"
-        return
-        
-    print(f"  -> [Propagation] Solving Node at Depth {node.depth} using {len(child_data)} child solutions...")
-    
-    prompt = create_hierarchical_parent_solver_prompt(node.question, child_data, config)
-    
-    model_name = config.get("GEMINI_MODEL_NAME_FINAL_SOLVER") 
-    if isinstance(api_manager, AvalAIAPIManager): model_name = config.get("AVALAI_MODEL_NAME_FINAL_SOLVER")
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config.get("OLLAMA_MODEL_NAME_FINAL_SOLVER")
-    
-    temp = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-    
-    if node.depth > 0:
-        resp = api_manager.generate_content(prompt, model_name, temp)
-        
-        trace_accumulator.append(create_trace_entry(
-            "hierarchical_tree", "propagate_solve_node",
-            {"depth": node.depth, "prompt": prompt}, resp, {"model": model_name, "temp": temp}
-        ))
-
-        if resp['status'] == 'SUCCESS':
-            node.solution = resp['text']
-            node.status = "SOLVED"
-        else:
-            node.status = "FAILED"
-    else:
-        n_attempts = config.get("N_PASS_ATTEMPTS", 1)
-        print(f"    -> Root Node detected. Solving {n_attempts} times (Pass@{n_attempts})...")
-        
-        success_count = 0
-        for i in range(n_attempts):
-            resp = api_manager.generate_content(prompt, model_name, temp)
-            
-            trace_accumulator.append(create_trace_entry(
-                "hierarchical_tree", f"solve_root_attempt_{i+1}",
-                {"prompt": prompt}, resp, {"model": model_name, "temp": temp}
-            ))
-
-            if resp['status'] == 'SUCCESS':
-                node.solution_attempts.append(resp['text'])
-                success_count += 1
-                if node.solution is None:
-                    node.solution = resp['text']
-        
-        if success_count > 0:
-            node.status = "SOLVED"
-        else:
-            node.status = "FAILED"
 
 
 
 
-def solve_hierarchical_tree(
+
+
+
+
+
+def _generate_reverse_validation_candidates(
     target_query: str,
-    exemplar_data: Dict[str, Any],
-    embedding_model: SentenceTransformer,
-    api_manager_adapt: Any,
-    api_manager_solve: Any,
-    api_manager_augment: Any, 
-    config: Dict[str, Any]
+    n_candidates: int,
+    api_manager: Any,
+    model_name: str,
+    config: Dict[str, Any],
+    trace_accumulator: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    logger = logging.getLogger(__name__)
-    logger.info("Starting Hierarchical Augmentation Pipeline.")
-    local_trace = []
-    
-    max_depth = config.get("HIERARCHICAL_TREE_DEPTH", 2)
-    branching = config.get("HIERARCHICAL_BRANCHING_FACTOR", 3)
-    
-    print("\n[HIERARCHICAL] Phase 1: Building Tree...")
-    root = build_hierarchical_tree(target_query, 0, max_depth, branching, api_manager_augment, config, local_trace)
-    
-    print("\n[HIERARCHICAL] Phase 2: Processing Leaves...")
-    
-    _process_leaves(root, target_query, exemplar_data, embedding_model, api_manager_adapt, api_manager_solve, config, local_trace)
-    
-    print("\n[HIERARCHICAL] Phase 3: Backward Propagation...")
-    propagate_solutions_upward(root, api_manager_solve, config, local_trace)
-    
-    final_status = "SUCCESS" if root.status == "SOLVED" else "FAILURE"
-    
-    final_attempts = []
-    if root.solution_attempts:
-        final_attempts = root.solution_attempts
-    elif root.solution:
-        final_attempts = [root.solution]
+    """Generate direct candidates owned exclusively by reverse validation."""
+    prompt = create_reverse_validation_candidate_prompt(target_query, config)
+    temperature = config.get("REVERSE_VALIDATION_CANDIDATE_TEMPERATURE", 1.0)
+    candidates = []
+    failures = []
 
-    return {
-        "status": final_status,
-        "root_solution": root.solution,
-        "root_solution_attempts": final_attempts,
-        "tree_structure": root.to_dict(),
-        "trace": local_trace
-    }
+    for candidate_index in range(n_candidates):
+        response = api_manager.generate_content(prompt, model_name, temperature)
+        trace_accumulator.append(create_trace_entry(
+            "reverse_validation",
+            f"generate_candidate_direct_{candidate_index}",
+            {"prompt": prompt},
+            response,
+            {"model": model_name, "temp": temperature},
+        ))
+        if response.get("status") == "SUCCESS":
+            candidates.append(
+                f"Question: {target_query}\n"
+                f"Rationale and Answer: {response['text']}"
+            )
+        else:
+            failures.append({
+                "candidate_index": candidate_index,
+                "error_info": response,
+            })
+
+    if candidates and failures:
+        status = "PARTIAL_SUCCESS"
+    elif candidates:
+        status = "SUCCESS"
+    else:
+        status = "FAILURE"
+    return {"status": status, "candidates": candidates, "failures": failures}
 
 
 def solve_with_analogical_consistency(
@@ -2378,7 +1548,7 @@ def solve_with_analogical_consistency(
             
             # Using the exact prompt structure as the evaluation phase
             prompt = create_reverse_validation_prompt(target_query, helper_text, config)
-            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
+            temp = config.get("REVERSE_VALIDATION_SOLVER_TEMPERATURE", 1.0)
             
             resp = api_manager_solve.generate_content(prompt, model_name, temp)
             
@@ -2438,25 +1608,25 @@ def solve_with_analogical_consistency(
         print(f"\n  [Phase 2] Using {len(validator_indices)} Pre-retrieved Validators...")
 
     else:
-        # ORIGINAL PATH: EXACTLY AS IT WAS WRITTEN BEFORE
         print(f"\n  [Phase 1] Generating {n_candidates} Candidate Solutions...")
-        
-        candidate_config = config.copy()
-        candidate_config["SELF_SAMPLING_N"] = n_candidates
-        
-        candidates_result = self_sample(target_query, api_manager_solve, candidate_config)
-        
-        if candidates_result.get('trace'):
-            local_trace.extend(candidates_result['trace'])
-        
+
+        candidates_result = _generate_reverse_validation_candidates(
+            target_query=target_query,
+            n_candidates=n_candidates,
+            api_manager=api_manager_solve,
+            model_name=model_name,
+            config=config,
+            trace_accumulator=local_trace,
+        )
+
         if candidates_result['status'] == 'FAILURE':
             logger.error("Failed to generate any candidates.")
             return {"status": "FAILURE", "error": "Candidate generation failed", "trace": local_trace}
-            
-        candidates = candidates_result['self_sampled_texts'] 
+
+        candidates = candidates_result['candidates']
         print(f"    -> Generated {len(candidates)} candidates.")
 
-        # Optional: add zero-shot candidates to self-sampled candidates
+        # Optional: add zero-shot candidates to the direct candidates
         if config.get("REVERSE_VALIDATION_ADD_ZEROSHOT_CANDIDATES", False):
             rz_n = config.get("REVERSE_VALIDATION_ZEROSHOT_CANDIDATES_N", 3)
             template_name = config.get("PROMPT_TEMPLATE_REVERSE_VALIDATION_ZERO_SHOT_SOLVER", "final_solver_simple_v1")
@@ -2571,7 +1741,7 @@ def solve_with_analogical_consistency(
             val_gt = val['ground_truth']
             
             prompt = create_reverse_validation_prompt(val_q, cand_text, config)
-            temp = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0) 
+            temp = config.get("REVERSE_VALIDATION_SOLVER_TEMPERATURE", 1.0)
             
             v_correct = 0
             
@@ -2764,7 +1934,7 @@ def select_best_transformations(
         raise TypeError(f"Unsupported API manager: {type(api_manager_adapt)}")
     
     temp_transform = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
-    temp_solve = config.get("DEFAULT_ANALOGICAL_ADAPTATION_TEMPERATURE", 1.0)
+    temp_solve = config.get("BEST_OF_TRANSFORMATION_SOLVER_TEMPERATURE", 1.0)
     temp_eval = config.get("DEFAULT_EVALUATOR_TEMPERATURE", 0.0)
     
     evaluation_contexts = {}
@@ -2853,7 +2023,7 @@ def select_best_transformations(
         
         for pool_idx, candidate_dict in enumerate(pool):
             # Generate solution for this candidate
-            prompt_solve = create_analogical_adaptation_prompt(
+            prompt_solve = create_best_of_transformation_solver_prompt(
                 target_query,
                 candidate_dict['text'],
                 config
