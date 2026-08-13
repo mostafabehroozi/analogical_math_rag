@@ -25,6 +25,8 @@ directory.
   validation stages.
 - `src/api_manager.py` — provider clients, retry behavior, and rate limiting.
 - `src/evaluation.py` — answer evaluation and aggregate metrics.
+- `src/benchmark_data.py` — Hugging Face benchmark schemas, downloads, and
+  question/ground-truth normalization.
 - `src/layer1_base_execution.py`, `src/layer2_analysis.py`, and
   `src/layer2_integration.py` — cached execution and offline analysis.
 - `src/*_dataset_builder.py` — optional dataset-construction workflows.
@@ -33,7 +35,8 @@ directory.
 
 ## Before a run
 
-1. Select the benchmark and feature flags in `CONFIG`.
+1. Select `numina_hard`, `math500`, `gsm8k`, `aime25`, or `aime26` as the
+   benchmark in `CONFIG`, then choose the feature flags.
 2. Configure the selected provider and its model names/credentials.
 3. Keep `BATCH_PROCESSING_ENABLED` and `QUESTION_PARALLEL_API_ENABLED` disabled
    for the first small validation run.

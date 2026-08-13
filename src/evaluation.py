@@ -31,6 +31,7 @@ from collections import defaultdict
 
 from src.utils import save_json, load_json
 from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.benchmark_data import uses_exact_final_answers
 
 # Define a structured type for the result of a single LLM-based evaluation
 class EvaluationResult(TypedDict):
@@ -86,11 +87,11 @@ def evaluate_single_answer_with_llm(
         return {"is_correct": None, "status": "EMPTY_ANSWER", "error_details": None}
 
     target_benchmark = str(config.get("TARGET_BENCHMARK", "")).lower().strip()
-    is_math500 = target_benchmark in ["math500", "math_500", "math-500"]
+    has_exact_final_answers = uses_exact_final_answers(target_benchmark)
 
-    if is_math500:
-        # MATH500 ground truth does not have CoT; it is already the final answer.
-        # In all situations of MATH500, use evaluator_v2.
+    if has_exact_final_answers:
+        # MATH-500 and AIME expose a dedicated final-answer field. Always compare
+        # it directly; boxed-line parsing is only for solution/rationale fields.
         template_name = "evaluator_v2"
     else:
         # For datasets with CoT + final answer (e.g. NuminaMath, GSM8K)

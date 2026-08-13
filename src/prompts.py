@@ -1,5 +1,7 @@
 from typing import List, Dict, Any, Optional
 
+from src.benchmark_data import uses_exact_final_answers
+
 EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
 
 PROMPT_TEMPLATES: Dict[str, str] = {
@@ -1518,7 +1520,7 @@ def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[s
 def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any], template_name: Optional[str] = None) -> str:
     if not template_name:
         target_benchmark = str(config.get("TARGET_BENCHMARK", "")).lower().strip()
-        if target_benchmark in ["math500", "math_500", "math-500"]:
+        if uses_exact_final_answers(target_benchmark):
             template_name = "evaluator_v2"
         else:
             template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
