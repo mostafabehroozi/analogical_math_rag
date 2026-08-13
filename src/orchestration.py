@@ -158,6 +158,10 @@ def run_pipeline_for_single_query(
                     "USE_RETRIEVAL", "APPLY_NORMALIZATION", "APPLY_TRANSFORMATION_1",
                     "APPLY_TRANSFORMATION_2", "APPLY_TRANSFORMATION_3",
                     "DEFER_SOLVE_STEP", "TOP_N_CANDIDATES_RETRIEVAL", "N_PASS_ATTEMPTS",
+                    # UPDATE: Persist provider routing so a retry uses the same
+                    # managers as the original experiment-level configuration.
+                    "API_PROVIDER_ADAPTATION", "API_PROVIDER_SOLVER",
+                    "API_PROVIDER_EVALUATOR", "API_PROVIDER_SIMPLIFICATION",
                     # Layer 1 Flags
                     "APPLY_LAYER1_BASE_EXECUTION", "LAYER1_ONLY_MODE", "LAYER1_CACHE_DIR",
                     "LAYER1_N_CANDIDATES", "LAYER1_ONE_SHOT_CANDIDATES_N", "LAYER1_DATASET_NAME",

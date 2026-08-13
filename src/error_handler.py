@@ -346,13 +346,18 @@ def retry_failed_generation_pipelines(
     embedding_model: Any,
     exemplar_data: Dict[str, Any],
     api_managers: Dict[str, Any],
-    manual_retry_query_indices: Optional[List[int]] = None
+    manual_retry_query_indices: Optional[List[int]] = None,
+    hard_solutions: Optional[List[str]] = None
 ) -> Dict[str, List[Dict]]:
     """
     Retry failed generation logs and explicitly requested hard-question indices.
 
     Manual indices are hard-question indices, not positions in the loaded run-log
     list. They are retried even if absent from both the run log and Layer-1 cache.
+
+    ``hard_solutions`` is optional for backward compatibility, but callers that
+    load an external benchmark should pass it. This keeps retry ground truths
+    aligned with the original run instead of falling back to exemplar solutions.
     """
     
     logger = logging.getLogger(__name__)
@@ -441,7 +446,9 @@ def retry_failed_generation_pipelines(
                 config=retry_config,
                 embedding_model=embedding_model,
                 exemplar_data=exemplar_data,
-                api_managers=api_managers
+                api_managers=api_managers,
+                # UPDATE: Preserve benchmark-answer alignment during retries.
+                hard_solutions=hard_solutions
             )
 
             if current_config.get("APPLY_LAYER1_BASE_EXECUTION", False):
@@ -483,7 +490,7 @@ def retry_failed_evaluations(
     logger.info("Starting the process to retry failed evaluation attempts.")
     results_dir = config['RESULTS_DIR']
 
-    for exp_name, _ in all_experiments_logs.items():
+    for exp_name, query_logs in all_experiments_logs.items():
         eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
         detailed_evaluations = load_json(eval_file_path)
 
@@ -493,8 +500,15 @@ def retry_failed_evaluations(
 
         logger.info(f"--- Retrying evaluations for Experiment: {exp_name} ---")
         
-        # MODIFIED: Select the correct API manager for evaluation based on the config
-        provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
+        # UPDATE: Honor the evaluator provider recorded by the original
+        # experiment, with global config as a backward-compatible fallback.
+        experiment_config = config.copy()
+        if query_logs and isinstance(query_logs[0], dict):
+            logged_config = query_logs[0].get("config_flags_used", {})
+            if isinstance(logged_config, dict):
+                experiment_config.update(logged_config)
+
+        provider_for_eval = experiment_config.get('API_PROVIDER_EVALUATOR', 'gemini')
         manager_for_eval = api_managers[provider_for_eval]
 
         # Find all attempts across all queries that did not succeed
@@ -522,7 +536,10 @@ def retry_failed_evaluations(
                 
                 # MODIFIED: Use the selected manager for evaluation
                 eval_result = evaluate_single_answer_with_llm(
-                    attempt_text_or_dict, ground_truth, manager_for_eval, config
+                    attempt_text_or_dict,
+                    ground_truth,
+                    manager_for_eval,
+                    experiment_config,
                 )
                 
                 # Update the log in place
@@ -533,11 +550,11 @@ def retry_failed_evaluations(
 
             # Persist changes after each retry
             save_json(detailed_evaluations, eval_file_path)
-            periodic_sync_check(loop_idx, config)
+            periodic_sync_check(loop_idx, experiment_config)
 
         # Final save and sync
         save_json(detailed_evaluations, eval_file_path)
-        sync_workspace_to_hub(config)
+        sync_workspace_to_hub(experiment_config)
 
     logger.info("Finished retrying all failed evaluations across all experiments.")
 

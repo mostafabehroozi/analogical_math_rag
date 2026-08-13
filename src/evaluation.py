@@ -180,6 +180,14 @@ def analyze_experiment_logs(
         if not query_logs:
             logger.warning(f"No logs found for experiment '{exp_name}'. Skipping.")
             continue
+
+        # UPDATE: New run logs persist provider routing in config_flags_used.
+        # Merge it here so experiment-level evaluator overrides remain consistent
+        # during post-run analysis; old logs safely fall back to global config.
+        experiment_config = config.copy()
+        logged_config = query_logs[0].get("config_flags_used", {})
+        if isinstance(logged_config, dict):
+            experiment_config.update(logged_config)
         
         # --- Phase 1: State Management & Resumption ---
         eval_file_path = os.path.join(results_dir, f"{exp_name}_detailed_eval.json")
@@ -196,7 +204,7 @@ def analyze_experiment_logs(
         logger.info(f"Loaded {len(detailed_evaluations)} existing evaluation entries for '{exp_name}'.")
 
         # Phase 2: Process Logs (Detecting Strategies)
-        provider_for_eval = config.get('API_PROVIDER_EVALUATOR', 'gemini')
+        provider_for_eval = experiment_config.get('API_PROVIDER_EVALUATOR', 'gemini')
         manager_for_eval = api_managers[provider_for_eval]
 
         # 1. Gather all tasks that need evaluation
@@ -234,7 +242,7 @@ def analyze_experiment_logs(
         # 2. Execute Evaluations in Parallel
         if tasks_to_run:
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            max_workers = config.get("BATCH_MAX_WORKERS", 5)
+            max_workers = experiment_config.get("BATCH_MAX_WORKERS", 5)
             
             def eval_worker(task):
                 from src.context_logger import pipeline_context
@@ -243,7 +251,12 @@ def analyze_experiment_logs(
                     is_correct_list, status_list, error_details_list = [], [], []
                     for attempt in task["attempts"]:
                         if isinstance(attempt, str):
-                            eval_result = evaluate_single_answer_with_llm(attempt, task["ground_truth"], manager_for_eval, config)
+                            eval_result = evaluate_single_answer_with_llm(
+                                attempt,
+                                task["ground_truth"],
+                                manager_for_eval,
+                                experiment_config,
+                            )
                             is_correct_list.append(eval_result["is_correct"])
                             status_list.append(eval_result["status"])
                             error_details_list.append(eval_result["error_details"])
