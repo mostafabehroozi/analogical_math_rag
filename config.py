@@ -253,7 +253,6 @@ CONFIG = {
     "MIRROR_BENCHMARK_GROUPS": [(0,), (0, 1), (0, 1, 2)],
     "MIRROR_BENCHMARK_SAMPLES_N": 10,
     "PROMPT_TEMPLATE_MIRROR_BASELINE": "mirror_baseline_zero_shot_v1",
-    "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS": "mirror_hypothesis_gen_v1",
     "PROMPT_TEMPLATE_MIRROR_VERIFICATION": "mirror_verification_v1",
     "PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT": "mirror_hypothesis_gen_zero_shot_v1",
 

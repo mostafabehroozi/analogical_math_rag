@@ -21,7 +21,7 @@ directory.
 - `config.py` — providers, models, feature flags, paths, and experiment sizes.
 - `main_experiment.ipynb` — environment setup and experiment entry point.
 - `src/orchestration.py` — top-level Layer 1/Layer 2 pipeline coordination.
-- `src/pipeline_steps.py` — retrieval, adaptation, solving, augmentation, and
+- `src/pipeline_steps.py` — retrieval, adaptation, solving, simplification, and
   validation stages.
 - `src/api_manager.py` — provider clients, retry behavior, and rate limiting.
 - `src/evaluation.py` — answer evaluation and aggregate metrics.
