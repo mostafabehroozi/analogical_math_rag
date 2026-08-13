@@ -11,6 +11,3 @@ tqdm
 google-genai
 ollama
 openai
-
-# Optional experiment tracking used when available
-wandb

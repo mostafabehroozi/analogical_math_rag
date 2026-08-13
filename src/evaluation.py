@@ -29,11 +29,6 @@ from tqdm import tqdm
 from typing import List, Dict, Any, Tuple, Optional, TypedDict
 from collections import defaultdict
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
 from src.utils import save_json, load_json
 from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
@@ -364,28 +359,5 @@ def analyze_experiment_logs(
     logger.info("Finished analysis of all experiments.")
     
     analysis_df = pd.DataFrame(analysis_summary)
-    
-    # Log evaluation results to W&B
-    if config.get('WANDB_PERSIST_ONLINE', False) and wandb is not None:
-        try:
-            from src.wandb_sync import log_experiment_metrics
-            
-            # Log metrics for each experiment from the analysis summary
-            for _, row in analysis_df.iterrows():
-                exp_name = row.get('experiment_name', 'unknown')
-                metrics = {}
-                
-                # Extract metric columns (those starting with 'pass@')
-                for col in analysis_df.columns:
-                    if col.startswith('pass@'):
-                        metrics[col] = row[col]
-                    elif col == 'num_eval_primary':
-                        metrics['evaluations'] = row[col]
-                
-                if metrics:
-                    log_experiment_metrics(config, exp_name, metrics)
-                    logger.debug(f"Logged evaluation metrics for '{exp_name}' to W&B")
-        except Exception as e:
-            logger.debug(f"Failed to log evaluation metrics to W&B: {e}")
     
     return analysis_df
