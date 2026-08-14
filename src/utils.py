@@ -462,6 +462,231 @@ def load_exemplar_corpus(config: dict, logger=None):
         return None
 
 
+# --- 8. NuminaMath Hard-Question Set Construction ---
+
+NUMINA_MATH_SOURCES = (
+    "aops_forum",
+    "amc_aime",
+    "cn_k12",
+    "gsm8k",
+    "math",
+    "olympiads",
+    "orca_math",
+    "synthetic_amc",
+    "synthetic_math",
+)
+
+
+def _allocate_percentage_counts(total, percentages):
+    """Convert percentages to integer counts with the largest-remainder rule."""
+    exact = {name: total * percentage / 100.0 for name, percentage in percentages.items()}
+    counts = {name: int(value) for name, value in exact.items()}
+    remaining = total - sum(counts.values())
+    order = sorted(percentages, key=lambda name: (-(exact[name] - counts[name]), name))
+    for name in order[:remaining]:
+        counts[name] += 1
+    return counts
+
+
+def _select_farthest_indices(indices, questions, count, embedding_model, rng, batch_size):
+    """Greedy max-min selection using cosine distance from the selected set."""
+    if count == len(indices):
+        return list(indices)
+
+    embeddings = np.asarray(
+        embedding_model.encode(
+            questions,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=True,
+        ),
+        dtype=np.float32,
+    )
+    if embeddings.ndim != 2 or embeddings.shape[0] != len(indices):
+        raise ValueError("The embedding model returned an unexpected embedding shape.")
+
+    # Normalize here too, because custom embedding models may ignore the encode flag.
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embeddings = embeddings / np.maximum(norms, 1e-12)
+
+    first = int(rng.integers(len(indices)))
+    selected_positions = [first]
+    available = np.ones(len(indices), dtype=bool)
+    available[first] = False
+    nearest_similarity = embeddings @ embeddings[first]
+
+    while len(selected_positions) < count:
+        candidates = np.flatnonzero(available)
+        candidate_scores = nearest_similarity[candidates]
+        lowest_score = candidate_scores.min()
+        ties = candidates[np.isclose(candidate_scores, lowest_score, rtol=1e-6, atol=1e-7)]
+        next_position = int(rng.choice(ties))
+        selected_positions.append(next_position)
+        available[next_position] = False
+        nearest_similarity = np.maximum(
+            nearest_similarity,
+            embeddings @ embeddings[next_position],
+        )
+
+    return [int(indices[position]) for position in selected_positions]
+
+
+def create_numina_hard_question_set(
+    dataset,
+    total_questions,
+    source_percentages=None,
+    selection_strategy="random",
+    embedding_model=None,
+    output_dir=None,
+    question_column="problem",
+    source_column="source",
+    random_seed=42,
+    embedding_batch_size=64,
+    candidate_pool_size=None,
+    shuffle_output=True,
+):
+    """Select NuminaMath rows and save pipeline-compatible hard-question indices.
+
+    ``source_percentages`` reserves the stated percentage for each named source.
+    Any percentage left up to 100 is sampled from all unlisted sources as one
+    integrated ``other`` pool. With an empty mapping, the full dataset is one pool.
+
+    ``selection_strategy`` is either ``random`` or ``farthest``. The latter starts
+    randomly inside every source pool and then greedily maximizes the minimum
+    cosine distance from rows already chosen in that pool.
+
+    The saved JSON is deliberately only ``list[int]``, matching the format read by
+    ``HARD_QUESTIONS_INDICES_PATH`` in the main pipeline. A report containing the
+    path, allocation, and selected indices is returned separately.
+    """
+    if isinstance(total_questions, bool) or not isinstance(total_questions, (int, np.integer)):
+        raise TypeError("total_questions must be an integer.")
+    total_questions = int(total_questions)
+    if total_questions <= 0:
+        raise ValueError("total_questions must be greater than zero.")
+    if total_questions > len(dataset):
+        raise ValueError(f"Requested {total_questions} rows from a dataset of {len(dataset)} rows.")
+
+    strategy = str(selection_strategy).strip().lower()
+    if strategy not in {"random", "farthest"}:
+        raise ValueError("selection_strategy must be 'random' or 'farthest'.")
+    if strategy == "farthest" and embedding_model is None:
+        raise ValueError("embedding_model is required for selection_strategy='farthest'.")
+    if not output_dir:
+        raise ValueError("output_dir must be provided.")
+    if candidate_pool_size is not None and (
+        isinstance(candidate_pool_size, bool) or not isinstance(candidate_pool_size, (int, np.integer))
+        or candidate_pool_size <= 0
+    ):
+        raise ValueError("candidate_pool_size must be a positive integer or None.")
+
+    column_names = set(getattr(dataset, "column_names", []))
+    if column_names and source_column not in column_names:
+        raise KeyError(f"Dataset has no source column named '{source_column}'.")
+    if strategy == "farthest" and column_names and question_column not in column_names:
+        raise KeyError(f"Dataset has no question column named '{question_column}'.")
+
+    raw_percentages = source_percentages or {}
+    if not isinstance(raw_percentages, dict):
+        raise TypeError("source_percentages must be a dictionary such as {'amc_aime': 10}.")
+    percentages = {}
+    for raw_name, raw_percentage in raw_percentages.items():
+        name = str(raw_name).strip().lower()
+        if name == "other":
+            raise ValueError("Do not specify 'other'; it is automatically assigned the remainder.")
+        if name not in NUMINA_MATH_SOURCES:
+            raise ValueError(f"Unknown NuminaMath source '{name}'. Expected one of {NUMINA_MATH_SOURCES}.")
+        if isinstance(raw_percentage, bool) or not isinstance(raw_percentage, (int, float, np.number)):
+            raise TypeError(f"Percentage for '{name}' must be numeric.")
+        percentage = float(raw_percentage)
+        if not np.isfinite(percentage) or percentage < 0:
+            raise ValueError(f"Percentage for '{name}' must be finite and non-negative.")
+        percentages[name] = percentage
+
+    specified_total = sum(percentages.values())
+    if specified_total > 100.0 + 1e-9:
+        raise ValueError(f"Source percentages sum to {specified_total:g}; they cannot exceed 100.")
+    if percentages and specified_total < 100.0 - 1e-9:
+        percentages["other"] = 100.0 - specified_total
+    elif percentages:
+        # Avoid floating-point residue while preserving an exact 100% allocation.
+        percentages[next(iter(percentages))] += 100.0 - specified_total
+    else:
+        percentages = {"all": 100.0}
+
+    source_values = [str(value).strip().lower() for value in dataset[source_column]]
+    specified_sources = set(percentages) - {"other", "all"}
+    pools = {}
+    for block_name in percentages:
+        if block_name == "all":
+            pools[block_name] = list(range(len(dataset)))
+        elif block_name == "other":
+            pools[block_name] = [i for i, source in enumerate(source_values) if source not in specified_sources]
+        else:
+            pools[block_name] = [i for i, source in enumerate(source_values) if source == block_name]
+
+    counts = _allocate_percentage_counts(total_questions, percentages)
+    for block_name, count in counts.items():
+        if count > len(pools[block_name]):
+            raise ValueError(
+                f"Block '{block_name}' needs {count} rows but only {len(pools[block_name])} are available."
+            )
+
+    rng = np.random.default_rng(random_seed)
+    selected = []
+    for block_name, count in counts.items():
+        if count == 0:
+            continue
+        pool = pools[block_name]
+        if candidate_pool_size is not None and len(pool) > max(count, candidate_pool_size):
+            pool = rng.choice(pool, size=max(count, candidate_pool_size), replace=False).tolist()
+
+        if strategy == "random":
+            chosen = rng.choice(pool, size=count, replace=False).tolist()
+        else:
+            questions = [str(dataset[int(index)][question_column]) for index in pool]
+            chosen = _select_farthest_indices(
+                pool, questions, count, embedding_model, rng, embedding_batch_size
+            )
+        selected.extend(int(index) for index in chosen)
+
+    if shuffle_output:
+        rng.shuffle(selected)
+    if len(selected) != total_questions or len(set(selected)) != total_questions:
+        raise RuntimeError("Selection did not produce the requested number of unique indices.")
+
+    source_slug = "-".join(
+        f"{name}{percentage:g}" for name, percentage in percentages.items()
+    ).replace(".", "p")
+    seed_slug = "none" if random_seed is None else str(random_seed)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = (
+        f"hard_questions_n{total_questions}_{strategy}_src-{source_slug}"
+        f"_seed{seed_slug}_{timestamp}.json"
+    )
+    output_path = os.path.abspath(os.path.join(os.fspath(output_dir), filename))
+    if not save_json_atomic(selected, output_path, indent=2):
+        raise OSError(f"Could not save hard-question indices to '{output_path}'.")
+
+    selected_source_counts = {}
+    for index in selected:
+        source = source_values[index]
+        selected_source_counts[source] = selected_source_counts.get(source, 0) + 1
+
+    return {
+        "output_path": output_path,
+        "selected_indices": selected,
+        "selection_strategy": strategy,
+        "requested_percentages": percentages,
+        "allocated_counts": counts,
+        "available_counts": {name: len(pool) for name, pool in pools.items()},
+        "selected_source_counts": dict(sorted(selected_source_counts.items())),
+        "candidate_pool_size": candidate_pool_size,
+        "random_seed": random_seed,
+    }
+
+
 def verify_local_resources(config: dict, logger=None) -> dict:
     """
     Verify that all required local resources exist and are accessible.
