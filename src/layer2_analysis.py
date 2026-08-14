@@ -31,10 +31,8 @@ import pickle
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
-import time
 from datetime import datetime
 from collections import defaultdict
-import concurrent.futures
 
 from src.utils import save_json
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager
@@ -933,64 +931,65 @@ class ActiveInferenceEngine:
         executions = []
         temp = self.global_config.get("DEFAULT_PASS_N_SOLVER_TEMPERATURE", 1.0)
 
-        # 2. Worker function with RETRY LOGIC (Exponential Backoff)
+        # The API manager owns retries and backoff. Layer 2 performs one
+        # generation/evaluation chain per statistical attempt so retry limits
+        # are not multiplied by another hidden loop.
         def run_attempt(i):
-            max_retries = 3
-            backoff = 2.0
-            
-            for _ in range(max_retries):
-                resp = self.api_manager_solve.generate_content(prompt, self.model_name, temp)
-                
-                # Extreme safeguard against APIs returning raw lists on timeout/error
-                while isinstance(resp, list):
-                    resp = resp[0] if len(resp) > 0 else {"status": "FAILURE", "error_message": "Empty list returned"}
-                if not isinstance(resp, dict):
-                    resp = {"status": "FAILURE", "error_message": f"Unexpected type: {type(resp)}"}
-                # ---------------------
-                
-                raw_text = resp.get('text', '')
-                error_msg = resp.get('error_message', '')
-                
-                if resp.get('status') == 'SUCCESS':
-                    
-                    # WRAP IN TRY-EXCEPT TO CATCH INTERNAL PARSING CRASHES
-                    try:
-                        eval_res = evaluate_single_answer_with_llm(raw_text, ground_truth, self.api_manager_eval, self.global_config)
-                        
-                        # Extreme safeguard against deeply nested lists
-                        while isinstance(eval_res, list):
-                            eval_res = eval_res[0] if len(eval_res) > 0 else {}
-                        if not isinstance(eval_res, dict):
-                            eval_res = {}
-                            
-                    except Exception as e:
-                        # If evaluate_single_answer_with_llm crashes internally (e.g. 'list' object has no attribute 'get')
-                        eval_res = {"status": "FAILURE", "error": f"Internal eval crash: {str(e)}"}
-                    
-                    # Did the evaluator API fail or crash? If yes, trigger a retry!
-                    if eval_res.get('status') != 'SUCCESS':
-                        time.sleep(backoff)
-                        backoff *= 2
-                        continue 
-                        
-                    return {
-                        "attempt_index": i + 1,
-                        "raw_llm_generation": raw_text,
-                        "error": "",
-                        "is_correct": eval_res.get('is_correct', False),
-                        "api_success": True
-                    }
-                else:
-                    time.sleep(backoff)
-                    backoff *= 2  # Double the wait time
-            
-            # If all retries fail
+            resp = self.api_manager_solve.generate_content(prompt, self.model_name, temp)
+
+            while isinstance(resp, list):
+                resp = resp[0] if resp else {
+                    "status": "FAILURE",
+                    "error_message": "Empty list returned",
+                }
+            if not isinstance(resp, dict):
+                resp = {
+                    "status": "FAILURE",
+                    "error_message": f"Unexpected type: {type(resp)}",
+                }
+
+            raw_text = resp.get("text", "") or ""
+            if resp.get("status") != "SUCCESS":
+                return {
+                    "attempt_index": i + 1,
+                    "raw_llm_generation": "",
+                    "error": resp.get("error_message", "Generation failed"),
+                    "is_correct": False,
+                    "api_success": False,
+                }
+
+            try:
+                eval_res = evaluate_single_answer_with_llm(
+                    raw_text,
+                    ground_truth,
+                    self.api_manager_eval,
+                    self.global_config,
+                )
+                while isinstance(eval_res, list):
+                    eval_res = eval_res[0] if eval_res else {}
+                if not isinstance(eval_res, dict):
+                    eval_res = {}
+            except Exception as exc:
+                eval_res = {
+                    "status": "FAILURE",
+                    "error": f"Internal eval crash: {exc}",
+                }
+
+            if eval_res.get("status") == "SUCCESS":
+                return {
+                    "attempt_index": i + 1,
+                    "raw_llm_generation": raw_text,
+                    "error": "",
+                    "is_correct": eval_res.get("is_correct", False),
+                    "api_success": True,
+                }
+
             return {
                 "attempt_index": i + 1,
-                "raw_llm_generation": "",
-                "error": error_msg,
+                "raw_llm_generation": raw_text,
+                "error": eval_res.get("error", eval_res.get("status", "Evaluation failed")),
                 "is_correct": False,
-                "api_success": False  
+                "api_success": False,
             }
 
         # 3. Execute N Independent Inferences in Parallel
@@ -2191,18 +2190,10 @@ class Layer2Orchestrator:
             res.group_pass_at_n = pass_at_k.get(self.config.global_pass_at_N, 0.0)
             return res
 
-        # 3. Execute live configs in parallel or sequentially based on global config
-        if self.global_config.get("QUESTION_PARALLEL_API_ENABLED", False) and live_configs:
-            max_workers = self.global_config.get("QUESTION_PARALLEL_MAX_WORKERS", 3)
-            print(f"  -> Processing {len(live_configs)} configurations CONCURRENTLY (Max Workers: {max_workers})")
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # map() runs the function over the list concurrently and waits for all to finish
-                list(executor.map(process_config, live_configs))
-        else:
-            # Fallback to sequential
-            for res in live_configs:
-                process_config(res)
+        # Configurations are processed in their stable grid order. Independent
+        # Pass@N calls inside each configuration use the bounded API pool.
+        for res in live_configs:
+            process_config(res)
 
         with self._results_lock:
             self.all_results.extend(query_results)
@@ -2507,7 +2498,6 @@ def run_layer2_experiments(
             
             # Import necessary batching tools safely
             from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
-            from src.context_logger import pipeline_context
             from src.hf_sync import periodic_batch_sync_check
             
             # 1. Package the pending questions into Work Items
@@ -2526,16 +2516,14 @@ def run_layer2_experiments(
 
             # 2. Define the worker that runs a single question
             def worker(item: QuestionWorkItem):
-                # Using pipeline_context ensures console logs display the correct Q#
-                with pipeline_context(query_idx=item.index, batch_id="layer2_analysis"):
-                    # This internally runs the question and appends to orchestrator.all_results
-                    results = orchestrator.run_single_query(item.existing_log)
-                    
-                    # Return a dict instead of a list so the batch coordinator doesn't crash
-                    return {
-                        "pipeline_status": "SUCCESS" if results else "SKIPPED",
-                        "results_count": len(results) if results else 0
-                    }
+                results = orchestrator.run_single_query(item.existing_log)
+
+                # Return a dict instead of a list so the batch coordinator
+                # receives the same result contract as the other workflows.
+                return {
+                    "pipeline_status": "SUCCESS" if results else "SKIPPED",
+                    "results_count": len(results) if results else 0,
+                }
 
             # 3. Define the commit function that saves data after each batch finishes
             def commit(results: List[QuestionResult], batch_id: str, batch_number: int) -> None:
@@ -2554,7 +2542,7 @@ def run_layer2_experiments(
                         
                     status = result.terminal_status or status_from_value
                     
-                    if result.terminal_status:
+                    if result.terminal_status != "SUCCESS":
                         print(f"  🔴 [Q#{q_idx}] Status: {status} ({round(result.elapsed_seconds, 2)}s)")
                         if isinstance(result.value, dict) and "batch_error" in result.value:
                             error_msg = result.value["batch_error"].get("message", "Unknown error")

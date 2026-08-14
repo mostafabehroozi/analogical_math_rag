@@ -48,7 +48,7 @@ from tqdm import tqdm
 import os
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
-from src.context_logger import pipeline_context, tprint
+from src.context_logger import tprint
 
 
 from src.pipeline_steps import (
@@ -966,19 +966,17 @@ def _run_pipeline_items_in_batches(
     unindexed_logs = [log for log in existing_logs if _log_query_index(log) is None]
 
     def worker(item: QuestionWorkItem) -> Dict[str, Any]:
-        # Inject context! Now, everything running inside this block automatically knows its Q#
-        with pipeline_context(query_idx=item.index, batch_id=phase_name):
-            return run_pipeline_for_single_query(
-                hard_list_idx=item.index,
-                target_query=item.question,
-                config=current_config,
-                embedding_model=embedding_model,
-                exemplar_data=exemplar_data,
-                api_managers=api_managers,
-                run_mode=run_mode,
-                existing_log=item.existing_log,
-                hard_solutions=hard_solutions,
-            )
+        return run_pipeline_for_single_query(
+            hard_list_idx=item.index,
+            target_query=item.question,
+            config=current_config,
+            embedding_model=embedding_model,
+            exemplar_data=exemplar_data,
+            api_managers=api_managers,
+            run_mode=run_mode,
+            existing_log=item.existing_log,
+            hard_solutions=hard_solutions,
+        )
 
     def commit(results: List[QuestionResult], batch_id: str, batch_number: int) -> None:
         

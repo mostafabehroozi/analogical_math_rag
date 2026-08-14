@@ -29,7 +29,6 @@ import time
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import numpy as np
-import concurrent.futures 
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager
 from src.utils import save_json, load_json, create_trace_entry
 from src.parallel_utils import run_parallel_api_calls
@@ -123,6 +122,26 @@ def _load_cached_state(cache_path: str, target_query_index: int) -> Optional[Dic
             f"Failed to load Layer 1 cache for query #{target_query_index} from {cache_path}: {e}"
         )
         return None
+
+
+def _cache_matches_zero_shot_config(
+    cached_state: Dict[str, Any],
+    expected_zero_shot_count: int,
+) -> bool:
+    """Reject stale cache entries created with a different zero-shot count."""
+    snapshot = cached_state.get("metadata", {}).get("config_snapshot", {})
+    cached_count = snapshot.get("LAYER1_ZERO_SHOT_CANDIDATES_N")
+    if cached_count is None:
+        candidate_set = cached_state.get("candidate_set", {})
+        if isinstance(candidate_set, dict):
+            cached_count = sum(
+                1 for candidate_id in candidate_set if str(candidate_id).startswith("zs_")
+            )
+
+    try:
+        return int(cached_count) == int(expected_zero_shot_count)
+    except (TypeError, ValueError):
+        return False
 
 
 def _save_cached_state(
@@ -417,13 +436,10 @@ def _execute_candidate_generation(
             tasks = [lambda i=i: _zs_task(i, prompt) for i in range(zs_n)]
             return run_parallel_api_calls(tasks, config)
 
-        # EXECUTE 1-SHOT AND 0-SHOT AT THE SAME TIME
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_1shot = executor.submit(run_1_shots)
-            future_0shot = executor.submit(run_0_shots)
-
-            hypotheses = future_1shot.result()
-            zero_shot_results = future_0shot.result()
+        # Each helper already uses the one bounded per-question API pool. Keep
+        # the helpers sequential so nested executors cannot multiply the cap.
+        hypotheses = run_1_shots()
+        zero_shot_results = run_0_shots()
 
         # 1. Process 1-Shot results (USE ORIGINAL INTEGER KEYS FOR BACKWARD COMPATIBILITY)
         for exemplar_idx, hypothesis_text in hypotheses.items():
@@ -724,6 +740,15 @@ def run_layer1_base_execution(
     cached_state = None
     if not force_reexecution:
         cached_state = _load_cached_state(cache_path, target_query_index)
+        expected_zs = max(0, int(config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0)))
+        if cached_state and not _cache_matches_zero_shot_config(cached_state, expected_zs):
+            logger.warning(
+                "Ignoring Layer 1 cache for query #%s because its zero-shot "
+                "candidate count does not match the active configuration (%s).",
+                target_query_index,
+                expected_zs,
+            )
+            cached_state = None
         if cached_state:
             last_step = cached_state.get("metadata", {}).get("last_completed_step", -1)
             if last_step == 4:  # Full Cache Hit
@@ -745,6 +770,7 @@ def run_layer1_base_execution(
                 "TOP_N_CANDIDATES_RETRIEVAL": config.get("TOP_N_CANDIDATES_RETRIEVAL"),
                 "LAYER1_ONE_SHOT_CANDIDATES_N": config.get("LAYER1_ONE_SHOT_CANDIDATES_N"),
                 "LAYER1_N_CANDIDATES": config.get("LAYER1_N_CANDIDATES"),
+                "LAYER1_ZERO_SHOT_CANDIDATES_N": config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0),
                 "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION")
             }
         },
@@ -796,30 +822,29 @@ def run_layer1_base_execution(
     layer1_state["retrieved_set"] = retrieval_result.get("retrieval_data", [])
     layer1_state["execution_trace"].extend(retrieval_result.get("trace", []))
     
-    # PARALLEL BLOCK 1: STEP B (CANDIDATES) & STEP C (BASELINES)
-    print("\n[Steps B & C] Running Candidate Generation and Baseline Calculation in parallel...")
+    # Each step parallelizes only its own independent API calls. Running the
+    # steps sequentially prevents nested executors from multiplying the limit.
     start_time_bc = time.time()
 
     indices_for_generation = retrieved_indices[:n_candidates]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_b = executor.submit(
-            _execute_candidate_generation, target_query, indices_for_generation,
-            exemplar_data, api_manager_solve, config, trace_accumulator
-        )
-        future_c = executor.submit(
-            _execute_baseline_calculation, retrieved_indices, exemplar_data,
-            api_manager_solve, api_manager_eval, config, trace_accumulator
-        )   
-
-        candidate_result = future_b.result()
-        baseline_result = future_c.result()
+    print("\n[Step B] Candidate Generation...")
+    candidate_result = _execute_candidate_generation(
+        target_query, indices_for_generation, exemplar_data,
+        api_manager_solve, config, trace_accumulator
+    )
 
     # Save Step B results
     layer1_state["step_statuses"]["candidate_generation"] = candidate_result["status"]
     candidates = candidate_result.get("candidates", {})
     print(f"  ✓ Step B: Generated {candidate_result.get('generated_count', 0)} candidates.")
     layer1_state["candidate_set"] = candidates
+
+    print("\n[Step C] Baseline Calculation...")
+    baseline_result = _execute_baseline_calculation(
+        retrieved_indices, exemplar_data, api_manager_solve,
+        api_manager_eval, config, trace_accumulator
+    )
 
     # Save Step C results
     layer1_state["step_statuses"]["baseline_calculation"] = baseline_result["status"]
@@ -828,27 +853,24 @@ def run_layer1_base_execution(
     layer1_state["intrinsic_baselines"] = baselines
     print(f"  -> Steps B & C finished in {time.time() - start_time_bc:.2f}s")
 
-    # --- PARALLEL BLOCK 2: STEP D (CROSS-EVAL) & STEP E (GROUND TRUTH) ---
-    print("\n[Steps D & E] Running Cross-Evaluation and Ground Truth Eval in parallel...")
+    # Steps D and E follow the same one-pool-per-step rule.
     start_time_de = time.time()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_d = executor.submit(
-            _execute_cross_evaluation, target_query, candidates, retrieved_indices,
-            exemplar_data, api_manager_solve, api_manager_eval, config, trace_accumulator
-        )
-        future_e = executor.submit(
-            _execute_ground_truth_evaluation, target_query, ground_truth_answer,
-            candidates, api_manager_eval, config
-        )   
-
-        cross_eval_result = future_d.result()
-        gt_result = future_e.result()
+    print("\n[Step D] Cross-Evaluation...")
+    cross_eval_result = _execute_cross_evaluation(
+        target_query, candidates, retrieved_indices, exemplar_data,
+        api_manager_solve, api_manager_eval, config, trace_accumulator
+    )
 
     # Save Step D results
     layer1_state["step_statuses"]["cross_evaluation"] = cross_eval_result["status"]
     layer1_state["cross_evaluation_matrix"] = cross_eval_result.get("cross_evaluation_matrix", {})
     print("  ✓ Step D: Cross-evaluation complete.")
+
+    print("\n[Step E] Ground Truth Evaluation...")
+    gt_result = _execute_ground_truth_evaluation(
+        target_query, ground_truth_answer, candidates, api_manager_eval, config
+    )
 
     # Save Step E results
     layer1_state["step_statuses"]["ground_truth_evaluation"] = gt_result["status"]

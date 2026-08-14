@@ -834,21 +834,26 @@ def solve(
         
     temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
     
-    solution_attempts: List[Union[str, Dict]] = []
-    
     logger.info(f"Generating {n_attempts} solution attempts for Pass@{n_attempts}.")
-    for i in range(n_attempts):
+
+    def run_attempt(i: int):
         logger.info(f"Generating attempt {i+1}/{n_attempts}.")
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
-        
         print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
-        
+
         response = api_manager.generate_content(prompt, model_name, temperature)
-        
-        local_trace.append(create_trace_entry(
+        trace_entry = create_trace_entry(
             "solve", f"attempt_{i+1}",
             {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
-        ))
+        )
+        return response, trace_entry
+
+    tasks = [lambda i=i: run_attempt(i) for i in range(n_attempts)]
+    attempt_results = run_parallel_api_calls(tasks, config)
+
+    solution_attempts: List[Union[str, Dict]] = []
+    for response, trace_entry in attempt_results:
+        local_trace.append(trace_entry)
 
         if response['status'] == 'SUCCESS':
             solution_attempts.append(response['text'])

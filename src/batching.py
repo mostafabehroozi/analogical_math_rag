@@ -83,10 +83,10 @@ class BatchCoordinator:
                 def execute(item: QuestionWorkItem) -> QuestionResult:
                     started = time.monotonic()
                     try:
-                        with api_call_context(batch=batch_id, question=item.index):
+                        with api_call_context(query_idx=item.index, batch_id=batch_id):
                             value = worker(item)
                         return QuestionResult(item, value, _terminal_status(value), time.monotonic() - started)
-                    except BaseException as exc:  # Keep other questions running even after an unexpected worker crash.
+                    except Exception as exc:  # Keep sibling questions running after a worker failure.
                         value = {
                             "target_query_original_hard_list_idx": item.index,
                             "target_query_text": item.question,

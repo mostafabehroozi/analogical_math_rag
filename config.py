@@ -38,7 +38,10 @@ CONFIG = {
     "BATCH_WRITE_JOURNALS": True,
     "HF_SYNC_INTERVAL_BATCHES": 1,
     # In-question parallelism, including repeated solve/evaluate attempts in
-    # Core Simplification and independent calls in Merging workflows.
+    # Core Simplification and independent calls in Merging workflows. Pipeline
+    # steps use one bounded pool, so the normal combined ceiling is roughly
+    # min(BATCH_SIZE, BATCH_MAX_WORKERS) * QUESTION_PARALLEL_MAX_WORKERS
+    # API-task chains.
     "QUESTION_PARALLEL_API_ENABLED": False,  # Master switch: Set to True to enable parallel API calls inside a question's steps
     "QUESTION_PARALLEL_MAX_WORKERS": 3,      # Max number of concurrent API calls allowed per step (e.g., batches of 3)
     "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
