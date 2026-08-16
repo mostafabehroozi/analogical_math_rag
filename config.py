@@ -1,4 +1,5 @@
 import os
+import time
 
 # --- 1. Core Directory Structure ---
 # Determine the project root directory
@@ -37,6 +38,24 @@ CONFIG = {
     "BATCH_FAILURE_POLICY": "halt_after_failed_batch",
     "BATCH_WRITE_JOURNALS": True,
     "HF_SYNC_INTERVAL_BATCHES": 1,
+    # Independent Kaggle workers.  Disabled keeps the original single-process
+    # paths, resume rules, Layer 2 behavior, and Hugging Face sync unchanged.
+    # For one distributed run, every notebook must use the same RUN_ID and
+    # WORKER_COUNT, with a distinct WORKER_ID in [0, WORKER_COUNT).
+    "DISTRIBUTED_EXECUTION_ENABLED": False,
+    "DISTRIBUTED_FINALIZER_MODE": False,
+    "DISTRIBUTED_RUN_ID": None,
+    "DISTRIBUTED_WORKER_COUNT": 5,
+    "DISTRIBUTED_WORKER_ID": 0,
+    "DISTRIBUTED_SESSION_STOP_NEW_BATCH_HOURS": 11.0,
+    "DISTRIBUTED_SESSION_API_DEADLINE_HOURS": 11.75,
+    # Captured when config.py is imported near notebook startup, so model/data
+    # setup time also counts against Kaggle's 12-hour lifetime.
+    "DISTRIBUTED_SESSION_ORIGIN_MONOTONIC": time.monotonic(),
+    "DISTRIBUTED_CONTINUE_AFTER_FAILED_BATCH": True,
+    "DISTRIBUTED_HF_REVISION": "main",
+    "DISTRIBUTED_HF_SYNC_MAX_RETRIES": 5,
+    "DISTRIBUTED_HF_SYNC_RETRY_BASE_SECONDS": 2.0,
     # In-question parallelism, including repeated solve/evaluate attempts in
     # Core Simplification and independent calls in Merging workflows. Pipeline
     # steps use one bounded pool, so the normal combined ceiling is roughly
@@ -232,6 +251,12 @@ CONFIG = {
     "HF_SYNC_REVISION_ENABLED": False,
     "HF_SYNC_REVISION_ID": "main",
     "HF_SYNC_INTERVAL": 10,
+    # Kaggle starts from an empty disk. Restore the complete latest snapshot
+    # conservatively so repositories with many small files do not burst into
+    # Hugging Face's HTTP 429 rate limit.
+    "HF_DOWNLOAD_MAX_WORKERS": 1,
+    "HF_DOWNLOAD_MAX_RETRIES": 8,
+    "HF_DOWNLOAD_RETRY_BASE_SECONDS": 15.0,
 
     
     "APPLY_MIRROR_RERANKING": False,  # Enable/disable the unified re-ranking stage

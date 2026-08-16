@@ -59,15 +59,21 @@ print = safe_thread_print
 def _get_cache_filename(
     top_k: int,
     n_candidates: int,
-    experiment_name: str = "default_experiment"
+    experiment_name: str = "default_experiment",
+    zero_shot_candidates: Optional[int] = None,
 ) -> str:
     """
     Generates a deterministic cache filename based on configuration.
     """
     safe_experiment_name = experiment_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
     
-    from config import CONFIG
-    zs_n = CONFIG.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0)
+    if zero_shot_candidates is None:
+        # Backward-compatible fallback for older external callers.  Pipeline
+        # code passes the effective experiment value explicitly so different
+        # experiments/workers cannot collide on a mislabeled cache filename.
+        from config import CONFIG
+        zero_shot_candidates = CONFIG.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0)
+    zs_n = max(0, int(zero_shot_candidates or 0))
     
     return f"layer1_cache_k{top_k}_n{n_candidates}_z{zs_n}_{safe_experiment_name}.json"
 
@@ -734,7 +740,12 @@ def run_layer1_base_execution(
     logger.info(f"[Layer 1] Starting base execution for Query #{target_query_index} (Experiment: {experiment_name})")
     
     # CACHE-FIRST CHECK
-    cache_filename = _get_cache_filename(top_k, n_candidates, experiment_name)
+    cache_filename = _get_cache_filename(
+        top_k,
+        n_candidates,
+        experiment_name,
+        config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0),
+    )
     cache_path = _get_cache_path(cache_dir, cache_filename)
     
     cached_state = None

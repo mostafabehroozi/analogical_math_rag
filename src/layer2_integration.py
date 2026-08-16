@@ -28,7 +28,8 @@ def load_layer1_cache_combined(
     cache_dir: str,
     experiment_name: str = "default_experiment",
     top_k: int = 3,
-    n_candidates: int = None
+    n_candidates: int = None,
+    zero_shot_candidates: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Load the combined Layer 1 cache for a given experiment configuration.
@@ -45,7 +46,9 @@ def load_layer1_cache_combined(
     from src.layer1_base_execution import _get_cache_filename, _get_cache_path, _cache_exists
     
     # Generate cache filename
-    filename = _get_cache_filename(top_k, n_candidates or 0, experiment_name)
+    filename = _get_cache_filename(
+        top_k, n_candidates or 0, experiment_name, zero_shot_candidates
+    )
     cache_path = _get_cache_path(cache_dir, filename)
     
     if not _cache_exists(cache_path):
@@ -198,7 +201,11 @@ def run_layer2_complete_pipeline(
     # Step 1: Load Layer 1 cache
     logger.info(f"\nStep 1: Loading Layer 1 cache from {layer1_cache_dir}")
     combined_cache = load_layer1_cache_combined(
-        layer1_cache_dir, experiment_name, top_k, n_candidates
+        layer1_cache_dir,
+        experiment_name,
+        top_k,
+        n_candidates,
+        (global_config or {}).get("LAYER1_ZERO_SHOT_CANDIDATES_N"),
     )
     
     if combined_cache is None:

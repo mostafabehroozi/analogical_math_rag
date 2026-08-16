@@ -394,8 +394,17 @@ def retry_failed_generation_pipelines(
             or global_config["RESULTS_DIR"]
         )
         top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
-        n_candidates = current_config.get("LAYER1_N_CANDIDATES") or top_k
-        cache_filename = _get_cache_filename(top_k, n_candidates, exp_name)
+        n_candidates = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+        if n_candidates is None:
+            n_candidates = current_config.get("LAYER1_N_CANDIDATES")
+        if n_candidates is None:
+            n_candidates = top_k
+        cache_filename = _get_cache_filename(
+            top_k,
+            n_candidates,
+            exp_name,
+            current_config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0),
+        )
         cache_path = _get_cache_path(cache_dir, cache_filename)
 
         l1_cache = load_json(cache_path) if os.path.exists(cache_path) else None

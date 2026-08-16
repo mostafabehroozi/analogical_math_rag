@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, TypedDict, Union
 from src.context_logger import ctx_query_idx, ctx_batch_id, tprint
+from src.distributed_execution import api_deadline_due, remaining_api_seconds
 
 try:  # Keep scheduler/batch tests importable without optional provider SDKs.
     import ollama
@@ -41,7 +42,7 @@ RETRYABLE_ERROR_TYPES = {
     "OllamaConnectionError", "UnknownError", "APIStatusError",
     "RateLimitError", 
 }
-NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "InvalidArgument", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit"}
+NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "InvalidArgument", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit", "SessionDeadline"}
 
 class APIResponse(TypedDict, total=False):
     status: str
@@ -96,9 +97,14 @@ class _GlobalAPIPauseManager:
             # 2. Put the thread to sleep until the pause expires
             while True:
                 now = time.monotonic()
+                if api_deadline_due(config, now):
+                    return
                 if now >= self._pause_until:
                     break
                 wait_time = self._pause_until - now
+                remaining = remaining_api_seconds(config, now)
+                if remaining is not None:
+                    wait_time = min(wait_time, remaining)
                 self._condition.wait(timeout=wait_time)
 
     def record_result(self, is_success: bool, config: Dict[str, Any]) -> None:
@@ -216,6 +222,8 @@ class RPMKeyScheduler:
         while True:
             with self._condition:
                 now = time.monotonic()
+                if api_deadline_due(self.config, now):
+                    return None
                 today = self._today()
                 ready: List[Tuple[int, int, int, str, int]] = []
                 waits: List[float] = []
@@ -257,7 +265,11 @@ class RPMKeyScheduler:
                 if not waits:
                     return None  # Every key is disabled or has exhausted RPD.
 
-                self._condition.wait(timeout=max(0.001, min(waits)))
+                wait_seconds = max(0.001, min(waits))
+                remaining = remaining_api_seconds(self.config, now)
+                if remaining is not None:
+                    wait_seconds = min(wait_seconds, max(0.001, remaining))
+                self._condition.wait(timeout=wait_seconds)
 
     def cooldown(self, api_key: str, model_name: str, seconds: Optional[float] = None) -> None:
         delay = float(seconds if seconds is not None else self.config.get("API_KEY_ERROR_COOLDOWN_SECONDS", 20.0))
@@ -311,11 +323,26 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
     max_attempts = max(1, int(config.get("MAX_API_RETRIES", 3))) if config.get("ENABLE_API_RETRY", False) else 1
     retry_all = config.get("RETRY_ALL_API_ERRORS", True)
     last_response: Optional[APIResponse] = None
+
+    def deadline_response() -> APIResponse:
+        return {
+            "status": "ERROR",
+            "text": None,
+            "error_type": "SessionDeadline",
+            "error_message": (
+                "Distributed session API deadline reached; this question will be "
+                "checkpointed as incomplete and retried by the same worker next session."
+            ),
+        }
     
     for attempt in range(1, max_attempts + 1):
+        if api_deadline_due(config):
+            return deadline_response()
         
         # Check if the system is globally paused before making ANY request
         global_pause_manager.wait_if_needed(config)
+        if api_deadline_due(config):
+            return deadline_response()
         
         # --- NEW: Enforce minimum time between consecutive API calls per provider ---
         if config.get("ENABLE_MIN_TIME_BETWEEN_API_CALLS", False):
@@ -363,7 +390,13 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
             return response
         
         # Wait before retrying
-        time.sleep(float(config.get("API_RETRY_DELAY_SECONDS", 20.0)))
+        retry_delay = float(config.get("API_RETRY_DELAY_SECONDS", 20.0))
+        remaining = remaining_api_seconds(config)
+        if remaining is not None:
+            if remaining <= 0:
+                return deadline_response()
+            retry_delay = min(retry_delay, remaining)
+        time.sleep(max(0.0, retry_delay))
             
         last_response = response
         

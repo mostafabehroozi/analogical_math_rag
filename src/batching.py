@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 from tqdm import tqdm  
 from src.context_logger import pipeline_context as api_call_context
+from src.distributed_execution import distributed_enabled, stop_new_batches_due
 from src.utils import save_json_atomic
 
 
@@ -74,6 +75,18 @@ class BatchCoordinator:
         # Wrap the execution loop in a tqdm progress bar
         with tqdm(total=len(items), desc=f"{self.experiment_name} | {self.phase_name}", unit="q") as pbar:
             for batch_number, start in enumerate(range(0, len(items), self.batch_size), start=1):
+                # Kaggle sessions have a hard lifetime.  In distributed mode a
+                # single run-level monotonic cutoff is created before the first
+                # experiment, then shared by every coordinator.  We only check
+                # between batches: an active batch is allowed to finish and be
+                # durably checkpointed.
+                if stop_new_batches_due(self.config):
+                    self.config["_DISTRIBUTED_TIME_LIMIT_REACHED"] = True
+                    print(
+                        "\n[DISTRIBUTED PAUSE] Soft session limit reached. "
+                        "No new batch will start; restart this same worker id to resume."
+                    )
+                    break
                 batch_items = list(items[start:start + self.batch_size])
                 batch_id = f"{self.phase_name}-{batch_number:04d}-{batch_items[0].index}-{batch_items[-1].index}"
                 print(f"\n[BATCH {batch_id}] started: {len(batch_items)} question(s), workers={min(self.max_workers, len(batch_items))}")
@@ -114,7 +127,11 @@ class BatchCoordinator:
 
                 pbar.update(len(batch_items))
 
-                if failed and self.failure_policy == "halt_after_failed_batch":
+                continue_after_failure = (
+                    distributed_enabled(self.config)
+                    and self.config.get("DISTRIBUTED_CONTINUE_AFTER_FAILED_BATCH", True)
+                )
+                if failed and self.failure_policy == "halt_after_failed_batch" and not continue_after_failure:
                     print(f"[BATCH {batch_id}] stopping before next batch due to BATCH_FAILURE_POLICY={self.failure_policy}")
                     break
                     

@@ -72,8 +72,34 @@ from src.layer1_base_execution import (
 from src.layer2_integration import run_layer2_complete_pipeline
 
 from src.utils import save_json, save_json_atomic, load_json
-from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
+from src.hf_sync import (
+    download_distributed_run_for_merge,
+    ensure_distributed_manifest,
+    initialize_workspace,
+    periodic_sync_check,
+    periodic_batch_sync_check,
+    sync_distributed_merged_results,
+    sync_workspace_to_hub,
+)
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
+from src.distributed_execution import (
+    DistributedExecutionError,
+    assigned_indices,
+    build_run_manifest,
+    configure_worker_paths,
+    distributed_enabled,
+    fingerprint_exemplar_data,
+    layer1_state_complete,
+    merge_distributed_run,
+    run_log_successful,
+    start_worker_session,
+    stop_new_batches_due,
+    validate_worker_layer1_cache,
+    validate_worker_run_logs,
+    validate_experiment_name,
+    write_or_validate_manifest,
+    write_worker_status,
+)
 
 import builtins
 def safe_thread_print(*args, **kwargs):
@@ -102,6 +128,257 @@ def _reject_removed_feature_flags(config: Dict[str, Any]) -> None:
                 f"{flag_name}=True requests the removed {feature_name}. "
                 "Remove this stale activation from the configuration."
             )
+
+
+_DISTRIBUTED_UNSUPPORTED_FLAGS = {
+    "DEFER_SOLVE_STEP": "deferred solve mode",
+    "APPLY_TRANSFORMATION_DATASET_CONSTRUCTION": "transformation dataset construction",
+    "APPLY_CORE_SIMP_PHASE1": "Core Simplification phase 1",
+    "APPLY_CORE_SIMP_PHASE2": "Core Simplification phase 2",
+    "APPLY_MERGING_DATASET_CONSTRUCTION": "merging dataset construction",
+}
+_DISTRIBUTED_RUNTIME_PATH_KEYS = {
+    "RESULTS_DIR", "LAYER1_CACHE_DIR", "LOGS_DIR", "OUTPUTS_DIR",
+}
+
+
+def _merge_experiment_config(
+    global_config: Dict[str, Any],
+    overrides: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge one experiment while retaining coordinator-owned worker paths."""
+    merged = global_config.copy()
+    merged.update(overrides)
+    if distributed_enabled(global_config):
+        for key, value in global_config.items():
+            if (
+                key in _DISTRIBUTED_RUNTIME_PATH_KEYS
+                or key.startswith("DISTRIBUTED_")
+                or key.startswith("_DISTRIBUTED_")
+            ):
+                merged[key] = value
+    return merged
+
+
+def _validate_distributed_scope(
+    global_config: Dict[str, Any],
+    experiment_configs: List[Dict[str, Any]],
+    hard_solutions: Optional[List[str]],
+) -> None:
+    """Keep v1 narrow: the ordinary batch pipeline used by this experiment."""
+    if not global_config.get("PERSIST_RESULTS_ONLINE", False):
+        raise DistributedExecutionError(
+            "Distributed execution requires PERSIST_RESULTS_ONLINE=True."
+        )
+    for setting in ("HF_SYNC_TOKEN", "HF_HUB_USERNAME", "HF_HUB_REPO_NAME"):
+        value = global_config.get(setting)
+        normalized = str(value or "").strip().lower()
+        is_placeholder = (
+            "your_hugging_face" in normalized
+            or normalized in {"your-hf-username-here", "your-hf-repo-name-here"}
+        )
+        if not value or is_placeholder:
+            raise DistributedExecutionError(
+                f"{setting} must be supplied from Kaggle Secrets/environment before "
+                "distributed execution starts."
+            )
+    experiment_names = set()
+    for overrides in experiment_configs:
+        for key in overrides:
+            if key.startswith("DISTRIBUTED_") and overrides[key] != global_config.get(key):
+                raise DistributedExecutionError(
+                    f"{key} is worker/run identity and cannot be overridden per experiment."
+                )
+        effective = _merge_experiment_config(global_config, overrides)
+        experiment_name = validate_experiment_name(effective.get("experiment_name"))
+        if experiment_name in experiment_names:
+            raise DistributedExecutionError(
+                f"Duplicate distributed experiment_name: {experiment_name}"
+            )
+        experiment_names.add(experiment_name)
+        if not effective.get("BATCH_PROCESSING_ENABLED", False):
+            raise DistributedExecutionError(
+                "Distributed execution requires BATCH_PROCESSING_ENABLED=True so each "
+                "completed batch can be checkpointed synchronously."
+            )
+        for flag, workflow in _DISTRIBUTED_UNSUPPORTED_FLAGS.items():
+            if effective.get(flag, False):
+                raise DistributedExecutionError(
+                    f"Distributed v1 intentionally does not support {workflow} ({flag}=True)."
+                )
+        if effective.get("APPLY_LAYER1_BASE_EXECUTION", False) and hard_solutions is None:
+            raise DistributedExecutionError(
+                "Distributed Layer 1 requires hard_solutions so ground-truth identity can be "
+                "frozen in the manifest and checked during merge."
+            )
+        if effective.get("APPLY_LAYER1_BASE_EXECUTION", False) and any(
+            solution is None or not str(solution).strip()
+            for solution in ([] if hard_solutions is None else hard_solutions)
+        ):
+            raise DistributedExecutionError(
+                "Distributed Layer 1 requires a non-empty ground-truth solution for every question."
+            )
+
+
+def _distributed_cache_for_experiment(
+    current_config: Dict[str, Any],
+    experiment_name: str,
+) -> Optional[Dict[str, Any]]:
+    if not current_config.get("APPLY_LAYER1_BASE_EXECUTION", False):
+        return None
+    top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
+    n_candidates = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+    if n_candidates is None:
+        n_candidates = current_config.get("LAYER1_N_CANDIDATES")
+    if n_candidates is None:
+        n_candidates = top_k
+    filename = _get_cache_filename(
+        top_k,
+        n_candidates,
+        experiment_name,
+        current_config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0),
+    )
+    cache_path = os.path.join(current_config["LAYER1_CACHE_DIR"], filename)
+    if not os.path.exists(cache_path):
+        return None
+    cache = load_json(cache_path)
+    if not isinstance(cache, dict):
+        raise DistributedExecutionError(f"Malformed Layer-1 checkpoint: {cache_path}")
+    return cache
+
+
+def _distributed_progress_for_experiment(
+    current_config: Dict[str, Any],
+    experiment_name: str,
+    run_logs: List[Dict[str, Any]],
+    manifest: Dict[str, Any],
+) -> Dict[str, Any]:
+    worker_id = int(current_config["DISTRIBUTED_WORKER_ID"])
+    owned = assigned_indices(
+        int(manifest["question_count"]),
+        worker_id,
+        int(manifest["worker_count"]),
+    )
+    validated_logs = validate_worker_run_logs(run_logs, manifest, worker_id)
+    require_layer1 = bool(current_config.get("APPLY_LAYER1_BASE_EXECUTION", False))
+    complete_cache_indices = set()
+    if require_layer1:
+        cache = _distributed_cache_for_experiment(current_config, experiment_name)
+        if cache is not None:
+            cache_queries = validate_worker_layer1_cache(cache, manifest, worker_id)
+            complete_cache_indices = {
+                int(index) for index, state in cache_queries.items()
+                if layer1_state_complete(state)
+            }
+    successful = {
+        index for index, log in validated_logs.items()
+        if run_log_successful(log, require_layer1=require_layer1)
+        and (not require_layer1 or index in complete_cache_indices)
+    }
+    return {
+        "assigned": len(owned),
+        "successful": len(successful),
+        "remaining": len(owned) - len(successful),
+        "checkpoint_entries": len(validated_logs),
+        "successful_indices": sorted(successful),
+    }
+
+
+def _distributed_all_progress(
+    global_config: Dict[str, Any],
+    experiment_configs: List[Dict[str, Any]],
+    manifest: Dict[str, Any],
+) -> Dict[str, Any]:
+    progress: Dict[str, Any] = {}
+    for overrides in experiment_configs:
+        current_config = _merge_experiment_config(global_config, overrides)
+        experiment_name = current_config.get("experiment_name", "unnamed_experiment")
+        log_path = os.path.join(global_config["RESULTS_DIR"], f"{experiment_name}_run_log.json")
+        run_logs = load_json(log_path) if os.path.exists(log_path) else []
+        if not isinstance(run_logs, list):
+            raise DistributedExecutionError(f"Malformed worker run log: {log_path}")
+        progress[experiment_name] = _distributed_progress_for_experiment(
+            current_config, experiment_name, run_logs, manifest
+        )
+    return progress
+
+
+def _prepare_distributed_worker(
+    global_config: Dict[str, Any],
+    experiment_configs: List[Dict[str, Any]],
+    hard_questions: List[str],
+    hard_solutions: Optional[List[str]],
+    exemplar_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate/create the immutable run and restore only this worker shard."""
+    _validate_distributed_scope(global_config, experiment_configs, hard_solutions)
+    paths = configure_worker_paths(global_config)
+    manifest = build_run_manifest(
+        global_config,
+        experiment_configs,
+        hard_questions,
+        hard_solutions,
+        code_fingerprint=global_config.get("DISTRIBUTED_CODE_FINGERPRINT"),
+        exemplar_fingerprint=fingerprint_exemplar_data(exemplar_data),
+    )
+    manifest_path = write_or_validate_manifest(paths["manifest_path"], manifest)
+
+    # The results repo is created once by its owner.  Every notebook validates
+    # or creates exactly the same write-once manifest before any provider call.
+    ensure_distributed_manifest(global_config, manifest_path)
+    initialize_workspace(global_config)
+    write_or_validate_manifest(paths["manifest_path"], manifest)
+
+    start_worker_session(global_config)
+    global_config["_DISTRIBUTED_MANIFEST"] = manifest
+    global_config["_DISTRIBUTED_ALLOWED_QUERY_INDICES"] = assigned_indices(
+        len(hard_questions),
+        int(global_config["DISTRIBUTED_WORKER_ID"]),
+        int(global_config["DISTRIBUTED_WORKER_COUNT"]),
+    )
+    progress = _distributed_all_progress(global_config, experiment_configs, manifest)
+    write_worker_status(
+        global_config,
+        "RUNNING",
+        manifest=manifest,
+        experiment_progress=progress,
+        message="Worker session started or resumed; same worker id must not run concurrently.",
+    )
+    sync_workspace_to_hub(global_config)
+    print(
+        f"Distributed worker {global_config['DISTRIBUTED_WORKER_ID']}/"
+        f"{global_config['DISTRIBUTED_WORKER_COUNT'] - 1} owns "
+        f"{len(global_config['_DISTRIBUTED_ALLOWED_QUERY_INDICES'])} global question(s)."
+    )
+    return manifest
+
+
+def _finalize_distributed_worker_status(
+    global_config: Dict[str, Any],
+    experiment_configs: List[Dict[str, Any]],
+    manifest: Dict[str, Any],
+) -> str:
+    progress = _distributed_all_progress(global_config, experiment_configs, manifest)
+    complete = all(item["remaining"] == 0 for item in progress.values())
+    if complete:
+        state = "COMPLETE"
+        message = "Every assigned question is durably complete for every experiment."
+    elif stop_new_batches_due(global_config):
+        state = "PAUSED_TIME_LIMIT"
+        message = "Soft Kaggle session limit reached; restart this same worker id to resume."
+    else:
+        state = "INCOMPLETE"
+        message = "Some assigned questions failed or remain incomplete; rerun this worker id."
+    write_worker_status(
+        global_config,
+        state,
+        manifest=manifest,
+        experiment_progress=progress,
+        message=message,
+    )
+    sync_workspace_to_hub(global_config)
+    print(f"Distributed worker session finished with state={state}.")
+    return state
 
 
 def run_pipeline_for_single_query(
@@ -982,7 +1259,7 @@ def _run_pipeline_items_in_batches(
         
         # --- NEW: Print a clean summary to the console! ---
         print(f"\n{'='*70}")
-        print(f"✅ BATCH {batch_number} COMPLETED [Phase: {phase_name.upper()}]")
+        print(f"[COMPLETED] BATCH {batch_number} [Phase: {phase_name.upper()}]")
         for result in results:
             q_idx = result.item.index
             
@@ -997,7 +1274,7 @@ def _run_pipeline_items_in_batches(
             
             # Add some nice color/icons based on status
             is_error = "FAIL" in status.upper() or "ERROR" in status.upper()
-            icon = "🟢" if "SUCCESS" in status else "🔴" if is_error else "🟡"
+            icon = "[OK]" if "SUCCESS" in status else "[FAIL]" if is_error else "[PARTIAL]"
             
             print(f"  {icon} [Q#{q_idx}] Status: {status} ({elapsed}s)")
             
@@ -1033,11 +1310,42 @@ def _run_pipeline_items_in_batches(
             top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 5)
             n_candidates = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N") or current_config.get("LAYER1_N_CANDIDATES") or top_k
             cache_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
-            cache_path = _get_cache_path(cache_dir, _get_cache_filename(top_k, n_candidates, experiment_name))
+            cache_path = _get_cache_path(
+                cache_dir,
+                _get_cache_filename(
+                    top_k,
+                    n_candidates,
+                    experiment_name,
+                    current_config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0),
+                ),
+            )
             if not _save_cached_states_batch(cache_path, layer1_states, top_k, n_candidates, experiment_name, batch_id):
                 raise RuntimeError(f"Could not commit Layer-1 cache for batch {batch_id}")
 
-        periodic_batch_sync_check(batch_number - 1, current_config)
+        try:
+            periodic_batch_sync_check(batch_number - 1, current_config)
+        except Exception as sync_error:
+            manifest = current_config.get("_DISTRIBUTED_MANIFEST")
+            if distributed_enabled(current_config) and isinstance(manifest, dict):
+                try:
+                    progress = _distributed_progress_for_experiment(
+                        current_config, experiment_name, committed_logs, manifest
+                    )
+                    write_worker_status(
+                        current_config,
+                        "SYNC_ERROR",
+                        manifest=manifest,
+                        experiment_progress={experiment_name: progress},
+                        message=(
+                            "Local batch commit succeeded, but its remote checkpoint failed; "
+                            "no later batch was started."
+                        ),
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Could not write local distributed SYNC_ERROR status."
+                    )
+            raise sync_error
 
     BatchCoordinator(current_config, experiment_name, phase_name).run(items, worker, commit)
     return [logs_by_index[index] for index in sorted(logs_by_index)] + unindexed_logs
@@ -1058,11 +1366,25 @@ def run_experiments(
     """
     logger = logging.getLogger(__name__)
     all_results = {}
+    distributed_manifest: Optional[Dict[str, Any]] = None
 
     for exp_overrides in experiment_configs:
-        effective_config = global_config.copy()
-        effective_config.update(exp_overrides)
+        effective_config = _merge_experiment_config(global_config, exp_overrides)
         _reject_removed_feature_flags(effective_config)
+
+    if distributed_enabled(global_config):
+        if global_config.get("DISTRIBUTED_FINALIZER_MODE", False):
+            raise DistributedExecutionError(
+                "DISTRIBUTED_FINALIZER_MODE=True cannot call run_experiments; call "
+                "finalize_distributed_experiments instead."
+            )
+        distributed_manifest = _prepare_distributed_worker(
+            global_config,
+            experiment_configs,
+            hard_questions,
+            hard_solutions,
+            exemplar_data,
+        )
     
     # ADDED THIS LINE TO MAKE THE SAFEGUARD WORK 
     global_config['hard_questions_length'] = len(hard_questions)
@@ -1085,8 +1407,7 @@ def run_experiments(
         from src.transformation_dataset_builder import build_transformation_dataset
 
         for exp_overrides in transformation_ds_configs:
-            current_config = global_config.copy()
-            current_config.update(exp_overrides)
+            current_config = _merge_experiment_config(global_config, exp_overrides)
             exp_name = current_config.get(
                 "experiment_name", "transformation_dataset_construction"
             )
@@ -1120,8 +1441,7 @@ def run_experiments(
         from src.core_simplification import execute_core_simplification_phase1
         
         for exp_overrides in phase1_configs:
-            current_config = global_config.copy()
-            current_config.update(exp_overrides)
+            current_config = _merge_experiment_config(global_config, exp_overrides)
             exp_name = current_config.get("experiment_name", "core_simp_phase1")
             
             logger.info(f"--- Core Simplification Phase 1 '{exp_name}' starting ---")
@@ -1151,8 +1471,7 @@ def run_experiments(
         from src.core_simplification_layer2 import execute_core_simplification_phase2
         
         for exp_overrides in phase2_configs:
-            current_config = global_config.copy()
-            current_config.update(exp_overrides)
+            current_config = _merge_experiment_config(global_config, exp_overrides)
             exp_name = current_config.get("experiment_name", "core_simp_phase2")
             
             logger.info(f"--- Core Simplification Phase 2 '{exp_name}' starting ---")
@@ -1180,8 +1499,7 @@ def run_experiments(
         from src.merging_dataset_builder import build_merging_dataset
         
         for exp_overrides in merging_ds_configs:
-            current_config = global_config.copy()
-            current_config.update(exp_overrides)
+            current_config = _merge_experiment_config(global_config, exp_overrides)
             exp_name = current_config.get("experiment_name", "merging_dataset_construction")
             
             logger.info(f"--- Merging Dataset Construction '{exp_name}' starting ---")
@@ -1214,8 +1532,7 @@ def run_experiments(
         
         # PHASE 1: Intermediate Steps for ALL experiments 
         for exp_overrides in experiment_configs:
-            current_config = global_config.copy()
-            current_config.update(exp_overrides)
+            current_config = _merge_experiment_config(global_config, exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
             
             # Only run intermediate steps for experiments that are actually deferred
@@ -1261,7 +1578,10 @@ def run_experiments(
                             if n_cands is None: n_cands = current_config.get("LAYER1_N_CANDIDATES")
                             if n_cands is None: n_cands = t_k
                             c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
-                            c_file = _get_cache_filename(t_k, n_cands, exp_name)
+                            c_file = _get_cache_filename(
+                                t_k, n_cands, exp_name,
+                                current_config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0)
+                            )
                             _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
                         periodic_sync_check(loop_idx, current_config)
             else:
@@ -1272,8 +1592,7 @@ def run_experiments(
 
         # --- PHASE 2: Final Solving Steps for ALL experiments ---
         for exp_overrides in experiment_configs:
-            current_config = global_config.copy()
-            current_config.update(exp_overrides)
+            current_config = _merge_experiment_config(global_config, exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
 
             # Only run solve steps for experiments that are deferred
@@ -1325,7 +1644,10 @@ def run_experiments(
             logger.info(f"########## Finished Experiment: {exp_name} ##########")
 
             # --- AUTOMATIC LAYER 2 EXECUTION ---
-            if current_config.get('APPLY_LAYER2_ANALYSIS', False):
+            if (
+                current_config.get('APPLY_LAYER2_ANALYSIS', False)
+                and distributed_manifest is None
+            ):
                 print("\n" + "#"*25 + f" STARTING LAYER 2 ANALYSIS FOR: {exp_name} " + "#"*25)
                 
                 layer2_cfg = current_config.get('LAYER2_CONFIG', {})
@@ -1363,8 +1685,7 @@ def run_experiments(
         # Original Mode: Run each experiment sequentially
         logger.info("Deferred mode is DISABLED. Running experiments sequentially.")
         for exp_overrides in experiment_configs:
-            current_config = global_config.copy()
-            current_config.update(exp_overrides)
+            current_config = _merge_experiment_config(global_config, exp_overrides)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
             logger.info(f"########## Starting Experiment: {exp_name} ##########")
             log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
@@ -1374,8 +1695,35 @@ def run_experiments(
                 # --- Standard Mode: Run query-by-query ---
                 logger.info(f"Running '{exp_name}' in standard (query-by-query) mode.")
                 run_logs = load_json(log_file_path) or []
-                completed_indices = {log['target_query_original_hard_list_idx'] for log in run_logs}
-                queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_indices]
+                if not isinstance(run_logs, list):
+                    raise DistributedExecutionError(f"Malformed run log: {log_file_path}")
+                if distributed_manifest is not None:
+                    progress = _distributed_progress_for_experiment(
+                        current_config, exp_name, run_logs, distributed_manifest
+                    )
+                    completed_indices = set(progress["successful_indices"])
+                    allowed_indices = set(global_config["_DISTRIBUTED_ALLOWED_QUERY_INDICES"])
+                    queries_to_process = [
+                        (idx, hard_questions[idx]) for idx in sorted(allowed_indices)
+                        if idx not in completed_indices
+                    ]
+                    logger.info(
+                        "Worker %s resume for '%s': assigned=%s successful=%s remaining=%s",
+                        global_config["DISTRIBUTED_WORKER_ID"],
+                        exp_name,
+                        progress["assigned"],
+                        progress["successful"],
+                        progress["remaining"],
+                    )
+                else:
+                    # Preserve the legacy single-notebook resume behavior.
+                    completed_indices = {
+                        log['target_query_original_hard_list_idx'] for log in run_logs
+                    }
+                    queries_to_process = [
+                        (idx, q) for idx, q in enumerate(hard_questions)
+                        if idx not in completed_indices
+                    ]
                 
                 if not queries_to_process:
                     logger.info(f"All queries for '{exp_name}' are already processed. Skipping LLM execution.")
@@ -1413,7 +1761,10 @@ def run_experiments(
                             if n_cands is None: n_cands = current_config.get("LAYER1_N_CANDIDATES")
                             if n_cands is None: n_cands = t_k
                             c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
-                            c_file = _get_cache_filename(t_k, n_cands, exp_name)
+                            c_file = _get_cache_filename(
+                                t_k, n_cands, exp_name,
+                                current_config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0)
+                            )
                             _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
                         
                         periodic_sync_check(loop_idx, current_config)
@@ -1460,7 +1811,10 @@ def run_experiments(
                                 if n_cands is None: n_cands = current_config.get("LAYER1_N_CANDIDATES")
                                 if n_cands is None: n_cands = t_k
                                 c_dir = current_config.get("LAYER1_CACHE_DIR", current_config.get("RESULTS_DIR"))
-                                c_file = _get_cache_filename(t_k, n_cands, exp_name)
+                                c_file = _get_cache_filename(
+                                    t_k, n_cands, exp_name,
+                                    current_config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0)
+                                )
                                 _save_cached_state(_get_cache_path(c_dir, c_file), original_idx, l1_state, t_k, n_cands, exp_name)
                             periodic_sync_check(loop_idx, current_config)
                 else:
@@ -1507,7 +1861,10 @@ def run_experiments(
             all_results[exp_name] = final_logs
             logger.info(f"########## Finished Experiment: {exp_name} ##########")
 
-            if current_config.get('APPLY_LAYER2_ANALYSIS', False):
+            if (
+                current_config.get('APPLY_LAYER2_ANALYSIS', False)
+                and distributed_manifest is None
+            ):
                 print("\n" + "#"*25 + f" STARTING LAYER 2 ANALYSIS FOR: {exp_name} " + "#"*25)
                 
                 layer2_cfg = current_config.get('LAYER2_CONFIG', {})
@@ -1537,7 +1894,161 @@ def run_experiments(
                     hard_solutions=hard_solutions
                 )
                 print("#"*25 + f" LAYER 2 ANALYSIS COMPLETE FOR: {exp_name} " + "#"*25)
+            elif current_config.get('APPLY_LAYER2_ANALYSIS', False):
+                logger.info(
+                    "Layer 2 for '%s' is deferred until all worker shards pass strict merge.",
+                    exp_name,
+                )
 
         print("\n" + "#"*25 + " PHASE 2 COMPLETE. ALL EXPERIMENTS FINISHED. " + "#"*25)
         
+    if distributed_manifest is not None:
+        _finalize_distributed_worker_status(
+            global_config, experiment_configs, distributed_manifest
+        )
     return all_results
+
+
+def finalize_distributed_experiments(
+    experiment_configs: List[Dict[str, Any]],
+    global_config: Dict[str, Any],
+    hard_questions: List[str],
+    exemplar_data: Dict[str, Any],
+    api_managers: Dict[str, Any],
+    hard_solutions: Optional[List[str]] = None,
+    run_layer2: bool = True,
+) -> Dict[str, Any]:
+    """Download, strictly merge, publish, and optionally run Layer 2 once.
+
+    Run this in one final notebook only after all worker notebooks report
+    ``COMPLETE``.  Missing/offline/forgotten workers produce a clear error and
+    no canonical merge marker is published.
+    """
+    if not distributed_enabled(global_config):
+        raise DistributedExecutionError(
+            "finalize_distributed_experiments requires DISTRIBUTED_EXECUTION_ENABLED=True."
+        )
+    _validate_distributed_scope(global_config, experiment_configs, hard_solutions)
+    paths = configure_worker_paths(global_config)
+    run_root = download_distributed_run_for_merge(global_config)
+
+    expected_manifest = build_run_manifest(
+        global_config,
+        experiment_configs,
+        hard_questions,
+        hard_solutions,
+        code_fingerprint=global_config.get("DISTRIBUTED_CODE_FINGERPRINT"),
+        exemplar_fingerprint=fingerprint_exemplar_data(exemplar_data),
+    )
+    write_or_validate_manifest(
+        os.path.join(run_root, "manifest.json"), expected_manifest
+    )
+
+    merged_root = os.path.join(run_root, "merged")
+    merge_result = merge_distributed_run(run_root, output_dir=merged_root)
+    sync_distributed_merged_results(global_config, merged_root)
+    print(
+        f"Strict merge complete for run {expected_manifest['run_id']}: "
+        f"{expected_manifest['question_count']} questions across "
+        f"{expected_manifest['worker_count']} workers."
+    )
+
+    layer2_results: Dict[str, Any] = {}
+    layer2_status: Dict[str, Any] = {}
+    if run_layer2:
+        start_worker_session(global_config)
+        deadline_keys = (
+            "DISTRIBUTED_EXECUTION_ENABLED",
+            "_DISTRIBUTED_STOP_NEW_BATCH_MONOTONIC",
+            "_DISTRIBUTED_API_DEADLINE_MONOTONIC",
+        )
+        for manager in api_managers.values():
+            manager_config = getattr(manager, "config", None)
+            if isinstance(manager_config, dict):
+                manager_config.update({key: global_config[key] for key in deadline_keys})
+        merged_results_dir = os.path.join(merged_root, "results")
+        for overrides in experiment_configs:
+            current_config = _merge_experiment_config(global_config, overrides)
+            if not current_config.get("APPLY_LAYER2_ANALYSIS", False):
+                continue
+            current_config["RESULTS_DIR"] = merged_results_dir
+            current_config["LAYER1_CACHE_DIR"] = merged_results_dir
+            current_config["DISTRIBUTED_FINALIZER_MODE"] = True
+            current_config["_DISTRIBUTED_MERGED_ROOT"] = merged_root
+            current_config["_DISTRIBUTED_LAYER2_SYNC_ONLY"] = True
+            experiment_name = current_config.get("experiment_name", "unnamed_experiment")
+            top_k = current_config.get("TOP_N_CANDIDATES_RETRIEVAL", 3)
+            n_candidates = current_config.get("LAYER1_ONE_SHOT_CANDIDATES_N")
+            if n_candidates is None:
+                n_candidates = current_config.get("LAYER1_N_CANDIDATES")
+            if n_candidates is None:
+                n_candidates = top_k
+            output_dir = os.path.join(
+                merged_results_dir, f"{experiment_name}_layer2_analytics"
+            )
+            solver_manager = api_managers.get(
+                current_config.get("API_PROVIDER_SOLVER", "gemini")
+            )
+            evaluator_manager = api_managers.get(
+                current_config.get("API_PROVIDER_EVALUATOR", "gemini")
+            )
+            layer2_result = run_layer2_complete_pipeline(
+                layer1_cache_dir=merged_results_dir,
+                layer2_output_dir=output_dir,
+                experiment_name=experiment_name,
+                api_manager_solve=solver_manager,
+                api_manager_eval=evaluator_manager,
+                layer2_config_dict=current_config.get("LAYER2_CONFIG", {}),
+                top_k=top_k,
+                n_candidates=n_candidates,
+                global_config=current_config,
+                exemplar_data=exemplar_data,
+                hard_questions=hard_questions,
+                hard_solutions=hard_solutions,
+            )
+            layer2_results[experiment_name] = layer2_result
+            result_rows = layer2_result[0] if isinstance(layer2_result, tuple) else None
+            completed_indices = set()
+            for row in result_rows or []:
+                value = (
+                    row.get("target_query_idx")
+                    if isinstance(row, dict)
+                    else getattr(row, "target_query_idx", None)
+                )
+                try:
+                    completed_indices.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            missing_indices = sorted(set(range(len(hard_questions))) - completed_indices)
+            if not missing_indices:
+                state = "COMPLETE"
+            elif stop_new_batches_due(global_config):
+                state = "PAUSED_TIME_LIMIT"
+            else:
+                state = "INCOMPLETE"
+            status_payload = {
+                "state": state,
+                "run_id": expected_manifest["run_id"],
+                "manifest_sha256": expected_manifest["manifest_sha256"],
+                "experiment_name": experiment_name,
+                "expected_query_count": len(hard_questions),
+                "completed_query_count": len(completed_indices),
+                "missing_query_indices": missing_indices,
+            }
+            status_path = os.path.join(output_dir, "distributed_layer2_status.json")
+            if not save_json_atomic(status_payload, status_path):
+                raise DistributedExecutionError(
+                    f"Could not save distributed Layer-2 status: {status_path}"
+                )
+            layer2_status[experiment_name] = status_payload
+        if layer2_results:
+            sync_distributed_merged_results(global_config, merged_root)
+
+    return {
+        "run_root": run_root,
+        "merged_root": merged_root,
+        "merge": merge_result,
+        "layer2": layer2_results,
+        "layer2_status": layer2_status,
+        "worker_paths": paths,
+    }
