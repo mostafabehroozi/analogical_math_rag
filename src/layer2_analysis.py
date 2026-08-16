@@ -903,7 +903,7 @@ class ActiveInferenceEngine:
         else:
             self.model_name = self.global_config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
 
-    def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int, use_mirror_baseline_template: bool = False):
+    def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int, use_mirror_baseline_template: bool = False, target_index: Optional[int] = None):
         # NEW: Deduplicate text strings to save tokens and prevent redundant context
         unique_contexts = []
         if context_texts:
@@ -964,6 +964,7 @@ class ActiveInferenceEngine:
                     ground_truth,
                     self.api_manager_eval,
                     self.global_config,
+                    target_index=target_index,
                 )
                 while isinstance(eval_res, list):
                     eval_res = eval_res[0] if eval_res else {}
@@ -2181,7 +2182,8 @@ class Layer2Orchestrator:
                 ground_truth=res.ground_truth_answer,
                 context_texts=res.selected_exemplar_texts, 
                 n_attempts=self.config.global_pass_at_N,
-                use_mirror_baseline_template=getattr(res, 'is_zero_shot_fallback', False)
+                use_mirror_baseline_template=getattr(res, 'is_zero_shot_fallback', False),
+                target_index=ptu_engine.target_query_idx,
             )
             
             res.final_prompt_text = prompt

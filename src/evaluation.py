@@ -31,7 +31,7 @@ from collections import defaultdict
 
 from src.utils import save_json, load_json
 from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
-from src.benchmark_data import uses_exact_final_answers
+from src.benchmark_data import benchmark_name_for_target_index, uses_exact_final_answers
 
 # Define a structured type for the result of a single LLM-based evaluation
 class EvaluationResult(TypedDict):
@@ -63,7 +63,8 @@ def evaluate_single_answer_with_llm(
     model_answer: str,
     ground_truth: str,
     api_manager: Any,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    target_index: Optional[int] = None,
 ) -> EvaluationResult:
     """
     Evaluates a single model-generated answer against a ground truth using an LLM.
@@ -86,7 +87,7 @@ def evaluate_single_answer_with_llm(
     if not model_answer or not isinstance(model_answer, str):
         return {"is_correct": None, "status": "EMPTY_ANSWER", "error_details": None}
 
-    target_benchmark = str(config.get("TARGET_BENCHMARK", "")).lower().strip()
+    target_benchmark = benchmark_name_for_target_index(config, target_index)
     has_exact_final_answers = uses_exact_final_answers(target_benchmark)
 
     if has_exact_final_answers:
@@ -257,6 +258,7 @@ def analyze_experiment_logs(
                                 task["ground_truth"],
                                 manager_for_eval,
                                 experiment_config,
+                                target_index=task["hard_list_idx"],
                             )
                             is_correct_list.append(eval_result["is_correct"])
                             status_list.append(eval_result["status"])

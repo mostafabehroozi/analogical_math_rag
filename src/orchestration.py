@@ -49,6 +49,7 @@ import os
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 from src.context_logger import tprint
+from src.benchmark_data import benchmark_name_for_target_index
 
 
 from src.pipeline_steps import (
@@ -409,6 +410,13 @@ def run_pipeline_for_single_query(
                                         Can also be set via CONFIG['FORCE_LAYER1_REEXECUTION'].
     """
     _reject_removed_feature_flags(config)
+    # Isolate source-specific evaluation metadata per query.  This copy is
+    # essential for batch workers: sharing a mutable current benchmark would
+    # make mixed exact-answer and rationale evaluation race-dependent.
+    config = config.copy()
+    config["_TARGET_BENCHMARK_FOR_QUERY"] = benchmark_name_for_target_index(
+        config, hard_list_idx
+    )
     logger = logging.getLogger(__name__)
     
     # --- Log Initialization ---

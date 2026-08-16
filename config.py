@@ -17,6 +17,9 @@ CONFIG = {
     #  Benchmark Selection 
     # Options: "numina_hard", "math500", "gsm8k", "aime25", "aime26"
     "TARGET_BENCHMARK": "numina_hard",  
+    # Optional ordered combined selection. A non-empty list overrides the
+    # scalar setting and intentionally ignores BENCHMARK_MAX_QUESTIONS.
+    "TARGET_BENCHMARKS": [],
     "BENCHMARK_MAX_QUESTIONS": None, # Put a number like 10 here if you want to do a quick test
     # Execution Mode
     "OFFLINE_MODE": True,  # Set to False for Kaggle/online execution

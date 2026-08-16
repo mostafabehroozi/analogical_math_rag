@@ -549,6 +549,7 @@ def retry_failed_evaluations(
                     ground_truth,
                     manager_for_eval,
                     experiment_config,
+                    target_index=hard_list_idx,
                 )
                 
                 # Update the log in place

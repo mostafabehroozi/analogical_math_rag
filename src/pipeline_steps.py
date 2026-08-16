@@ -86,7 +86,7 @@ def retrieve(
     exemplar_questions: List[str],
     embedded_exemplars: np.ndarray,
     top_k: int,
-    question_to_index_map: Optional[Dict[str, int]] = None
+    question_to_index_map: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     logger = logging.getLogger(__name__)
     logger.info(f"Starting retrieval for Top-{top_k} exemplars.")
@@ -140,10 +140,16 @@ def retrieve(
         self_match_start_time = time.time()
 
         if question_to_index_map is not None:
-            query_index_in_corpus = question_to_index_map.get(target_query)
-            if query_index_in_corpus is not None:
-                similarities[query_index_in_corpus] = -np.inf
-                print(f"{'  '*indent_level}Self-match found at index {query_index_in_corpus}, set to -np.inf.")
+            query_indices_in_corpus = question_to_index_map.get(target_query)
+            if query_indices_in_corpus is not None:
+                # Legacy callers may supply a single index. New corpus maps
+                # preserve every duplicate question so none can be retrieved.
+                if isinstance(query_indices_in_corpus, (list, tuple, set, np.ndarray)):
+                    indices_to_exclude = list(query_indices_in_corpus)
+                else:
+                    indices_to_exclude = [query_indices_in_corpus]
+                similarities[indices_to_exclude] = -np.inf
+                print(f"{'  '*indent_level}Self-match found at indices {indices_to_exclude}, set to -np.inf.")
             else:
                 print(f"{'  '*indent_level}Target query not found in corpus (no self-match to remove).")
         else:
@@ -153,7 +159,15 @@ def retrieve(
         log_time_diagnostic("Handle self-match (O(1) lookup)", self_match_start_time, indent=indent_level)
 
         k_retrieve_start_time = time.time()
-        k_to_retrieve = min(top_k, len(similarities))
+        eligible_count = int(np.isfinite(similarities).sum())
+        if eligible_count == 0:
+            logger.error("No eligible exemplars remain after exact-question exclusion.")
+            return {
+                "status": "FAILURE", "retrieved_indices": [], "retrieved_exemplars": [],
+                "trace": local_trace,
+                "error": "No eligible exemplars remain after exact-question exclusion.",
+            }
+        k_to_retrieve = min(top_k, eligible_count)
         log_time_diagnostic("Determine k_to_retrieve", k_retrieve_start_time, indent=indent_level)
         print(f"{'  '*indent_level}Effective k_to_retrieve: {k_to_retrieve}")
 

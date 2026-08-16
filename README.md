@@ -35,8 +35,10 @@ directory.
 
 ## Before a run
 
-1. Select `numina_hard`, `math500`, `gsm8k`, `aime25`, or `aime26` as the
-   benchmark in `CONFIG`, then choose the feature flags.
+1. Select `numina_hard`, `math500`, `gsm8k`, `aime25`, or `aime26` with
+   `TARGET_BENCHMARK`, or set `TARGET_BENCHMARKS` to an ordered unique list
+   such as `["math500", "gsm8k"]`. A non-empty combined list overrides the
+   scalar setting and is not capped by `BENCHMARK_MAX_QUESTIONS`.
 2. Configure the selected provider and its model names/credentials.
 3. Keep `BATCH_PROCESSING_ENABLED` and `QUESTION_PARALLEL_API_ENABLED` disabled
    for the first small validation run.

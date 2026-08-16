@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 # Benchmarks in this set provide a dedicated gold final-answer column. Their
@@ -56,6 +56,125 @@ def normalize_benchmark_name(benchmark_name: Any) -> str:
 def uses_exact_final_answers(benchmark_name: Any) -> bool:
     """Whether the benchmark supplies gold final answers rather than solutions."""
     return normalize_benchmark_name(benchmark_name) in EXACT_FINAL_ANSWER_BENCHMARKS
+
+
+def selected_benchmark_names(config: Mapping[str, Any]) -> List[str]:
+    """Resolve the configured target selection to canonical benchmark names.
+
+    ``TARGET_BENCHMARKS`` is deliberately opt-in: an empty list preserves the
+    established scalar ``TARGET_BENCHMARK`` behavior.  A non-empty list is
+    validated as one ordered, duplicate-free benchmark selection.
+    """
+    combined = config.get("TARGET_BENCHMARKS", [])
+    if combined is None:
+        combined = []
+    if combined:
+        if not isinstance(combined, list):
+            raise ValueError("TARGET_BENCHMARKS must be a list of benchmark names.")
+        raw_names: Sequence[Any] = combined
+    elif isinstance(combined, list):
+        raw_names = [config.get("TARGET_BENCHMARK", "numina_hard")]
+    else:
+        raise ValueError("TARGET_BENCHMARKS must be a list when configured.")
+
+    names: List[str] = []
+    for raw_name in raw_names:
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError("Benchmark names must be non-empty strings.")
+        name = normalize_benchmark_name(raw_name)
+        if name not in SUPPORTED_BENCHMARKS:
+            raise ValueError(
+                f"Unknown benchmark {raw_name!r}; expected one of: "
+                f"{', '.join(SUPPORTED_BENCHMARKS)}."
+            )
+        if name in names:
+            raise ValueError(f"TARGET_BENCHMARKS contains duplicate benchmark {name!r}.")
+        names.append(name)
+    return names
+
+
+def benchmark_name_for_target_index(
+    config: Mapping[str, Any], target_index: Optional[int] = None
+) -> str:
+    """Return the source benchmark for one combined-target position.
+
+    The per-index list is internal pipeline metadata.  Its absence keeps old
+    logs and scalar benchmark configurations fully backward compatible.
+    """
+    current_name = config.get("_TARGET_BENCHMARK_FOR_QUERY")
+    if current_name is not None:
+        return normalize_benchmark_name(current_name)
+    indexed_names = config.get("TARGET_BENCHMARK_BY_INDEX")
+    if target_index is not None and isinstance(indexed_names, Sequence) and not isinstance(indexed_names, str):
+        if isinstance(target_index, bool) or not isinstance(target_index, int):
+            raise ValueError("target_index must be an integer.")
+        try:
+            return normalize_benchmark_name(indexed_names[target_index])
+        except IndexError as exc:
+            raise IndexError(f"No benchmark metadata for target index {target_index}.") from exc
+    return normalize_benchmark_name(config.get("TARGET_BENCHMARK", "numina_hard"))
+
+
+def load_target_benchmarks(
+    config: Mapping[str, Any],
+    exemplar_data: Mapping[str, Any],
+    *,
+    load_json_fn: Callable[[str], Any],
+    load_dataset_fn: Optional[Callable[..., Any]] = None,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Load one scalar benchmark or ordered benchmark blocks atomically.
+
+    Returns questions, ground truths, and internal canonical benchmark metadata
+    aligned one-to-one with the returned targets.  Combined mode intentionally
+    ignores ``BENCHMARK_MAX_QUESTIONS``; scalar mode keeps its legacy cap.
+    """
+    names = selected_benchmark_names(config)
+    combined_mode = bool(config.get("TARGET_BENCHMARKS"))
+    blocks: List[Tuple[str, List[str], List[str]]] = []
+
+    for name in names:
+        if name in HUGGINGFACE_BENCHMARK_SPECS:
+            questions, ground_truths = load_huggingface_benchmark(name, load_dataset_fn)
+        else:  # ``selected_benchmark_names`` restricts this to numina_hard.
+            hard_indices = load_json_fn(config.get("HARD_QUESTIONS_INDICES_PATH"))
+            if not isinstance(hard_indices, list) or not hard_indices:
+                raise ValueError("HARD_QUESTIONS_INDICES_PATH must contain a non-empty JSON list.")
+            corpus_questions = exemplar_data.get("questions", [])
+            corpus_solutions = exemplar_data.get("solutions", [])
+            if len(corpus_questions) != len(corpus_solutions):
+                raise ValueError("Numina exemplar questions and solutions must have matching lengths.")
+            invalid_indices = [
+                index for index in hard_indices
+                if isinstance(index, bool) or not isinstance(index, int)
+                or index < 0 or index >= len(corpus_questions)
+            ]
+            if invalid_indices:
+                raise IndexError(f"Invalid hard-question indices: {invalid_indices[:10]}")
+            if len(set(hard_indices)) != len(hard_indices):
+                raise ValueError("HARD_QUESTIONS_INDICES_PATH must not contain duplicate indices.")
+            questions = [str(corpus_questions[index]) for index in hard_indices]
+            ground_truths = [str(corpus_solutions[index]) for index in hard_indices]
+
+        if not questions or len(questions) != len(ground_truths):
+            raise ValueError(f"Benchmark '{name}' produced invalid target data.")
+        blocks.append((name, questions, ground_truths))
+
+    questions = [question for _, block, _ in blocks for question in block]
+    ground_truths = [answer for _, _, block in blocks for answer in block]
+    target_names = [name for name, block, _ in blocks for _ in block]
+
+    if not combined_mode:
+        max_questions = config.get("BENCHMARK_MAX_QUESTIONS")
+        if max_questions is not None:
+            if isinstance(max_questions, bool) or not isinstance(max_questions, int) or max_questions <= 0:
+                raise ValueError("BENCHMARK_MAX_QUESTIONS must be None or a positive integer.")
+            questions = questions[:max_questions]
+            ground_truths = ground_truths[:max_questions]
+            target_names = target_names[:max_questions]
+
+    if not questions:
+        raise ValueError(f"Benchmark selection {names!r} produced no target questions.")
+    return questions, ground_truths, target_names
 
 
 def _format_gsm8k_answer(answer: Any) -> str:

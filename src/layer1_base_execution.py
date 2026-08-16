@@ -306,7 +306,7 @@ def _execute_retrieval(
     exemplar_questions: List[str],
     embedded_exemplars: np.ndarray,
     top_k: int,
-    question_to_index_map: Optional[Dict[str, int]] = None
+    question_to_index_map: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Executes Step A: Retrieval.
@@ -611,7 +611,8 @@ def _execute_ground_truth_evaluation(
     ground_truth_answer: str,
     candidates: Dict[int, Dict[str, Any]],
     api_manager_eval: Any,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    target_query_index: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Executes Step E: Ground-Truth Correctness Evaluation.
@@ -645,7 +646,8 @@ def _execute_ground_truth_evaluation(
                 model_answer=c_text,
                 ground_truth=ground_truth_answer,
                 api_manager=api_manager_eval,
-                config=config
+                config=config,
+                target_index=target_query_index,
             )
             return c_idx, eval_result
 
@@ -811,7 +813,9 @@ def run_layer1_base_execution(
     if exemplar_data and 'question_to_index' in exemplar_data:
         question_to_index_map = exemplar_data['question_to_index']
     else:
-        question_to_index_map = {q: i for i, q in enumerate(exemplar_questions)}
+        question_to_index_map = {}
+        for index, question in enumerate(exemplar_questions):
+            question_to_index_map.setdefault(question, []).append(index)
     
     retrieval_result = _execute_retrieval(
         target_query=target_query,
@@ -880,7 +884,8 @@ def run_layer1_base_execution(
 
     print("\n[Step E] Ground Truth Evaluation...")
     gt_result = _execute_ground_truth_evaluation(
-        target_query, ground_truth_answer, candidates, api_manager_eval, config
+        target_query, ground_truth_answer, candidates, api_manager_eval, config,
+        target_query_index=target_query_index,
     )
 
     # Save Step E results

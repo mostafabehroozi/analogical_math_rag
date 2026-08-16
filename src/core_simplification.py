@@ -11,6 +11,7 @@ from src.prompts import (
     create_final_reasoning_prompt_simple
 )
 from src.evaluation import evaluate_single_answer_with_llm
+from src.benchmark_data import benchmark_name_for_target_index
 from src.utils import create_trace_entry, load_json, save_json, save_json_atomic
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
@@ -331,12 +332,16 @@ def execute_core_simplification_phase1(
         return full_logs
 
     def run_item(item: QuestionWorkItem) -> Dict[str, Any]:
+        item_config = config.copy()
+        item_config["_TARGET_BENCHMARK_FOR_QUERY"] = benchmark_name_for_target_index(
+            config, item.index
+        )
         result = run_core_simplification_phase1(
             target_query=item.question,
             ground_truth=ground_truth_by_index[item.index],
             api_manager_solve=api_manager_solve,
             api_manager_eval=api_manager_eval,
-            config=config,
+            config=item_config,
         )
         result["original_index"] = item.index
         return result
