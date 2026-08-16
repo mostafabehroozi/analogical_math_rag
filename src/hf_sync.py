@@ -60,6 +60,77 @@ _DISTRIBUTED_SECRET_NAME_MARKERS = (
 _DISTRIBUTED_TEMP_SUFFIXES = (".bak", ".lock", ".part", ".swp", ".tmp", "~")
 
 
+def _startup_progress_enabled(config: dict) -> bool:
+    """Return whether startup diagnostics should be printed to the notebook."""
+    return bool(config.get("HF_STARTUP_DIAGNOSTICS_ENABLED", True))
+
+
+def _print_startup_progress(config: dict, message: str) -> None:
+    """Emit an immediate, flush-safe marker for long Hugging Face operations."""
+    if _startup_progress_enabled(config):
+        print(f"[HF startup {time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+class _StartupOperationReporter:
+    """Print start/completion and optional heartbeats around one blocking call."""
+
+    def __init__(self, config: dict, operation: str):
+        self.config = config
+        self.operation = operation
+        self.started_at = 0.0
+        self.stop_event = threading.Event()
+        self.heartbeat_thread: Optional[threading.Thread] = None
+
+    def __enter__(self):
+        self.started_at = time.monotonic()
+        _print_startup_progress(self.config, f"START: {self.operation}")
+        if not _startup_progress_enabled(self.config):
+            return self
+
+        interval = self.config.get("HF_STARTUP_DIAGNOSTIC_HEARTBEAT_SECONDS", 30.0)
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError):
+            interval = 30.0
+
+        if interval > 0:
+            self.heartbeat_thread = threading.Thread(
+                target=self._print_heartbeats,
+                args=(interval,),
+                name="hf-startup-progress",
+                daemon=True,
+            )
+            self.heartbeat_thread.start()
+        return self
+
+    def _print_heartbeats(self, interval: float) -> None:
+        while not self.stop_event.wait(interval):
+            if self.stop_event.is_set():
+                return
+            elapsed = time.monotonic() - self.started_at
+            _print_startup_progress(
+                self.config,
+                f"WAITING ({elapsed:.0f}s): {self.operation} is still running.",
+            )
+
+    def __exit__(self, exc_type, exc_value, _traceback) -> bool:
+        self.stop_event.set()
+        if self.heartbeat_thread is not None:
+            self.heartbeat_thread.join(timeout=1.0)
+        elapsed = time.monotonic() - self.started_at
+        if exc_type is None:
+            _print_startup_progress(
+                self.config,
+                f"DONE ({elapsed:.1f}s): {self.operation}",
+            )
+        else:
+            _print_startup_progress(
+                self.config,
+                f"FAILED after {elapsed:.1f}s: {self.operation} ({exc_type.__name__})",
+            )
+        return False
+
+
 def _distributed_execution_enabled(config: dict) -> bool:
     return bool(config.get("DISTRIBUTED_EXECUTION_ENABLED", False))
 
@@ -658,16 +729,19 @@ def initialize_workspace(config: dict):
     HF token directly from the provided configuration dictionary.
     """
     logger = logging.getLogger(__name__)
+    _print_startup_progress(config, "initialize_workspace() entered.")
 
     # Distributed workers restore only the immutable manifest and their own
     # checkpoint prefix. This branch is deliberately fail-closed because a
     # missing remote checkpoint can otherwise cause duplicate paid API calls.
     if _distributed_execution_enabled(config):
+        _print_startup_progress(config, "Distributed restore selected; handing off to distributed initialization.")
         return _initialize_distributed_workspace(config)
     
     # 1. Check if persistence is enabled
     if not config.get("PERSIST_RESULTS_ONLINE"):
         logger.info("Online persistence is disabled. Skipping workspace initialization.")
+        _print_startup_progress(config, "Online persistence is disabled; no remote restore will run.")
         return
 
     # 2. Extract credentials safely
@@ -683,6 +757,11 @@ def initialize_workspace(config: dict):
     # Changed: Download to BASE_OUTPUT_DIR instead of OUTPUTS_DIR for consistency
     # This allows all subdirectories (outputs, results, logs) to be downloaded and available
     local_outputs_dir = config["BASE_OUTPUT_DIR"]
+
+    _print_startup_progress(
+        config,
+        f"Workspace restore configured for repo '{repo_id}' into '{local_outputs_dir}'.",
+    )
 
     logger.info(f"Initializing workspace from Hugging Face Hub repo: {repo_id}")
 
@@ -700,18 +779,21 @@ def initialize_workspace(config: dict):
     try:
         # Instantiate the API client
         api = HfApi(token=hf_token)
+        _print_startup_progress(config, "Hugging Face API client created.")
 
         # Ensure the repository exists, creating it if necessary
-        api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
+        with _StartupOperationReporter(config, "checking/creating the Hugging Face dataset repository"):
+            api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
         logger.info(f"Repository {repo_id} exists or was created successfully.")
 
         # Pin the branch head once so every retry restores one coherent latest
         # snapshot even if another notebook uploads while this one downloads.
-        repo_info = api.repo_info(
-            repo_id=repo_id,
-            repo_type="dataset",
-            revision=revision,
-        )
+        with _StartupOperationReporter(config, "resolving the Hugging Face revision"):
+            repo_info = api.repo_info(
+                repo_id=repo_id,
+                repo_type="dataset",
+                revision=revision,
+            )
         resolved_revision = getattr(repo_info, "sha", None)
         if not resolved_revision:
             raise RuntimeError(f"Could not resolve a commit for {repo_id}.")
@@ -723,19 +805,28 @@ def initialize_workspace(config: dict):
             max_workers,
             max_retries,
         )
+        _print_startup_progress(
+            config,
+            "Snapshot download will start next "
+            f"(workers={max_workers}, retry_rounds={max_retries}).",
+        )
 
         # local_dir retains completed files plus Hub metadata. A retry therefore
         # continues the incomplete snapshot instead of downloading 5+ GB again.
         for attempt in range(max_retries + 1):
             try:
-                downloaded_path = snapshot_download(
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    local_dir=local_outputs_dir,
-                    token=hf_token,
-                    revision=resolved_revision,
-                    max_workers=max_workers,
-                )
+                with _StartupOperationReporter(
+                    config,
+                    f"downloading workspace snapshot (attempt {attempt + 1}/{max_retries + 1})",
+                ):
+                    downloaded_path = snapshot_download(
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                        local_dir=local_outputs_dir,
+                        token=hf_token,
+                        revision=resolved_revision,
+                        max_workers=max_workers,
+                    )
                 break
             except Exception as exc:
                 if attempt >= max_retries or not _is_retryable_hf_error(exc):
