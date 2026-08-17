@@ -346,10 +346,15 @@ def _prepare_distributed_worker(
         message="Worker session started or resumed; same worker id must not run concurrently.",
     )
     sync_workspace_to_hub(global_config)
+    owned_indices = global_config["_DISTRIBUTED_ALLOWED_QUERY_INDICES"]
+    owned_range = (
+        f", indices {owned_indices[0]}..{owned_indices[-1]}"
+        if owned_indices else ", empty chunk"
+    )
     print(
         f"Distributed worker {global_config['DISTRIBUTED_WORKER_ID']}/"
         f"{global_config['DISTRIBUTED_WORKER_COUNT'] - 1} owns "
-        f"{len(global_config['_DISTRIBUTED_ALLOWED_QUERY_INDICES'])} global question(s)."
+        f"{len(owned_indices)} global question(s){owned_range}."
     )
     return manifest
 

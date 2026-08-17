@@ -1,7 +1,7 @@
 """Deterministic, restart-safe execution across independent Kaggle workers.
 
 The module deliberately contains no provider or Hugging Face imports.  It owns
-the immutable run manifest, round-robin assignment, local worker layout,
+the immutable run manifest, contiguous assignment, local worker layout,
 checkpoint validation, status files, and the fail-closed local merge.  Hub I/O
 is implemented in :mod:`src.hf_sync` so these invariants remain easy to test
 without a network or optional ML dependencies.
@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 STATUS_SCHEMA_VERSION = 1
-ASSIGNMENT_STRATEGY = "round_robin_modulo"
+ASSIGNMENT_STRATEGY = "contiguous_balanced_chunks"
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WINDOWS_RESERVED_NAMES = {
@@ -130,16 +130,34 @@ def validate_experiment_name(name: Any) -> str:
 
 
 def assigned_indices(total_questions: int, worker_id: int, worker_count: int) -> List[int]:
-    """Return stable global indices owned by one worker.
+    """Return one worker's contiguous, balanced range of global indices.
 
-    With five workers this is exactly the user's desired 20% split whenever
-    the dataset size is divisible by five, while interleaving slow/easy items.
+    Any remainder is assigned one item at a time to the lowest worker ids, so
+    chunk sizes differ by at most one and every index is owned exactly once.
     """
     if total_questions < 0:
         raise DistributedExecutionError("Question count cannot be negative.")
     if worker_count < 1 or worker_id < 0 or worker_id >= worker_count:
         raise DistributedExecutionError("Invalid worker id/count for assignment.")
-    return list(range(worker_id, total_questions, worker_count))
+    base_size, remainder = divmod(total_questions, worker_count)
+    start = worker_id * base_size + min(worker_id, remainder)
+    stop = start + base_size + (1 if worker_id < remainder else 0)
+    return list(range(start, stop))
+
+
+def _assigned_worker_id(index: int, total_questions: int, worker_count: int) -> int:
+    """Return the owner of one valid global index under contiguous chunking."""
+    if index < 0 or index >= total_questions:
+        raise DistributedExecutionError("Question index is outside the dataset.")
+    if worker_count < 1:
+        raise DistributedExecutionError("Worker count must be at least 1.")
+
+    base_size, remainder = divmod(total_questions, worker_count)
+    larger_region_size = (base_size + 1) * remainder
+    if index < larger_region_size:
+        return index // (base_size + 1)
+    # When base_size is zero, every valid index is in the larger region.
+    return remainder + (index - larger_region_size) // base_size
 
 
 _SECRET_PARTS = (
@@ -302,7 +320,7 @@ def build_run_manifest(
         answer = None if hard_solutions is None else hard_solutions[index]
         question_records.append({
             "index": index,
-            "worker_id": index % worker_count,
+            "worker_id": _assigned_worker_id(index, len(hard_questions), worker_count),
             "question_sha256": _sha256_text(str(question)),
             "answer_sha256": None if answer is None else _sha256_text(str(answer)),
         })
@@ -356,11 +374,21 @@ def validate_manifest_integrity(manifest: Mapping[str, Any]) -> None:
     worker_count = manifest.get("worker_count")
     if not isinstance(worker_count, int) or worker_count < 1:
         raise DistributedManifestMismatch("Manifest worker_count is invalid.")
+    if manifest.get("assignment_strategy") != ASSIGNMENT_STRATEGY:
+        raise DistributedManifestMismatch(
+            f"Manifest assignment_strategy must be {ASSIGNMENT_STRATEGY!r}."
+        )
+    total_questions = len(questions)
     for expected_index, record in enumerate(questions):
         if record.get("index") != expected_index:
             raise DistributedManifestMismatch("Manifest question indices are not contiguous and ordered.")
-        if record.get("worker_id") != expected_index % worker_count:
-            raise DistributedManifestMismatch("Manifest assignment does not match round-robin modulo.")
+        expected_worker_id = _assigned_worker_id(
+            expected_index, total_questions, worker_count
+        )
+        if record.get("worker_id") != expected_worker_id:
+            raise DistributedManifestMismatch(
+                "Manifest assignment does not match contiguous balanced chunks."
+            )
     experiments = manifest.get("experiments")
     if not isinstance(experiments, list) or not experiments:
         raise DistributedManifestMismatch("Manifest experiments are missing or malformed.")
