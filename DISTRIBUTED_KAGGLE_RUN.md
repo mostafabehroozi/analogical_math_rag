@@ -61,17 +61,18 @@ mode in every restarted worker and in the finalizer:
 
 ```python
 CONFIG["DISTRIBUTED_ALLOW_MODEL_ROTATION"] = True
-CONFIG["DISTRIBUTED_CODE_FINGERPRINT"] = "<code_fingerprint from the existing manifest.json>"
 
 CONFIG["AVALAI_MODEL_NAME_ADAPTATION"] = "meta/llama-3.2-11b-vision-instruct"
 CONFIG["AVALAI_MODEL_NAME_FINAL_SOLVER"] = "meta/llama-3.2-11b-vision-instruct"
 CONFIG["AVALAI_MODEL_NAME_EVALUATOR"] = "openai/gpt-oss-20b"
 ```
 
-The code-fingerprint override is needed only when applying the compatibility
-patch to a run created by older source code. Copy it exactly from
-`distributed_runs/<run-id>/manifest.json`; do not invent or shorten it. Remove
-the override for new run IDs so automatic source fingerprinting remains active.
+When applying this patch to a run created by older source code, the worker
+automatically adopts the exact `code_fingerprint` from the valid immutable
+manifest after verifying that every other difference is limited to the three
+approved model names. The actual patched runtime fingerprint is recorded
+separately in worker status. An explicit `DISTRIBUTED_CODE_FINGERPRINT` remains
+supported, but is not required; if supplied, it must match the manifest exactly.
 
 With rotation enabled, only the three model-name fields above may differ. The
 stored manifest is never rewritten, completed questions remain complete, and

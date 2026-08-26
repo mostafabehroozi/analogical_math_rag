@@ -366,19 +366,43 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
             )
             if remote_manifest_record is not None:
                 remote_manifest, remote_hash = remote_manifest_record
+                allow_model_rotation = bool(
+                    config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
+                )
+                auto_pin_legacy_code = (
+                    allow_model_rotation
+                    and not config.get("DISTRIBUTED_CODE_FINGERPRINT")
+                )
                 try:
                     model_changes = validate_manifest_compatibility(
                         remote_manifest,
                         expected_manifest,
-                        allow_model_rotation=bool(
-                            config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
-                        ),
+                        allow_model_rotation=allow_model_rotation,
+                        allow_legacy_code_fingerprint=auto_pin_legacy_code,
                     )
                 except DistributedManifestMismatch as exc:
                     raise DistributedManifestMismatchError(
                         "The remote distributed manifest already exists with different content "
                         f"(expected {expected_hash}, found {remote_hash}): {exc}"
                     ) from exc
+                if (
+                    auto_pin_legacy_code
+                    and remote_manifest.get("code_fingerprint")
+                    != expected_manifest.get("code_fingerprint")
+                ):
+                    stored_code_fingerprint = remote_manifest.get("code_fingerprint")
+                    if not isinstance(stored_code_fingerprint, str) or not stored_code_fingerprint:
+                        raise DistributedSyncError(
+                            "The authoritative remote manifest has no usable code_fingerprint."
+                        )
+                    config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
+                    config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
+                    logger.warning(
+                        "Automatically pinned the pre-patch code fingerprint from immutable "
+                        "manifest %s for this model-rotation resume. The actual runtime "
+                        "fingerprint remains recorded separately.",
+                        remote_path,
+                    )
                 if model_changes:
                     logger.warning(
                         "Authorized distributed model rotation against immutable manifest %s: %s",

@@ -245,11 +245,17 @@ def record_avalai_model_provenance(
         history.append(record)
 
 
-def _manifest_without_rotatable_models(manifest: Mapping[str, Any]) -> Dict[str, Any]:
+def _manifest_without_rotatable_models(
+    manifest: Mapping[str, Any],
+    *,
+    remove_code_fingerprint: bool = False,
+) -> Dict[str, Any]:
     """Remove only model-rotation fields and hashes derived from those fields."""
     normalized = copy.deepcopy(dict(manifest))
     normalized.pop("manifest_sha256", None)
     normalized.pop("scientific_config_sha256", None)
+    if remove_code_fingerprint:
+        normalized.pop("code_fingerprint", None)
     for experiment in normalized.get("experiments", []):
         if not isinstance(experiment, dict):
             continue
@@ -294,16 +300,23 @@ def validate_manifest_compatibility(
     expected_manifest: Mapping[str, Any],
     *,
     allow_model_rotation: bool = False,
+    allow_legacy_code_fingerprint: bool = False,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Validate exact identity, optionally allowing only the three model keys."""
+    """Validate identity with a narrow opt-in bridge for pre-patch runs."""
     validate_manifest_integrity(existing_manifest)
     validate_manifest_integrity(expected_manifest)
     if _canonical_json(existing_manifest) == _canonical_json(expected_manifest):
         return {}
 
     if allow_model_rotation and (
-        _canonical_json(_manifest_without_rotatable_models(existing_manifest))
-        == _canonical_json(_manifest_without_rotatable_models(expected_manifest))
+        _canonical_json(_manifest_without_rotatable_models(
+            existing_manifest,
+            remove_code_fingerprint=allow_legacy_code_fingerprint,
+        ))
+        == _canonical_json(_manifest_without_rotatable_models(
+            expected_manifest,
+            remove_code_fingerprint=allow_legacy_code_fingerprint,
+        ))
     ):
         changes = _manifest_model_changes(existing_manifest, expected_manifest)
         if changes:
@@ -317,7 +330,11 @@ def validate_manifest_compatibility(
         if existing_manifest.get(key) != expected_manifest.get(key)
     ]
     legacy_rotation_guidance = ""
-    if allow_model_rotation and "code_fingerprint" in changed:
+    if (
+        allow_model_rotation
+        and not allow_legacy_code_fingerprint
+        and "code_fingerprint" in changed
+    ):
         legacy_rotation_guidance = (
             " For a pre-patch run, set DISTRIBUTED_CODE_FINGERPRINT to the exact "
             "code_fingerprint stored in the existing manifest."

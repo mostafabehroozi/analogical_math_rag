@@ -132,6 +132,64 @@ def _announce_authorized_model_rotation(
     builtins.print(f"\n[WARNING] {message}\n", flush=True)
 
 
+def _build_requested_distributed_manifest(
+    global_config: Dict[str, Any],
+    experiment_configs: List[Dict[str, Any]],
+    hard_questions: List[str],
+    hard_solutions: Optional[List[str]],
+    exemplar_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    return build_run_manifest(
+        global_config,
+        experiment_configs,
+        hard_questions,
+        hard_solutions,
+        code_fingerprint=global_config.get("DISTRIBUTED_CODE_FINGERPRINT"),
+        exemplar_fingerprint=fingerprint_exemplar_data(exemplar_data),
+    )
+
+
+def _auto_pin_local_legacy_code_fingerprint(
+    global_config: Dict[str, Any],
+    manifest_path: str,
+    requested_manifest: Dict[str, Any],
+) -> bool:
+    """Pin a valid local pre-patch manifest only when model names are the sole drift."""
+    if (
+        not global_config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
+        or global_config.get("DISTRIBUTED_CODE_FINGERPRINT")
+        or not os.path.exists(manifest_path)
+    ):
+        return False
+    existing_manifest = load_json(manifest_path)
+    if not isinstance(existing_manifest, dict):
+        raise DistributedExecutionError(
+            f"Malformed existing distributed manifest: {manifest_path}"
+        )
+    model_changes = validate_manifest_compatibility(
+        existing_manifest,
+        requested_manifest,
+        allow_model_rotation=True,
+        allow_legacy_code_fingerprint=True,
+    )
+    stored_code_fingerprint = existing_manifest.get("code_fingerprint")
+    if stored_code_fingerprint == requested_manifest.get("code_fingerprint"):
+        return False
+    if not isinstance(stored_code_fingerprint, str) or not stored_code_fingerprint:
+        raise DistributedExecutionError(
+            "The existing distributed manifest has no usable code_fingerprint."
+        )
+    global_config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
+    global_config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
+    logging.getLogger(__name__).warning(
+        "Automatically pinned the pre-patch code fingerprint from %s after "
+        "verifying that only approved model names changed: %s",
+        manifest_path,
+        model_changes,
+    )
+    return True
+
+
 print = safe_thread_print
 
 
@@ -342,14 +400,15 @@ def _prepare_distributed_worker(
         global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
             resolve_code_fingerprint(project_root)
         )
-    requested_manifest = build_run_manifest(
-        global_config,
-        experiment_configs,
-        hard_questions,
-        hard_solutions,
-        code_fingerprint=global_config.get("DISTRIBUTED_CODE_FINGERPRINT"),
-        exemplar_fingerprint=fingerprint_exemplar_data(exemplar_data),
+    requested_manifest = _build_requested_distributed_manifest(
+        global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
     )
+    if _auto_pin_local_legacy_code_fingerprint(
+        global_config, paths["manifest_path"], requested_manifest
+    ):
+        requested_manifest = _build_requested_distributed_manifest(
+            global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
+        )
     manifest_path = write_or_validate_manifest(
         paths["manifest_path"],
         requested_manifest,
@@ -359,6 +418,10 @@ def _prepare_distributed_worker(
     # The results repo is created once by its owner.  Every notebook validates
     # or creates exactly the same write-once manifest before any provider call.
     ensure_distributed_manifest(global_config, manifest_path)
+    if global_config.get("_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"):
+        requested_manifest = _build_requested_distributed_manifest(
+            global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
+        )
     initialize_workspace(global_config)
     write_or_validate_manifest(
         paths["manifest_path"],
@@ -2003,15 +2066,16 @@ def finalize_distributed_experiments(
         global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
             resolve_code_fingerprint(project_root)
         )
-    requested_manifest = build_run_manifest(
-        global_config,
-        experiment_configs,
-        hard_questions,
-        hard_solutions,
-        code_fingerprint=global_config.get("DISTRIBUTED_CODE_FINGERPRINT"),
-        exemplar_fingerprint=fingerprint_exemplar_data(exemplar_data),
+    requested_manifest = _build_requested_distributed_manifest(
+        global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
     )
     manifest_path = os.path.join(run_root, "manifest.json")
+    if _auto_pin_local_legacy_code_fingerprint(
+        global_config, manifest_path, requested_manifest
+    ):
+        requested_manifest = _build_requested_distributed_manifest(
+            global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
+        )
     write_or_validate_manifest(
         manifest_path,
         requested_manifest,
