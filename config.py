@@ -47,6 +47,9 @@ CONFIG = {
     # WORKER_COUNT, with a distinct WORKER_ID in [0, WORKER_COUNT).
     "DISTRIBUTED_EXECUTION_ENABLED": False,
     "DISTRIBUTED_FINALIZER_MODE": False,
+    # Explicitly permit only AvalAI adaptation/solver/evaluator model-name
+    # changes while resuming an existing immutable distributed run.
+    "DISTRIBUTED_ALLOW_MODEL_ROTATION": False,
     "DISTRIBUTED_RUN_ID": None,
     "DISTRIBUTED_WORKER_COUNT": 5,
     "DISTRIBUTED_WORKER_ID": 0,

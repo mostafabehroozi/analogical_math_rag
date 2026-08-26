@@ -53,6 +53,33 @@ only the immutable manifest and its own latest shard, skips strictly successful
 questions, and retries failed/partial questions. Different workers may run at
 different times. Do not run the same worker id concurrently in two notebooks.
 
+### Emergency model rotation during an existing run
+
+Model names remain immutable by default. If an AvalAI model becomes unavailable
+after a distributed run has started, explicitly enable the narrow compatibility
+mode in every restarted worker and in the finalizer:
+
+```python
+CONFIG["DISTRIBUTED_ALLOW_MODEL_ROTATION"] = True
+CONFIG["DISTRIBUTED_CODE_FINGERPRINT"] = "<code_fingerprint from the existing manifest.json>"
+
+CONFIG["AVALAI_MODEL_NAME_ADAPTATION"] = "meta/llama-3.2-11b-vision-instruct"
+CONFIG["AVALAI_MODEL_NAME_FINAL_SOLVER"] = "meta/llama-3.2-11b-vision-instruct"
+CONFIG["AVALAI_MODEL_NAME_EVALUATOR"] = "openai/gpt-oss-20b"
+```
+
+The code-fingerprint override is needed only when applying the compatibility
+patch to a run created by older source code. Copy it exactly from
+`distributed_runs/<run-id>/manifest.json`; do not invent or shorten it. Remove
+the override for new run IDs so automatic source fingerprinting remains active.
+
+With rotation enabled, only the three model-name fields above may differ. The
+stored manifest is never rewritten, completed questions remain complete, and
+failed or pending questions use the active models. Every new or solve-only query
+log records its active model configuration. The resulting run is intentionally
+mixed-model; keep the original experiment name unchanged so checkpoint artifact
+names continue to match.
+
 ## Final merge and Layer 2
 
 After all workers report `COMPLETE`, run exactly one finalizer notebook:
@@ -95,3 +122,5 @@ distributed_runs/<run-id>/merged/{MERGE_COMPLETE.json,results}
 
 If scientific inputs, code, worker count, question order, or answers change,
 choose a new run id. The existing manifest is intentionally never overwritten.
+The sole exception is the explicit model-rotation mode above, which still rejects
+every change outside its three-field allowlist.

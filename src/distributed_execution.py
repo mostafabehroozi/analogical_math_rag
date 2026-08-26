@@ -9,6 +9,7 @@ without a network or optional ML dependencies.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -24,6 +25,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 MANIFEST_SCHEMA_VERSION = 2
 STATUS_SCHEMA_VERSION = 1
 ASSIGNMENT_STRATEGY = "contiguous_balanced_chunks"
+MODEL_ROTATION_CONFIG_KEYS = frozenset({
+    "AVALAI_MODEL_NAME_ADAPTATION",
+    "AVALAI_MODEL_NAME_FINAL_SOLVER",
+    "AVALAI_MODEL_NAME_EVALUATOR",
+})
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WINDOWS_RESERVED_NAMES = {
@@ -213,6 +219,116 @@ def sanitize_scientific_config(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return repr(value)
+
+
+def active_avalai_models(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the model settings whose rotation can be explicitly authorized."""
+    return {
+        key: config.get(key)
+        for key in sorted(MODEL_ROTATION_CONFIG_KEYS)
+    }
+
+
+def record_avalai_model_provenance(
+    run_log: Dict[str, Any],
+    config: Mapping[str, Any],
+    run_mode: str,
+) -> None:
+    """Record active models for new work, including solve-only resumes."""
+    models = active_avalai_models(config)
+    flags = run_log.setdefault("config_flags_used", {})
+    if isinstance(flags, dict):
+        flags.update(models)
+    record = {"run_mode": str(run_mode), "models": models}
+    history = run_log.setdefault("avalai_model_config_history", [])
+    if isinstance(history, list) and (not history or history[-1] != record):
+        history.append(record)
+
+
+def _manifest_without_rotatable_models(manifest: Mapping[str, Any]) -> Dict[str, Any]:
+    """Remove only model-rotation fields and hashes derived from those fields."""
+    normalized = copy.deepcopy(dict(manifest))
+    normalized.pop("manifest_sha256", None)
+    normalized.pop("scientific_config_sha256", None)
+    for experiment in normalized.get("experiments", []):
+        if not isinstance(experiment, dict):
+            continue
+        experiment_config = experiment.get("config")
+        if not isinstance(experiment_config, dict):
+            continue
+        for key in MODEL_ROTATION_CONFIG_KEYS:
+            experiment_config.pop(key, None)
+    return normalized
+
+
+def _manifest_model_changes(
+    existing_manifest: Mapping[str, Any],
+    expected_manifest: Mapping[str, Any],
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    existing_by_name = {
+        experiment.get("experiment_name"): experiment
+        for experiment in existing_manifest.get("experiments", [])
+        if isinstance(experiment, Mapping)
+    }
+    changes: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for expected_experiment in expected_manifest.get("experiments", []):
+        if not isinstance(expected_experiment, Mapping):
+            continue
+        name = expected_experiment.get("experiment_name")
+        existing_experiment = existing_by_name.get(name, {})
+        existing_config = existing_experiment.get("config", {})
+        expected_config = expected_experiment.get("config", {})
+        experiment_changes: Dict[str, Dict[str, Any]] = {}
+        for key in sorted(MODEL_ROTATION_CONFIG_KEYS):
+            previous = existing_config.get(key) if isinstance(existing_config, Mapping) else None
+            active = expected_config.get(key) if isinstance(expected_config, Mapping) else None
+            if previous != active:
+                experiment_changes[key] = {"original": previous, "active": active}
+        if experiment_changes:
+            changes[str(name)] = experiment_changes
+    return changes
+
+
+def validate_manifest_compatibility(
+    existing_manifest: Mapping[str, Any],
+    expected_manifest: Mapping[str, Any],
+    *,
+    allow_model_rotation: bool = False,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Validate exact identity, optionally allowing only the three model keys."""
+    validate_manifest_integrity(existing_manifest)
+    validate_manifest_integrity(expected_manifest)
+    if _canonical_json(existing_manifest) == _canonical_json(expected_manifest):
+        return {}
+
+    if allow_model_rotation and (
+        _canonical_json(_manifest_without_rotatable_models(existing_manifest))
+        == _canonical_json(_manifest_without_rotatable_models(expected_manifest))
+    ):
+        changes = _manifest_model_changes(existing_manifest, expected_manifest)
+        if changes:
+            return changes
+
+    changed = [
+        key for key in (
+            "run_id", "worker_count", "assignment_strategy", "code_fingerprint",
+            "scientific_config_sha256", "dataset_sha256", "question_count",
+        )
+        if existing_manifest.get(key) != expected_manifest.get(key)
+    ]
+    legacy_rotation_guidance = ""
+    if allow_model_rotation and "code_fingerprint" in changed:
+        legacy_rotation_guidance = (
+            " For a pre-patch run, set DISTRIBUTED_CODE_FINGERPRINT to the exact "
+            "code_fingerprint stored in the existing manifest."
+        )
+    raise DistributedManifestMismatch(
+        "Existing run manifest does not match this invocation"
+        + (f" (changed: {', '.join(changed)})" if changed else "")
+        + "."
+        + legacy_rotation_guidance
+        + " Otherwise use the original inputs/config or choose a new DISTRIBUTED_RUN_ID."
+    )
 
 
 def resolve_code_fingerprint(project_root: os.PathLike[str] | str) -> str:
@@ -420,26 +536,19 @@ def validate_manifest_integrity(manifest: Mapping[str, Any]) -> None:
 def write_or_validate_manifest(
     path: os.PathLike[str] | str,
     expected_manifest: Mapping[str, Any],
+    *,
+    allow_model_rotation: bool = False,
 ) -> Path:
-    """Create a local manifest once, or reject any semantic difference."""
+    """Create a local manifest once, or reject any unauthorized difference."""
     validate_manifest_integrity(expected_manifest)
     destination = Path(path)
     if destination.exists():
         existing = _load_json(destination)
-        validate_manifest_integrity(existing)
-        if _canonical_json(existing) != _canonical_json(expected_manifest):
-            changed = [
-                key for key in (
-                    "run_id", "worker_count", "assignment_strategy", "code_fingerprint",
-                    "scientific_config_sha256", "dataset_sha256", "question_count",
-                )
-                if existing.get(key) != expected_manifest.get(key)
-            ]
-            raise DistributedManifestMismatch(
-                "Existing run manifest does not match this invocation"
-                + (f" (changed: {', '.join(changed)})" if changed else "")
-                + ". Use the original inputs/config or choose a new DISTRIBUTED_RUN_ID."
-            )
+        validate_manifest_compatibility(
+            existing,
+            expected_manifest,
+            allow_model_rotation=allow_model_rotation,
+        )
         return destination
     return _atomic_write_json(destination, dict(expected_manifest))
 
@@ -635,6 +744,12 @@ def write_worker_status(
         "assigned_indices": assigned_indices(manifest["question_count"], worker_id, worker_count),
         "experiments": dict(experiment_progress or {}),
     }
+    if config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False):
+        payload["model_rotation"] = {
+            "enabled": True,
+            "active_avalai_models": active_avalai_models(config),
+            "runtime_code_fingerprint": config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"),
+        }
     if message:
         payload["message"] = str(message)
     status_path = config.get("_DISTRIBUTED_WORKER_STATUS_PATH")
@@ -866,13 +981,14 @@ def merge_distributed_run(
 
 
 __all__ = [
-    "ASSIGNMENT_STRATEGY", "DistributedExecutionError", "DistributedManifestMismatch",
+    "ASSIGNMENT_STRATEGY", "MODEL_ROTATION_CONFIG_KEYS", "DistributedExecutionError", "DistributedManifestMismatch",
+    "active_avalai_models", "record_avalai_model_provenance",
     "DistributedMergeError", "api_deadline_due", "assigned_indices", "build_run_manifest",
     "configure_worker_paths", "distributed_enabled", "fingerprint_exemplar_data", "layer1_cache_filename",
     "layer1_state_complete", "merge_distributed_run", "pending_indices_for_worker",
     "remaining_api_seconds", "resolve_code_fingerprint", "run_log_successful",
     "sanitize_scientific_config", "start_worker_session", "stop_new_batches_due",
-    "validate_distributed_config", "validate_experiment_name", "validate_manifest_integrity",
+    "validate_distributed_config", "validate_experiment_name", "validate_manifest_compatibility", "validate_manifest_integrity",
     "validate_worker_layer1_cache", "validate_worker_run_logs",
     "worker_directory_name", "worker_question_records", "write_or_validate_manifest",
     "write_worker_status",

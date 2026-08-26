@@ -92,12 +92,15 @@ from src.distributed_execution import (
     fingerprint_exemplar_data,
     layer1_state_complete,
     merge_distributed_run,
+    record_avalai_model_provenance,
+    resolve_code_fingerprint,
     run_log_successful,
     start_worker_session,
     stop_new_batches_due,
     validate_worker_layer1_cache,
     validate_worker_run_logs,
     validate_experiment_name,
+    validate_manifest_compatibility,
     write_or_validate_manifest,
     write_worker_status,
 )
@@ -111,6 +114,23 @@ def safe_thread_print(*args, **kwargs):
     sep = kwargs.get('sep', ' ')
     message = sep.join(str(a) for a in args)
     tprint(message, level="INFO")
+
+
+def _announce_authorized_model_rotation(
+    model_changes: Dict[str, Any],
+    *,
+    context: str,
+) -> None:
+    if not model_changes:
+        return
+    message = (
+        f"AUTHORIZED MODEL ROTATION ({context}): the immutable run manifest is retained; "
+        f"completed results may use the original models while new work uses active models. "
+        f"Changes: {model_changes}"
+    )
+    logging.getLogger(__name__).warning(message)
+    builtins.print(f"\n[WARNING] {message}\n", flush=True)
+
 
 print = safe_thread_print
 
@@ -314,7 +334,15 @@ def _prepare_distributed_worker(
     """Validate/create the immutable run and restore only this worker shard."""
     _validate_distributed_scope(global_config, experiment_configs, hard_solutions)
     paths = configure_worker_paths(global_config)
-    manifest = build_run_manifest(
+    allow_model_rotation = bool(
+        global_config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
+    )
+    if allow_model_rotation:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
+            resolve_code_fingerprint(project_root)
+        )
+    requested_manifest = build_run_manifest(
         global_config,
         experiment_configs,
         hard_questions,
@@ -322,13 +350,32 @@ def _prepare_distributed_worker(
         code_fingerprint=global_config.get("DISTRIBUTED_CODE_FINGERPRINT"),
         exemplar_fingerprint=fingerprint_exemplar_data(exemplar_data),
     )
-    manifest_path = write_or_validate_manifest(paths["manifest_path"], manifest)
+    manifest_path = write_or_validate_manifest(
+        paths["manifest_path"],
+        requested_manifest,
+        allow_model_rotation=allow_model_rotation,
+    )
 
     # The results repo is created once by its owner.  Every notebook validates
     # or creates exactly the same write-once manifest before any provider call.
     ensure_distributed_manifest(global_config, manifest_path)
     initialize_workspace(global_config)
-    write_or_validate_manifest(paths["manifest_path"], manifest)
+    write_or_validate_manifest(
+        paths["manifest_path"],
+        requested_manifest,
+        allow_model_rotation=allow_model_rotation,
+    )
+    manifest = load_json(paths["manifest_path"])
+    if not isinstance(manifest, dict):
+        raise DistributedExecutionError(
+            f"Malformed authoritative distributed manifest: {paths['manifest_path']}"
+        )
+    model_changes = validate_manifest_compatibility(
+        manifest,
+        requested_manifest,
+        allow_model_rotation=allow_model_rotation,
+    )
+    _announce_authorized_model_rotation(model_changes, context="worker resume")
 
     start_worker_session(global_config)
     global_config["_DISTRIBUTED_MANIFEST"] = manifest
@@ -485,6 +532,9 @@ def run_pipeline_for_single_query(
             "steps_alternatives": {},
             "benchmarks": {} #Store Track A results
         }
+
+    if distributed_enabled(config):
+        record_avalai_model_provenance(run_log, config, run_mode)
 
     # API Manager Selection 
     def _get_api_manager(provider_name):
@@ -1945,7 +1995,15 @@ def finalize_distributed_experiments(
     paths = configure_worker_paths(global_config)
     run_root = download_distributed_run_for_merge(global_config)
 
-    expected_manifest = build_run_manifest(
+    allow_model_rotation = bool(
+        global_config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
+    )
+    if allow_model_rotation:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
+            resolve_code_fingerprint(project_root)
+        )
+    requested_manifest = build_run_manifest(
         global_config,
         experiment_configs,
         hard_questions,
@@ -1953,9 +2011,23 @@ def finalize_distributed_experiments(
         code_fingerprint=global_config.get("DISTRIBUTED_CODE_FINGERPRINT"),
         exemplar_fingerprint=fingerprint_exemplar_data(exemplar_data),
     )
+    manifest_path = os.path.join(run_root, "manifest.json")
     write_or_validate_manifest(
-        os.path.join(run_root, "manifest.json"), expected_manifest
+        manifest_path,
+        requested_manifest,
+        allow_model_rotation=allow_model_rotation,
     )
+    expected_manifest = load_json(manifest_path)
+    if not isinstance(expected_manifest, dict):
+        raise DistributedExecutionError(
+            f"Malformed authoritative distributed manifest: {manifest_path}"
+        )
+    model_changes = validate_manifest_compatibility(
+        expected_manifest,
+        requested_manifest,
+        allow_model_rotation=allow_model_rotation,
+    )
+    _announce_authorized_model_rotation(model_changes, context="finalizer")
 
     merged_root = os.path.join(run_root, "merged")
     merge_result = merge_distributed_run(run_root, output_dir=merged_root)

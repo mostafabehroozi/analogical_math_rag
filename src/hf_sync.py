@@ -37,6 +37,11 @@ from huggingface_hub import (
 )
 from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError
 
+from src.distributed_execution import (
+    DistributedManifestMismatch,
+    validate_manifest_compatibility,
+)
+
 
 class DistributedSyncError(RuntimeError):
     """Raised when a required distributed checkpoint cannot be made durable."""
@@ -279,13 +284,13 @@ def _canonical_json_hash(raw_bytes: bytes, *, source: str) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _remote_manifest_hash_at_revision(
+def _remote_manifest_at_revision(
     *,
     repo_id: str,
     remote_path: str,
     revision: str,
     token: str,
-) -> Optional[str]:
+) -> Optional[Tuple[dict, str]]:
     try:
         downloaded_path = hf_hub_download(
             repo_id=repo_id,
@@ -297,7 +302,15 @@ def _remote_manifest_hash_at_revision(
     except EntryNotFoundError:
         return None
     remote_bytes = Path(downloaded_path).read_bytes()
-    return _canonical_json_hash(remote_bytes, source=f"{repo_id}/{remote_path}@{revision}")
+    source = f"{repo_id}/{remote_path}@{revision}"
+    remote_hash = _canonical_json_hash(remote_bytes, source=source)
+    try:
+        payload = json.loads(remote_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DistributedSyncError(f"Invalid JSON manifest at {source}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise DistributedSyncError(f"Distributed manifest at {source} must be a JSON object.")
+    return payload, remote_hash
 
 
 def ensure_distributed_manifest(config: dict, manifest_path) -> str:
@@ -307,7 +320,7 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
     An existing semantically different JSON manifest is never overwritten.
     Concurrent creators are resolved optimistically with ``parent_commit``.
 
-    Returns the canonical SHA-256 hash of the validated manifest.
+    Returns the canonical SHA-256 hash of the authoritative remote manifest.
     """
     if not _distributed_execution_enabled(config):
         raise ValueError("ensure_distributed_manifest requires DISTRIBUTED_EXECUTION_ENABLED=True.")
@@ -327,6 +340,14 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
         raise DistributedSyncError("The expected local distributed manifest must be a regular file.")
     local_bytes = local_manifest_path.read_bytes()
     expected_hash = _canonical_json_hash(local_bytes, source=str(local_manifest_path))
+    try:
+        expected_manifest = json.loads(local_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DistributedSyncError(
+            f"Invalid JSON manifest at {local_manifest_path}: {exc}"
+        ) from exc
+    if not isinstance(expected_manifest, dict):
+        raise DistributedSyncError("The expected local distributed manifest must be a JSON object.")
 
     api = HfApi(token=hf_token)
     last_error: Optional[BaseException] = None
@@ -337,20 +358,35 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
             if not parent_commit:
                 raise DistributedSyncError(f"Could not resolve the head commit for {repo_id}@{revision}.")
 
-            remote_hash = _remote_manifest_hash_at_revision(
+            remote_manifest_record = _remote_manifest_at_revision(
                 repo_id=repo_id,
                 remote_path=remote_path,
                 revision=parent_commit,
                 token=hf_token,
             )
-            if remote_hash is not None:
-                if remote_hash != expected_hash:
+            if remote_manifest_record is not None:
+                remote_manifest, remote_hash = remote_manifest_record
+                try:
+                    model_changes = validate_manifest_compatibility(
+                        remote_manifest,
+                        expected_manifest,
+                        allow_model_rotation=bool(
+                            config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
+                        ),
+                    )
+                except DistributedManifestMismatch as exc:
                     raise DistributedManifestMismatchError(
                         "The remote distributed manifest already exists with different content "
-                        f"(expected {expected_hash}, found {remote_hash})."
+                        f"(expected {expected_hash}, found {remote_hash}): {exc}"
+                    ) from exc
+                if model_changes:
+                    logger.warning(
+                        "Authorized distributed model rotation against immutable manifest %s: %s",
+                        remote_path,
+                        model_changes,
                     )
                 logger.info("Validated immutable distributed manifest %s.", remote_path)
-                return expected_hash
+                return remote_hash
 
             api.create_commit(
                 repo_id=repo_id,
