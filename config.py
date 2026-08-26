@@ -49,7 +49,7 @@ CONFIG = {
     "DISTRIBUTED_FINALIZER_MODE": False,
     # Explicitly permit only AvalAI adaptation/solver/evaluator model-name
     # changes while resuming an existing immutable distributed run.
-    "DISTRIBUTED_ALLOW_MODEL_ROTATION": False,
+    "DISTRIBUTED_ALLOW_MODEL_ROTATION": True,
     "DISTRIBUTED_RUN_ID": None,
     "DISTRIBUTED_WORKER_COUNT": 5,
     "DISTRIBUTED_WORKER_ID": 0,
