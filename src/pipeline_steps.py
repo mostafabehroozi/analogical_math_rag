@@ -255,7 +255,9 @@ def _calculate_baseline_difficulty(
         
         prompt = base_template.format(question=question)
         
-        resp = api_manager_solve.generate_content(prompt, model_name, temperature=1.0)
+        resp = api_manager_solve.generate_content(
+            prompt, model_name, temperature=1.0, avalai_role="final_solver"
+        )
         
         trace_entry = create_trace_entry(
             "mirror_phase_0", f"baseline_idx_{idx}_attempt_{attempt_idx}",
@@ -352,7 +354,9 @@ def _generate_hypotheses(
             )
 
         # Generate Hypothesis (Single attempt, Temp=0.0)
-        resp = api_manager.generate_content(prompt, model_name, temperature=0.0)
+        resp = api_manager.generate_content(
+            prompt, model_name, temperature=0.0, avalai_role="final_solver"
+        )
         
         # Return data instead of appending to shared list
         trace_entry = create_trace_entry(
@@ -417,7 +421,9 @@ def _evaluate_mirror_consistency(
             validation_question=val_q
         )
         
-        resp = api_manager_solve.generate_content(prompt, model_name, temperature=1.0)
+        resp = api_manager_solve.generate_content(
+            prompt, model_name, temperature=1.0, avalai_role="final_solver"
+        )
         
         trace_entry = create_trace_entry(
             "mirror_phase_2", f"cand_{cand_id}_vs_val_{val_idx}_run_{attempt_idx}",
@@ -583,7 +589,9 @@ def simplify_retrieved_samples(
 
         # 1. Simplify Question
         prompt_simp = create_simplification_prompt(original_q, config)
-        resp_simp = api_manager.generate_content(prompt_simp, model_name, temp)
+        resp_simp = api_manager.generate_content(
+            prompt_simp, model_name, temp, avalai_role="adaptation"
+        )
         
         local_trace.append(create_trace_entry(
             "simplify_samples", "simplify_question", 
@@ -601,7 +609,9 @@ def simplify_retrieved_samples(
         
         # 2. Solve Simplified Question using Original Rationale
         prompt_solve = create_simplified_sample_solver_prompt(simple_q, original_exemplar_text, config)
-        resp_solve = api_manager.generate_content(prompt_solve, model_name, temp)
+        resp_solve = api_manager.generate_content(
+            prompt_solve, model_name, temp, avalai_role="final_solver"
+        )
         
         local_trace.append(create_trace_entry(
             "simplify_samples", "solve_simplified_sample",
@@ -670,7 +680,9 @@ def adapt(
             prompt = create_normalization_prompt(current_text)
             
             print(f"      [API Context] Calling LLM for: Normalization (Exemplar #{idx})")
-            response = api_manager.generate_content(prompt, model_name, temperature)
+            response = api_manager.generate_content(
+                prompt, model_name, temperature, avalai_role="adaptation"
+            )
             
             local_trace.append(create_trace_entry(
                 "adapt", "normalization",
@@ -691,7 +703,9 @@ def adapt(
             print(f"    -> Applying Transformation 1 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_1")
             print(f"      [API Context] Calling LLM for: Transformation 1 (Exemplar #{idx})")
-            response = api_manager.generate_content(prompt, model_name, temperature)
+            response = api_manager.generate_content(
+                prompt, model_name, temperature, avalai_role="adaptation"
+            )
 
             local_trace.append(create_trace_entry(
                 "adapt", "transformation_1",
@@ -712,7 +726,9 @@ def adapt(
             print(f"    -> Applying Transformation 2 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_2")
             print(f"      [API Context] Calling LLM for: Transformation 2 (Exemplar #{idx})")
-            response = api_manager.generate_content(prompt, model_name, temperature)
+            response = api_manager.generate_content(
+                prompt, model_name, temperature, avalai_role="adaptation"
+            )
 
             local_trace.append(create_trace_entry(
                 "adapt", "transformation_2",
@@ -733,7 +749,9 @@ def adapt(
             print(f"    -> Applying Transformation 3 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_3")
             print(f"      [API Context] Calling LLM for: Transformation 3 (Exemplar #{idx})")
-            response = api_manager.generate_content(prompt, model_name, temperature)
+            response = api_manager.generate_content(
+                prompt, model_name, temperature, avalai_role="adaptation"
+            )
 
             local_trace.append(create_trace_entry(
                 "adapt", "transformation_3",
@@ -808,7 +826,9 @@ def solve(
         
         print("    -> Checking for duplicate questions...")
         print("      [API Context] Calling LLM for: Duplicate Check")
-        response = api_manager.generate_content(prompt, model_name, temperature)
+        response = api_manager.generate_content(
+            prompt, model_name, temperature, avalai_role="adaptation"
+        )
 
         local_trace.append(create_trace_entry(
             "solve", "duplicate_check",
@@ -855,7 +875,9 @@ def solve(
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
         print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
 
-        response = api_manager.generate_content(prompt, model_name, temperature)
+        response = api_manager.generate_content(
+            prompt, model_name, temperature, avalai_role="final_solver"
+        )
         trace_entry = create_trace_entry(
             "solve", f"attempt_{i+1}",
             {"prompt": prompt}, response, {"model": model_name, "temp": temperature}
@@ -906,7 +928,9 @@ def solve_via_main_simplification(
     
     print("    -> [Simplification] Generating Simplified Main Question...")
     prompt_simp = create_simplification_prompt(target_query, config)
-    resp_simp = api_manager.generate_content(prompt_simp, model_simp, temp_simp)
+    resp_simp = api_manager.generate_content(
+        prompt_simp, model_simp, temp_simp, avalai_role="adaptation"
+    )
     
     local_trace.append(create_trace_entry(
         "solve_via_simplification", "simplify_main",
@@ -927,7 +951,10 @@ def solve_via_main_simplification(
     else:
         prompt_solve_simple = create_final_reasoning_prompt_simple(simple_main_q, config)
         
-    resp_solve_simple = api_manager.generate_content(prompt_solve_simple, model_solve, temp_solve)
+    resp_solve_simple = api_manager.generate_content(
+        prompt_solve_simple, model_solve, temp_solve,
+        avalai_role="final_solver",
+    )
     
     local_trace.append(create_trace_entry(
         "solve_via_simplification", "solve_simple_q",
@@ -948,7 +975,9 @@ def solve_via_main_simplification(
     
     for i in range(n_attempts):
         print(f"       Generating Attempt {i+1}/{n_attempts}...")
-        resp_final = api_manager.generate_content(prompt_proxy, model_solve, temp_solve)
+        resp_final = api_manager.generate_content(
+            prompt_proxy, model_solve, temp_solve, avalai_role="final_solver"
+        )
         
         local_trace.append(create_trace_entry(
             "solve_via_simplification", f"final_attempt_{i+1}",
@@ -1017,7 +1046,10 @@ def reverse_transform_and_solve(
             target_query, original_exemplar_q, original_exemplar_sol, config
         )
         
-        resp_transform = api_manager.generate_content(prompt_transform, model_transform, temp_transform)
+        resp_transform = api_manager.generate_content(
+            prompt_transform, model_transform, temp_transform,
+            avalai_role="adaptation",
+        )
         
         local_trace.append(create_trace_entry(
             "reverse_transform", f"transform_q_{idx}",
@@ -1046,7 +1078,10 @@ def reverse_transform_and_solve(
             transformed_q, original_exemplar_q, original_exemplar_sol, config
         )
         
-        resp_solve_transformed = api_manager.generate_content(prompt_solve_transformed, model_solve, temp_solve)
+        resp_solve_transformed = api_manager.generate_content(
+            prompt_solve_transformed, model_solve, temp_solve,
+            avalai_role="final_solver",
+        )
         
         local_trace.append(create_trace_entry(
             "reverse_transform", f"solve_transformed_{idx}",
@@ -1099,7 +1134,9 @@ def reverse_transform_and_solve(
     
     for i in range(n_attempts):
         print(f"        -> Generating final solution attempt {i+1}/{n_attempts}...")
-        resp_final = api_manager.generate_content(prompt_final, model_solve, temp_final)
+        resp_final = api_manager.generate_content(
+            prompt_final, model_solve, temp_final, avalai_role="final_solver"
+        )
         
         local_trace.append(create_trace_entry(
             "reverse_transform", f"final_attempt_{i+1}",
@@ -1474,7 +1511,9 @@ def _generate_reverse_validation_candidates(
     failures = []
 
     for candidate_index in range(n_candidates):
-        response = api_manager.generate_content(prompt, model_name, temperature)
+        response = api_manager.generate_content(
+            prompt, model_name, temperature, avalai_role="final_solver"
+        )
         trace_accumulator.append(create_trace_entry(
             "reverse_validation",
             f"generate_candidate_direct_{candidate_index}",
@@ -1568,7 +1607,9 @@ def solve_with_analogical_consistency(
             prompt = create_reverse_validation_prompt(target_query, helper_text, config)
             temp = config.get("REVERSE_VALIDATION_SOLVER_TEMPERATURE", 1.0)
             
-            resp = api_manager_solve.generate_content(prompt, model_name, temp)
+            resp = api_manager_solve.generate_content(
+                prompt, model_name, temp, avalai_role="final_solver"
+            )
             
             local_trace.append(create_trace_entry(
                 "reverse_validation", f"generate_candidate_via_helper_{h_idx}",
@@ -1609,7 +1650,9 @@ def solve_with_analogical_consistency(
                     prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
 
                 temp_z = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-                resp_z = api_manager_solve.generate_content(prompt, model_name, temp_z)
+                resp_z = api_manager_solve.generate_content(
+                    prompt, model_name, temp_z, avalai_role="final_solver"
+                )
 
                 local_trace.append(create_trace_entry(
                     "reverse_validation", f"generate_candidate_zeroshot_{z_idx}",
@@ -1668,7 +1711,9 @@ def solve_with_analogical_consistency(
                     prompt = create_mirror_hypothesis_zeroshot_prompt(target_query, config)
 
                 temp_z = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
-                resp_z = api_manager_solve.generate_content(prompt, model_name, temp_z)
+                resp_z = api_manager_solve.generate_content(
+                    prompt, model_name, temp_z, avalai_role="final_solver"
+                )
 
                 local_trace.append(create_trace_entry(
                     "reverse_validation", f"generate_candidate_zeroshot_{z_idx}",
@@ -1725,7 +1770,10 @@ def solve_with_analogical_consistency(
             v_correct = 0
             
             for att in range(n_validation_attempts): # Reuse same N attempts for fair comparison
-                resp = api_manager_solve.generate_content(prompt, model_name, temperature=1.0)
+                resp = api_manager_solve.generate_content(
+                    prompt, model_name, temperature=1.0,
+                    avalai_role="final_solver",
+                )
                 
                 local_trace.append(create_trace_entry(
                     "reverse_validation", f"baseline_validator_{v_idx}_attempt_{att}",
@@ -1764,7 +1812,9 @@ def solve_with_analogical_consistency(
             v_correct = 0
             
             for att in range(n_validation_attempts):
-                resp = api_manager_solve.generate_content(prompt, model_name, temp)
+                resp = api_manager_solve.generate_content(
+                    prompt, model_name, temp, avalai_role="final_solver"
+                )
                 
                 local_trace.append(create_trace_entry(
                     "reverse_validation", f"solve_candidate_{c_idx}_validator_{v_idx}_attempt_{att}",
@@ -2001,7 +2051,8 @@ def select_best_transformations(
             )
             
             resp_transform = api_manager_adapt.generate_content(
-                prompt_transform, model_adapt, temp_transform
+                prompt_transform, model_adapt, temp_transform,
+                avalai_role="adaptation",
             )
             
             local_trace.append(create_trace_entry(
@@ -2048,7 +2099,8 @@ def select_best_transformations(
             )
             
             resp_solve = api_manager_solve.generate_content(
-                prompt_solve, model_solve, temp_solve
+                prompt_solve, model_solve, temp_solve,
+                avalai_role="final_solver",
             )
             
             local_trace.append(create_trace_entry(
@@ -2079,7 +2131,8 @@ def select_best_transformations(
                     )
                     
                     resp_eval = api_manager_eval.generate_content(
-                        prompt_eval, model_solve, temp_eval
+                        prompt_eval, model_solve, temp_eval,
+                        avalai_role="evaluator",
                     )
                     
                     local_trace.append(create_trace_entry(

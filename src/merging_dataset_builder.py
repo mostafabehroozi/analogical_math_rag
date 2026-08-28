@@ -106,7 +106,9 @@ def process_single_question(
 
     def run_ccs_attempt(prompt: str, group: str, attempt_index: int) -> Dict[str, Any]:
         """Run one independent generation/evaluation pair for a CCS group."""
-        resp = api_manager_solve.generate_content(prompt, model_name, temperature)
+        resp = api_manager_solve.generate_content(
+            prompt, model_name, temperature, avalai_role="final_solver"
+        )
         is_correct = False
         if resp.get('status') == 'SUCCESS':
             eval_res = evaluate_single_answer_with_llm(
@@ -187,10 +189,10 @@ def process_single_question(
     resp_r1, resp_r2 = run_parallel_api_calls(
         [
             lambda: api_manager_solve.generate_content(
-                prompt_r1, model_name, temperature
+                prompt_r1, model_name, temperature, avalai_role="final_solver"
             ),
             lambda: api_manager_solve.generate_content(
-                prompt_r2, model_name, temperature
+                prompt_r2, model_name, temperature, avalai_role="final_solver"
             ),
         ],
         config,

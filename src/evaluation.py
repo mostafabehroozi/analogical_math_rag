@@ -123,7 +123,9 @@ def evaluate_single_answer_with_llm(
     prompt = create_evaluation_prompt(model_answer, ground_truth, config, template_name=template_name)
     
     # print(f"      [API Context] Calling LLM for: Evaluation")
-    response = api_manager.generate_content(prompt, evaluator_model, evaluator_temp)
+    response = api_manager.generate_content(
+        prompt, evaluator_model, evaluator_temp, avalai_role="evaluator"
+    )
 
     # Unpack unexpected lists returned by API providers
     while isinstance(response, list):

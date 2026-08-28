@@ -84,7 +84,9 @@ def _solve_and_evaluate(
 
     def run_attempt(i: int) -> Dict[str, Any]:
         """Run one independent generation/evaluation pair."""
-        resp = api_manager_solve.generate_content(prompt, model_solve, temp)
+        resp = api_manager_solve.generate_content(
+            prompt, model_solve, temp, avalai_role="final_solver"
+        )
         trace_entry = create_trace_entry(
             "core_simplification", f"{trace_name_prefix}_attempt_{i+1}",
             {"prompt": prompt}, resp, {"model": model_solve, "temp": temp}
@@ -200,7 +202,9 @@ def run_core_simplification_phase1(
     print("  -> [Step B] Generating Proxy Question...")
     gen_prompt = create_core_simp_zero_shot_prompt(target_query)
     
-    gen_resp = api_manager_solve.generate_content(gen_prompt, model_gen, temp_gen)
+    gen_resp = api_manager_solve.generate_content(
+        gen_prompt, model_gen, temp_gen, avalai_role="adaptation"
+    )
     
     local_trace.append(create_trace_entry(
         "core_simplification", "generate_proxy",
@@ -237,7 +241,9 @@ def run_core_simplification_phase1(
     proxy_solve_prompt = create_final_reasoning_prompt_simple(proxy_q, config)
     
     # We only need 1 good attempt for the proxy solution to use as context
-    proxy_solve_resp = api_manager_solve.generate_content(proxy_solve_prompt, model_solve, temp_solve)
+    proxy_solve_resp = api_manager_solve.generate_content(
+        proxy_solve_prompt, model_solve, temp_solve, avalai_role="final_solver"
+    )
     
     local_trace.append(create_trace_entry(
         "core_simplification", "solve_proxy",

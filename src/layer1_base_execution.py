@@ -432,7 +432,9 @@ def _execute_candidate_generation(
                             prompt = target_query
 
             def _zs_task(zs_idx, p):
-                resp = api_manager.generate_content(p, model_name, temperature=0.7)
+                resp = api_manager.generate_content(
+                    p, model_name, temperature=0.7, avalai_role="final_solver"
+                )
                 trace_entry = create_trace_entry(
                     "layer1_candidate_gen", f"zero_shot_{zs_idx}",
                     {"prompt": p}, resp, {"model": model_name, "temp": 0.7}

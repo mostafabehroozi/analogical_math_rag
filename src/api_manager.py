@@ -479,7 +479,7 @@ class GeminiAPIManager(_KeyedAPIManager):
             return self.config.get("DEFAULT_EVALUATOR_MAX_TOKENS", 512)
         return None
 
-    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
+    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
         self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
 
         def attempt() -> APIResponse:
@@ -571,7 +571,7 @@ class AvalAIAPIManager(_KeyedAPIManager):
         if global_delay_seconds:
             self.logger.info("GLOBAL_API_CALL_DELAY_SECONDS is ignored by the RPM scheduler.")
 
-    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
+    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
         self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
 
         def attempt() -> APIResponse:
@@ -585,7 +585,15 @@ class AvalAIAPIManager(_KeyedAPIManager):
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": temperature
                 }
-                reasoning_effort = self.config.get("AVALAI_REASONING_EFFORT")
+                role_effort_keys = {
+                    "adaptation": "AVALAI_REASONING_EFFORT_ADAPTATION",
+                    "final_solver": "AVALAI_REASONING_EFFORT_FINAL_SOLVER",
+                    "evaluator": "AVALAI_REASONING_EFFORT_EVALUATOR",
+                }
+                role_effort_key = role_effort_keys.get(avalai_role)
+                reasoning_effort = self.config.get(role_effort_key) if role_effort_key else None
+                if reasoning_effort is None:
+                    reasoning_effort = self.config.get("AVALAI_REASONING_EFFORT")
                 if reasoning_effort:
                     kwargs["reasoning_effort"] = reasoning_effort
                 
@@ -639,7 +647,7 @@ class OllamaAPIManager:
         max_concurrent = config.get("OLLAMA_MAX_CONCURRENT", 1) 
         self.semaphore = threading.Semaphore(max_concurrent)
 
-    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None) -> APIResponse:
+    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
         def attempt() -> APIResponse:
             with self.semaphore:
                 try:

@@ -83,7 +83,9 @@ def _ccs(
 
     def run_attempt(attempt_index: int) -> Dict[str, Any]:
         try:
-            response = api_manager_solve.generate_content(prompt, model_name, temperature)
+            response = api_manager_solve.generate_content(
+                prompt, model_name, temperature, avalai_role="final_solver"
+            )
         except Exception as exc:  # Keep one failed attempt from losing the target.
             response = {"status": "FAILURE", "error_message": str(exc)}
 
@@ -361,7 +363,9 @@ def _generate_transformation(
         "TRANSFORMATION_DS_PROMPT_TEMPLATE",
     )
     try:
-        response = api_manager_adapt.generate_content(prompt, model_name, temperature)
+        response = api_manager_adapt.generate_content(
+            prompt, model_name, temperature, avalai_role="adaptation"
+        )
     except Exception as exc:
         response = {"status": "FAILURE", "error_message": str(exc)}
     transformed_sample = ""

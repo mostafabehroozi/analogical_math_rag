@@ -183,7 +183,9 @@ def run_parallel_evaluation_branches(
         print(f"  -> [{branch_name}] Generating Proxy...")
         
         # 1. Generate Proxy
-        resp_gen = api_manager_solve.generate_content(gen_prompt, m_gen, temp_gen)
+        resp_gen = api_manager_solve.generate_content(
+            gen_prompt, m_gen, temp_gen, avalai_role="adaptation"
+        )
         local_trace.append(create_trace_entry("layer2", f"{branch_name}_generate", {"prompt": gen_prompt}, resp_gen, {"model": m_gen}))
         
         is_fallback = False
@@ -228,7 +230,9 @@ def run_parallel_evaluation_branches(
                 
                 # B. Mirror Generation (A_simp_mirrored)
                 prompt_mirror_gen = create_core_simp_few_shot_prompt(d_q, inverted_demo, config)
-                resp_mirror_gen = api_manager_solve.generate_content(prompt_mirror_gen, m_gen, temp_gen)
+                resp_mirror_gen = api_manager_solve.generate_content(
+                    prompt_mirror_gen, m_gen, temp_gen, avalai_role="adaptation"
+                )
                 local_trace.append(create_trace_entry("layer2", f"{branch_name}_mirror_gen", {"prompt": prompt_mirror_gen}, resp_mirror_gen, {"model": m_gen}))
                 
                 if resp_mirror_gen['status'] != 'SUCCESS':
@@ -241,7 +245,10 @@ def run_parallel_evaluation_branches(
                     
                     # C. Mirror Solve
                     prompt_mirror_solve = create_final_reasoning_prompt_simple(proxy_a, config)
-                    resp_mirror_solve = api_manager_solve.generate_content(prompt_mirror_solve, m_solve, temp_solve)
+                    resp_mirror_solve = api_manager_solve.generate_content(
+                        prompt_mirror_solve, m_solve, temp_solve,
+                        avalai_role="final_solver",
+                    )
                     local_trace.append(create_trace_entry("layer2", f"{branch_name}_mirror_solve", {"prompt": prompt_mirror_solve}, resp_mirror_solve, {"model": m_solve}))
                     
                     if resp_mirror_solve['status'] != 'SUCCESS' or not resp_mirror_solve['text'].strip():
@@ -294,7 +301,10 @@ def run_parallel_evaluation_branches(
             # Solve the Proxy
             print(f"  -> [{branch_name}] Solving Proxy...")
             prompt_proxy_solve = create_final_reasoning_prompt_simple(proxy_q, config)
-            resp_proxy = api_manager_solve.generate_content(prompt_proxy_solve, m_solve, temp_solve)
+            resp_proxy = api_manager_solve.generate_content(
+                prompt_proxy_solve, m_solve, temp_solve,
+                avalai_role="final_solver",
+            )
             local_trace.append(create_trace_entry("layer2", f"{branch_name}_solve_proxy", {"prompt": prompt_proxy_solve}, resp_proxy, {"model": m_solve}))
             
             # === EMPTY RESPONSE FAST-FAIL OPTIMIZATION ===

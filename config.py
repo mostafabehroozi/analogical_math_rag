@@ -121,6 +121,10 @@ CONFIG = {
     "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_SIMPLIFICATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_REASONING_EFFORT": None,  # Options: "low", "medium", "high" (if supported)
+    # Optional per-role overrides. None inherits AVALAI_REASONING_EFFORT.
+    "AVALAI_REASONING_EFFORT_ADAPTATION": None,
+    "AVALAI_REASONING_EFFORT_FINAL_SOLVER": None,
+    "AVALAI_REASONING_EFFORT_EVALUATOR": None,
     "AVALAI_ENABLE_THINKING": None,  # Options: None (default), True, False (controls chat_template_kwargs enable_thinking in extra_body)
 
     # Ollama (Local LLM) Settings

@@ -935,7 +935,9 @@ class ActiveInferenceEngine:
         # generation/evaluation chain per statistical attempt so retry limits
         # are not multiplied by another hidden loop.
         def run_attempt(i):
-            resp = self.api_manager_solve.generate_content(prompt, self.model_name, temp)
+            resp = self.api_manager_solve.generate_content(
+                prompt, self.model_name, temp, avalai_role="final_solver"
+            )
 
             while isinstance(resp, list):
                 resp = resp[0] if resp else {
