@@ -30,6 +30,15 @@ MODEL_ROTATION_CONFIG_KEYS = frozenset({
     "AVALAI_MODEL_NAME_FINAL_SOLVER",
     "AVALAI_MODEL_NAME_EVALUATOR",
 })
+# These optional settings use ``None`` to mean "inherit AVALAI_REASONING_EFFORT".
+# Omitting such a key has exactly the same runtime behavior.  Keeping this
+# allowlist explicit prevents unrelated new ``None`` defaults from silently
+# changing the distributed-manifest contract.
+INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS = frozenset({
+    "AVALAI_REASONING_EFFORT_ADAPTATION",
+    "AVALAI_REASONING_EFFORT_FINAL_SOLVER",
+    "AVALAI_REASONING_EFFORT_EVALUATOR",
+})
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WINDOWS_RESERVED_NAMES = {
@@ -274,12 +283,16 @@ def _is_runtime_or_secret_key(key: str) -> bool:
 
 
 def sanitize_scientific_config(value: Any) -> Any:
-    """Return JSON-safe scientific settings with credentials/runtime removed."""
+    """Return canonical JSON-safe scientific settings for manifest hashing."""
     if isinstance(value, Mapping):
         return {
             str(key): sanitize_scientific_config(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
             if not _is_runtime_or_secret_key(str(key))
+            and not (
+                str(key) in INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS
+                and item is None
+            )
         }
     if isinstance(value, (list, tuple)):
         return [sanitize_scientific_config(item) for item in value]
@@ -329,6 +342,12 @@ def _manifest_without_rotatable_models(
         experiment_config = experiment.get("config")
         if not isinstance(experiment_config, dict):
             continue
+        # Manifests produced immediately after per-role reasoning settings were
+        # introduced may contain explicit nulls.  Runtime treats those nulls
+        # exactly like absent keys, so normalize only this narrow legacy case.
+        for key in INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS:
+            if experiment_config.get(key) is None:
+                experiment_config.pop(key, None)
         for key in MODEL_ROTATION_CONFIG_KEYS:
             experiment_config.pop(key, None)
     return normalized

@@ -101,6 +101,13 @@ log records its active model configuration. The resulting run is intentionally
 mixed-model; keep the original experiment name unchanged so checkpoint artifact
 names continue to match.
 
+The optional per-role `AVALAI_REASONING_EFFORT_*` settings use `None` to inherit
+`AVALAI_REASONING_EFFORT`. That inherited state is canonically omitted from new
+manifests, and a legacy explicit `null` is treated as equivalent to an absent
+key during the narrow rotation check. Any explicit per-role reasoning effort,
+global reasoning-effort change, or unrelated setting remains a scientific
+configuration change and requires a new run id.
+
 ## Final merge and Layer 2
 
 After all workers report `COMPLETE`, run exactly one finalizer notebook:

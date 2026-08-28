@@ -121,7 +121,9 @@ CONFIG = {
     "AVALAI_MODEL_NAME_EVALUATOR": "openai.gpt-oss-20b-1:0",
     "AVALAI_MODEL_NAME_SIMPLIFICATION": "openai.gpt-oss-20b-1:0",
     "AVALAI_REASONING_EFFORT": None,  # Options: "low", "medium", "high" (if supported)
-    # Optional per-role overrides. None inherits AVALAI_REASONING_EFFORT.
+    # Optional per-role overrides. None inherits AVALAI_REASONING_EFFORT and is
+    # canonically omitted from distributed manifests; explicit values remain
+    # protected scientific configuration.
     "AVALAI_REASONING_EFFORT_ADAPTATION": None,
     "AVALAI_REASONING_EFFORT_FINAL_SOLVER": None,
     "AVALAI_REASONING_EFFORT_EVALUATOR": None,
