@@ -135,6 +135,73 @@ def validate_experiment_name(name: Any) -> str:
     return value
 
 
+def _result_json_filename(value: Any, setting_name: str) -> str:
+    """Return one direct JSON result filename, rejecting path traversal/collisions."""
+    filename = str(value or "").strip()
+    path = Path(filename)
+    if (
+        not filename
+        or filename in {".", ".."}
+        or path.name != filename
+        or "/" in filename
+        or "\\" in filename
+        or path.suffix.casefold() != ".json"
+    ):
+        raise DistributedExecutionError(
+            f"{setting_name} must be a direct .json filename inside RESULTS_DIR."
+        )
+    return filename
+
+
+def indexed_output_artifacts(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Describe sparse, index-addressed outputs produced by special workflows."""
+    if config.get("APPLY_TRANSFORMATION_DATASET_CONSTRUCTION", False):
+        return [{
+            "filename": _result_json_filename(
+                config.get(
+                    "TRANSFORMATION_DS_OUTPUT_FILENAME",
+                    "transformation_dataset.json",
+                ),
+                "TRANSFORMATION_DS_OUTPUT_FILENAME",
+            ),
+            "index_path": ["metadata", "original_index"],
+        }]
+    if config.get("APPLY_CORE_SIMP_PHASE1", False):
+        return [{
+            "filename": _result_json_filename(
+                config.get("CORE_SIMP_DATASET_NAME", "core_simp_dataset.json"),
+                "CORE_SIMP_DATASET_NAME",
+            ),
+            "index_path": ["original_index"],
+        }]
+    if config.get("APPLY_MERGING_DATASET_CONSTRUCTION", False):
+        return [{
+            "filename": _result_json_filename(
+                config.get(
+                    "MERGING_DS_OUTPUT_FILENAME",
+                    "merging_fine_tuning_dataset.json",
+                ),
+                "MERGING_DS_OUTPUT_FILENAME",
+            ),
+            "index_path": ["metadata", "original_index"],
+        }]
+    return []
+
+
+def apply_distributed_run_log_contract(
+    result: Dict[str, Any],
+    *,
+    index: int,
+    question: str,
+    completed: bool,
+) -> Dict[str, Any]:
+    """Add the common shard-validation fields to a special-workflow result."""
+    result["target_query_original_hard_list_idx"] = int(index)
+    result["target_query_text"] = str(question)
+    result["pipeline_status"] = "SUCCESS" if completed else "FAILED"
+    return result
+
+
 def assigned_indices(total_questions: int, worker_id: int, worker_count: int) -> List[int]:
     """Return one worker's contiguous, balanced range of global indices.
 
@@ -438,7 +505,7 @@ def build_run_manifest(
             "experiment_name": name,
             "config": sanitize_scientific_config(effective),
         }
-        experiment_record["artifacts"] = {
+        artifacts = {
             "run_log": f"{name}_run_log.json",
             "layer1_cache": (
                 layer1_cache_filename(experiment_record)
@@ -446,6 +513,10 @@ def build_run_manifest(
                 else None
             ),
         }
+        indexed_outputs = indexed_output_artifacts(effective)
+        if indexed_outputs:
+            artifacts["indexed_outputs"] = indexed_outputs
+        experiment_record["artifacts"] = artifacts
         effective_experiments.append(experiment_record)
 
     question_records: List[Dict[str, Any]] = []
@@ -544,6 +615,9 @@ def validate_manifest_integrity(manifest: Mapping[str, Any]) -> None:
                 else None
             ),
         }
+        indexed_outputs = indexed_output_artifacts(experiment.get("config", {}))
+        if indexed_outputs:
+            expected_artifacts["indexed_outputs"] = indexed_outputs
         if experiment.get("artifacts") != expected_artifacts:
             raise DistributedManifestMismatch(
                 f"Manifest artifact names are invalid for experiment {name}."
@@ -841,6 +915,29 @@ def validate_worker_layer1_cache(
     return normalized
 
 
+def _indexed_output_entry_index(
+    entry: Mapping[str, Any], index_path: Sequence[str], filename: str
+) -> int:
+    value: Any = entry
+    for key in index_path:
+        if not isinstance(value, Mapping) or key not in value:
+            raise DistributedMergeError(
+                f"Indexed output {filename} contains an entry without "
+                f"{'.'.join(index_path)}."
+            )
+        value = value[key]
+    if isinstance(value, bool):
+        raise DistributedMergeError(
+            f"Indexed output {filename} contains a boolean global index."
+        )
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise DistributedMergeError(
+            f"Indexed output {filename} contains an invalid global index: {value!r}."
+        ) from exc
+
+
 def merge_distributed_run(
     run_root: os.PathLike[str] | str,
     *,
@@ -897,6 +994,34 @@ def merge_distributed_run(
         merged_cache_queries: Dict[str, Any] = {}
         cache_metadata: Optional[Dict[str, Any]] = None
         require_layer1 = bool(experiment["config"].get("APPLY_LAYER1_BASE_EXECUTION", False))
+        indexed_output_specs = experiment.get("artifacts", {}).get(
+            "indexed_outputs", []
+        )
+        if not isinstance(indexed_output_specs, list):
+            raise DistributedMergeError(
+                f"Manifest indexed outputs for {name} are malformed."
+            )
+        merged_indexed_outputs: Dict[str, Dict[int, Mapping[str, Any]]] = {}
+        normalized_output_specs: List[Tuple[str, List[str]]] = []
+        for spec in indexed_output_specs:
+            if not isinstance(spec, Mapping):
+                raise DistributedMergeError(
+                    f"Manifest indexed output for {name} is malformed."
+                )
+            filename = _result_json_filename(
+                spec.get("filename"), f"manifest artifact for {name}"
+            )
+            index_path = spec.get("index_path")
+            if (
+                not isinstance(index_path, list)
+                or not index_path
+                or any(not isinstance(key, str) or not key for key in index_path)
+            ):
+                raise DistributedMergeError(
+                    f"Manifest index path for {name}/{filename} is malformed."
+                )
+            normalized_output_specs.append((filename, index_path))
+            merged_indexed_outputs[filename] = {}
 
         for worker_id in range(worker_count):
             worker_results = root / "workers" / worker_directory_name(worker_id) / "results"
@@ -931,6 +1056,43 @@ def merge_distributed_run(
                 else:
                     merged_logs[index] = log
 
+            for filename, index_path in normalized_output_specs:
+                artifact_path = worker_results / filename
+                if not artifact_path.exists():
+                    if expected_worker_indices:
+                        raise DistributedMergeError(
+                            f"Worker {worker_id} is missing indexed output for "
+                            f"{name}: {filename}"
+                        )
+                    entries = []
+                else:
+                    entries = _load_json(artifact_path)
+                if not isinstance(entries, list):
+                    raise DistributedMergeError(
+                        f"Worker {worker_id} indexed output {filename} is not a list."
+                    )
+                output_by_index = merged_indexed_outputs[filename]
+                for entry in entries:
+                    if not isinstance(entry, Mapping):
+                        raise DistributedMergeError(
+                            f"Worker {worker_id} indexed output {filename} contains "
+                            "a non-object entry."
+                        )
+                    index = _indexed_output_entry_index(entry, index_path, filename)
+                    if index not in expected_worker_indices:
+                        raise DistributedMergeError(
+                            f"Worker {worker_id} indexed output {filename} contains "
+                            f"unassigned index {index}."
+                        )
+                    if index in output_by_index:
+                        if _canonical_json(output_by_index[index]) != _canonical_json(entry):
+                            raise DistributedMergeError(
+                                f"Conflicting indexed-output duplicate {index} in {filename}."
+                            )
+                        duplicate_count += 1
+                    else:
+                        output_by_index[index] = entry
+
             if require_layer1:
                 cache_path = worker_results / layer1_cache_filename(experiment)
                 if not expected_worker_indices and not cache_path.exists():
@@ -956,6 +1118,17 @@ def merge_distributed_run(
             merged_logs[index] for index in range(total_questions)
         ]
         duplicate_recoveries[name] = duplicate_count
+
+        for filename, _index_path in normalized_output_specs:
+            output_path = destination / "results" / filename
+            if output_path in planned_outputs:
+                raise DistributedMergeError(
+                    f"Multiple experiments publish the same merged artifact: {filename}."
+                )
+            entries_by_index = merged_indexed_outputs[filename]
+            planned_outputs[output_path] = [
+                entries_by_index[index] for index in sorted(entries_by_index)
+            ]
 
         if require_layer1:
             if set(map(int, merged_cache_queries)) != set(range(total_questions)):
@@ -999,7 +1172,8 @@ def merge_distributed_run(
 
 __all__ = [
     "ASSIGNMENT_STRATEGY", "MODEL_ROTATION_CONFIG_KEYS", "DistributedExecutionError", "DistributedManifestMismatch",
-    "active_avalai_models", "record_avalai_model_provenance",
+    "active_avalai_models", "apply_distributed_run_log_contract",
+    "indexed_output_artifacts", "record_avalai_model_provenance",
     "DistributedMergeError", "api_deadline_due", "assigned_indices", "build_run_manifest",
     "configure_worker_paths", "distributed_enabled", "fingerprint_exemplar_data", "layer1_cache_filename",
     "layer1_state_complete", "merge_distributed_run", "pending_indices_for_worker",

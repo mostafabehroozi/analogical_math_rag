@@ -15,10 +15,25 @@ from src.benchmark_data import benchmark_name_for_target_index
 from src.utils import create_trace_entry, load_json, save_json, save_json_atomic
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
+from src.distributed_execution import (
+    apply_distributed_run_log_contract,
+    distributed_enabled,
+)
 from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
 from src.parallel_utils import run_parallel_api_calls
 
 logger = logging.getLogger(__name__)
+
+_COMPLETED_PHASE1_STATUSES = {
+    "SUCCESS",
+    "REJECTED_BY_FILTER",
+    "SKIPPED_FAILSAFE",
+    "SKIPPED_PERFECT_BASELINE",
+}
+
+
+def _phase1_result_completed(result: Dict[str, Any]) -> bool:
+    return str(result.get("status", "")).upper() in _COMPLETED_PHASE1_STATUSES
 
 def _parse_simplification_trace(llm_output: str) -> Dict[str, str]:
     """
@@ -294,7 +309,9 @@ def execute_core_simplification_phase1(
     successful_samples = load_json(dataset_path) or []
     full_logs = load_json(log_file_path) or []
     completed_indices = {
-        log.get("original_index") for log in full_logs if "original_index" in log
+        log.get("original_index")
+        for log in full_logs
+        if "original_index" in log and _phase1_result_completed(log)
     }
 
     def resolve_ground_truth(index: int) -> Any:
@@ -323,8 +340,24 @@ def execute_core_simplification_phase1(
         QuestionWorkItem(index=index, question=hard_questions[index])
         for index in sorted(ground_truth_by_index)
     ]
+    if distributed_enabled(config):
+        owned_indices = set(config.get("_DISTRIBUTED_ALLOWED_QUERY_INDICES", []))
+        items = [item for item in items if item.index in owned_indices]
 
     if not items:
+        if distributed_enabled(config):
+            if not os.path.exists(dataset_path) and not save_json_atomic(
+                successful_samples, dataset_path
+            ):
+                raise RuntimeError(
+                    "Failed to initialize core simplification Phase 1 donor shard"
+                )
+            if not os.path.exists(log_file_path) and not save_json_atomic(
+                full_logs, log_file_path
+            ):
+                raise RuntimeError(
+                    "Failed to initialize core simplification Phase 1 run-log shard"
+                )
         logger.info(
             "All eligible queries for Phase 1 '%s' are already processed. Skipping.",
             experiment_name,
@@ -344,6 +377,13 @@ def execute_core_simplification_phase1(
             config=item_config,
         )
         result["original_index"] = item.index
+        if distributed_enabled(config):
+            apply_distributed_run_log_contract(
+                result,
+                index=item.index,
+                question=item.question,
+                completed=_phase1_result_completed(result),
+            )
         return result
 
     if config.get("BATCH_PROCESSING_ENABLED", False):

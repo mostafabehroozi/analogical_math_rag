@@ -16,7 +16,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from tqdm import tqdm
 
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.benchmark_data import benchmark_name_for_target_index
 from src.batching import BatchCoordinator, QuestionResult, QuestionWorkItem
+from src.distributed_execution import (
+    apply_distributed_run_log_contract,
+    distributed_enabled,
+)
 from src.evaluation import evaluate_single_answer_with_llm
 from src.hf_sync import periodic_batch_sync_check, periodic_sync_check
 from src.parallel_utils import run_parallel_api_calls
@@ -30,6 +35,12 @@ from src.prompts import (
 from src.utils import load_json, save_json, save_json_atomic
 
 logger = logging.getLogger(__name__)
+
+_COMPLETED_STATUSES = {"SUCCESS", "REJECTED", "REJECTED_BY_FILTER"}
+
+
+def _result_completed(result: Dict[str, Any]) -> bool:
+    return str(result.get("status", "")).upper() in _COMPLETED_STATUSES
 
 
 def _model_name(manager: Any, config: Dict[str, Any], role: str) -> str:
@@ -384,7 +395,9 @@ def build_transformation_dataset(
     dataset = load_json(dataset_path) or []
     logs = load_json(log_path) or []
     completed_indices = {
-        entry.get("original_index") for entry in logs if "original_index" in entry
+        entry.get("original_index")
+        for entry in logs
+        if "original_index" in entry and _result_completed(entry)
     }
     targets = _target_records(hard_questions, hard_solutions, exemplar_data, config)
     if not config.get("TRANSFORMATION_DS_DETERMINISTIC", True):
@@ -393,6 +406,9 @@ def build_transformation_dataset(
     max_targets = config.get("TRANSFORMATION_DS_MAX_TARGETS")
     if max_targets is not None:
         targets = targets[: max(0, int(max_targets))]
+    if distributed_enabled(config):
+        owned_indices = set(config.get("_DISTRIBUTED_ALLOWED_QUERY_INDICES", []))
+        targets = [target for target in targets if target["index"] in owned_indices]
 
     max_members = config.get("TRANSFORMATION_DS_MAX_MEMBERS")
     if max_members is not None and len(dataset) >= int(max_members):
@@ -409,10 +425,29 @@ def build_transformation_dataset(
     eval_manager = api_managers.get(config.get("API_PROVIDER_EVALUATOR", "gemini"))
 
     def worker(item: QuestionWorkItem) -> Dict[str, Any]:
-        return process_single_question(
-            target_by_index[item.index], exemplar_data, embedding_model,
-            adapt_manager, solve_manager, eval_manager, config,
+        item_config = config.copy()
+        item_config["_TARGET_BENCHMARK_FOR_QUERY"] = benchmark_name_for_target_index(
+            config, item.index
         )
+        result = process_single_question(
+            target_by_index[item.index], exemplar_data, embedding_model,
+            adapt_manager, solve_manager, eval_manager, item_config,
+        )
+        if distributed_enabled(config):
+            apply_distributed_run_log_contract(
+                result,
+                index=item.index,
+                question=item.question,
+                completed=_result_completed(result),
+            )
+        return result
+
+    if distributed_enabled(config) and not items:
+        if not os.path.exists(dataset_path) and not save_json_atomic(dataset, dataset_path):
+            raise RuntimeError("Failed to initialize transformation dataset shard")
+        if not os.path.exists(log_path) and not save_json_atomic(logs, log_path):
+            raise RuntimeError("Failed to initialize transformation run-log shard")
+        return logs
 
     if config.get("BATCH_PROCESSING_ENABLED", False) and items:
         logs_by_index = {

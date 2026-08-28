@@ -609,7 +609,7 @@ def sync_distributed_merged_results(config: dict, merged_root) -> object:
         relative = candidate.resolve().relative_to(local_root)
         if layer2_only and not (
             relative.as_posix() == "MERGE_COMPLETE.json"
-            or (len(relative.parts) >= 3 and relative.parts[0].casefold() == "results")
+            or (len(relative.parts) >= 2 and relative.parts[0].casefold() == "results")
         ):
             continue
         if (

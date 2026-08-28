@@ -16,9 +16,20 @@ from src.prompts import (
 )
 from src.evaluation import evaluate_single_answer_with_llm
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.benchmark_data import benchmark_name_for_target_index
+from src.distributed_execution import (
+    apply_distributed_run_log_contract,
+    distributed_enabled,
+)
 from src.parallel_utils import run_parallel_api_calls
 
 logger = logging.getLogger(__name__)
+
+_COMPLETED_STATUSES = {"SUCCESS", "REJECTED"}
+
+
+def _result_completed(result: Dict[str, Any]) -> bool:
+    return str(result.get("status", "")).upper() in _COMPLETED_STATUSES
 
 def _get_model_name(api_manager: Any, config: Dict[str, Any]) -> str:
     """Helper to extract the correct solver model name based on the API manager."""
@@ -245,11 +256,31 @@ def build_merging_dataset(
     successful_dataset = load_json(dataset_path) or []
     full_logs = load_json(log_file_path) or []
     
-    completed_indices = {log.get('original_index') for log in full_logs if 'original_index' in log}
+    completed_indices = {
+        log.get("original_index")
+        for log in full_logs
+        if "original_index" in log and _result_completed(log)
+    }
     
     queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_indices]
+    if distributed_enabled(config):
+        owned_indices = set(config.get("_DISTRIBUTED_ALLOWED_QUERY_INDICES", []))
+        queries_to_process = [
+            (index, query)
+            for index, query in queries_to_process
+            if index in owned_indices
+        ]
     
     if not queries_to_process:
+        if distributed_enabled(config):
+            if not os.path.exists(dataset_path) and not save_json_atomic(
+                successful_dataset, dataset_path
+            ):
+                raise RuntimeError("Failed to initialize merging dataset shard")
+            if not os.path.exists(log_file_path) and not save_json_atomic(
+                full_logs, log_file_path
+            ):
+                raise RuntimeError("Failed to initialize merging run-log shard")
         logger.info(f"All queries for '{exp_name}' are already processed. Returning existing results.")
         return full_logs
 
@@ -296,11 +327,22 @@ def build_merging_dataset(
             ]
 
         def worker(item: QuestionWorkItem) -> Dict[str, Any]:
+            item_config = config.copy()
+            item_config["_TARGET_BENCHMARK_FOR_QUERY"] = benchmark_name_for_target_index(
+                config, item.index
+            )
             result = process_single_question(
                 target_query=item.question, ground_truth=ground_truths[item.index], exemplar_data=exemplar_data,
-                embedding_model=embedding_model, api_manager_solve=solver_mgr, api_manager_eval=eval_mgr, config=config,
+                embedding_model=embedding_model, api_manager_solve=solver_mgr, api_manager_eval=eval_mgr, config=item_config,
             )
             result["original_index"] = item.index
+            if distributed_enabled(config):
+                apply_distributed_run_log_contract(
+                    result,
+                    index=item.index,
+                    question=item.question,
+                    completed=_result_completed(result),
+                )
             return result
         def commit(results: List[QuestionResult], _batch_id: str, batch_number: int) -> None:
             for result in results:

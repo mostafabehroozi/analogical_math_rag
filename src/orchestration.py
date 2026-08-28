@@ -90,6 +90,7 @@ from src.distributed_execution import (
     configure_worker_paths,
     distributed_enabled,
     fingerprint_exemplar_data,
+    indexed_output_artifacts,
     layer1_state_complete,
     merge_distributed_run,
     record_avalai_model_provenance,
@@ -211,10 +212,6 @@ def _reject_removed_feature_flags(config: Dict[str, Any]) -> None:
 
 _DISTRIBUTED_UNSUPPORTED_FLAGS = {
     "DEFER_SOLVE_STEP": "deferred solve mode",
-    "APPLY_TRANSFORMATION_DATASET_CONSTRUCTION": "transformation dataset construction",
-    "APPLY_CORE_SIMP_PHASE1": "Core Simplification phase 1",
-    "APPLY_CORE_SIMP_PHASE2": "Core Simplification phase 2",
-    "APPLY_MERGING_DATASET_CONSTRUCTION": "merging dataset construction",
 }
 _DISTRIBUTED_RUNTIME_PATH_KEYS = {
     "RESULTS_DIR", "LAYER1_CACHE_DIR", "LOGS_DIR", "OUTPUTS_DIR",
@@ -244,7 +241,7 @@ def _validate_distributed_scope(
     experiment_configs: List[Dict[str, Any]],
     hard_solutions: Optional[List[str]],
 ) -> None:
-    """Keep v1 narrow: the ordinary batch pipeline used by this experiment."""
+    """Validate shard-safe workflows and their immutable input/output contracts."""
     if not global_config.get("PERSIST_RESULTS_ONLINE", False):
         raise DistributedExecutionError(
             "Distributed execution requires PERSIST_RESULTS_ONLINE=True."
@@ -262,6 +259,7 @@ def _validate_distributed_scope(
                 "distributed execution starts."
             )
     experiment_names = set()
+    published_result_filenames = set()
     for overrides in experiment_configs:
         for key in overrides:
             if key.startswith("DISTRIBUTED_") and overrides[key] != global_config.get(key):
@@ -275,6 +273,60 @@ def _validate_distributed_scope(
                 f"Duplicate distributed experiment_name: {experiment_name}"
             )
         experiment_names.add(experiment_name)
+        special_families = []
+        if effective.get("APPLY_TRANSFORMATION_DATASET_CONSTRUCTION", False):
+            special_families.append("transformation dataset construction")
+        if effective.get("APPLY_MERGING_DATASET_CONSTRUCTION", False):
+            special_families.append("merging dataset construction")
+        if effective.get("APPLY_CORE_SIMP_PHASE1", False) or effective.get(
+            "APPLY_CORE_SIMP_PHASE2", False
+        ):
+            special_families.append("Core Simplification")
+        if len(special_families) > 1:
+            raise DistributedExecutionError(
+                f"Distributed experiment {experiment_name!r} enables multiple special "
+                f"workflow families: {', '.join(special_families)}. Split them into "
+                "separate experiment configurations."
+            )
+        if effective.get("APPLY_CORE_SIMP_PHASE2", False) and not effective.get(
+            "APPLY_CORE_SIMP_PHASE1", False
+        ):
+            raise DistributedExecutionError(
+                "Distributed Core Simplification Phase 2 requires "
+                "APPLY_CORE_SIMP_PHASE1=True in the same experiment. Worker notebooks "
+                "build Phase 1 shards; the finalizer runs Phase 2 once from merged donors."
+            )
+        if effective.get("APPLY_TRANSFORMATION_DATASET_CONSTRUCTION", False):
+            source = str(
+                effective.get("TRANSFORMATION_DS_TARGET_SOURCE", "hard_questions")
+            ).casefold()
+            if source not in {"hard_questions", "hard", "targets"}:
+                raise DistributedExecutionError(
+                    "Distributed transformation dataset construction currently requires "
+                    "TRANSFORMATION_DS_TARGET_SOURCE='hard_questions' so manifest indices "
+                    "and question hashes remain aligned."
+                )
+            if effective.get("TRANSFORMATION_DS_MAX_TARGETS") is not None:
+                raise DistributedExecutionError(
+                    "Distributed transformation dataset construction requires "
+                    "TRANSFORMATION_DS_MAX_TARGETS=None; cap the input question set before "
+                    "starting the distributed run instead."
+                )
+            if effective.get("TRANSFORMATION_DS_MAX_MEMBERS") is not None:
+                raise DistributedExecutionError(
+                    "Distributed transformation dataset construction requires "
+                    "TRANSFORMATION_DS_MAX_MEMBERS=None because a global accepted-member "
+                    "cap cannot be enforced independently by workers."
+                )
+        if special_families and (
+            hard_solutions is None
+            or len(hard_solutions) == 0
+            or any(solution is None or not str(solution).strip() for solution in hard_solutions)
+        ):
+            raise DistributedExecutionError(
+                f"Distributed {special_families[0]} requires a non-empty ground-truth "
+                "solution for every question."
+            )
         if not effective.get("BATCH_PROCESSING_ENABLED", False):
             raise DistributedExecutionError(
                 "Distributed execution requires BATCH_PROCESSING_ENABLED=True so each "
@@ -285,6 +337,43 @@ def _validate_distributed_scope(
                 raise DistributedExecutionError(
                     f"Distributed v1 intentionally does not support {workflow} ({flag}=True)."
                 )
+        indexed_artifacts = indexed_output_artifacts(effective)
+        expected_result_filename_count = 1 + len(indexed_artifacts)
+        result_filenames = {f"{experiment_name}_run_log.json"}
+        result_filenames.update(artifact["filename"] for artifact in indexed_artifacts)
+        if effective.get("APPLY_CORE_SIMP_PHASE2", False):
+            phase2_filename = str(
+                effective.get(
+                    "CORE_SIMP_LAYER2_RESULTS_NAME",
+                    "core_simp_layer2_results.json",
+                )
+                or ""
+            ).strip()
+            if (
+                not phase2_filename
+                or os.path.basename(phase2_filename) != phase2_filename
+                or "/" in phase2_filename
+                or "\\" in phase2_filename
+                or not phase2_filename.casefold().endswith(".json")
+            ):
+                raise DistributedExecutionError(
+                    "CORE_SIMP_LAYER2_RESULTS_NAME must be a direct .json filename "
+                    "inside RESULTS_DIR for distributed finalization."
+                )
+            result_filenames.add(phase2_filename)
+            expected_result_filename_count += 1
+        collisions = result_filenames & published_result_filenames
+        if collisions:
+            raise DistributedExecutionError(
+                "Distributed experiments must publish unique result filenames; "
+                f"collisions: {sorted(collisions)}"
+            )
+        if len(result_filenames) != expected_result_filename_count:
+            raise DistributedExecutionError(
+                f"Distributed experiment {experiment_name!r} reuses its run-log filename "
+                "for another output artifact."
+            )
+        published_result_filenames.update(result_filenames)
         if effective.get("APPLY_LAYER1_BASE_EXECUTION", False) and hard_solutions is None:
             raise DistributedExecutionError(
                 "Distributed Layer 1 requires hard_solutions so ground-truth identity can be "
@@ -1493,6 +1582,7 @@ def run_experiments(
     logger = logging.getLogger(__name__)
     all_results = {}
     distributed_manifest: Optional[Dict[str, Any]] = None
+    distributed_experiment_configs = list(experiment_configs)
 
     for exp_overrides in experiment_configs:
         effective_config = _merge_experiment_config(global_config, exp_overrides)
@@ -1518,11 +1608,15 @@ def run_experiments(
     # SPECIAL CASE: Transformation Dataset Construction
     transformation_ds_configs = [
         exp for exp in experiment_configs
-        if exp.get("APPLY_TRANSFORMATION_DATASET_CONSTRUCTION")
+        if _merge_experiment_config(global_config, exp).get(
+            "APPLY_TRANSFORMATION_DATASET_CONSTRUCTION"
+        )
     ]
     experiment_configs = [
         exp for exp in experiment_configs
-        if not exp.get("APPLY_TRANSFORMATION_DATASET_CONSTRUCTION")
+        if not _merge_experiment_config(global_config, exp).get(
+            "APPLY_TRANSFORMATION_DATASET_CONSTRUCTION"
+        )
     ]
 
     if transformation_ds_configs:
@@ -1551,14 +1645,30 @@ def run_experiments(
             logger.info("--- Transformation Dataset Construction '%s' finished ---", exp_name)
 
     if not experiment_configs:
+        if distributed_manifest is not None:
+            _finalize_distributed_worker_status(
+                global_config, distributed_experiment_configs, distributed_manifest
+            )
         return all_results
         
     # SPECIAL CASE: Core-Preserving Simplification Phase 1 & Phase 2
-    phase1_configs = [exp for exp in experiment_configs if exp.get("APPLY_CORE_SIMP_PHASE1")]
-    phase2_configs = [exp for exp in experiment_configs if exp.get("APPLY_CORE_SIMP_PHASE2")]
+    phase1_configs = [
+        exp for exp in experiment_configs
+        if _merge_experiment_config(global_config, exp).get("APPLY_CORE_SIMP_PHASE1")
+    ]
+    phase2_configs = [
+        exp for exp in experiment_configs
+        if _merge_experiment_config(global_config, exp).get("APPLY_CORE_SIMP_PHASE2")
+    ]
     
     # Update normal_configs to exclude Phase 1 and Phase 2 configs from the standard pipeline
-    experiment_configs = [exp for exp in experiment_configs if not (exp.get("APPLY_CORE_SIMP_PHASE1") or exp.get("APPLY_CORE_SIMP_PHASE2"))]
+    experiment_configs = [
+        exp for exp in experiment_configs
+        if not (
+            _merge_experiment_config(global_config, exp).get("APPLY_CORE_SIMP_PHASE1")
+            or _merge_experiment_config(global_config, exp).get("APPLY_CORE_SIMP_PHASE2")
+        )
+    ]
 
 
     # EXECUTE PHASE 1: Build the Donor Dataset
@@ -1592,7 +1702,7 @@ def run_experiments(
             logger.info(f"--- Phase 1 '{exp_name}' finished. Saved {len(successful_samples)} verified samples. ---")
 
     # EXECUTE PHASE 2: Analogical Evaluation (The 3 Branches)
-    if phase2_configs:
+    if phase2_configs and distributed_manifest is None:
         logger.info(f"Found {len(phase2_configs)} Core Simplification Phase 2 config(s); running them now.")
         from src.core_simplification_layer2 import execute_core_simplification_phase2
         
@@ -1613,11 +1723,26 @@ def run_experiments(
             
             all_results[exp_name] = phase2_results
             logger.info(f"--- Phase 2 '{exp_name}' finished. ---")
+    elif phase2_configs:
+        logger.info(
+            "Core Simplification Phase 2 is deferred until the finalizer has "
+            "strictly merged all Phase 1 donor shards."
+        )
 
     # SPECIAL CASE: Merging Dataset Construction
-    merging_ds_configs = [exp for exp in experiment_configs if exp.get("APPLY_MERGING_DATASET_CONSTRUCTION")]
+    merging_ds_configs = [
+        exp for exp in experiment_configs
+        if _merge_experiment_config(global_config, exp).get(
+            "APPLY_MERGING_DATASET_CONSTRUCTION"
+        )
+    ]
     # Update experiment_configs to exclude merging configs from the standard pipeline
-    experiment_configs = [exp for exp in experiment_configs if not exp.get("APPLY_MERGING_DATASET_CONSTRUCTION")]
+    experiment_configs = [
+        exp for exp in experiment_configs
+        if not _merge_experiment_config(global_config, exp).get(
+            "APPLY_MERGING_DATASET_CONSTRUCTION"
+        )
+    ]
 
     if merging_ds_configs:
         logger.info(f"Found {len(merging_ds_configs)} Merging Dataset Construction config(s); running them now.")
@@ -1645,6 +1770,10 @@ def run_experiments(
 
     # If there are no normal experiments left to run, return early
     if not experiment_configs:
+        if distributed_manifest is not None:
+            _finalize_distributed_worker_status(
+                global_config, distributed_experiment_configs, distributed_manifest
+            )
         return all_results
         
         
@@ -2030,7 +2159,7 @@ def run_experiments(
         
     if distributed_manifest is not None:
         _finalize_distributed_worker_status(
-            global_config, experiment_configs, distributed_manifest
+            global_config, distributed_experiment_configs, distributed_manifest
         )
     return all_results
 
@@ -2043,6 +2172,7 @@ def finalize_distributed_experiments(
     api_managers: Dict[str, Any],
     hard_solutions: Optional[List[str]] = None,
     run_layer2: bool = True,
+    embedding_model: Optional[SentenceTransformer] = None,
 ) -> Dict[str, Any]:
     """Download, strictly merge, publish, and optionally run Layer 2 once.
 
@@ -2055,6 +2185,15 @@ def finalize_distributed_experiments(
             "finalize_distributed_experiments requires DISTRIBUTED_EXECUTION_ENABLED=True."
         )
     _validate_distributed_scope(global_config, experiment_configs, hard_solutions)
+    if run_layer2 and embedding_model is None and any(
+        _merge_experiment_config(global_config, overrides).get(
+            "APPLY_CORE_SIMP_PHASE2", False
+        )
+        for overrides in experiment_configs
+    ):
+        raise DistributedExecutionError(
+            "Core Simplification Phase 2 finalization requires embedding_model."
+        )
     paths = configure_worker_paths(global_config)
     run_root = download_distributed_run_for_merge(global_config)
 
@@ -2104,6 +2243,8 @@ def finalize_distributed_experiments(
 
     layer2_results: Dict[str, Any] = {}
     layer2_status: Dict[str, Any] = {}
+    core_simplification_layer2_results: Dict[str, Any] = {}
+    core_simplification_layer2_status: Dict[str, Any] = {}
     if run_layer2:
         start_worker_session(global_config)
         deadline_keys = (
@@ -2190,7 +2331,66 @@ def finalize_distributed_experiments(
                     f"Could not save distributed Layer-2 status: {status_path}"
                 )
             layer2_status[experiment_name] = status_payload
-        if layer2_results:
+
+        for overrides in experiment_configs:
+            current_config = _merge_experiment_config(global_config, overrides)
+            if not current_config.get("APPLY_CORE_SIMP_PHASE2", False):
+                continue
+            current_config["RESULTS_DIR"] = merged_results_dir
+            current_config["DISTRIBUTED_FINALIZER_MODE"] = True
+            current_config["_DISTRIBUTED_MERGED_ROOT"] = merged_root
+            current_config["_DISTRIBUTED_LAYER2_SYNC_ONLY"] = True
+            experiment_name = current_config.get(
+                "experiment_name", "core_simp_phase2"
+            )
+            from src.core_simplification_layer2 import (
+                execute_core_simplification_phase2,
+            )
+
+            phase2_result = execute_core_simplification_phase2(
+                hard_questions=hard_questions,
+                hard_solutions=hard_solutions,
+                exemplar_data=exemplar_data,
+                embedding_model=embedding_model,
+                api_managers=api_managers,
+                config=current_config,
+            )
+            core_simplification_layer2_results[experiment_name] = phase2_result
+            expected_indices = set(
+                current_config.get("_CORE_SIMP_PHASE2_EXPECTED_TEST_INDICES", [])
+            )
+            completed_indices = {
+                int(result["test_idx"])
+                for result in phase2_result
+                if isinstance(result, dict) and "test_idx" in result
+            }
+            missing_indices = sorted(expected_indices - completed_indices)
+            if not missing_indices:
+                state = "COMPLETE"
+            elif stop_new_batches_due(global_config):
+                state = "PAUSED_TIME_LIMIT"
+            else:
+                state = "INCOMPLETE"
+            status_payload = {
+                "state": state,
+                "run_id": expected_manifest["run_id"],
+                "manifest_sha256": expected_manifest["manifest_sha256"],
+                "experiment_name": experiment_name,
+                "expected_test_count": len(expected_indices),
+                "completed_test_count": len(completed_indices & expected_indices),
+                "missing_test_indices": missing_indices,
+            }
+            status_path = os.path.join(
+                merged_results_dir,
+                f"{experiment_name}_core_simplification_layer2_status.json",
+            )
+            if not save_json_atomic(status_payload, status_path):
+                raise DistributedExecutionError(
+                    f"Could not save Core Simplification Layer-2 status: {status_path}"
+                )
+            core_simplification_layer2_status[experiment_name] = status_payload
+
+        if layer2_results or core_simplification_layer2_results:
             sync_distributed_merged_results(global_config, merged_root)
 
     return {
@@ -2199,5 +2399,7 @@ def finalize_distributed_experiments(
         "merge": merge_result,
         "layer2": layer2_results,
         "layer2_status": layer2_status,
+        "core_simplification_layer2": core_simplification_layer2_results,
+        "core_simplification_layer2_status": core_simplification_layer2_status,
         "worker_paths": paths,
     }

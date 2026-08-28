@@ -12,6 +12,7 @@ from sentence_transformers import SentenceTransformer
 from src.utils import load_json, save_json, save_json_atomic, create_trace_entry
 from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
+from src.benchmark_data import benchmark_name_for_target_index
 from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
 
 # Import shared prompts
@@ -415,6 +416,9 @@ def execute_core_simplification_phase2(
 
     # 2. Build the strictly paired test suite
     test_suite = build_paired_test_suite(hard_questions, hard_solutions, embedding_model, config)
+    config["_CORE_SIMP_PHASE2_EXPECTED_TEST_INDICES"] = sorted(
+        item["test_idx"] for item in test_suite
+    )
     
     if not test_suite:
         return all_results
@@ -429,7 +433,13 @@ def execute_core_simplification_phase2(
         results_by_index = {result.get("test_idx"): result for result in all_results if "test_idx" in result}
         tests_by_index = {item["test_idx"]: item for item in tests_to_process}
         def worker(item: QuestionWorkItem) -> Dict[str, Any]:
-            return run_parallel_evaluation_branches(tests_by_index[item.index], solver_mgr, eval_mgr, config)
+            item_config = config.copy()
+            item_config["_TARGET_BENCHMARK_FOR_QUERY"] = benchmark_name_for_target_index(
+                config, item.index
+            )
+            return run_parallel_evaluation_branches(
+                tests_by_index[item.index], solver_mgr, eval_mgr, item_config
+            )
         def commit(results: List[QuestionResult], _batch_id: str, batch_number: int) -> None:
             for result in results:
                 results_by_index[result.item.index] = result.value
@@ -445,7 +455,13 @@ def execute_core_simplification_phase2(
     # 3. Execution Loop
     for loop_idx, test_item in enumerate(tqdm(tests_to_process, desc="Phase 2 Execution")):
         # Execute the 3 Branches
-        branch_results = run_parallel_evaluation_branches(test_item, solver_mgr, eval_mgr, config)
+        item_config = config.copy()
+        item_config["_TARGET_BENCHMARK_FOR_QUERY"] = benchmark_name_for_target_index(
+            config, test_item["test_idx"]
+        )
+        branch_results = run_parallel_evaluation_branches(
+            test_item, solver_mgr, eval_mgr, item_config
+        )
         
         # Save immediately
         all_results.append(branch_results)

@@ -27,6 +27,8 @@ CONFIG.update({
     "BATCH_PROCESSING_ENABLED": True,
     "BATCH_SIZE": 5,
     "BATCH_MAX_WORKERS": 5,
+    "QUESTION_PARALLEL_API_ENABLED": True,
+    "QUESTION_PARALLEL_MAX_WORKERS": 3,
     "PERSIST_RESULTS_ONLINE": True,
 })
 ```
@@ -38,13 +40,13 @@ selected provider credential (`AVALAI_API_KEY`, `GEMINI_API_KEY`, or
 `GEMINI_API_KEYS_JSON`).
 
 Run the normal `run_experiments(...)` call. For question index `i`, ownership
-is `i % worker_count`; with five workers this is a balanced 20% share when the
-question count is divisible by five. Global indices and the full answer list
-are retained, so no question is renumbered.
+uses contiguous, balanced ranges. For 2,000 questions and five workers, worker
+0 owns indices 0..399, worker 1 owns 400..799, and so on. Global indices and
+the full answer list are retained, so no question is renumbered.
 
-After every completed batch, the worker atomically uploads only its own run
-log, Layer-1 cache, and status. The next batch does not start until
-that upload succeeds. At the soft session limit (11 hours by default), no new
+After every completed batch, the worker atomically uploads only its own direct
+result artifacts and status. The next batch does not start until that upload
+succeeds. At the soft session limit (11 hours by default), no new
 batch starts; an active batch may finish and checkpoint. The API retry deadline
 is 11.75 hours by default, leaving time before Kaggle's hard cutoff.
 
@@ -52,6 +54,24 @@ When a session ends, restart a notebook with the same worker id. It downloads
 only the immutable manifest and its own latest shard, skips strictly successful
 questions, and retries failed/partial questions. Different workers may run at
 different times. Do not run the same worker id concurrently in two notebooks.
+
+### Special dataset and simplification workflows
+
+Transformation-dataset construction, merging-dataset construction, and Core
+Simplification Phase 1 use the same three concurrency levels: notebook shards,
+question batches, and bounded API-call parallelism within each question. Their
+sparse accepted datasets are merged by immutable global question index.
+
+For distributed transformation datasets, use `hard_questions` as the target
+source and leave `TRANSFORMATION_DS_MAX_TARGETS` and
+`TRANSFORMATION_DS_MAX_MEMBERS` as `None`. If a smaller run is needed, slice the
+question/answer inputs identically in every notebook before starting a new run.
+
+Core Simplification Phase 2 depends on the complete Phase-1 donor set. Enable
+both phase flags in the same experiment configuration: workers build Phase 1
+shards, then the single finalizer merges the donors and runs Phase 2. Running
+Phase 2 independently on each worker would create different donor/test pairings
+and is therefore intentionally not allowed.
 
 ### Emergency model rotation during an existing run
 
@@ -98,6 +118,7 @@ finalized = finalize_distributed_experiments(
     hard_solutions=hard_solutions,
     exemplar_data=exemplar_data,
     api_managers=api_managers,
+    embedding_model=embedding_model,
     run_layer2=True,
 )
 ```
@@ -107,9 +128,10 @@ hash, ownership, question and answer hashes, successful run status, complete
 Layer-1 states, and exact question coverage. If a worker was forgotten, is
 paused, or has a missing/conflicting artifact, it raises a clear error and does
 not publish `MERGE_COMPLETE.json`. Once validation succeeds, it writes the
-legacy-compatible merged run log and `{metadata, queries}` Layer-1 cache in
-global numeric order, publishes them atomically, and runs configured Layer 2
-once against the merged cache.
+legacy-compatible merged run log, sparse dataset outputs, and any
+`{metadata, queries}` Layer-1 cache in global numeric order, publishes them
+atomically, and runs configured Layer 2 or Core Simplification Phase 2 once
+against the merged artifacts.
 
 Remote layout:
 
