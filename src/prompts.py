@@ -1517,6 +1517,11 @@ def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[s
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question_text)
 
+
+def is_prompt_construction_error(prompt: str) -> bool:
+    """Return whether a prompt builder returned its explicit error sentinel."""
+    return prompt.startswith("Error:")
+
 def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[str, Any], template_name: Optional[str] = None) -> str:
     if not template_name:
         target_benchmark = benchmark_name_for_target_index(config)

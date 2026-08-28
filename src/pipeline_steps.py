@@ -15,6 +15,7 @@ from src.prompts import (
     create_transformation_prompt,
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple,
+    is_prompt_construction_error,
     create_duplicate_check_prompt,
     create_best_of_transformation_solver_prompt,
     create_reverse_validation_candidate_prompt,
@@ -850,7 +851,7 @@ def solve(
     prompt = create_final_reasoning_prompt(target_query, final_exemplars, config) if final_exemplars else create_final_reasoning_prompt_simple(target_query, config)
     logger.info(f"Using {'retrieval-augmented' if final_exemplars else 'simple'} prompt for the solver.")
 
-    if "Error:" in prompt:
+    if is_prompt_construction_error(prompt):
         error_msg = f"Failed to create final reasoning prompt: {prompt}"
         logger.error(error_msg)
         return {"status": "FAILURE", "solution_attempts": [{"status": "FAILURE", "error_info": {"error_message": error_msg}}], "trace": local_trace}
