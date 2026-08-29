@@ -125,7 +125,7 @@ def _announce_authorized_model_rotation(
     if not model_changes:
         return
     message = (
-        f"AUTHORIZED MODEL ROTATION ({context}): the immutable run manifest is retained; "
+        f"RUNTIME MODEL CHANGE ({context}): the immutable run manifest is retained; "
         f"completed results may use the original models while new work uses active models. "
         f"Changes: {model_changes}"
     )
@@ -481,14 +481,13 @@ def _prepare_distributed_worker(
     """Validate/create the immutable run and restore only this worker shard."""
     _validate_distributed_scope(global_config, experiment_configs, hard_solutions)
     paths = configure_worker_paths(global_config)
-    allow_model_rotation = bool(
-        global_config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
+    # The three AvalAI role model names are runtime provenance and may change
+    # between worker sessions. All other manifest fields remain immutable.
+    allow_model_rotation = True
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
+        resolve_code_fingerprint(project_root)
     )
-    if allow_model_rotation:
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
-            resolve_code_fingerprint(project_root)
-        )
     requested_manifest = _build_requested_distributed_manifest(
         global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
     )
@@ -2197,14 +2196,13 @@ def finalize_distributed_experiments(
     paths = configure_worker_paths(global_config)
     run_root = download_distributed_run_for_merge(global_config)
 
-    allow_model_rotation = bool(
-        global_config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
+    # Match worker semantics: role model names are runtime provenance, while
+    # every other manifest field remains strict during finalization.
+    allow_model_rotation = True
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
+        resolve_code_fingerprint(project_root)
     )
-    if allow_model_rotation:
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
-            resolve_code_fingerprint(project_root)
-        )
     requested_manifest = _build_requested_distributed_manifest(
         global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
     )

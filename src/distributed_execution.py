@@ -388,13 +388,18 @@ def validate_manifest_compatibility(
     allow_model_rotation: bool = False,
     allow_legacy_code_fingerprint: bool = False,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Validate identity with a narrow opt-in bridge for pre-patch runs."""
+    """Validate identity while treating the three role model names as runtime state.
+
+    ``allow_model_rotation`` is retained for call-site compatibility, but model-name-only
+    drift is always accepted.  The separate legacy-code-fingerprint bridge remains
+    explicit because ignoring arbitrary source changes would weaken run identity.
+    """
     validate_manifest_integrity(existing_manifest)
     validate_manifest_integrity(expected_manifest)
     if _canonical_json(existing_manifest) == _canonical_json(expected_manifest):
         return {}
 
-    if allow_model_rotation and (
+    if (
         _canonical_json(_manifest_without_rotatable_models(
             existing_manifest,
             remove_code_fingerprint=allow_legacy_code_fingerprint,
@@ -417,8 +422,7 @@ def validate_manifest_compatibility(
     ]
     legacy_rotation_guidance = ""
     if (
-        allow_model_rotation
-        and not allow_legacy_code_fingerprint
+        not allow_legacy_code_fingerprint
         and "code_fingerprint" in changed
     ):
         legacy_rotation_guidance = (
@@ -854,12 +858,11 @@ def write_worker_status(
         "assigned_indices": assigned_indices(manifest["question_count"], worker_id, worker_count),
         "experiments": dict(experiment_progress or {}),
     }
-    if config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False):
-        payload["model_rotation"] = {
-            "enabled": True,
-            "active_avalai_models": active_avalai_models(config),
-            "runtime_code_fingerprint": config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"),
-        }
+    payload["model_rotation"] = {
+        "enabled": True,
+        "active_avalai_models": active_avalai_models(config),
+        "runtime_code_fingerprint": config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"),
+    }
     if message:
         payload["message"] = str(message)
     status_path = config.get("_DISTRIBUTED_WORKER_STATUS_PATH")

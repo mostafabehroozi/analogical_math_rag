@@ -76,7 +76,7 @@ class DistributedReasoningEffortManifestTests(unittest.TestCase):
         self.assertIn("UNRELATED_SCIENTIFIC_OPTION", scientific_config)
         self.assertIsNone(scientific_config["UNRELATED_SCIENTIFIC_OPTION"])
 
-    def test_legacy_nulls_allow_only_authorized_model_rotation(self):
+    def test_legacy_nulls_allow_model_rotation_without_opt_in(self):
         existing = self._manifest(
             self._config(),
             code_fingerprint="legacy-code",
@@ -93,7 +93,6 @@ class DistributedReasoningEffortManifestTests(unittest.TestCase):
         changes = validate_manifest_compatibility(
             existing,
             expected,
-            allow_model_rotation=True,
             allow_legacy_code_fingerprint=True,
         )
 
@@ -121,7 +120,6 @@ class DistributedReasoningEffortManifestTests(unittest.TestCase):
         changes = validate_manifest_compatibility(
             existing,
             expected,
-            allow_model_rotation=True,
             allow_legacy_code_fingerprint=True,
         )
 
@@ -151,7 +149,6 @@ class DistributedReasoningEffortManifestTests(unittest.TestCase):
             write_or_validate_manifest(
                 manifest_path,
                 expected,
-                allow_model_rotation=True,
             )
 
             self.assertEqual(manifest_path.read_bytes(), original_bytes)
@@ -172,7 +169,6 @@ class DistributedReasoningEffortManifestTests(unittest.TestCase):
             validate_manifest_compatibility(
                 existing,
                 expected,
-                allow_model_rotation=True,
                 allow_legacy_code_fingerprint=True,
             )
 
@@ -194,7 +190,6 @@ class DistributedReasoningEffortManifestTests(unittest.TestCase):
             validate_manifest_compatibility(
                 existing,
                 expected,
-                allow_model_rotation=True,
                 allow_legacy_code_fingerprint=True,
             )
 

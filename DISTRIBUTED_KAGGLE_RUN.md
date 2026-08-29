@@ -75,29 +75,29 @@ and is therefore intentionally not allowed.
 
 ### Emergency model rotation during an existing run
 
-Model names remain immutable by default. If an AvalAI model becomes unavailable
-after a distributed run has started, explicitly enable the narrow compatibility
-mode in every restarted worker and in the finalizer:
+The AvalAI adaptation, final-solver, and evaluator model names are runtime
+provenance rather than immutable run identity. If a model becomes unavailable,
+set the replacement names in every restarted worker and in the finalizer:
 
 ```python
-CONFIG["DISTRIBUTED_ALLOW_MODEL_ROTATION"] = True
-
 CONFIG["AVALAI_MODEL_NAME_ADAPTATION"] = "meta/llama-3.2-11b-vision-instruct"
 CONFIG["AVALAI_MODEL_NAME_FINAL_SOLVER"] = "meta/llama-3.2-11b-vision-instruct"
 CONFIG["AVALAI_MODEL_NAME_EVALUATOR"] = "openai/gpt-oss-20b"
 ```
 
-When applying this patch to a run created by older source code, the worker
-automatically adopts the exact `code_fingerprint` from the valid immutable
-manifest after verifying that every other difference is limited to the three
-approved model names. The actual patched runtime fingerprint is recorded
-separately in worker status. An explicit `DISTRIBUTED_CODE_FINGERPRINT` remains
-supported, but is not required; if supplied, it must match the manifest exactly.
+No opt-in flag is required for a model-name-only change when the code fingerprint
+is unchanged. When applying this compatibility patch to a run created by older
+source code, set `DISTRIBUTED_ALLOW_MODEL_ROTATION=True`; that legacy bridge
+adopts the exact `code_fingerprint` from the valid immutable manifest only after
+verifying that every other difference is limited to the three approved model
+names. The actual patched runtime fingerprint is recorded separately in worker
+status. An explicit `DISTRIBUTED_CODE_FINGERPRINT` remains supported, but is not
+required; if supplied, it must match the manifest exactly.
 
-With rotation enabled, only the three model-name fields above may differ. The
-stored manifest is never rewritten, completed questions remain complete, and
-failed or pending questions use the active models. Every new or solve-only query
-log records its active model configuration. The resulting run is intentionally
+Only the three model-name fields above may differ automatically. The stored
+manifest is never rewritten, completed questions remain complete, and failed or
+pending questions use the active models. Every new or solve-only query log
+records its active model configuration. The resulting run is intentionally
 mixed-model; keep the original experiment name unchanged so checkpoint artifact
 names continue to match.
 

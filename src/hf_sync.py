@@ -366,11 +366,12 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
             )
             if remote_manifest_record is not None:
                 remote_manifest, remote_hash = remote_manifest_record
-                allow_model_rotation = bool(
-                    config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
-                )
+                # Role model names are runtime provenance, so model-only drift
+                # is always compatible. The opt-in flag now controls only the
+                # pre-patch code-fingerprint bootstrap below.
+                allow_model_rotation = True
                 auto_pin_legacy_code = (
-                    allow_model_rotation
+                    bool(config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False))
                     and not config.get("DISTRIBUTED_CODE_FINGERPRINT")
                 )
                 try:
