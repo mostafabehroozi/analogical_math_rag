@@ -333,6 +333,16 @@ CONFIG = {
     "TRANSFORMATION_DS_RANDOM_SEED": None,
     "TRANSFORMATION_DS_MAX_TARGETS": None,
     "TRANSFORMATION_DS_MAX_MEMBERS": None,
+    # Prompt template -> number of independently sampled candidates. Dictionary
+    # order is retained and is used as the deterministic tie-break order.
+    "TRANSFORMATION_DS_PROMPT_TEMPLATES": {
+        "transformation_v1": 1,
+        "transformation_shallow": 1,
+        "transformation_shallow-&-moderately-deep": 1,
+        "transformation_complete": 1,
+    },
+    # Legacy single-template fallback used only when the dictionary is
+    # explicitly set to None (or is absent in a standalone configuration).
     "TRANSFORMATION_DS_N_CANDIDATES": 3,
     "TRANSFORMATION_DS_PROMPT_TEMPLATE": "transformation_shallow-&-moderately-deep",
     "TRANSFORMATION_DS_TEMPERATURE": 0.0,

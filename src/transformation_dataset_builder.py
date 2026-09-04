@@ -28,6 +28,7 @@ from src.parallel_utils import run_parallel_api_calls
 from src.pipeline_steps import retrieve
 from src.prompts import (
     EXEMPLAR_FORMAT,
+    PROMPT_TEMPLATES,
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple,
     create_transformation_prompt,
@@ -61,6 +62,54 @@ def _model_name(manager: Any, config: Dict[str, Any], role: str) -> str:
         if prefix == "SOLVER":
             prefix = "GEMINI"
     return config.get(f"{prefix}_MODEL_NAME_{suffix}", config.get("GEMINI_MODEL_NAME_FINAL_SOLVER"))
+
+
+def _transformation_candidate_specs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Expand prompt-template sample counts into stable candidate specifications."""
+    configured = config.get("TRANSFORMATION_DS_PROMPT_TEMPLATES")
+    if configured is None:
+        template_name = config.get(
+            "TRANSFORMATION_DS_PROMPT_TEMPLATE",
+            "transformation_shallow-&-moderately-deep",
+        )
+        configured = {
+            template_name: max(1, int(config.get("TRANSFORMATION_DS_N_CANDIDATES", 3)))
+        }
+
+    if not isinstance(configured, dict) or not configured:
+        raise ValueError(
+            "TRANSFORMATION_DS_PROMPT_TEMPLATES must be a non-empty dictionary "
+            "mapping prompt-template names to positive integer sample counts."
+        )
+
+    specs: List[Dict[str, Any]] = []
+    for template_name, sample_count in configured.items():
+        if not isinstance(template_name, str) or not template_name.strip():
+            raise ValueError(
+                "TRANSFORMATION_DS_PROMPT_TEMPLATES keys must be non-empty strings."
+            )
+        if template_name not in PROMPT_TEMPLATES:
+            raise ValueError(
+                f"Unknown transformation prompt template {template_name!r}."
+            )
+        if (
+            isinstance(sample_count, bool)
+            or not isinstance(sample_count, int)
+            or sample_count <= 0
+        ):
+            raise ValueError(
+                "TRANSFORMATION_DS_PROMPT_TEMPLATES sample counts must be "
+                "positive integers."
+            )
+        for template_sample_index in range(sample_count):
+            specs.append(
+                {
+                    "candidate_index": len(specs),
+                    "template_name": template_name,
+                    "template_sample_index": template_sample_index,
+                }
+            )
+    return specs
 
 
 def _ccs(
@@ -232,17 +281,19 @@ def process_single_question(
         "one_shot_base": one_attempts,
     }
 
-    candidate_count = max(1, int(config.get("TRANSFORMATION_DS_N_CANDIDATES", 3)))
+    candidate_specs = _transformation_candidate_specs(config)
     transform_model = _model_name(api_manager_adapt, config, "adaptation")
     transform_temperature = config.get(
         "TRANSFORMATION_DS_TEMPERATURE",
         config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0),
     )
     transform_tasks = []
-    for candidate_index in range(candidate_count):
+    for candidate_spec in candidate_specs:
         transform_tasks.append(
-            lambda index=candidate_index: _generate_transformation(
-                index,
+            lambda spec=candidate_spec: _generate_transformation(
+                spec["candidate_index"],
+                spec["template_name"],
+                spec["template_sample_index"],
                 target_query,
                 original_sample,
                 api_manager_adapt,
@@ -259,6 +310,8 @@ def process_single_question(
         transformed_sample = generated.get("transformed_sample", "")
         candidate_log: Dict[str, Any] = {
             "candidate_index": candidate_index,
+            "transformation_template": generated["transformation_template"],
+            "template_sample_index": generated["template_sample_index"],
             "transformation_prompt": generated.get("transformation_prompt"),
             "transformation_response": generated.get("response"),
             "transformed_sample": transformed_sample,
@@ -291,6 +344,8 @@ def process_single_question(
         valid_candidates.append(
             {
                 "candidate_index": candidate_index,
+                "transformation_template": generated["transformation_template"],
+                "template_sample_index": generated["template_sample_index"],
                 "transformed_sample": transformed_sample,
                 "transformation_prompt": generated["transformation_prompt"],
                 "transformed_aug_ccs": transformed_score,
@@ -334,14 +389,12 @@ def process_single_question(
             "retrieved_solution": retrieved_solution,
             "retrieval_similarity": retrieval_score,
             "selected_candidate_index": best["candidate_index"],
+            "selected_template_sample_index": best["template_sample_index"],
             "zero_shot_base_ccs": zero_score,
             "one_shot_base_ccs": one_score,
             "transformed_aug_ccs": best["transformed_aug_ccs"],
             "ccs_n": max(1, int(config.get("TRANSFORMATION_DS_CCS_N", 5))),
-            "transformation_template": config.get(
-                "TRANSFORMATION_DS_PROMPT_TEMPLATE",
-                "transformation_shallow-&-moderately-deep",
-            ),
+            "transformation_template": best["transformation_template"],
         },
     }
     return log
@@ -349,6 +402,8 @@ def process_single_question(
 
 def _generate_transformation(
     candidate_index: int,
+    template_name: str,
+    template_sample_index: int,
     target_query: str,
     original_sample: str,
     api_manager_adapt: Any,
@@ -356,10 +411,12 @@ def _generate_transformation(
     temperature: float,
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
+    prompt_config = config.copy()
+    prompt_config["TRANSFORMATION_DS_PROMPT_TEMPLATE"] = template_name
     prompt = create_transformation_prompt(
         target_query,
         original_sample,
-        config,
+        prompt_config,
         "TRANSFORMATION_DS_PROMPT_TEMPLATE",
     )
     try:
@@ -373,6 +430,8 @@ def _generate_transformation(
         transformed_sample = str(response.get("text", "")).strip()
     return {
         "candidate_index": candidate_index,
+        "transformation_template": template_name,
+        "template_sample_index": template_sample_index,
         "transformation_prompt": prompt,
         "response": response,
         "transformed_sample": transformed_sample,
