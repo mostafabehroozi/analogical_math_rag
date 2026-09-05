@@ -27,9 +27,9 @@ CONFIG = {
     # Logging & Control
     "PRINT_API_CALL_DETAILS": True,  
     "ENABLE_API_RETRY": True,          
-    "MAX_API_RETRIES": 200,              
+    "MAX_API_RETRIES": 200,  # Maximum total attempts per API call, including the first.
     "API_RETRY_DELAY_SECONDS": 20.0,
-    "RETRY_ALL_API_ERRORS": True,  # If True, retry all API error types; if False, only retry RETRYABLE_ERROR_TYPES
+    "RETRY_ALL_API_ERRORS": True,  # Retry every API error type; local session deadlines still stop execution.
     "API_RESPONSE_TRUNCATION_LENGTH": 70,
     # Batch execution is intentionally opt-in until quotas are configured and
     # the existing experiment has been validated with a small batch.

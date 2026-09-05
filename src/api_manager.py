@@ -354,7 +354,14 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         start_time = time.monotonic()
         
         # 2. Make the API Call
-        response = api_call_func()
+        try:
+            response = api_call_func()
+        except Exception as error:
+            response = {
+                "status": "ERROR", "text": None,
+                "error_type": type(error).__name__,
+                "error_message": str(error), "error_details": repr(error),
+            }
         
         # 3. Stop the Timer
         duration = time.monotonic() - start_time
@@ -379,10 +386,13 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         error_type = response.get("error_type") or status
         tprint(log_msg, level="WARNING")
         
-        if error_type in NON_RETRYABLE_ERROR_TYPES:
+        # A session deadline is a local stop signal, not a failed API call.
+        if error_type == "SessionDeadline":
             retryable = False
+        elif retry_all:
+            retryable = True
         else:
-            retryable = retry_all or (error_type in RETRYABLE_ERROR_TYPES)
+            retryable = error_type in RETRYABLE_ERROR_TYPES and error_type not in NON_RETRYABLE_ERROR_TYPES
 
         if not retryable or attempt == max_attempts:
             response["retry_exhausted"] = attempt == max_attempts
