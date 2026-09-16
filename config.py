@@ -325,6 +325,9 @@ CONFIG = {
     "MERGING_DS_CCS_N": 5,                       # N attempts for calculating Correctness Consistency Score
     "MERGING_DS_TEMPERATURE": 0.7,               # Temperature for sampling multiple reasoning paths
     "MERGING_DS_OUTPUT_FILENAME": "merging_fine_tuning_dataset.json",
+    # Used only by QLoRA preparation and same-question tree fusion. The legacy
+    # merging dataset builder keeps its original final_solver_v3 prompts.
+    "PROMPT_TEMPLATE_MERGING": "merging_same_question_v1",
 
     # --- TRANSFORMATION DATASET CONSTRUCTION FLAGS ---
     "APPLY_TRANSFORMATION_DATASET_CONSTRUCTION": False,

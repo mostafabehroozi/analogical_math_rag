@@ -48,3 +48,11 @@ directory.
 
 Runtime data is written below the configured `local_data/` or Kaggle output
 directory; it is not source code and should not be edited by hand.
+
+## Merging-model fine-tuning
+
+`merging_finetuning.ipynb` is the dedicated Kaggle GPU workflow for preparing
+merging JSON files, QLoRA fine-tuning Qwen3-4B-Instruct-2507, and comparing base
+and adapted binary fusion trees. Install its isolated dependencies from
+`requirements-merging-finetuning.txt`. The reusable implementation is in
+`src/merging_finetuning.py`.

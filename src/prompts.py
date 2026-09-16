@@ -368,6 +368,30 @@ Final Answer:
 [Your final answer to the Main Question]
 </Your  Answer/Output Format>
 """,
+    "merging_same_question_v1": """You are an expert mathematician. Solve the Main Question by critically combining the two Candidate Solutions.
+
+Both candidates attempt the same Main Question. Either candidate may contain incorrect calculations, invalid reasoning, or an incorrect final answer. Check their steps independently, retain only useful and valid reasoning, repair errors, and produce one coherent solution. Do not mention the candidates in your answer.
+
+<Candidate Solution 1>
+{candidate_solution_1}
+</Candidate Solution 1>
+
+<Candidate Solution 2>
+{candidate_solution_2}
+</Candidate Solution 2>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your checked, step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your Answer/Output Format>
+""",
     "final_solver_v4": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
 <Instructions>
@@ -1516,6 +1540,26 @@ def create_final_reasoning_prompt_simple(main_question_text: str, config: Dict[s
     template_name = config.get("PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE", "final_solver_simple_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(main_question_text=main_question_text)
+
+
+def create_merging_prompt(
+    main_question_text: str,
+    candidate_solutions: List[str],
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Create the production prompt used to fuse two same-question solutions."""
+    if len(candidate_solutions) != 2:
+        raise ValueError("A merging prompt requires exactly two candidate solutions.")
+    template_name = (config or {}).get(
+        "PROMPT_TEMPLATE_MERGING", "merging_same_question_v1"
+    )
+    if template_name not in PROMPT_TEMPLATES:
+        raise KeyError(f"Unknown merging prompt template: {template_name!r}")
+    return PROMPT_TEMPLATES[template_name].format(
+        main_question_text=main_question_text.strip(),
+        candidate_solution_1=str(candidate_solutions[0]).strip(),
+        candidate_solution_2=str(candidate_solutions[1]).strip(),
+    )
 
 
 def is_prompt_construction_error(prompt: str) -> bool:
