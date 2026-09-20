@@ -14,6 +14,7 @@ from src.merging_finetuning import (
     run_merging_tree,
     retrieve_exemplars_cpu,
     tokenize_splits,
+    upload_adapter_to_hub,
 )
 from src.prompts import EXEMPLAR_FORMAT, create_final_reasoning_prompt, create_merging_prompt
 
@@ -59,7 +60,46 @@ class RecordingGenerator:
         }
 
 
+class RecordingHubApi:
+    def __init__(self):
+        self.created = []
+        self.uploaded = []
+
+    def whoami(self):
+        return {"name": "test-user"}
+
+    def create_repo(self, **kwargs):
+        self.created.append(kwargs)
+
+    def upload_folder(self, **kwargs):
+        self.uploaded.append(kwargs)
+
+
 class MergingDatasetTests(unittest.TestCase):
+    def test_upload_adapter_creates_private_model_repo_and_uploads_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            adapter_dir = Path(directory) / "best_adapter"
+            adapter_dir.mkdir()
+            (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+            api = RecordingHubApi()
+            result = upload_adapter_to_hub(
+                adapter_dir, "secret-token", private=True, api=api
+            )
+        self.assertEqual(result["repo_id"], "test-user/merging-qwen3-4b-qlora")
+        self.assertEqual(api.created[0]["repo_type"], "model")
+        self.assertTrue(api.created[0]["private"])
+        self.assertEqual(api.uploaded[0]["repo_id"], result["repo_id"])
+        self.assertNotIn("secret-token", repr(api.created) + repr(api.uploaded))
+
+    def test_upload_adapter_requires_saved_peft_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            adapter_dir = Path(directory) / "best_adapter"
+            adapter_dir.mkdir()
+            (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(FileNotFoundError, "adapter weights"):
+                upload_adapter_to_hub(adapter_dir, "secret-token", api=RecordingHubApi())
+
     def test_parses_legacy_contract_and_builds_cautious_prompt(self):
         parsed = parse_legacy_merging_prompt(legacy_prompt())
         self.assertEqual(parsed["question"], "What is 1 + 1?")

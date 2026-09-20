@@ -447,6 +447,66 @@ def train_qlora(
     return trainer
 
 
+def upload_adapter_to_hub(
+    adapter_path: os.PathLike[str] | str,
+    token: str,
+    repo_id: Optional[str] = None,
+    *,
+    private: bool = True,
+    commit_message: str = "Upload trained merging QLoRA adapter",
+    api: Optional[Any] = None,
+) -> Dict[str, str]:
+    """Create/update a Hub model repo and upload a saved PEFT adapter folder.
+
+    When ``repo_id`` is omitted, the authenticated user's namespace is used.
+    The token is passed directly to the Hub client and is never persisted.
+    """
+    adapter_dir = Path(adapter_path).expanduser().resolve()
+    if not adapter_dir.is_dir():
+        raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
+    if not (adapter_dir / "adapter_config.json").is_file():
+        raise FileNotFoundError(f"Missing adapter_config.json in {adapter_dir}")
+    if not any(
+        (adapter_dir / filename).is_file()
+        for filename in ("adapter_model.safetensors", "adapter_model.bin")
+    ):
+        raise FileNotFoundError(f"No PEFT adapter weights found in {adapter_dir}")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("A non-empty Hugging Face write token is required.")
+
+    if api is None:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+    resolved_repo_id = repo_id.strip() if isinstance(repo_id, str) else ""
+    if not resolved_repo_id:
+        identity = api.whoami()
+        username = identity.get("name") if isinstance(identity, Mapping) else None
+        if not username:
+            raise RuntimeError("Could not determine the authenticated Hugging Face username.")
+        resolved_repo_id = f"{username}/merging-qwen3-4b-qlora"
+    if "/" not in resolved_repo_id:
+        raise ValueError("repo_id must use the 'owner/repository' format.")
+
+    api.create_repo(
+        repo_id=resolved_repo_id,
+        repo_type="model",
+        private=private,
+        exist_ok=True,
+    )
+    api.upload_folder(
+        folder_path=str(adapter_dir),
+        repo_id=resolved_repo_id,
+        repo_type="model",
+        commit_message=commit_message,
+    )
+    return {
+        "repo_id": resolved_repo_id,
+        "url": f"https://huggingface.co/{resolved_repo_id}",
+        "adapter_path": str(adapter_dir),
+    }
+
+
 class LocalFusionGenerator:
     """Generate with either the disabled base model or the active trained adapter."""
 

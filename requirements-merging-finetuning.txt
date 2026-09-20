@@ -5,3 +5,4 @@ accelerate>=1.2,<2
 bitsandbytes>=0.45,<1
 datasets>=3.2,<5
 safetensors>=0.4,<1
+huggingface-hub>=0.30,<2
