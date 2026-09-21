@@ -216,7 +216,10 @@ def retrieve(
     return {
         "status": "SUCCESS",
         "retrieved_indices": top_k_indices.tolist(),
-        "retrieved_similarity_scores": relevant_similarities.tolist(),
+        # Keep every score aligned with the final, descending retrieval order.
+        # ``relevant_similarities`` still follows the unsorted argpartition
+        # slice and therefore cannot safely be zipped with ``top_k_indices``.
+        "retrieved_similarity_scores": similarities[top_k_indices].tolist(),
         "trace": local_trace
     }
 

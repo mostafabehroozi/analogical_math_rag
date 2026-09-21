@@ -224,6 +224,15 @@ CONFIG = {
     "LAYER1_ONE_SHOT_CANDIDATES_N": None,  # Number of 1-shot candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
     "LAYER1_ZERO_SHOT_CANDIDATES_N": 5,    # Number of zero-shot candidates to generate in Layer 1 (0 = OFF)
+
+    # Layer-1 grouping is an independent, lower-cost companion run. It creates
+    # one candidate for every configured combination of retrieved exemplars and
+    # evaluates only target-answer correctness (no baseline or CCS matrix).
+    "APPLY_LAYER1_GROUPING": False,
+    "LAYER1_GROUPING_ONLY_MODE": False,
+    "LAYER1_GROUP_SIZES": [2],
+    "LAYER1_GROUPING_PROMPT_TEMPLATE": "layer1_grouping_solver_v1",
+    "LAYER1_GROUPING_TEMPERATURE": 0.0,
     
     "APPLY_LAYER2_ANALYSIS": False,
     "LAYER2_CONFIG": {

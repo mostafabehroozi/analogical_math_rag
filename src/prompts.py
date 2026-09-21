@@ -415,6 +415,27 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
+    "layer1_grouping_solver_v1": """You are an expert mathematician. Solve the Main Question using the provided solved examples as optional analogical guidance.
+
+Analyze the examples for useful reasoning patterns, but verify every step independently. Do not mention the examples in your answer. Return one coherent solution to the Main Question.
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Required Output Format>
+Rationale:
+[Your checked, step-by-step rationale]
+
+Final Answer:
+[Your final answer]
+</Required Output Format>
+""",
+
     "final_solver_simple_v1": """**Objective:**
 Your task is to solve the **Main Question** by generating a clear, step-by-step **Rationale** and the **Final Answer**.
 

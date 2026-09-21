@@ -1,0 +1,1371 @@
+ADAPTIVE ANALOGICAL REASONING
+Complete research context and implementation specification
+From full-evidence correctness prediction to partial-evidence prediction
+and a frozen-encoder reinforcement-learning acquisition head
+
+Prepared: 20 September 2026
+Status: proposed design; no new models trained or benchmark results established.
+
+HOW TO READ THIS DOCUMENT
+
+This document consolidates the author's research idea and the subsequent design discussions. It is a standalone specification for understanding, implementing, and evaluating the proposed system. It complements research_story_analogical_transfer_neural_verification.txt rather than replacing that earlier account of the analogical-transfer research.
+
+Three kinds of statements are distinguished throughout:
+  EXISTING: behavior checked in the supplied/local training code or project.
+  REQUIRED: a condition needed for the proposed experiment to mean what it claims.
+  PROPOSED V1: a concrete starting choice, not an established optimum or a result.
+
+The agreed architectural constraint is central: reinforcement learning updates ONLY a new action head. Its learned input is the frozen snapshot network's final hidden representation, before the correctness/SAFE/MAX prediction heads. The application controls stopping. The first action policy does not learn a separate STOP action.
+
+The author's SAFE/MAX definitions are preserved as explicit supervision and configurable stopping modes. A reliability-based stopping alternative is a recommendation to evaluate, not an assertion that SAFE/MAX have been replaced or already validated.
+
+No training script, notebook, experiment configuration, or existing research document is changed by this specification. The underlying benchmark logs still require a direct data audit before implementation or empirical claims.
+
+CONTENTS
+
+  1. Research philosophy and scientific objective
+  2. The original measurement pipeline
+  3. Why learn from raw CCS and Base-CCS
+  4. What the existing neural model actually does
+  5. The complete proposed system and its training stages
+  6. Data contracts and quality checks
+  7. Splits, teacher cross-fitting, and leakage prevention
+  8. Full-evidence teacher training
+  9. Exact SAFE/MAX label construction
+ 10. Snapshot states and missing-value representation
+ 11. Valid acquisitions and their costs
+ 12. Snapshot network, outputs, and losses
+ 13. Confidence, calibration, and stopping configuration
+ 14. Freezing the predictor and attaching the action head
+ 15. Cached environment and the boundary of valid simulation
+ 16. DQN in plain language and exact training targets
+ 17. Reward, delayed information, and objective choices
+ 18. RL training procedure and starting configuration
+ 19. Runtime algorithm and worked example
+ 20. Evaluation, ablations, and statistical reporting
+ 21. Known limits and what would falsify the claims
+ 22. Implementation modules and saved artifacts
+ 23. Verification and acceptance checks
+ 24. Paper contributions and narrative
+ 25. Ordered implementation plan and decision register
+ 26. Glossary, sources, and final handoff contract
+
+
+1. RESEARCH PHILOSOPHY AND SCIENTIFIC OBJECTIVE
+
+The original intuition is that a mathematical solution can contain a reusable procedure. Related questions may be different instances of similar reasoning. If a candidate solution can be reused to help solve related questions with known answers, the pattern of those outcomes may tell us something about the candidate's quality.
+
+The operational hypothesis is deliberately more precise than saying that successful transfer proves a latent program is correct:
+
+  A candidate's measured behavior when reused on known-answer problems
+  contains predictive evidence about its correctness on the target question.
+
+An LLM may ignore, repair, partially reuse, or be distracted by a candidate. Correct final answers do not prove that every reasoning step is valid. Thus target correctness, reasoning validity, transfer usefulness, and diagnostic usefulness must remain distinct.
+
+The first neural extension learns to interpret this evidence instead of applying one fixed handcrafted formula. The next extension learns how to acquire that evidence economically.
+
+The overall question becomes:
+
+  Given what we currently know, which answer should we return, and which
+  additional observation or generated solution would most improve that
+  decision relative to its cost?
+
+There are two complementary activities:
+
+  Improving the available answer pool: generate another candidate.
+  Improving our ability to judge the pool: evaluate through another exemplar.
+
+An exemplar acquisition can also enable a future one-shot generation. Its value may therefore appear several decisions later. Conversely, a new candidate and its probe outcomes can help interpret other candidates if the predictor jointly observes the pool.
+
+The system should allocate less computation when its configured stopping condition is met early and more when continued investigation is useful. This is an empirical goal, not a guaranteed consequence of adding RL.
+
+The primary proposed objective is correct selected answers with low acquisition cost. Recovering a teacher's preferred candidate is a different objective. Both can be studied, but their rewards and claims must be distinguished.
+
+
+2. THE ORIGINAL MEASUREMENT PIPELINE
+
+Let Q be a target question, whose answer is unavailable during deployment. Let R_j be a retrieved exemplar containing a question, a reference solution, and a known answer. Let rho_j denote retrieval similarity.
+
+A candidate C_i contains a proposed solution and final answer to Q. Candidates can be:
+
+  Zero-shot: generated from Q without a retrieved demonstration.
+  One-shot: generated from Q and one retrieved solved exemplar R_j.
+
+In the stated experiment, K=5 exemplars, N_zs=3 zero-shot candidates, N_os=5 one-shot candidates, and m=5 repeated solves per CCS estimate. There is one one-shot candidate per exemplar, not five per exemplar. Total candidate count is N=8.
+
+For each evaluator j:
+
+  b_j = Base-CCS = baseline successes / baseline attempts.
+
+For each candidate i and evaluator j:
+
+  t_ij = CCS = successes solving evaluator j with candidate i as a
+         demonstration / corresponding attempts.
+
+The candidate demonstration includes Q and its proposed solution. The new problem being solved is the evaluator question. Its known answer is used for grading, not inserted as the answer in that solving prompt.
+
+These are estimates under a particular solver, prompt, decoding setting, and grading protocol. They are not exact probabilities or universal properties of the questions.
+
+The inspected code stores the measurement state through:
+
+  retrieved_set
+  candidate_set
+  intrinsic_baselines
+  cross_evaluation_matrix
+  ground_truth_labels
+
+The last field contains historical target-candidate labels used for training and offline evaluation. It is never a deployment feature.
+
+Layer 1 collects these measurements and labels. The existing Layer 2 contains heuristic scoring, masks, ranking, and some downstream re-solving experiments. The proposed supervised models and adaptive controller are new consumers of the same measurement concept.
+
+The full 8-by-5 transfer matrix requires 200 probe solver generations at m=5. Five baselines require 25 more, and candidate generation requires eight. This gives 233 solver generations before retries, grading, and any downstream solving. The small neural model is cheap; obtaining its features is the expensive part.
+
+
+3. WHY LEARN FROM RAW CCS AND BASE-CCS
+
+The historical marginal formula is:
+
+  u_ij = max(0, t_ij - b_j).
+
+It asks whether a candidate improves evaluator correctness above measured baseline. That is sensible as one statistic, but it compresses different outcomes.
+
+When b_j=1:
+
+  t_ij=1.0 gives u_ij=0.
+  t_ij=0.2 also gives u_ij=0.
+
+Preserving measured performance and severely degrading it become identical under clipping. A raw-feature model can retain that distinction. Whether it predicts target correctness is an empirical question.
+
+Base-CCS therefore changes role: it becomes context for interpreting a response rather than an obligatory threshold that discards negative differences. Do not assume that a neural model must need baselines; retrain ablations with and without them.
+
+For the same evaluator set and common weights, summing signed differences subtracts the same baseline total from every candidate:
+
+  sum_j(t_ij - b_j) = sum_j(t_ij) - sum_j(b_j).
+
+Consequently, signed subtraction alone cannot change that within-query ranking. Nonlinear interactions, clipping, candidate-dependent masks, or weights are needed to change it.
+
+Five trials give a coarse rate grid: 0, .2, .4, .6, .8, 1. Five successes do not establish a true success probability of one. Counts and operational failures matter.
+
+Use 'baseline-relative correctness gain' for t_ij-b_j. 'Information gain' can describe the intuition of learning something useful, but it is not automatically a formal information-theoretic quantity. The RL design below does not require a separate information-gain label.
+
+
+4. WHAT THE EXISTING NEURAL MODEL ACTUALLY DOES
+
+The inspected neural_network_train_and_benchmark_eval.py constructs one feature vector per candidate:
+
+  [is_zero_shot, source_similarity,
+   evaluator_similarities[5], evaluator_baselines[5],
+   candidate_CCS_row[5], parent_one_hot[5]].
+
+This gives 22 features. Source information and the CCS row vary by candidate; evaluator similarities and baselines are shared within the target.
+
+The current model uses a width-128 residual network, two residual blocks, batch normalization, ReLU, dropout .10, and one output logit. A shared network is applied separately to candidates. It trains with binary cross-entropy and then ranks candidates by the resulting score. Although named LTR, its objective is pointwise correctness classification rather than a pairwise or listwise ranking loss.
+
+The current hyperparameters include Adam, learning rate .0003, weight decay .0001, batch size 128, up to 100 epochs, and patience 30. These are reproduction settings, not proof of optimal settings for the new tasks.
+
+The current independent scorer does not jointly inspect the full candidate pool. Adding another candidate by itself cannot change an existing candidate's score if its own input is unchanged. The new snapshot model must observe the pool jointly if we want those interactions.
+
+The present script also reuses reported benchmark files for checkpoint selection and skips queries without positive candidate labels in its ranking reports. Those results are exploratory. Neither practice is carried into the proposed confirmatory protocol.
+
+Independent sigmoid scores are suitable for candidate correctness: several candidates can be correct, or none can. A softmax over candidates would force their scores to sum to one and cannot itself represent the all-wrong event.
+
+
+5. THE COMPLETE PROPOSED SYSTEM AND ITS TRAINING STAGES
+
+There are three learning stages and a separate application loop.
+
+Stage A: full-evidence teacher.
+  Train a correctness predictor on complete measurements.
+  Produce out-of-fold teacher rankings for training questions.
+  Combine these rankings with true labels to derive SAFE/MAX targets.
+
+Stage B: supervised snapshot predictor.
+  Train on partial, reachable observations.
+  Predict correctness of each existing candidate and the defined SAFE/MAX
+  targets. Optionally train a selected-answer reliability output.
+  Freeze its encoder, output heads, and preprocessing before Stage C.
+
+Stage C: RL acquisition head.
+  Receive the final hidden representation of Stage B.
+  Predict a value for each available acquisition action.
+  Train only this head using correctness-minus-cost returns.
+
+Application loop:
+  Build current observation, run the frozen predictor, apply a fixed stopping
+  rule, and otherwise ask the RL head for the next action.
+  Execute that action and repeat after its results become available.
+
+The teacher is an offline training aid. It is not called on a full hidden matrix during deployment. The snapshot predictor supplies the live representation and answer-related predictions. The RL head supplies the next acquisition. The application supplies control flow, masks, budgeting, and actual API execution.
+
+Diagram:
+
+  Complete historical logs
+          |
+    grouped data split
+          |
+    full-data teachers -> out-of-fold rankings + true labels -> SAFE/MAX labels
+          |                                                  |
+          +------------ reachable snapshots -----------------+
+                                |
+                       supervised snapshot training
+                                |
+                    frozen encoder and prediction heads
+                                |
+                    final hidden representation h_t
+                                |
+                       trainable small DQN head
+                                |
+                       next acquisition action
+
+
+6. DATA CONTRACTS AND QUALITY CHECKS
+
+Use a compact normalized record per target rather than repeatedly loading multi-gigabyte traces for training. Retain a pointer to original records for audit.
+
+Suggested per-target fields:
+
+  target_id: dataset identity plus authoritative original index
+  canonical_group_id: groups duplicate/near-duplicate target instances
+  target_text_hash: reproducible overlap check
+  evaluator_ids[K], retrieval_order[K], similarity[K]
+  baseline_rate[K], baseline_attempt_count[K], baseline_valid[K]
+  candidate_ids[N], candidate_type[N], source_slot[N]
+  candidate_generation_status[N], candidate_correct[N], label_valid[N]
+  CCS[N,K], CCS_attempt_count[N,K], CCS_valid[N,K]
+  candidate text/answer references, model/prompt/run metadata
+  optional recorded tokens, latency, grader calls, retry counts
+
+Do not infer that a missing value means zero. Unknown labels are different from false labels. An API failure is different from a mathematically incorrect answer. Current measurement helpers can count unsuccessful attempts as non-success in the configured denominator, so audit the actual records before calling these pure mathematical success rates.
+
+For an initial clean scientific simulation, define eligibility from data integrity, not from whether a correct candidate exists. Report excluded/incomplete records and reasons. Do not remove all-wrong target pools. A separate operational evaluation should include failures under a fixed retry/budget policy.
+
+Check duplicate target IDs, missing rows/columns, candidate-source agreement, finite rates in [0,1], retrieval order, key normalization, and expected 3/5/8 counts. Do not silently keep only the first one-shot candidate if a future run contains multiple generations per source.
+
+JSON object keys can be strings even where producer IDs were numeric. Normalize IDs once. Use original target indices rather than list position as identity.
+
+Check overlap across target training data, evaluation data, and the exemplar corpus. Exact-question exclusion is insufficient to rule out paraphrases or near duplicates. Record any overlap policy explicitly.
+
+Verify grader behavior, including answer extraction, equivalent mathematical forms, evaluator errors, and benchmark-specific handling. Known target labels remain labels; evaluator reference answers are legitimately used to construct probe features.
+
+Maintain separate storage/access paths for public observations and hidden simulator data. Make it difficult for feature construction to accidentally read future CCS values, full teacher scores, hidden labels, or final ranking positions.
+
+
+7. SPLITS, TEACHER CROSS-FITTING, AND LEAKAGE PREVENTION
+
+Split by target group BEFORE generating snapshots, trajectories, or teacher predictions. Every version and candidate of the same target stays together.
+
+For a simple, conservative first design, reserve these disjoint roles:
+
+  D_supervised: train teachers and snapshot predictor.
+  D_policy: train the RL head using the already frozen predictor.
+  D_dev: select supervised checkpoints, stopping settings, and RL settings.
+  D_audit: audit the final frozen system's stopping reliability.
+  D_test: final evaluation; no tuning or label-driven development.
+
+An illustrative allocation within 2,000 training-domain questions is
+1,200 / 400 / 200 / 200 for the first four roles. This is not mandatory and may
+leave limited data for both policy learning and reliability assessment. It is
+a transparent starting split, not a promise of sufficient statistical power.
+
+Keeping D_policy separate avoids teaching the controller using an encoder whose correctness behavior on those same questions may be memorized. More elaborate cross-fitting can use data more efficiently later, but the first experiment should favor a clear split.
+
+Within D_supervised, obtain teacher predictions by grouped cross-fitting:
+  1. Divide D_supervised into, for example, five folds.
+  2. Train on four folds and predict the fifth.
+  3. Do not select epochs using the excluded fold's labels.
+  4. Repeat so each target has an out-of-fold full-data ranking.
+
+Use an internal training split for each teacher's early stopping, or a fixed
+training schedule chosen on separate development data. Early stopping alone
+does not make in-sample predictions out-of-sample.
+
+Train a final teacher on D_supervised for reference-label construction on
+D_policy/D_dev/D_audit/D_test if those auxiliary labels are needed. Their
+ground truth may be used to compute retrospective SAFE/MAX evaluation labels,
+but never features or deployment stopping decisions.
+
+Fit feature normalization only on eligible supervised training observations.
+Fit RL-specific choices using D_policy and select them on D_dev. All use of
+D_dev is development, not independent final evidence.
+
+D_audit is for checking a frozen policy plus stopping rule. If its labels are
+used to revise thresholds, it becomes development data and another untouched
+audit is needed for an independent reliability claim.
+
+The previously reported external benchmarks already influenced early stopping
+and research choices. Disclose that history. A clean rerun is valuable, but
+cannot retroactively make those benchmarks untouched. Seek additional held-out
+confirmation for the strongest generalization claims.
+
+
+8. FULL-EVIDENCE TEACHER TRAINING
+
+PROPOSED V1: retain the existing pointwise BCE architecture as the teacher to
+avoid mixing a new representation and new learning objective immediately.
+
+For candidate i, with full features x_i and correctness y_i:
+
+  p_i = sigmoid(f_teacher(x_i))
+  loss_i = BCEWithLogits(f_teacher(x_i), y_i).
+
+Group metrics by target. If candidate counts vary, normalize the loss within
+each question before averaging questions so targets with more candidates do
+not automatically dominate. Preserve all-wrong and all-correct pools.
+
+Rank candidates by descending score with a deterministic tie rule. Never
+break ties using correctness. Save raw logits as well as probabilities.
+
+Report all-query Top-1 and AP with explicit denominator conventions. AP on
+no-positive lists can be defined as zero; also report conditional AP and
+oracle coverage separately. A positive-only AP report alone is inadequate.
+
+For the teacher, AP-based development early stopping is reasonable if ranking
+is its intended output. Also inspect BCE/log loss and all-query Top-1. The
+best AP checkpoint is not necessarily the best calibrated predictor.
+
+No claim of calibrated probability follows from sigmoid+BCE alone. A
+temperature or another small postprocessing calibrator may be fitted using
+development/calibration data, with the chosen role clearly documented [1].
+Positive global temperature scaling preserves score ordering and therefore
+does not by itself change the SAFE prefix.
+
+Save teacher fold ID, training group IDs, scaler, checkpoint hash, ordering
+rule, architecture, seed, and prediction version. Fold identity is provenance,
+not a feature for later models.
+
+
+9. EXACT SAFE/MAX LABEL CONSTRUCTION
+
+Let pi be the candidate order induced by the full-data teacher. Let y_i be
+the real correctness label. Define L as the number of leading correct
+candidates before the first incorrect candidate:
+
+  If y_pi[1]=0, L=0.
+  Otherwise increase L until the first incorrect label or the list ends.
+
+Then:
+  SAFE_full = {pi[1], ..., pi[L]}.
+  MAX_full = pi[1] if L>0, otherwise absent.
+
+Example:
+  order:  C1 C4 C5 C2 C3 C6 C8 C7
+  labels:  1  1  1  0  1  0  0  0
+  SAFE_full = {C1,C4,C5}; MAX_full=C1.
+
+For a snapshot with existing candidate set A_t:
+
+  safe_member_i = 1[i in SAFE_full], supervised only when i exists.
+  max_member_i  = 1[i = MAX_full], supervised only when i exists.
+  safe_present = 1[A_t intersects SAFE_full].
+  max_present  = 1[MAX_full exists and MAX_full is in A_t].
+
+If MAX is absent, all MAX labels are zero. If the first teacher candidate is
+incorrect, SAFE is empty even if later candidates are correct. If every
+candidate is correct, every candidate is SAFE and only the first is MAX.
+
+Compute SAFE_full ONCE for the complete candidate universe. Do not recompute
+the prefix from each snapshot: that would change the meaning of the target
+and make comparisons across stages inconsistent.
+
+Ground-truth membership obeys:
+  MAX membership implies SAFE membership implies candidate correctness.
+  MAX present implies SAFE present.
+
+Independent predicted heads may violate these implications. A simple initial
+implementation logs violations; the application's MAX condition additionally
+requires predicted SAFE presence. A consistency penalty or structured heads
+can be compared later without changing the ground-truth definitions.
+
+These targets are retrospective properties of a teacher ranking. They do
+not establish a universal probability range or a per-question certainty
+guarantee. A MAX with teacher score .52 and a MAX with score .99 receive the
+same identity label. Reaching MAX can also be unnecessary if a reliably
+selectable correct SAFE candidate already exists.
+
+Keep raw teacher probabilities, true labels, SAFE membership, and MAX
+identity as separate fields. Student correctness is supervised by true
+correctness, not by replacing truth with the teacher's predictions.
+
+
+10. SNAPSHOT STATES AND MISSING-VALUE REPRESENTATION
+
+A snapshot describes observations available after a completed acquisition,
+not the hidden future record. It contains candidate/evaluator availability,
+observed baselines and CCS, trial counts, provenance, and budgeting context.
+
+PROPOSED V1 uses fixed maxima N=8 and K=5. Candidate slots have a permanent
+canonical order, for example ZS1, ZS2, ZS3, OS1, ..., OS5. Evaluator slots
+follow retrieval rank. Never arrange snapshot slots using the full-data
+teacher's ranking: even slot order could leak future evidence.
+
+Use zero-filled missing numeric values with explicit masks:
+  rate=0, observed=1 means measured zero success.
+  rate=0, observed=0 means unknown.
+
+Do not use -1 alone as the missingness contract. It can be used internally,
+but explicit masks are easier to audit and remain necessary for losses.
+
+One concrete fixed-size input schema is:
+
+  candidate_present[8]                                8
+  observed_source_one_hot[8,6]                       48
+    Six categories: zero-shot, source1,...,source5.
+    All zeros for nonexistent candidates.
+  observed_generation_ordinal[8]                     8
+  evaluator_active[5]                                 5
+  observed_similarity[5]                              5
+  observed_baseline_rate[5]                           5
+  baseline_observed_mask[5]                           5
+  baseline_attempt_count[5]                           5
+  observed_CCS[8,5]                                  40
+  CCS_observed_mask[8,5]                              40
+  CCS_attempt_count[8,5]                              40
+  global_context[4]                                   4
+    spent budget fraction, remaining budget fraction,
+    candidate fraction present, evaluator fraction active.
+  TOTAL                                             213
+
+This is a proposed schema, not the current 22-feature input. Adding error
+status, variable stopping modes, variable lambda, or other fields requires
+a new schema version and a revised dimension, not silent extra columns.
+
+Generation ordinal is historical generation order, not teacher rank. In a
+strict replay experiment, define whether ordinal means stored zero-shot
+sample index or actual acquisition order; actual acquisition order can be
+recorded separately when needed. Never relabel stored samples by correctness.
+
+Keep rates and binary masks on their natural scales initially; divide known
+counts by fixed declared maxima. If standardizing, fit statistics only on
+observed training entries and fill missing transformed entries afterward.
+Do not let padding determine means or variances.
+
+In V1, acquiring an evaluator reveals its similarity to the model. Its rank
+and planned availability can be known by the application. An alternative
+could expose all retrieval similarities cheaply upfront, but it is a
+different observation protocol and must be used consistently in training
+and evaluation. 'Add evaluator' primarily purchases its baseline/probes;
+retrieval from an index need not itself be an LLM call.
+
+No candidate text embedding is required in V1. If a later system adds answer
+agreement or text features, compute them only from existing candidates and
+count any required external computation.
+
+
+11. VALID ACQUISITIONS AND THEIR COSTS
+
+Use bundled acquisitions initially. Every active candidate is evaluated
+against every active evaluator using the fixed m trials. Sparse individual
+CCS-cell acquisition is a later extension.
+
+Initial state:
+  Generate ZS1; activate R1; measure b_1 and t_ZS1,1.
+
+For m=5, this requires 1+5+5=11 solver generations. Evaluator grading can
+require another 10 calls. Count initialization in all reported costs even
+though the RL head does not choose it.
+
+Action 0: ADD_NEXT_EVALUATOR.
+  Activate the next unactivated exemplar in retrieval order.
+  Measure its baseline and its CCS against every existing candidate.
+  Generate no candidate automatically.
+  This source now becomes eligible for a one-shot generation.
+
+Action 1: ADD_ZERO_SHOT.
+  Generate/reveal the next zero-shot candidate in fixed sample order.
+  Measure its CCS against all active evaluators.
+
+Actions 2..6: ADD_ONE_SHOT_FROM_SOURCE_1..5.
+  Require that source to be active.
+  Generate/reveal its one recorded one-shot candidate.
+  Measure that candidate against all active evaluators.
+
+With n existing candidates and k active evaluators, incremental solver
+generation costs are:
+  evaluator: m*(n+1).
+  candidate: 1+m*k.
+
+Each new baseline/probe output may also require grading. No target-candidate
+grading call is needed at deployment; the target's true answer is unknown.
+Offline target labeling is training-data cost, reported separately.
+
+Under these bundles, each baseline and each candidate-evaluator pair is paid
+for at most once. Completing the same full pool costs the same number of
+solver generations regardless of acquisition order. Savings arise from
+stopping before completing the pool, from valid cache reuse, or from later
+sparse acquisition extensions. RL cannot save calls merely by reordering a
+process that always collects every measurement.
+
+After the initial state, there are at most 11 acquisitions in the stated
+setup: four evaluators, two zero-shot candidates, and five one-shot candidates.
+There are no cycles or unbounded re-acquisitions in V1.
+
+Mask actions when they have no recorded remaining result, require an
+inactive source, would duplicate an acquired result, or cannot fit the
+remaining budget under the declared admission rule.
+
+For simulation, exact call counts are straightforward. Monetary costs and
+token counts may differ across zero-shot and one-shot prompts. At runtime,
+an action's realized output length is unknown in advance: budget admission
+uses an estimate or a conservative cap, never the hidden future token bill.
+Charge realized cost afterward and log any overshoot policy.
+
+If baseline caching across targets is allowed, model it explicitly and use
+the same cache assumptions for every baseline and controller. Start with
+per-target uncached accounting for a clear first experiment.
+
+Multi-exemplar few-shot generation, repeated one-shot samples, selecting an
+arbitrary unseen evaluator, and individual-trial acquisition are extensions.
+They require corresponding recorded outcomes or new data collection.
+
+
+12. SNAPSHOT NETWORK, OUTPUTS, AND LOSSES
+
+PROPOSED V1: flatten the fixed 213-dimensional observation into a small global
+MLP/residual encoder, such as width 128 with two residual blocks. Its final
+hidden vector h_t summarizes the whole observed pool.
+
+Because this is a global encoder, changing one candidate's observed data can
+change predictions for other candidates. It differs from the original
+independent row scorer. Fixed slots are adequate for the bounded first
+experiment; permutation-invariant set/graph architectures are optional
+extensions if variable pool sizes become important.
+
+Start the snapshot model separately rather than claiming automatic weight
+compatibility with the 22-input teacher. Teacher rankings supply targets;
+the teacher architecture need not be copied exactly.
+
+Required prediction heads for the author's design:
+  correctness logits[8]
+  SAFE membership logits[8]
+  MAX membership logits[8]
+  SAFE-present logit[1]
+  MAX-present logit[1]
+
+This gives 26 supervised logits. An optional selected-answer reliability
+head gives a 27th output; its training is described below.
+
+Use independent binary logits, not a softmax forcing exactly one correct
+candidate or exactly one existing MAX. The global MAX-present output must
+allow no MAX to exist in the full record or current pool.
+
+Mask nonexistent candidates out of correctness and membership losses. Their
+public output may be displayed as zero, but do not train 'absent' as 'wrong.'
+Global presence heads are supervised in every valid snapshot, including
+states with no SAFE/MAX member present.
+
+A starting loss is:
+  L = L_correct + alpha*L_safe_members + beta*L_max_members
+      + eta*L_safe_present + zeta*L_max_present.
+
+Each candidate loss is averaged over existing candidates first. Normalize
+global losses separately so the number of output slots does not set their
+relative importance by accident. Start with correctness weight 1 and
+auxiliary weights .25 each, then select a small prespecified alternative
+set on D_dev. These are starting scales, not validated optimal values.
+
+Sample targets roughly uniformly and then snapshots within targets. Mix
+early, intermediate, and late states. Use valid random acquisition orders,
+simple candidate-first/evaluator-first orders, and full states for coverage.
+Do not generate states by choosing hidden correct candidates preferentially
+without explicitly treating this as a biased training intervention.
+
+No need to materialize all combinations in RAM. Generate deterministic
+snapshot specifications from masks and seeds, fetch scalar measurements
+from compact records, and construct batches lazily.
+
+Useful training diagnostics include all-query Top-1 by stage, BCE/Brier
+score, SAFE/MAX precision/recall by stage, false SAFE/MAX activations, and
+consistency-violation frequency. Early-stop on a prespecified development
+criterion; for a selector, all-query selected-answer accuracy is primary,
+with correctness loss useful for tie-breaking and calibration diagnostics.
+
+For a separate reliability output, first fix the candidate selector. On
+development/calibration-role snapshots, define i_star as the selector's
+chosen candidate and label r_target=y_i_star. Fit a small reliability head
+or calibrator using current h_t and observable selection statistics only.
+Do not use a constantly changing selector without tracking label versions.
+For minimum V1 complexity, the calibrated p_i_star can serve as the
+reliability estimate instead of adding a learned head.
+
+Maintain the independence of final audits: fitting a reliability model on
+held-out data makes that data calibration/development data, not final test.
+
+
+13. CONFIDENCE, CALIBRATION, AND STOPPING CONFIGURATION
+
+SAFE/MAX labels and high predicted correctness are not interchangeable.
+The application must specify a stopping mode and an answer-selection rule.
+
+First define the returned candidate, for example:
+  i_star = argmax correctness score over existing candidates.
+  Break exact ties deterministically using canonical order.
+
+Supported experimental modes:
+
+  SAFE mode:
+    Stop when predicted SAFE presence exceeds tau_safe.
+    A recommended gate also requires i_star's predicted SAFE membership
+    to exceed tau_member. This links the presence claim to the returned
+    candidate. Presence-only is retained as an explicit ablation.
+
+  MAX mode:
+    Stop when predicted MAX presence and SAFE presence exceed their
+    thresholds, and optionally require i_star's MAX membership.
+    If instead returning argmax MAX membership, name that selector
+    explicitly and use it throughout training, rewards, and reporting.
+
+  RELIABILITY mode:
+    Stop when calibrated reliability of the actually returned candidate
+    exceeds tau_reliable. This is recommended for a direct correctness
+    objective, but is an alternative experiment to the author's modes.
+
+Every mode also terminates on a hard budget or no affordable valid action.
+Record a distinct stop reason: predicted SAFE, predicted MAX, reliability,
+budget, pool exhaustion, or operational failure. Do not call budget-stopped
+answers confident merely because an answer had to be returned.
+
+PROPOSED V1 chooses one mode, threshold set, selection rule, budget, and cost
+weight before RL training. Other modes get separate trained controllers or
+explicit conditioning in a later design. Changing the stopping rule changes
+the controller's task and its value targets.
+
+Neural probabilities require empirical calibration [1]. Calibrating random
+full-data candidates is insufficient for a sequential stopped selector.
+Evaluate complete trajectories and the answers selected at actual stopping
+times; repeated selection and stopping alter the evaluated population.
+
+Use D_dev to choose a preliminary calibrator and fixed thresholds, train
+the policy under those settings, and select the complete pipeline on D_dev.
+Then freeze all choices and audit complete trajectories on D_audit. If the
+policy fails the desired reliability target, report that failure; if you
+revise it using audit results, seek a new independent audit.
+
+Report confident-stop error and coverage with uncertainty. A numerical
+threshold .95 is not automatically a 95% correctness guarantee. A small
+audit set may be unable to support a tight risk claim, even with zero
+observed errors. Domain/model shift can invalidate measured calibration.
+
+SAFE/MAX may improve sample efficiency as auxiliary supervision, or may
+simply teach the student's teacher-specific preferences. That is why a
+correctness-only snapshot model and reliability-only stopping are essential
+comparisons, not assumptions that the proposed labels must help.
+
+
+14. FREEZING THE PREDICTOR AND ATTACHING THE ACTION HEAD
+
+The exact constraint is:
+
+  h_t = frozen_encoder(snapshot_t)
+  action_values = trainable_head(h_t).
+
+The RL head does not take the correctness/SAFE/MAX light outputs as its
+learned input. Those remain available to the application for stopping and
+answer selection. It shares their pre-output hidden representation.
+
+PROPOSED V1 head:
+  Linear(hidden_dim,64) -> ReLU -> Linear(64,7).
+
+Outputs are unrestricted real Q-values. They can be negative and are not
+probabilities. Choose the highest-valued valid action. Do not apply a
+softmax and reinterpret its output as probability that the action is right.
+
+Freeze parameters of the snapshot encoder, existing heads, scalers, and
+calibrators. Run the frozen model in eval mode with no gradients. Freezing
+weights alone does not freeze batch-normalization running statistics or
+disable dropout. The optimizer contains only the new action head.
+
+The final hidden representation must receive budget, masks, and counts
+through the encoder's input before freezing. Otherwise two states requiring
+different actions may become indistinguishable. A frozen representation
+can still discard useful information; that is a limitation to test.
+
+Action masking is application logic, not another learned input path. The
+application knows which actions are executable and masks invalid Q-values.
+Changing h_t to include raw-feature bypasses would be a separately named
+ablation, not silently violating the agreed hidden-only interface.
+
+Save the encoder hash with the RL head. If the encoder, scaler, hidden-layer
+ordering, or stopping policy changes, old RL values may no longer mean the
+same thing. In particular, hidden features from separately trained encoders
+are not automatically interchangeable even if their dimensions match.
+
+
+15. CACHED ENVIRONMENT AND THE BOUNDARY OF VALID SIMULATION
+
+One environment episode samples a target record. Internally the environment
+has the full stored outcome table; externally it exposes only the current
+snapshot and valid-action mask.
+
+The controller is allowed to learn from true rewards at training time. That
+is ordinary supervision. It is not allowed to observe hidden labels or
+future outcome values when choosing an action.
+
+Each action reveals exactly the bundle specified in Section 11. Existing
+measurements remain fixed; the simulator must not redraw them to favor an
+action or recompute teacher scores from hidden values inside the public
+observation builder.
+
+Replay is valid only when the recorded candidate/probe prompts and settings
+match the proposed action regardless of acquisition history. If the live
+generator uses all previous candidates, self-reflection, or a changing
+multi-exemplar context, a single fixed candidate in the log does not
+represent every possible history.
+
+The simulator supports the stored three zero-shot samples and one one-shot
+sample per source. It cannot invent a fourth zero-shot sample, a second
+one-shot sample, or an unrecorded few-shot combination. Generation at
+deployment remains stochastic; each cached sample is one realization.
+
+Full alternative outcome tables permit online interaction with a simulator
+whose data were collected offline. This is different from having only
+logged trajectories with missing alternative-action outcomes. Ordinary DQN
+on unsupported offline actions can be unreliable; V1 masks unsupported
+actions rather than pretending an algorithm can recover missing outcomes.
+
+Repeated cached episodes do not create new independent target questions or
+independent LLM generations. Report the number of unique targets and
+recorded outcomes alongside transition counts.
+
+The underlying task is partially observed. The vector h_t is a learned
+summary, not a proven sufficient belief state. A feed-forward controller is
+a practical approximation when the snapshot includes all acquired evidence
+and budget. If histories contain additional relevant information, record it
+or acknowledge the approximation; do not claim a fully observed Markov
+state merely because a neural encoder produces a vector.
+
+
+16. DQN IN PLAIN LANGUAGE AND EXACT TRAINING TARGETS
+
+DQN learns how rewarding each action tends to be from the current observed
+state. It learns from transitions, not a hand-labeled perfect action.
+
+A replay entry contains:
+  h_t, action a_t, reward r_t, h_next, done,
+  current and next valid-action masks,
+  target group ID and accounting metadata for audit.
+
+Because the encoder is frozen, hidden representations can be cached. Cache
+keys must include the target, snapshot specification, budget context,
+encoder/scaler version, and anything else that affects the representation.
+
+Use two copies of the small action head:
+  online head Q_theta: updated by the optimizer.
+  target head Q_bar: periodically copied from the online head.
+
+The frozen snapshot network is not one of these two Q heads. There is only
+one frozen encoder; the target head is a stability aid for RL training.
+
+For vanilla DQN, the scalar training target is:
+
+  if done:
+      y_DQN = r_t
+  else:
+      y_DQN = r_t + gamma * max_valid_a Q_bar(h_next,a).
+
+Minimize Huber loss between Q_theta(h_t,a_t) and detached y_DQN. Only the
+chosen action's Q-value is directly regressed for that replay item.
+
+Mask invalid actions in three places:
+  random exploratory action selection;
+  greedy action selection;
+  the next-state maximum in the training target.
+
+Never evaluate a maximum over an empty valid set. Such a state terminates
+through the application and returns its selected answer. Terminal targets
+have no bootstrap term.
+
+Use gamma=1 initially: episodes are bounded and positive acquisition costs
+already penalize extra computation. A lower gamma would add a separate
+preference for earlier rewards, including a dependence on how actions are
+bundled. Report it if used.
+
+The replay buffer stores past transitions so they can be reused in random
+minibatches. Epsilon-greedy exploration means choosing a random valid
+action with probability epsilon, otherwise choosing the highest Q-value.
+Validation and deployment use greedy valid-action choice, not exploration.
+
+PROPOSED V1 is masked vanilla DQN with replay and a target head [2]. A small
+optional upgrade is Double DQN [3]: choose a_star using the online head at
+the next state, but evaluate it using the target head. This changes the
+bootstrap to Q_bar(h_next, argmax_valid Q_theta(h_next,a)) and can reduce
+overestimation. It is an ablation/upgrade, not a requirement to start.
+
+Do not assume a library's DQN automatically supports masks or Double DQN.
+The inspected Stable-Baselines3 documentation describes vanilla DQN, and
+the mask contract needs explicit implementation and testing [2].
+
+
+17. REWARD, DELAYED INFORMATION, AND OBJECTIVE CHOICES
+
+Let C_ref be a declared fixed cost reference, such as the full procedure's
+solver-call count 233. Let c_t be the incremental acquisition cost in the
+same units. For each action:
+
+  r_t = -lambda * c_t/C_ref.
+
+If the resulting state terminates, add:
+
+  +1 if the candidate actually returned is correct; +0 otherwise.
+
+The target label is supplied by the training environment only. At deployment
+no reward computation using the target answer occurs.
+
+The initial acquisition cost is counted in reported total cost. It can be
+omitted from the RL return if it is the same unavoidable cost for every
+policy on the episode; document that choice. If initialization is later a
+learned decision, include its cost in the action objective.
+
+The total return measures selected correctness minus cost, not accuracy
+divided by cost. lambda is a preference parameter: selecting it changes
+the task. For example, with lambda=.2, spending one quarter of C_ref costs
+.05 reward, equivalent in expectation to five percentage points of
+correctness. This is an interpretation of the objective, not a measured gain.
+
+Only already spent costs are known exactly. Future costs in the decision
+are predictions; costs used in reward are the simulator's or execution
+ledger's realized costs under the declared accounting convention.
+
+An evaluator can lower confidence and still be valuable. It may expose an
+incorrect candidate and lead to a better later generation. The terminal
+reward propagates credit backward through that sequence. No separate
+label for instantaneous confidence increase or mutual information is needed.
+
+The head learns expected value conditional on current observations. It
+cannot know which unseen generation will be correct for a particular new
+target. Full teacher rankings can define auxiliary labels but do not make
+the zero-shot-versus-one-shot action choice certain in advance.
+
+Avoid giving the reward for predicted SAFE/MAX activation. That would
+reward a detector mistake. Correctness of the selected answer remains the
+primary terminal signal even when SAFE/MAX control termination.
+
+Optional objective variants must be named separately:
+  Teacher-MAX recovery: terminal reward for selecting the designated MAX.
+  Minimum cost under an empirical accuracy constraint: compare policies
+    at a prespecified allowed accuracy loss rather than one lambda alone.
+  Learned STOP action: extends the action set and changes the agreed V1.
+
+The policy cannot always attain certainty, correctness, or MAX. All-wrong
+candidate pools impose an oracle ceiling; empty SAFE/MAX labels can make
+their identity targets unattainable. The budget/exhaustion fallback ensures
+termination without inventing evidence.
+
+
+18. RL TRAINING PROCEDURE AND STARTING CONFIGURATION
+
+Before RL, lock the encoder, prediction heads, scaler, answer selector,
+stopping configuration, action definitions, costs, and split manifest.
+
+Training loop:
+  1. Sample a D_policy question approximately uniformly.
+  2. Construct and charge the initial state.
+  3. Run frozen predictions and application stopping.
+  4. If already terminal, log the answer/cost; there is no chosen RL action.
+  5. Otherwise choose an epsilon-greedy valid action.
+  6. Reveal its bundle; charge cost; run frozen predictions again.
+  7. Apply the same stopping rule and construct reward/done.
+  8. Store the transition and update from replay after warmup.
+  9. Periodically copy online Q weights to the target head.
+ 10. Evaluate the complete greedy policy on D_dev at fixed intervals.
+ 11. Save the best checkpoint under the declared development criterion.
+
+Suggested small starting configuration, to be tuned only modestly:
+  hidden representation: 128 if the snapshot encoder uses width 128.
+  action head: 128 -> 64 -> 7, ReLU, no dropout/BatchNorm in this head.
+  optimizer: Adam, learning rate 1e-4.
+  minibatch size: 64.
+  replay capacity: 50,000 transitions.
+  warmup: 1,000 valid transitions if enough nonterminal episodes exist.
+  training updates: one per collected transition after warmup.
+  target copy: every 500 optimizer updates.
+  loss: Huber; gradient norm cap: 10.
+  gamma: 1.0.
+  exploration: epsilon 1.0 declining to .05 over the first 30% of planned
+    environment steps; greedy evaluation.
+  first pilot budget: 20,000 transitions, with validation every 1,000.
+  reproducibility: at least three prespecified seeds for final comparisons.
+
+These are proposed pilot settings, not results or a guarantee of convergence.
+Monitor whether many questions stop immediately, whether valid actions are
+explored, and whether replay is dominated by a few long episodes. With very
+few unique questions, more transitions can overfit the simulator.
+
+Select checkpoints using full validation trajectories, such as mean
+correctness-minus-cost utility at fixed lambda. If the application demands
+an accuracy floor, predeclare that constrained selection criterion. Do not
+select by lowest TD loss alone; a lower value-fitting loss need not yield a
+better policy.
+
+Compare mean Q-values with observed returns for diagnostics; do not interpret
+them as calibrated correctness probabilities. Large divergence, unsupported
+action values, or dependence on query IDs indicates a problem to audit.
+
+If a new policy visits states poorly covered by snapshot training, first
+measure the predictor's failure on those states. An iteration may collect
+more reachable training snapshots and retrain the predictor, but that creates
+a new encoder version and requires retraining the action head. It is not
+part of one frozen-head run.
+
+
+19. RUNTIME ALGORITHM AND WORKED EXAMPLE
+
+Deployment pseudocode:
+
+  retrieve the configured exemplar list
+  acquire ZS1 and evaluator R1 with required baseline and CCS
+  initialize cost ledger
+
+  loop:
+      obs = build_observation(acquired_data, budget)
+      h, predictions = frozen_snapshot_model(obs)
+      chosen = select_existing_candidate(predictions)
+      valid = compute_affordable_valid_actions(acquired_data, budget)
+
+      if configured_stop_rule(predictions, chosen):
+          return chosen, predictions, cost, confidence_stop_reason
+      if budget_exhausted or no_valid_action:
+          return chosen, predictions, cost, forced_stop_reason
+
+      q_values = action_head(h)
+      action = argmax q_values over valid actions
+      new_data, actual_cost = execute_action(action)
+      update acquired_data and cost ledger
+
+There are no optimizer updates, teacher calls, true-target checks, or
+exploratory actions in ordinary deployment. Stop after the acquisition
+bundle completes; mid-bundle stopping is a future protocol change.
+
+Hypothetical trajectory, not an experimental result:
+
+  Initial: ZS1 + R1. No confident stopping condition is met.
+  Cost so far: 11 solver generations.
+
+  RL adds R2. With one existing candidate this costs 5*(1+1)=10.
+  New total: 21. No new candidate is automatically created.
+
+  New probe evidence lowers confidence in ZS1. The controller now prefers
+  a one-shot candidate from R2. This costs 1+5*2=11.
+  New total: 32 solver generations.
+
+  The snapshot model predicts that OS2 should be returned, and the configured
+  stopping gate is met. The application returns OS2 and records why it stopped.
+
+Whether OS2 is actually correct is known only in historical evaluation.
+The example shows how an evaluator can both inform a decision and enable a
+new source-conditioned generation. It does not assume R2 was identifiable
+as the best source at the first step.
+
+The complete 32-solver-call trajectory has 30 evaluator grading operations
+if all baseline/probe outputs are graded individually. Target-candidate
+grading is excluded from deployment. Dollar/token/latency comparisons need
+the corresponding measured accounting rather than solver counts alone.
+
+
+20. EVALUATION, ABLATIONS, AND STATISTICAL REPORTING
+
+Evaluate each learning stage and the final system. Do not use AP alone to
+judge a policy whose purpose is final answer selection at low cost.
+
+Teacher evaluation:
+  all-query Top-1, AP with declared no-positive convention, conditional AP,
+  oracle candidate coverage, log loss, and calibration diagnostics.
+
+Snapshot evaluation:
+  correctness and selection metrics by candidate/evaluator count;
+  SAFE/MAX member and presence precision/recall;
+  false stopping-gate activations;
+  all-wrong-pool behavior and global/member consistency.
+
+End-to-end policy evaluation:
+  all-query selected-answer accuracy;
+  mean, median, p90, and p95 cost;
+  latency measured separately from total calls;
+  confident-stop error and coverage;
+  forced-stop frequency and reasons;
+  final candidate/evaluator counts;
+  acquired-pool oracle coverage and full-pool oracle coverage;
+  zero-shot selection fraction;
+  paired correctness changes against fixed-budget selection.
+
+Pool coverage is the fraction of questions whose pool contains at least one
+correct candidate. Acquired-pool coverage measures what the policy found;
+selection accuracy measures whether it selected correctly from that pool.
+They diagnose generation/acquisition failures separately from ranking errors.
+
+Report numerator and denominator for small benchmarks. Include all-wrong
+queries in main accuracy. An empty conditional metric is undefined, not a
+reason to silently drop the benchmark from an aggregate labeled otherwise.
+
+Core baselines, using the same frozen predictor and stopping rule when
+comparing acquisition choices:
+  fixed cyclic or prespecified acquisition order;
+  evaluator-first and candidate-first with valid-action fallbacks;
+  random valid action;
+  simple heuristic acquisition;
+  RL acquisition.
+
+Also show complete fixed-budget inference and fixed small-budget procedures.
+Compare both at matched cost and at matched accuracy tolerance. Keep the
+same candidate-generation and probe protocols across comparisons.
+
+Essential ablations:
+  raw CCS alone versus CCS+Base-CCS;
+  full raw profiles versus clipped marginal profiles;
+  snapshot correctness-only versus SAFE/MAX auxiliary training;
+  presence-only versus selected-candidate-gated stopping;
+  SAFE, MAX, and reliability modes, with appropriately matched controllers;
+  heuristic/random versus learned action choice under identical gates;
+  fixed full-evidence scorer versus snapshot-trained predictor;
+  frozen encoder versus a separately named fine-tuned extension if studied.
+
+Useful additional controls:
+  zero-shot-only, one-shot-only, mixed pools;
+  Self/Others/All evaluator use and source-exposure checks;
+  saturation strata and available-candidate counts;
+  small vanilla DQN versus Double DQN;
+  budgets/cost weights and actual-call versus token-cost accounting.
+
+Use paired bootstrap over questions, keeping each question's entire
+trajectory together. Never treat its snapshots as independent samples.
+For benchmark-macro estimates, resample within each fixed benchmark and
+recompute the declared aggregate. Report variation across training seeds
+separately from uncertainty over test questions.
+
+The principal efficiency claim is an accuracy-cost tradeoff. A prespecified
+noninferiority tolerance, such as an application-chosen maximum acceptable
+accuracy loss, helps distinguish useful savings from simply stopping early
+and accepting many more wrong answers. The tolerance must be chosen before
+seeing final results.
+
+Inspect error cases where RL stops cheaply but wrongly, collects almost all
+evidence, chooses a poor generation source, or fails to acquire a correct
+candidate that existed in the full pool. Include all cases in aggregate
+metrics, not only illustrative successes.
+
+
+21. KNOWN LIMITS AND WHAT WOULD FALSIFY THE CLAIMS
+
+If all candidates are wrong, no selector can return a correct recorded
+answer. Expanding the pool is a separate generation experiment.
+
+If all relevant observed features collapse to the same h_t, the head cannot
+distinguish the situations. A frozen encoder trained only for prediction
+may lose information useful for action choice.
+
+If every episode reaches the full pool, ordering alone does not save the
+bundled solver-call cost. Investigate stopping behavior before attributing
+efficiency to RL.
+
+If SAFE/MAX auxiliaries do not help, report that and retain correctness-only
+prediction as the simpler result. A retrospective correct prefix is not
+automatically an optimal stopping target.
+
+If RL matches random acquisition under the same gate, any observed savings
+may come from stopping rather than intelligent acquisition. The contribution
+must then be described accordingly.
+
+If confidence gates are unreliable on new benchmarks, report their failure
+and avoid calling them certified certainty. Model/provider/prompt changes
+may require new measurements, predictor training, and calibration.
+
+If source-only probes drive gains, the method may be detecting exposure to
+the original source rather than generalizable reasoning transfer. Independent
+evaluator tests remain important to the original paper claim.
+
+If cached replay assumes history-independent prompts but the deployed
+system changes generation based on history, the simulation no longer
+evaluates the deployed method. Collect compatible data or narrow the claim.
+
+The fixed seven-action head is specific to the declared capacities and
+source slots. Larger K or repeated source generations require a changed
+action/schema contract and evaluation, not unchecked extrapolation.
+
+
+22. IMPLEMENTATION MODULES AND SAVED ARTIFACTS
+
+Keep implementation modular without creating unnecessary infrastructure.
+Suggested responsibilities, not files created by this document:
+
+  data preparation:
+    stream original logs, validate records, build compact arrays and report.
+  split/teacher training:
+    grouped manifests, cross-fit teachers, save full predictions and labels.
+  snapshot construction:
+    masks, costs, reachable transitions, normalized observation building.
+  snapshot training:
+    supervised encoder/heads, checkpoint selection, prediction diagnostics.
+  environment:
+    hidden records, reset/step, action masks, stopping, reward ledger.
+  RL training:
+    small Q head, replay, target updates, greedy development evaluation.
+  reporting:
+    all-query metrics, paired comparisons, cost curves, failure audit.
+
+Save at least:
+  data/schema version and input file hashes;
+  target grouping and split manifest;
+  original query/source identities;
+  data quality report and exclusions;
+  fold assignments and teacher checkpoints/predictions;
+  SAFE/MAX definitions, tie rule, and label version;
+  normalization parameters and snapshot field ordering;
+  encoder/prediction-head checkpoint and hidden dimension;
+  calibration parameters, stop mode, thresholds, and selector rule;
+  action mapping, cost units, budget admission/fallback policy;
+  RL online and target weights, optimizer and RNG state for resume;
+  replay state or deterministic regeneration specification;
+  lambda, gamma, hyperparameters, seeds, dependency versions;
+  per-question final predictions, trajectories, cost ledger, stop reasons.
+
+Keep rollout audit records readable:
+  question ID, stage, masks, chosen candidate ID, predictions, action mask,
+  chosen action, incremental/cumulative cost, and stop reason.
+Offline truth/reward columns should be explicitly marked evaluation-only.
+
+Checkpoint loading must reject incompatible schema/encoder/action versions.
+Changing one stage silently while reusing another stage's weights is a
+scientific compatibility problem as well as a software problem.
+
+
+23. VERIFICATION AND ACCEPTANCE CHECKS
+
+Before any large training run, use small synthetic records with known
+outcomes to verify behavior. These are contract checks, not benchmark proof.
+
+SAFE/MAX:
+  empty prefix when first candidate is wrong;
+  complete prefix when all are correct;
+  the provided C1/C4/C5 example;
+  fixed labels across snapshots;
+  deterministic score ties without correctness access.
+
+Observation isolation:
+  changing a hidden future CCS or candidate label must not change the
+  current observation, h_t, action mask, or chosen action;
+  acquiring an observation can change the subsequent state;
+  unavailable slots cannot be selected as returned answers;
+  no teacher ordering or target identity leaks through feature positions.
+
+Losses/freezing:
+  absent candidate slots do not contribute candidate BCE;
+  existing measured zero differs from missing;
+  encoder and old-head tensors/buffers remain unchanged during RL;
+  gradients and optimizer state exist only for the action head;
+  frozen hidden output is deterministic under identical observations.
+
+Simulator/cost:
+  each source dependency is enforced;
+  no duplicate acquisition or unrecorded generation is possible;
+  all routes to the same full pool have the same solver-call total;
+  initialization is charged in reporting;
+  the stated full pool has 233 solver generations;
+  cost admission does not inspect unobserved future outcomes.
+
+RL targets:
+  invalid actions cannot win exploration, selection, or bootstrap maxima;
+  terminal transitions have no future-value term;
+  no-valid-action states terminate safely;
+  budget completion includes actual selected-answer reward exactly once;
+  terminal-at-initial-state episodes are reported even with no RL step.
+
+Splits/reporting:
+  target groups never cross roles;
+  out-of-fold predictions really exclude their target during teacher fit;
+  all snapshots inherit their target's split;
+  all-wrong pools remain in accuracy;
+  macro denominators match their labels;
+  paired baselines share the same questions and accounting convention.
+
+Before larger runs, a tiny environment with deliberately obvious good/bad
+actions should be learnable. Success only demonstrates implementation sanity.
+Then compare held-out real-question behavior with simple baselines before
+increasing head size or training duration.
+
+
+24. PAPER CONTRIBUTIONS AND NARRATIVE
+
+The evolving paper can contain four connected contributions:
+
+  1. Behavioral analogical evaluation:
+     Reuse candidate solutions on known-answer problems to obtain evidence
+     predictive of target correctness.
+
+  2. Learned interpretation of transfer evidence:
+     Preserve raw response profiles, evaluator competence, similarities,
+     and provenance; learn how these relate to correctness rather than
+     requiring positive clipped gains.
+
+  3. Candidate-mediated context selection:
+     Rank exemplar-conditioned and zero-shot outputs together, enabling
+     selection of an already generated answer without assuming retrieval
+     always helps. Strong claims about future exemplar utility require
+     fresh generations after source selection.
+
+  4. Adaptive acquisition of candidates and evidence:
+     Train a small RL head on a frozen partial-observation representation
+     to choose acquisitions under application-controlled stopping, aiming
+     to improve the correctness-cost tradeoff.
+
+The SAFE/MAX construction is a specific proposed supervisory mechanism
+inside the system. Whether it deserves a headline contribution depends on
+ablations, interpretability, and reliable practical benefit.
+
+The architecture alone is not the novelty claim: supervised verification,
+calibration, DQN, and costly-feature acquisition already have substantial
+literature [1-4]. The research opportunity is the combination of analogical
+measurement, partial-profile prediction, and adaptive generation/evaluation
+decisions, together with evidence for when and why it helps.
+
+Suggested narrative paragraph:
+
+  We study solution selection through the observable effects of reusing
+  candidate reasoning on related known-answer problems. A learned predictor
+  interprets these transfer responses together with evaluator baselines and
+  source information. Because collecting a complete response matrix can be
+  expensive, we extend prediction to partial observations and train a small
+  acquisition controller on the predictor's frozen hidden representation.
+  The controller chooses between obtaining another evaluator and generating
+  another candidate, while an explicit application policy decides when to
+  return an answer. We assess both the correctness evidence provided by
+  transfer behavior and the cost of acquiring enough evidence for selection.
+
+Use prospective language until experiments are complete. Do not claim the
+system proves reasoning validity, guarantees certainty, always finds MAX,
+or has reduced calls without measuring complete end-to-end trajectories.
+
+
+25. ORDERED IMPLEMENTATION PLAN AND DECISION REGISTER
+
+Milestone 1: audit and compact the logs.
+  Verify 3/5/8 pools, labels, rates, statuses, duplicates, and cost records.
+  Resolve the earlier empty AIME25 reporting issue from actual records.
+
+Milestone 2: freeze grouped splits and full-data teacher protocol.
+  Produce baseline metrics and cross-fitted rankings.
+
+Milestone 3: derive and test SAFE/MAX labels.
+  Save exact definitions and empty-label frequencies.
+
+Milestone 4: implement the pure snapshot/transition simulator.
+  Test reachability, non-leakage, masks, and cost invariants before learning.
+
+Milestone 5: train the supervised snapshot network.
+  Compare correctness-only versus auxiliary SAFE/MAX heads.
+  Check early-state performance, not only full-state scores.
+
+Milestone 6: lock a stopping/selection configuration.
+  Use development data; retain separate final reliability audit data.
+  Run random/fixed acquisition baselines before adding RL.
+
+Milestone 7: attach and train only the small masked DQN head.
+  Keep the entire prediction path frozen; measure actual policy utility.
+
+Milestone 8: freeze and evaluate full trajectories.
+  Audit stop reliability, report accuracy-cost tradeoffs and paired results,
+  and disclose limitations of cached simulation.
+
+Milestone 9: perform a small live sequential validation.
+  Only after implementation and explicit authorization for paid calls.
+  Match prompts and settings to simulation; compare cost and outcomes.
+
+Milestone 10: expand only where evidence motivates it.
+  Optional Double DQN, sparse trials, larger pools, dynamic action scoring,
+  fresh source generations, or revised representations become separately
+  versioned experiments.
+
+Choices already specified for proposed V1:
+  fixed maximum 8 candidates / 5 evaluators;
+  one initial zero-shot candidate plus top evaluator;
+  bundled five-trial measurements;
+  next-in-order evaluator acquisition;
+  one-shot source-specific actions and sequential zero-shot actions;
+  application-controlled stopping; no learned STOP action;
+  frozen snapshot hidden representation as the RL head input;
+  masked vanilla DQN with correctness-minus-cost reward;
+  optional Double DQN comparison rather than mandatory complexity.
+
+Choices to register before running, rather than infer from results:
+  exact split allocation and duplicate grouping;
+  data eligibility and API-failure policy;
+  SAFE/MAX membership gates versus presence-only modes;
+  which candidate is returned in each stop mode;
+  stop thresholds and desired empirical reliability;
+  cost unit, lambda, maximum budget, and admission policy;
+  checkpoint-selection metrics and training step budget;
+  trial-count availability and actual provider/prompt versions.
+
+These unresolved numeric/application choices do not prevent understanding
+or implementing the modular design. They do prevent a scientifically
+meaningful claim until they are fixed and reported.
+
+
+26. GLOSSARY, SOURCES, AND FINAL HANDOFF CONTRACT
+
+Candidate: one generated proposed solution to the target.
+Evaluator: a known-answer exemplar activated for reverse-solving probes.
+CCS: measured reference-answer success rate under candidate conditioning.
+Base-CCS: measured evaluator success rate without candidate conditioning.
+Teacher: full-evidence correctness scorer used offline for supervision.
+Snapshot: exactly the acquired observations at one decision point.
+Encoder: network mapping the snapshot to its final hidden vector h_t.
+Prediction head: output layer estimating correctness or membership/presence.
+SAFE: the full teacher ranking's leading all-correct prefix, by definition.
+MAX: the first teacher-ranked candidate only if that prefix is nonempty.
+Calibration: checking/fitting the relationship between scores and observed
+             correctness under a declared evaluation population.
+Action head: small RL network mapping h_t to acquisition values.
+Q-value: expected future reward conditional on an observation and action;
+         not a correctness probability or a guarantee.
+Replay buffer: stored transitions reused for RL minibatch training.
+Target head: periodically refreshed Q-head copy used for stable targets.
+Episode: one target's acquisition sequence until application termination.
+Oracle coverage: retrospective fraction of pools containing a correct answer.
+Mask: explicit indicator of existence, observation, or action validity.
+
+Primary references checked for this specification:
+
+[1] Guo et al., On Calibration of Modern Neural Networks (ICML 2017).
+    https://proceedings.mlr.press/v70/guo17a.html
+    Supports the distinction between classifier scores and calibrated
+    confidence, and motivates evaluating probability quality separately.
+
+[2] Stable-Baselines3, DQN documentation (accessed 20 September 2026).
+    https://stable-baselines3.readthedocs.io/en/master/modules/dqn.html
+    Describes vanilla DQN with replay and a target network; the documented
+    implementation does not itself imply Double DQN or our mask contract.
+
+[3] van Hasselt, Guez, Silver, Deep Reinforcement Learning with Double
+    Q-learning.
+    https://arxiv.org/abs/1509.06461
+    Motivation for the optional separation of next-action selection and
+    evaluation in the Double DQN bootstrap.
+
+[4] Janisch, Pevny, and Lisy, Classification with Costly Features Using
+    Deep Reinforcement Learning (AAAI 2019).
+    https://ojs.aaai.org/index.php/AAAI/article/view/4287
+    A relevant precedent for sequential acquisition decisions with costs.
+    The proposed system additionally acquires new candidate solutions.
+
+This is a focused set of methodological anchors, not an exhaustive novelty
+review. Most of this document is a proposed task-specific design and direct
+reasoning from the author's pipeline, rather than a summary of those papers.
+
+Local implementation anchors inspected:
+  neural_network_train_and_benchmark_eval.py
+  analogical_math_rag/src/layer1_base_execution.py
+  analogical_math_rag/src/pipeline_steps.py
+  research_story_analogical_transfer_neural_verification.txt
+
+Handoff contract:
+  Train the complete-data teacher for rankings and auxiliary labels.
+  Train a separate predictor of partial snapshots.
+  Freeze that predictor completely.
+  Train only a small acquisition head from its final hidden representation.
+  Let the application stop under a fixed, explicitly evaluated policy.
+  Reward correctness of the returned answer minus actual acquisition cost.
+  Keep hidden outcomes out of observations and all final evaluation labels
+  out of development decisions.
+
+The system learns both how to interpret analogical evidence and where to
+spend the next computation, while preserving the distinction between known
+training outcomes, predictions at deployment, and uncertainty that remains.

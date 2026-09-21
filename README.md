@@ -27,6 +27,8 @@ directory.
 - `src/evaluation.py` — answer evaluation and aggregate metrics.
 - `src/benchmark_data.py` — Hugging Face benchmark schemas, downloads, and
   question/ground-truth normalization.
+- `src/layer1_grouping.py` - independent all-combinations few-shot generation
+  and target-answer evaluation without the Layer 1 CCS matrix.
 - `src/layer1_base_execution.py`, `src/layer2_analysis.py`, and
   `src/layer2_integration.py` — cached execution and offline analysis.
 - `src/*_dataset_builder.py` — optional dataset-construction workflows.
@@ -45,6 +47,29 @@ directory.
 4. Set `BENCHMARK_MAX_QUESTIONS` to a small number before a full experiment.
 5. Replace the Hugging Face placeholder values or set
    `PERSIST_RESULTS_ONLINE` to `False`.
+
+## Layer-1 grouping companion run
+
+Run grouping as its own experiment so its JSON can later be paired with the
+ordinary Layer-1 JSON by `target_query_original_hard_list_idx`:
+
+```python
+{
+    "experiment_name": "Layer1_Grouping_K5_Sizes_2_3",
+    "USE_RETRIEVAL": True,
+    "TOP_N_CANDIDATES_RETRIEVAL": 5,
+    "APPLY_LAYER1_BASE_EXECUTION": False,
+    "APPLY_LAYER1_GROUPING": True,
+    "LAYER1_GROUPING_ONLY_MODE": True,
+    "LAYER1_GROUP_SIZES": [2, 3],
+    "N_PASS_ATTEMPTS": 1,
+}
+```
+
+For K retrieved samples this makes one solver call and one correctness-
+evaluation call for every configured combination. For example, K=5 and sizes
+`[2, 3]` creates `C(5,2) + C(5,3) = 20` candidates. Grouping does not run
+baseline or candidate-conditioned CCS calls.
 
 Runtime data is written below the configured `local_data/` or Kaggle output
 directory; it is not source code and should not be edited by hand.

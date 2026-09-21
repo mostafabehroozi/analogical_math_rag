@@ -70,6 +70,7 @@ from src.layer1_base_execution import (
     _get_cache_filename, 
     _get_cache_path
 )
+from src.layer1_grouping import run_layer1_grouping
 from src.layer2_integration import run_layer2_complete_pipeline
 
 from src.utils import save_json, save_json_atomic, load_json
@@ -374,17 +375,21 @@ def _validate_distributed_scope(
                 "for another output artifact."
             )
         published_result_filenames.update(result_filenames)
-        if effective.get("APPLY_LAYER1_BASE_EXECUTION", False) and hard_solutions is None:
+        requires_target_labels = bool(
+            effective.get("APPLY_LAYER1_BASE_EXECUTION", False)
+            or effective.get("APPLY_LAYER1_GROUPING", False)
+        )
+        if requires_target_labels and hard_solutions is None:
             raise DistributedExecutionError(
-                "Distributed Layer 1 requires hard_solutions so ground-truth identity can be "
+                "Distributed Layer 1/grouping requires hard_solutions so ground-truth identity can be "
                 "frozen in the manifest and checked during merge."
             )
-        if effective.get("APPLY_LAYER1_BASE_EXECUTION", False) and any(
+        if requires_target_labels and any(
             solution is None or not str(solution).strip()
             for solution in ([] if hard_solutions is None else hard_solutions)
         ):
             raise DistributedExecutionError(
-                "Distributed Layer 1 requires a non-empty ground-truth solution for every question."
+                "Distributed Layer 1/grouping requires a non-empty ground-truth solution for every question."
             )
 
 
@@ -653,6 +658,8 @@ def run_pipeline_for_single_query(
                     # Layer 1 Flags
                     "APPLY_LAYER1_BASE_EXECUTION", "LAYER1_ONLY_MODE", "LAYER1_CACHE_DIR",
                     "LAYER1_N_CANDIDATES", "LAYER1_ONE_SHOT_CANDIDATES_N", "LAYER1_DATASET_NAME",
+                    "APPLY_LAYER1_GROUPING", "LAYER1_GROUPING_ONLY_MODE", "LAYER1_GROUP_SIZES",
+                    "LAYER1_GROUPING_PROMPT_TEMPLATE", "LAYER1_GROUPING_TEMPERATURE",
                     # Reverse Validation Flags
                     "APPLY_REVERSE_VALIDATION", "REVERSE_VALIDATION_CANDIDATES_N",
                     "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N",
@@ -767,7 +774,9 @@ def run_pipeline_for_single_query(
             run_log['layer1_base_execution_state'] = layer1_state
             
             # --- FIXED: Handle LAYER1_ONLY_MODE correctly regardless of success/failure ---
-            if config.get('LAYER1_ONLY_MODE', False):
+            if config.get('LAYER1_ONLY_MODE', False) and not config.get(
+                'APPLY_LAYER1_GROUPING', False
+            ):
                 overall_status = layer1_state.get('overall_status', 'FAILURE')
                 
                 print(f"\n[LAYER 1 COMPLETE] Layer 1 Only Mode is active. Status: {overall_status}. Pipeline execution halted.")
@@ -781,6 +790,85 @@ def run_pipeline_for_single_query(
             
             # Otherwise, continue with the main pipeline (if LAYER1_ONLY_MODE is False)
             logger.info(f"Layer 1 completed. Status: {layer1_state.get('overall_status')}. Proceeding with main pipeline.")
+
+    # --- LAYER 1 GROUPING: INDEPENDENT FEW-SHOT COMBINATION RUN ---
+    if config.get('APPLY_LAYER1_GROUPING', False):
+        print("\n[PRE-PROCESSING] LAYER 1 GROUPING ENABLED")
+
+        grouping_ground_truth = None
+        if hard_solutions and hard_list_idx < len(hard_solutions):
+            grouping_ground_truth = hard_solutions[hard_list_idx]
+        elif (
+            'ground_truths' in exemplar_data
+            and hard_list_idx < len(exemplar_data['ground_truths'])
+        ):
+            grouping_ground_truth = exemplar_data['ground_truths'][hard_list_idx]
+        elif (
+            'solutions' in exemplar_data
+            and config.get('hard_questions_length') == len(exemplar_data['solutions'])
+        ):
+            grouping_ground_truth = exemplar_data['solutions'][hard_list_idx]
+
+        if not grouping_ground_truth:
+            grouping_state = {
+                "overall_status": "FAILURE",
+                "error": (
+                    f"No ground-truth solution is available for grouping query "
+                    f"#{hard_list_idx}."
+                ),
+            }
+        else:
+            reusable_retrieved_set = None
+            if 'layer1_base_execution_state' in run_log:
+                reusable_retrieved_set = run_log['layer1_base_execution_state'].get(
+                    'retrieved_set'
+                )
+            grouping_state = run_layer1_grouping(
+                target_query_index=hard_list_idx,
+                target_query=target_query,
+                ground_truth_answer=grouping_ground_truth,
+                embedding_model=embedding_model,
+                exemplar_data=exemplar_data,
+                api_manager_solve=manager_for_solve,
+                api_manager_eval=manager_for_eval,
+                config=config,
+                retrieved_set=reusable_retrieved_set,
+            )
+
+        run_log['layer1_grouping_state'] = grouping_state
+        stop_after_grouping = bool(
+            config.get('LAYER1_GROUPING_ONLY_MODE', False)
+            or (
+                config.get('APPLY_LAYER1_BASE_EXECUTION', False)
+                and config.get('LAYER1_ONLY_MODE', False)
+            )
+        )
+        if stop_after_grouping:
+            grouping_status = grouping_state.get('overall_status', 'FAILURE')
+            statuses = [grouping_status]
+            if 'layer1_base_execution_state' in run_log:
+                statuses.append(
+                    run_log['layer1_base_execution_state'].get(
+                        'overall_status', 'FAILURE'
+                    )
+                )
+            if all(status == 'SUCCESS' for status in statuses):
+                run_log['pipeline_status'] = 'SUCCESS'
+            elif any(status in {'SUCCESS', 'PARTIAL'} for status in statuses):
+                run_log['pipeline_status'] = 'PARTIAL'
+            else:
+                run_log['pipeline_status'] = 'FAILURE'
+            run_log['execution_mode'] = (
+                'layer1_and_grouping_only'
+                if 'layer1_base_execution_state' in run_log
+                else 'layer1_grouping_only'
+            )
+            logger.info(
+                "Layer-1 grouping-only query #%s finished with status %s.",
+                hard_list_idx,
+                run_log['pipeline_status'],
+            )
+            return run_log
 
     # BEST-OF-TRANSFORMATION Pre-processing (Enhancement to best-of-N) 
     if config.get('APPLY_BEST_OF_TRANSFORMATION', False):
