@@ -392,6 +392,26 @@ Final Answer:
 [Your final answer to the Main Question]
 </Your Answer/Output Format>
 """,
+    "revision_same_question_v1": """You are an expert mathematician. Solve the Main Question by critically checking the Candidate Solution.
+
+The candidate attempts the Main Question but may contain incorrect calculations, invalid reasoning, or an incorrect final answer. Check every step independently, retain only useful and valid reasoning, repair errors, and produce one coherent solution. Do not mention the candidate in your answer.
+
+<Candidate Solution>
+{candidate_solution}
+</Candidate Solution>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your checked, step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your Answer/Output Format>
+""",
     "final_solver_v4": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
 
 <Instructions>
@@ -1580,6 +1600,23 @@ def create_merging_prompt(
         main_question_text=main_question_text.strip(),
         candidate_solution_1=str(candidate_solutions[0]).strip(),
         candidate_solution_2=str(candidate_solutions[1]).strip(),
+    )
+
+
+def create_revision_prompt(
+    main_question_text: str,
+    candidate_solution: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Create the control prompt that checks exactly one same-question solution."""
+    template_name = (config or {}).get(
+        "PROMPT_TEMPLATE_REVISION", "revision_same_question_v1"
+    )
+    if template_name not in PROMPT_TEMPLATES:
+        raise KeyError(f"Unknown revision prompt template: {template_name!r}")
+    return PROMPT_TEMPLATES[template_name].format(
+        main_question_text=main_question_text.strip(),
+        candidate_solution=str(candidate_solution).strip(),
     )
 
 

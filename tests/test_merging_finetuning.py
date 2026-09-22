@@ -2,21 +2,31 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.merging_finetuning import (
     build_evaluation_populations,
+    compare_base_and_adapted_candidate_trees,
     compare_base_and_adapted_trees,
+    evaluate_tree_trace,
+    generate_candidate_pool,
     grouped_split,
     load_merging_datasets,
     normalize_question,
     parse_legacy_merging_prompt,
     prepare_merging_data,
+    run_candidate_fusion_tree,
+    run_direct_solution,
+    run_single_candidate_revision,
     run_merging_tree,
     retrieve_exemplars_cpu,
     tokenize_splits,
     upload_adapter_to_hub,
 )
-from src.prompts import EXEMPLAR_FORMAT, create_final_reasoning_prompt, create_merging_prompt
+from src.prompts import (
+    EXEMPLAR_FORMAT, create_final_reasoning_prompt, create_merging_prompt,
+    create_revision_prompt,
+)
 
 
 def legacy_prompt(question="What is 1 + 1?", first="Rationale: a\nFinal Answer: 2", second="Rationale: b\nFinal Answer: 3"):
@@ -210,6 +220,97 @@ class MergingDatasetTests(unittest.TestCase):
 
 
 class MergingTreeTests(unittest.TestCase):
+    def test_candidate_pool_builds_independent_one_shot_candidates_with_base(self):
+        examples = [
+            {"question": "retrieved 1", "solution": "answer 1", "index": 10},
+            {"question": "retrieved 2", "solution": "answer 2", "index": 11},
+        ]
+        generator = RecordingGenerator()
+        pool = generate_candidate_pool(
+            "main question", generator, "one_shot", count=2,
+            retrieved_examples=examples,
+        )
+        self.assertEqual(pool["status"], "SUCCESS")
+        self.assertEqual(len(pool["candidates"]), 2)
+        self.assertIn("Question: retrieved 1", generator.calls[0][0])
+        self.assertNotIn("Question: retrieved 2", generator.calls[0][0])
+        self.assertIn("Question: retrieved 2", generator.calls[1][0])
+        self.assertTrue(all(not kwargs["use_adapter"] for _, kwargs in generator.calls))
+
+    def test_fixed_candidate_comparison_reuses_identical_leaves(self):
+        candidates = [
+            {"node_id": f"candidate-{index}", "kind": "zero_shot_candidate",
+             "status": "SUCCESS", "text": f"candidate answer {index}", "parents": []}
+            for index in range(4)
+        ]
+        generator = RecordingGenerator()
+        compared = compare_base_and_adapted_candidate_trees(
+            "q", candidates, generator
+        )
+        self.assertEqual(compared["base"]["trace"][:4], candidates)
+        self.assertEqual(compared["adapted"]["trace"][:4], candidates)
+        self.assertEqual(len(generator.calls), 6)  # three fusion calls per arm
+        self.assertTrue(all(not kwargs["use_adapter"] for _, kwargs in generator.calls[:3]))
+        self.assertTrue(all(kwargs["use_adapter"] for _, kwargs in generator.calls[3:]))
+
+    def test_fixed_candidate_tree_rejects_failed_leaf(self):
+        generator = RecordingGenerator()
+        result = run_candidate_fusion_tree(
+            "q",
+            [
+                {"node_id": "good", "status": "SUCCESS", "text": "ok"},
+                {"node_id": "bad", "status": "EMPTY", "text": ""},
+            ],
+            generator,
+            use_adapter=True,
+        )
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertEqual(generator.calls, [])
+
+    def test_direct_solution_routes_requested_model_arm(self):
+        generator = RecordingGenerator()
+        result = run_direct_solution("q", generator, use_adapter=True)
+        self.assertEqual(result["status"], "SUCCESS")
+        self.assertTrue(generator.calls[0][1]["use_adapter"])
+
+    def test_single_candidate_revision_uses_only_the_selected_candidate(self):
+        prompt = create_revision_prompt("main q", "selected work")
+        self.assertIn("selected work", prompt)
+        self.assertNotIn("Candidate Solution 2", prompt)
+        generator = RecordingGenerator()
+        result = run_single_candidate_revision(
+            "main q",
+            {"node_id": "candidate-0", "kind": "zero_shot_candidate",
+             "status": "SUCCESS", "text": "selected work", "parents": []},
+            generator,
+            use_adapter=False,
+        )
+        self.assertEqual(result["status"], "SUCCESS")
+        self.assertIn("selected work", generator.calls[0][0])
+        self.assertFalse(generator.calls[0][1]["use_adapter"])
+
+    def test_evaluation_cache_reuses_identical_answer_judgments(self):
+        tree = {
+            "root_node_id": "root",
+            "trace": [
+                {"node_id": "leaf", "kind": "zero_shot_candidate", "parents": [],
+                 "status": "SUCCESS", "text": "same answer"},
+                {"node_id": "root", "kind": "fusion", "parents": ["leaf", "leaf"],
+                 "status": "SUCCESS", "text": "same answer"},
+            ],
+        }
+        cache = {}
+        judged = {"status": "SUCCESS", "is_correct": True}
+        with patch(
+            "src.merging_finetuning.evaluate_single_answer_with_llm",
+            return_value=judged,
+        ) as evaluator:
+            first = evaluate_tree_trace(tree, "truth", object(), {}, cache)
+            second = evaluate_tree_trace(tree, "truth", object(), {}, cache)
+        self.assertTrue(first["root_correct"])
+        self.assertTrue(second["root_correct"])
+        self.assertEqual(evaluator.call_count, 1)
+
     def test_zero_shot_even_tree_routes_leaves_to_base_and_fusions_to_adapter(self):
         generator = RecordingGenerator()
         result = run_merging_tree("q", generator, "zero_shot", zero_shot_n=4)

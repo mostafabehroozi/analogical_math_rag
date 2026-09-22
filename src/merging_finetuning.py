@@ -25,6 +25,7 @@ from src.prompts import (
     create_final_reasoning_prompt,
     create_final_reasoning_prompt_simple,
     create_merging_prompt,
+    create_revision_prompt,
 )
 from src.utils import save_json_atomic
 
@@ -826,6 +827,245 @@ def run_direct_fusion(
     }
 
 
+def generate_candidate_pool(
+    question: str,
+    generator: Callable[..., Dict[str, Any]],
+    source: str,
+    *,
+    count: int,
+    retrieved_examples: Optional[Sequence[Mapping[str, Any]]] = None,
+    seed: int = 42,
+    generation: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generate fixed base-model candidates for controlled fusion experiments.
+
+    ``zero_shot`` samples the target question directly. ``one_shot`` generates
+    one target-question solution per retrieved exemplar, so R1 -> OS1 and
+    R2 -> OS2 remain independent. The adapter is always disabled here.
+    """
+    if source not in {"zero_shot", "one_shot"}:
+        raise ValueError("source must be zero_shot or one_shot")
+    if count < 1:
+        raise ValueError("count must be positive")
+    retrieved = list(retrieved_examples or [])
+    if source == "one_shot" and len(retrieved) < count:
+        raise ValueError(
+            f"one_shot requires at least {count} retrieved examples; got {len(retrieved)}"
+        )
+
+    defaults = {"temperature": 0.7, "top_p": 0.8, "max_new_tokens": 1024}
+    defaults.update(dict(generation or {}))
+    trace: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
+    for index in range(count):
+        parents: List[str] = []
+        if source == "zero_shot":
+            prompt = create_final_reasoning_prompt_simple(
+                question,
+                {"PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v3"},
+            )
+        else:
+            exemplar = retrieved[index]
+            source_id = f"retrieved-example-{index}"
+            trace.append({
+                "node_id": source_id,
+                "kind": "retrieved_exemplar",
+                "parents": [],
+                "status": "SOURCE",
+                "question": exemplar["question"],
+                "text": exemplar["solution"],
+                "retrieval_index": exemplar.get("index"),
+                "similarity": exemplar.get("similarity"),
+            })
+            parents = [source_id]
+            prompt = create_final_reasoning_prompt(
+                question,
+                [EXEMPLAR_FORMAT.format(
+                    question=exemplar["question"], solution=exemplar["solution"]
+                )],
+                {"PROMPT_TEMPLATE_FINAL_SOLVER": "final_solver_v3"},
+            )
+        node = _generation_node(
+            generator,
+            f"candidate-{source}-{index}",
+            f"{source}_candidate",
+            prompt,
+            parents,
+            False,
+            seed + index,
+            defaults,
+        )
+        trace.append(node)
+        candidates.append(node)
+
+    failed = [node["node_id"] for node in candidates if node.get("status") != "SUCCESS"]
+    return {
+        "status": "INCOMPLETE" if failed else "SUCCESS",
+        "source": source,
+        "question": question,
+        "candidates": candidates,
+        "failed_nodes": failed,
+        "trace": trace,
+        "generation": defaults,
+    }
+
+
+def run_candidate_fusion_tree(
+    question: str,
+    candidate_nodes: Sequence[Mapping[str, Any]],
+    generator: Callable[..., Dict[str, Any]],
+    *,
+    use_adapter: bool,
+    seed: int = 42,
+    generation: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Fuse a stored candidate pool without regenerating any candidate leaves."""
+    if len(candidate_nodes) < 2:
+        raise ValueError("A fusion tree requires at least two candidate nodes.")
+    defaults = {"temperature": 0.7, "top_p": 0.8, "max_new_tokens": 1024}
+    defaults.update(dict(generation or {}))
+    leaves = [dict(node) for node in candidate_nodes]
+    failed = [
+        str(node.get("node_id", index))
+        for index, node in enumerate(leaves)
+        if node.get("status") != "SUCCESS" or not node.get("text")
+    ]
+    if failed:
+        return {
+            "status": "INCOMPLETE", "mode": "fixed_candidates",
+            "question": question, "root_node_id": None, "root_solution": None,
+            "failed_nodes": failed, "trace": leaves, "generation": defaults,
+        }
+
+    trace: List[Dict[str, Any]] = list(leaves)
+    current = leaves
+    layer = 1
+    while len(current) > 1:
+        next_nodes: List[Dict[str, Any]] = []
+        for index in range(0, len(current) - 1, 2):
+            left, right = current[index], current[index + 1]
+            node = _generation_node(
+                generator,
+                f"fusion-{layer}-{index // 2}",
+                "fusion",
+                create_merging_prompt(question, [left["text"], right["text"]]),
+                [left["node_id"], right["node_id"]],
+                use_adapter,
+                seed + layer * 100 + index // 2,
+                defaults,
+            )
+            trace.append(node)
+            next_nodes.append(node)
+        if len(current) % 2:
+            next_nodes.append(current[-1])
+        failed = [node["node_id"] for node in next_nodes if node.get("status") != "SUCCESS"]
+        if failed:
+            return {
+                "status": "INCOMPLETE", "mode": "fixed_candidates",
+                "question": question, "root_node_id": None, "root_solution": None,
+                "failed_nodes": failed, "trace": trace, "generation": defaults,
+            }
+        current = next_nodes
+        layer += 1
+
+    return {
+        "status": "SUCCESS", "mode": "fixed_candidates", "question": question,
+        "root_node_id": current[0]["node_id"], "root_solution": current[0]["text"],
+        "trace": trace, "generation": defaults,
+    }
+
+
+def compare_base_and_adapted_candidate_trees(
+    question: str,
+    candidate_nodes: Sequence[Mapping[str, Any]],
+    generator: Callable[..., Dict[str, Any]],
+    **tree_kwargs: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """Compare base and adapted fusion on exactly the same stored candidates."""
+    return {
+        "base": run_candidate_fusion_tree(
+            question, candidate_nodes, generator, use_adapter=False, **tree_kwargs
+        ),
+        "adapted": run_candidate_fusion_tree(
+            question, candidate_nodes, generator, use_adapter=True, **tree_kwargs
+        ),
+    }
+
+
+def run_direct_solution(
+    question: str,
+    generator: Callable[..., Dict[str, Any]],
+    *,
+    use_adapter: bool,
+    seed: int = 42,
+    generation: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Solve without candidates to measure general-solving changes after SFT."""
+    defaults = {"temperature": 0.7, "top_p": 0.8, "max_new_tokens": 1024}
+    defaults.update(dict(generation or {}))
+    node = _generation_node(
+        generator,
+        "direct-solution-0",
+        "direct_solution",
+        create_final_reasoning_prompt_simple(
+            question,
+            {"PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v3"},
+        ),
+        [],
+        use_adapter,
+        seed,
+        defaults,
+    )
+    success = node.get("status") == "SUCCESS"
+    return {
+        "status": "SUCCESS" if success else "INCOMPLETE",
+        "mode": "direct_solution", "question": question,
+        "root_node_id": node["node_id"] if success else None,
+        "root_solution": node.get("text") if success else None,
+        "trace": [node], "generation": defaults,
+    }
+
+
+def run_single_candidate_revision(
+    question: str,
+    candidate_node: Mapping[str, Any],
+    generator: Callable[..., Dict[str, Any]],
+    *,
+    use_adapter: bool,
+    seed: int = 42,
+    generation: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Check one stored candidate, the control for incremental fusion value."""
+    candidate = dict(candidate_node)
+    if candidate.get("status") != "SUCCESS" or not candidate.get("text"):
+        return {
+            "status": "INCOMPLETE", "mode": "single_candidate_revision",
+            "question": question, "root_node_id": None, "root_solution": None,
+            "failed_nodes": [candidate.get("node_id", "candidate")],
+            "trace": [candidate], "generation": dict(generation or {}),
+        }
+    defaults = {"temperature": 0.7, "top_p": 0.8, "max_new_tokens": 1024}
+    defaults.update(dict(generation or {}))
+    node = _generation_node(
+        generator,
+        "single-revision-0",
+        "revision",
+        create_revision_prompt(question, candidate["text"]),
+        [candidate["node_id"]],
+        use_adapter,
+        seed,
+        defaults,
+    )
+    success = node.get("status") == "SUCCESS"
+    return {
+        "status": "SUCCESS" if success else "INCOMPLETE",
+        "mode": "single_candidate_revision", "question": question,
+        "root_node_id": node["node_id"] if success else None,
+        "root_solution": node.get("text") if success else None,
+        "trace": [candidate, node], "generation": defaults,
+    }
+
+
 def build_evaluation_populations(
     prepared: Mapping[str, Any],
     benchmark_questions: Sequence[str],
@@ -856,6 +1096,7 @@ def evaluate_tree_trace(
     ground_truth: str,
     evaluator_manager: Any,
     evaluator_config: Mapping[str, Any],
+    evaluation_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Judge successful generated nodes and compute transparent transition counts."""
     judged: Dict[str, Optional[bool]] = {}
@@ -863,9 +1104,16 @@ def evaluate_tree_trace(
     for node in tree_result.get("trace", []):
         if node.get("status") != "SUCCESS" or not node.get("text"):
             continue
-        result = evaluate_single_answer_with_llm(
-            node["text"], ground_truth, evaluator_manager, dict(evaluator_config)
-        )
+        cache_key = hashlib.sha256(
+            (str(ground_truth) + "\0" + str(node["text"])).encode("utf-8")
+        ).hexdigest()
+        result = (evaluation_cache or {}).get(cache_key)
+        if result is None:
+            result = evaluate_single_answer_with_llm(
+                node["text"], ground_truth, evaluator_manager, dict(evaluator_config)
+            )
+            if evaluation_cache is not None:
+                evaluation_cache[cache_key] = dict(result)
         judged[node["node_id"]] = result.get("is_correct") if result.get("status") == "SUCCESS" else None
         judge_status[node["node_id"]] = result.get("status", "UNKNOWN")
     transitions = {"corrections": 0, "regressions": 0, "unchanged": 0, "unknown": 0}
