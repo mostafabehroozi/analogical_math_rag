@@ -2,6 +2,7 @@
 import copy
 import ast
 import json
+import xml.etree.ElementTree as ET
 from dataclasses import asdict
 from pathlib import Path
 
@@ -45,6 +46,35 @@ def fake_predictor(cfg):
     a.seed_everything(7)
     model = a.ResNet(cfg.input_dim, 3*cfg.n+2, cfg)
     return a.FrozenPredictor({"weights": a.cpu_state(model), "temperatures": np.ones(5)}, cfg, torch.device("cpu"))
+
+
+class ScriptedPredictor:
+    """Fixed predictions from visible candidate masks for reward accounting tests."""
+    device = torch.device("cpu")
+
+    def __init__(self, cfg, second_score=.9, safe_score=0., safe_on_second=False):
+        self.cfg, self.second_score, self.safe_score = cfg, second_score, safe_score
+        self.safe_on_second = safe_on_second
+
+    def predict(self, record, state):
+        p = np.zeros(3*self.cfg.n+2, np.float32)
+        p[0] = .8
+        if a.present_mask(state, self.cfg)[1]:
+            p[1] = self.second_score
+        p[3*self.cfg.n] = (self.safe_score if not self.safe_on_second
+                           or a.present_mask(state, self.cfg)[1] else 0.)
+        return np.zeros(self.cfg.hidden_dim, np.float32), p
+
+
+def scripted_episode(cfg, labels, actions, predictor=None, reward_weight=None):
+    r = record(cfg)
+    r.labels[:] = labels
+    env = a.CachedEnvironment(r, predictor or ScriptedPredictor(cfg), cfg, reward_weight)
+    rewards = []
+    for action in actions:
+        reward, done = env.step(action)
+        rewards.append(reward)
+    return env, rewards
 
 
 def test_schema_counts_and_all_wrong_labels():
@@ -228,7 +258,7 @@ def test_bellman_masks_terminals_and_double_dqn():
 
 def test_terminal_reward_selects_actual_answer_and_charges_cost():
     cfg = a.Config(device="cpu", hidden_dim=8, residual_blocks=1, max_cost=17,
-                   stop_threshold=1, member_threshold=1)
+                   stop_threshold=1, member_threshold=1, early_quality_weight=0)
     r, predictor = record(cfg), fake_predictor(cfg)
     env = a.CachedEnvironment(r, predictor, cfg)
     assert np.flatnonzero(a.valid_actions(env.state, cfg)).tolist() == [1,2]
@@ -238,6 +268,77 @@ def test_terminal_reward_selects_actual_answer_and_charges_cost():
     assert reward == pytest.approx(r.labels[selected] - cfg.cost_weight*6/cfg.full_cost)
     with pytest.raises(ValueError, match="termination"):
         env.step(0)
+
+
+def test_early_quality_reward_prefers_earlier_correct_selection():
+    cfg = a.Config(k=1, zero_shots=2, repeats=1, stop_threshold=1,
+                   member_threshold=1, early_quality_weight=.1)
+    early, er = scripted_episode(cfg, [0, 1, 0], [1, 2])
+    late, lr = scripted_episode(cfg, [0, 1, 0], [2, 1])
+    assert early.reason == late.reason == "pool_exhaustion"
+    assert early.early_quality() == pytest.approx(.5)
+    assert late.early_quality() == pytest.approx(0)
+    assert sum(er) == pytest.approx(1 - cfg.cost_weight*4/cfg.full_cost + .1*.5)
+    assert sum(lr) == pytest.approx(1 - cfg.cost_weight*4/cfg.full_cost)
+    _, old = scripted_episode(cfg, [0, 1, 0], [1, 2], reward_weight=0)
+    assert sum(old) == pytest.approx(1 - cfg.cost_weight*4/cfg.full_cost)
+    assert old[0] == pytest.approx(-cfg.cost_weight*2/cfg.full_cost)
+    assert old[1] == pytest.approx(1 - cfg.cost_weight*2/cfg.full_cost)
+
+
+def test_early_quality_handles_early_stop_immediate_stop_and_wrong_pools():
+    cfg = a.Config(k=1, zero_shots=2, repeats=1, stop_threshold=.95,
+                   member_threshold=.9, early_quality_weight=.1)
+    early, rewards = scripted_episode(cfg, [0, 1, 0], [1],
+                                      ScriptedPredictor(cfg, safe_score=.99, safe_on_second=True))
+    # A selected-member gate is still required, so SAFE alone cannot stop.
+    assert early.reason is None
+    cfg.require_selected_member = False
+    early, rewards = scripted_episode(cfg, [0, 1, 0], [1],
+                                      ScriptedPredictor(cfg, safe_score=.99, safe_on_second=True))
+    assert early.reason == "safe" and early.early_quality() == pytest.approx(.5)
+    assert sum(rewards) == pytest.approx(1 - cfg.cost_weight*2/cfg.full_cost + .1*.5)
+    immediate = a.CachedEnvironment(record(cfg), ScriptedPredictor(cfg, safe_score=.99), cfg)
+    assert immediate.reason == "safe"
+    assert immediate.early_quality() == float(immediate.record.labels[0])
+    wrong, rewards = scripted_episode(cfg, [0, 0, 0], [1, 2],
+                                      ScriptedPredictor(cfg, safe_score=0))
+    assert wrong.early_quality() == 0 and sum(rewards) == pytest.approx(-cfg.cost_weight*4/cfg.full_cost)
+    lost, rewards = scripted_episode(cfg, [1, 0, 0], [1, 2],
+                                     ScriptedPredictor(cfg, safe_score=0))
+    assert lost.early_quality() == pytest.approx(.5)
+    assert sum(rewards) == pytest.approx(-cfg.cost_weight*4/cfg.full_cost + .1*.5)
+    capped = a.Config(k=1, zero_shots=2, repeats=1, max_cost=5,
+                      stop_threshold=1, member_threshold=1)
+    budget, rewards = scripted_episode(capped, [0, 1, 0], [1])
+    assert budget.reason == "budget" and budget.early_quality() == 0
+    assert sum(rewards) == pytest.approx(1 - capped.cost_weight*2/capped.full_cost)
+
+
+def test_confidence_changes_do_not_change_reward_and_accuracy_ranks_first():
+    cfg = a.Config(k=1, zero_shots=2, repeats=1, stop_threshold=1,
+                   member_threshold=1)
+    _, low = scripted_episode(cfg, [0, 1, 0], [1, 2], ScriptedPredictor(cfg, safe_score=.1))
+    _, high = scripted_episode(cfg, [0, 1, 0], [1, 2], ScriptedPredictor(cfg, safe_score=.9))
+    assert low == high
+    accurate = {"top1": .8, "early_quality": .2, "mean_cost": cfg.full_cost}
+    cheaper = {"top1": .7, "early_quality": 1., "mean_cost": 0}
+    assert a.policy_rank(accurate, cfg) > a.policy_rank(cheaper, cfg)
+    assert not (a.policy_rank(accurate.copy(), cfg) > a.policy_rank(accurate, cfg))
+    with pytest.raises(AssertionError):
+        a.Config(gamma=.9).validate()
+    a.Config(gamma=.9, early_quality_weight=0).validate()
+
+
+def test_unchanged_correct_selection_ignores_action_bundle_partition():
+    cfg = a.Config(k=2, zero_shots=2, max_cost=32, stop_threshold=1,
+                   member_threshold=1)
+    predictor = ScriptedPredictor(cfg, second_score=.1)
+    first, reward_first = scripted_episode(cfg, [1, 0, 0, 0], [0, 1], predictor)
+    second, reward_second = scripted_episode(cfg, [1, 0, 0, 0], [1, 0], predictor)
+    assert first.reason == second.reason == "budget"
+    assert first.early_quality() == second.early_quality() == 1
+    assert sum(reward_first) == pytest.approx(sum(reward_second))
 
 
 def test_query_splits_and_streamed_cache_envelope(tmp_path):
@@ -274,6 +375,23 @@ def test_complete_pipeline_checkpoint_resume_and_oof(tmp_path):
     test.write_text(json.dumps([raw_record(i,cfg,prefix="external",all_wrong=(i==0)) for i in range(5)]))
     work = a.run_pipeline(cfg)
     assert work.results["test"]["adaptive"]["policies"]["rl"]["n"] == 5
+    assert {"rl_baseline", "rl_refined", "rl"} <= set(
+        work.results["test"]["adaptive"]["policies"])
+    assert (tmp_path/"run"/"accuracy_vs_cost_audit.svg").exists()
+    assert ET.parse(tmp_path/"run"/"accuracy_vs_cost_audit.svg").getroot().tag.endswith("svg")
+    assert (tmp_path/"run"/"rl_baseline_completed.pt").exists()
+    assert (tmp_path/"run"/"rl_refined_completed.pt").exists()
+    selected = work.selection["exported"]
+    assert work.results["test"]["adaptive"]["policies"]["rl"] == (
+        work.results["test"]["adaptive"]["policies"][selected])
+    saved = [json.loads(line) for line in (tmp_path/"run"/"final_trajectories.jsonl")
+             .read_text(encoding="utf-8").splitlines()]
+    for method in ("evaluator_first", "candidate_first", "random", "cheapest",
+                   "rl_baseline", "rl_refined"):
+        row = next(row for row in saved if row["benchmark"] == "test" and row["method"] == method)
+        assert row["trajectory"][0]["cost"] == a.state_cost(a.State(), cfg)
+        assert row["trajectory"][-1]["cost"] == row["cost"]
+        assert "offline_selected_correct" in row["trajectory"][-1]
     for fold in work.teacher["folds"]:
         assert not set(fold["heldout_ids"]) & (set(fold["train_ids"]) | set(fold["validation_ids"]))
     assert len(set.union(*(set(f["heldout_ids"]) for f in work.teacher["folds"]))) == len(work.splits["supervised"])

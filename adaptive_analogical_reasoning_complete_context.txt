@@ -4,7 +4,8 @@ From full-evidence correctness prediction to partial-evidence prediction
 and a frozen-encoder reinforcement-learning acquisition head
 
 Prepared: 20 September 2026
-Status: proposed design; no new models trained or benchmark results established.
+Status: design context plus 24 September 2026 implementation update; no new
+real-data training or benchmark result established.
 
 HOW TO READ THIS DOCUMENT
 
@@ -19,7 +20,9 @@ The agreed architectural constraint is central: reinforcement learning updates O
 
 The author's SAFE/MAX definitions are preserved as explicit supervision and configurable stopping modes. A reliability-based stopping alternative is a recommendation to evaluate, not an assertion that SAFE/MAX have been replaced or already validated.
 
-No training script, notebook, experiment configuration, or existing research document is changed by this specification. The underlying benchmark logs still require a direct data audit before implementation or empirical claims.
+The implementation update below changes the training script and self-contained
+notebook. The underlying benchmark logs still require a direct data audit
+before empirical claims.
 
 CONTENTS
 
@@ -796,6 +799,38 @@ the mask contract needs explicit implementation and testing [2].
 
 
 17. REWARD, DELAYED INFORMATION, AND OBJECTIVE CHOICES
+
+Implementation update (24 September 2026): the original correctness-minus-
+cost reward below is retained as the baseline arm. The refined arm adds a
+small reward for having the currently selected answer correct earlier in the
+acquisition sequence. The selected answer is always chosen by the frozen
+predictor. True correctness is read from the training record only by the
+reward and offline evaluation code, never by policy input or stopping.
+
+Let C0 be the fixed initial cost, B the configured budget, C_t the cost of
+completed snapshot t, and y_t=1 only when its selected answer is actually
+correct. Early quality is
+
+  A = [sum_t<T y_t*(C_(t+1)-C_t) + y_T*(B-C_T)]/(B-C0).
+
+When B=C0 or the episode stops immediately, A=y_0. An action adds
+early_quality_weight*y_t*(C_(t+1)-C_t)/(B-C0) to its ordinary reward. On
+termination it also adds the unused-budget contribution using y_T. Default
+early_quality_weight=.10 and gamma=1. Setting the weight to zero gives the
+original reward exactly. This changes the objective intentionally; it is not
+policy-preserving shaping. Higher SAFE/MAX confidence or larger sums of
+candidate probabilities do not receive reward.
+
+Train baseline and refined DQN heads from the same initialization against
+the same frozen predictor and question splits. Rank development checkpoints
+by final selected-answer accuracy, then by .10*mean(A)-.20*mean(cost)/C_ref,
+keeping the earlier checkpoint on an exact tie. The refined head is accepted
+only if this ranking strictly exceeds the strongest existing adaptive
+baseline (baseline RL, random, cheapest, candidate-first, evaluator-first).
+Otherwise export baseline RL and report the strongest simple policy. Audit
+and external data are not used for selection. The report includes both heads,
+early quality, and an accuracy-versus-cost SVG; full evidence has endpoint
+metrics only. This is an offline cached comparison, not live API evidence.
 
 Let C_ref be a declared fixed cost reference, such as the full procedure's
 solver-call count 233. Let c_t be the incremental acquisition cost in the
