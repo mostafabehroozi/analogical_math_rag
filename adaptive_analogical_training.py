@@ -14,6 +14,7 @@ import random
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +55,9 @@ class Config:
     patience: int = 15
     snapshots_per_query: int = 24
     dev_snapshots_per_query: int = 16
+    snapshot_reachable_fraction: float = .50
+    snapshot_missing_fraction: float = .25
+    snapshot_permutation_fraction: float = .10
     auxiliary_weight: float = .25
     calibrate: bool = True          # Development-only temperature selection.
     stop_mode: str = "safe"         # safe / max / reliability
@@ -88,7 +92,9 @@ class Config:
 
     @property
     def input_dim(self):
-        return self.n * (self.k + 3) + 5 * self.k + 3 * self.n * self.k + 4
+        # The extra masks distinguish retrieval from evaluator activation and
+        # a known similarity from a missing similarity.
+        return self.n * (self.k + 3) + 7 * self.k + 3 * self.n * self.k + 4
 
     @property
     def full_cost(self):
@@ -112,6 +118,9 @@ class Config:
         assert self.replay_size >= self.rl_batch_size and self.target_update > 0
         assert self.warmup >= 0 and self.snapshots_per_query >= 2
         assert self.dev_snapshots_per_query >= 2 and self.cost_weight >= 0
+        assert 0 <= self.snapshot_reachable_fraction <= 1
+        assert 0 <= self.snapshot_missing_fraction <= 1
+        assert 0 <= self.snapshot_permutation_fraction <= 1
         assert 0 < self.gamma <= 1 and 0 < self.exploration_fraction <= 1
         assert 0 <= self.epsilon_end <= 1 and self.print_every > 0
 
@@ -539,11 +548,113 @@ class State:
     evaluators: int = 1             # Active retrieval prefix.
 
 
+@dataclass(frozen=True)
+class SnapshotState:
+    """A supervised state; retrieval, evaluation and generation are independent.
+
+    CCS bits use row-major candidate/evaluator order. Attempted but unobserved
+    calls represent failures; unattempted calls have both bits clear.
+    """
+    candidates: int
+    retrieved: int
+    evaluators: int
+    similarity_observed: int
+    baseline_attempted: int
+    baseline_observed: int
+    ccs_attempted: int
+    ccs_observed: int
+
+
+def bit_array(bits, size):
+    return np.asarray([(bits >> i) & 1 for i in range(size)], bool)
+
+
+def bits_from_array(values):
+    return sum(1 << i for i, value in enumerate(values) if value)
+
+
+def complete_snapshot_state(candidates, retrieved, evaluators, cfg):
+    """Construct the fully measured version of any coherent structural state."""
+    cells = sum(evaluators << (i * cfg.k) for i in range(cfg.n) if candidates & (1 << i))
+    state = SnapshotState(candidates, retrieved, evaluators, retrieved,
+                          evaluators, evaluators, cells, cells)
+    validate_snapshot_state(state, cfg)
+    return state
+
+
+def validate_snapshot_state(state, cfg):
+    """Enforce causal availability, including source without evaluator."""
+    if min(state.candidates, state.retrieved, state.evaluators,
+           state.similarity_observed, state.baseline_attempted,
+           state.baseline_observed, state.ccs_attempted, state.ccs_observed) < 0:
+        raise ValueError("negative snapshot mask")
+    if state.candidates == 0 or state.candidates >= 1 << cfg.n:
+        raise ValueError("snapshot needs at least one valid candidate")
+    if state.retrieved >= 1 << cfg.k or state.evaluators >= 1 << cfg.k:
+        raise ValueError("retrieval/evaluator mask out of range")
+    if state.evaluators & ~state.retrieved:
+        raise ValueError("evaluator without retrieved source")
+    if state.candidates >> cfg.zero_shots & ~state.retrieved:
+        raise ValueError("one-shot candidate without retrieved source")
+    if state.similarity_observed & ~state.retrieved:
+        raise ValueError("similarity without retrieved source")
+    if state.baseline_attempted & ~state.evaluators or state.baseline_observed & ~state.baseline_attempted:
+        raise ValueError("invalid baseline masks")
+    legal_cells = sum(state.evaluators << (i * cfg.k)
+                      for i in range(cfg.n) if state.candidates & (1 << i))
+    if state.ccs_attempted & ~legal_cells or state.ccs_observed & ~state.ccs_attempted:
+        raise ValueError("invalid CCS masks")
+
+
+def as_snapshot_state(state, cfg):
+    if isinstance(state, SnapshotState):
+        return state
+    if not isinstance(state, State):
+        raise TypeError("Expected State or SnapshotState")
+    active = (1 << state.evaluators) - 1
+    return complete_snapshot_state(state.candidates, active, active, cfg)
+
+
+@lru_cache(maxsize=4)
+def structural_catalog(zero_shots, k):
+    """Every nonempty, logically valid candidate/retrieval/evaluator structure."""
+    rows = []
+    for zero_mask in range(1 << zero_shots):
+        for code in range(5 ** k):
+            candidates, retrieved, evaluators, rest = zero_mask, 0, 0, code
+            for i in range(k):
+                choice, rest = rest % 5, rest // 5
+                if choice:
+                    retrieved |= 1 << i
+                if choice in (2, 4):
+                    evaluators |= 1 << i
+                if choice in (3, 4):
+                    candidates |= 1 << (zero_shots + i)
+            if candidates:
+                rows.append((candidates, retrieved, evaluators))
+    return tuple(rows)
+
+
+def reachable_states(cfg):
+    """All states supported by the seven current application actions."""
+    seen, pending = {State()}, [State()]
+    for state in pending:
+        for action in np.flatnonzero(valid_actions(state, cfg)):
+            nxt = advance(state, int(action), cfg)
+            if nxt not in seen:
+                seen.add(nxt)
+                pending.append(nxt)
+    return tuple(pending)
+
+
 def present_mask(state, cfg):
     return np.asarray([(state.candidates >> i) & 1 for i in range(cfg.n)], bool)
 
 
 def state_cost(state, cfg):
+    if isinstance(state, SnapshotState):
+        probes = cfg.repeats * (bin(state.baseline_attempted).count("1") + bin(state.ccs_attempted).count("1"))
+        return float(bin(state.candidates).count("1") + probes * (2 if cfg.cost_unit == "total_calls" else 1))
     return acquisition_cost(int(present_mask(state, cfg).sum()), state.evaluators, cfg)
 
 
@@ -583,25 +694,30 @@ def advance(state, action, cfg):
 
 def observation(record, state, cfg):
     """Only observed entries are indexed; no labels/teacher scores enter x."""
+    state = as_snapshot_state(state, cfg)
+    validate_snapshot_state(state, cfg)
     cm = present_mask(state, cfg)
-    k = state.evaluators
-    em = np.arange(cfg.k) < k
+    rm = bit_array(state.retrieved, cfg.k)
+    em = bit_array(state.evaluators, cfg.k)
+    sm = bit_array(state.similarity_observed, cfg.k)
+    bm = bit_array(state.baseline_observed, cfg.k)
+    ba = bit_array(state.baseline_attempted, cfg.k)
+    ca = bit_array(state.ccs_attempted, cfg.n * cfg.k).reshape(cfg.n, cfg.k)
+    co = bit_array(state.ccs_observed, cfg.n * cfg.k).reshape(cfg.n, cfg.k)
     sources = np.zeros((cfg.n, cfg.k + 1), np.float32)
     for i in np.flatnonzero(cm):
         sources[i, 0 if i < cfg.zero_shots else i - cfg.zero_shots + 1] = 1
     ordinal = np.zeros(cfg.n, np.float32)
     ordinal[cm] = (np.flatnonzero(cm) + 1) / cfg.n
     sim, base = np.zeros(cfg.k, np.float32), np.zeros(cfg.k, np.float32)
-    sim[:k], base[:k] = record.similarity[:k], record.baseline[:k]
-    cell_mask = cm[:, None] & em[None, :]
+    sim[sm], base[bm] = record.similarity[sm], record.baseline[bm]
     ccs = np.zeros((cfg.n, cfg.k), np.float32)
-    ccs[cell_mask] = record.ccs[cell_mask]
+    ccs[co] = record.ccs[co]
     spent = state_cost(state, cfg)
     context = [spent / cfg.full_cost, (cfg.budget - spent) / cfg.full_cost,
-               cm.mean(), em.mean()]
-    x = np.concatenate([cm, sources.ravel(), ordinal, em, sim, base, em, em,
-                        ccs.ravel(), cell_mask.ravel(), cell_mask.ravel(), context]).astype(np.float32)
-    # Counts divided by cfg.repeats equal their observed masks for fixed-m bundles.
+                cm.mean(), em.mean()]
+    x = np.concatenate([cm, sources.ravel(), ordinal, rm, em, sim, sm,
+                        base, bm, ba, ccs.ravel(), co.ravel(), ca.ravel(), context]).astype(np.float32)
     if x.shape != (cfg.input_dim,) or not np.isfinite(x).all():
         raise ValueError("Invalid snapshot observation.")
     return x
@@ -613,30 +729,96 @@ def snapshot_target(record, safe, maximum, state, cfg):
                  float(np.any(safe * cm)), float(np.any(maximum * cm)), cm].astype(np.float32)
 
 
-def sampled_states(cfg, count, rng):
-    states = [State()]
-    while len(states) < count:
-        state, trajectory = State(), []
-        while valid_actions(state, cfg).any():
-            action = int(rng.choice(np.flatnonzero(valid_actions(state, cfg))))
-            state = advance(state, action, cfg)
-            trajectory.append(state)
-        if not trajectory:
-            states.extend([State()] * (count - len(states)))
-            break
-        rng.shuffle(trajectory)
-        states.extend(trajectory[:count - len(states)])
-    return states
+def augment_measurements(state, cfg, rng):
+    """Hide real measurements or mark recorded calls as failed; never invent values."""
+    state = as_snapshot_state(state, cfg)
+    attempted, observed = state.ccs_attempted, state.ccs_observed
+    eligible = np.flatnonzero(bit_array(attempted, cfg.n * cfg.k))
+    if len(eligible):
+        pattern = int(rng.randint(5))
+        if pattern == 0:                   # Independent sparse cells.
+            chosen = rng.choice(eligible, max(1, len(eligible)//2), replace=False)
+        elif pattern == 1:                 # Whole candidate row.
+            row = int(rng.choice(eligible)) // cfg.k
+            chosen = eligible[eligible // cfg.k == row]
+        elif pattern == 2:                 # Whole evaluator column.
+            col = int(rng.choice(eligible)) % cfg.k
+            chosen = eligible[eligible % cfg.k == col]
+        elif pattern == 3:                 # No successful CCS.
+            chosen = eligible
+        else:                              # Exactly one missing cell.
+            chosen = rng.choice(eligible, 1)
+        remove = bits_from_array(np.isin(np.arange(cfg.n * cfg.k), chosen))
+        observed &= ~remove
+        if rng.rand() < .5:                # Unattempted rather than failed.
+            attempted &= ~remove
+    base_observed, base_attempted = state.baseline_observed, state.baseline_attempted
+    base_cells = np.flatnonzero(bit_array(base_observed, cfg.k))
+    if len(base_cells) and rng.rand() < .35:
+        bit = 1 << int(rng.choice(base_cells))
+        base_observed &= ~bit
+        if rng.rand() < .5:
+            base_attempted &= ~bit
+    similarity = state.similarity_observed
+    sim_cells = np.flatnonzero(bit_array(similarity, cfg.k))
+    if len(sim_cells) and rng.rand() < .15:
+        similarity &= ~(1 << int(rng.choice(sim_cells)))
+    result = SnapshotState(state.candidates, state.retrieved, state.evaluators,
+                           similarity, base_attempted, base_observed, attempted, observed)
+    validate_snapshot_state(result, cfg)
+    return result
 
 
-def build_snapshots(records, ids, teacher, cfg, per_query, seed):
+def permute_snapshot(record, state, safe, maximum, cfg, rng):
+    """Apply the same slot permutation to evidence, provenance and labels."""
+    state = as_snapshot_state(state, cfg)
+    eorder = rng.permutation(cfg.k)
+    corder = np.r_[rng.permutation(cfg.zero_shots), cfg.zero_shots + eorder]
+    def remap(bits, size, order):
+        return bits_from_array(bit_array(bits, size)[order])
+    cell_order = (corder[:, None] * cfg.k + eorder[None, :]).ravel()
+    new_state = SnapshotState(remap(state.candidates, cfg.n, corder),
+                              remap(state.retrieved, cfg.k, eorder),
+                              remap(state.evaluators, cfg.k, eorder),
+                              remap(state.similarity_observed, cfg.k, eorder),
+                              remap(state.baseline_attempted, cfg.k, eorder),
+                              remap(state.baseline_observed, cfg.k, eorder),
+                              remap(state.ccs_attempted, cfg.n*cfg.k, cell_order),
+                              remap(state.ccs_observed, cfg.n*cfg.k, cell_order))
+    new_record = Record(record.uid, record.group, record.benchmark,
+                        [record.candidate_ids[i] for i in corder],
+                        [record.evaluator_ids[i] for i in eorder],
+                        record.similarity[eorder], record.baseline[eorder],
+                        record.ccs[np.ix_(corder, eorder)], record.labels[corder])
+    validate_snapshot_state(new_state, cfg)
+    return new_record, new_state, safe[corder], maximum[corder]
+
+
+def build_snapshots(records, ids, teacher, cfg, per_query, seed, epoch=0, augmented=False):
     rng = np.random.RandomState(seed)
     xs, ys = [], []
-    for idx in ids:
-        for state in sampled_states(cfg, per_query, rng):
-            xs.append(observation(records[idx], state, cfg))
-            ys.append(snapshot_target(records[idx], teacher["safe"][idx],
-                                      teacher["maximum"][idx], state, cfg))
+    reachable = reachable_states(cfg)
+    catalog = structural_catalog(cfg.zero_shots, cfg.k) if augmented else ()
+    n_reachable = max(1, round(per_query * cfg.snapshot_reachable_fraction)) if augmented else per_query
+    for rank, idx in enumerate(ids):
+        states = [State()]
+        for j in range(n_reachable - 1):
+            position = (epoch * len(ids) + rank) * (n_reachable - 1) + j
+            states.append(reachable[(position * 53) % len(reachable)])
+        # The coprime stride cycles through the entire catalog across questions
+        # and epochs, rather than sampling only the common structures.
+        for j in range(per_query - n_reachable):
+            position = ((epoch * len(ids) + rank) * (per_query - n_reachable) + j)
+            candidates, retrieved, evaluators = catalog[(position * 7919) % len(catalog)]
+            states.append(complete_snapshot_state(candidates, retrieved, evaluators, cfg))
+        for state in states:
+            r, safe, maximum = records[idx], teacher["safe"][idx], teacher["maximum"][idx]
+            if augmented and rng.rand() < cfg.snapshot_missing_fraction:
+                state = augment_measurements(state, cfg, rng)
+            if augmented and rng.rand() < cfg.snapshot_permutation_fraction:
+                r, state, safe, maximum = permute_snapshot(r, state, safe, maximum, cfg, rng)
+            xs.append(observation(r, state, cfg))
+            ys.append(snapshot_target(r, safe, maximum, state, cfg))
     return np.stack(xs), np.stack(ys)
 
 
@@ -680,15 +862,19 @@ def fit_temperatures(logits, targets, cfg):
 
 def fit_snapshot(records, splits, teacher, cfg, device):
     seed_everything(cfg.seed + 200)
-    x, y = build_snapshots(records, splits["supervised"], teacher, cfg,
-                           cfg.snapshots_per_query, cfg.seed + 201)
     vx, vy = build_snapshots(records, splits["dev"], teacher, cfg,
                              cfg.dev_snapshots_per_query, cfg.seed + 202)
     model = ResNet(cfg.input_dim, 3*cfg.n+2, cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    loader = make_loader(x, y, cfg.batch_size)
     best, weights, stale, history = (-1., -math.inf), None, 0, []
+    catalog_size = len(structural_catalog(cfg.zero_shots, cfg.k))
+    print(f"Snapshot training: {len(reachable_states(cfg))} application states; "
+          f"{catalog_size} coherent structures; {cfg.snapshots_per_query} samples/question/epoch.")
     for epoch in range(cfg.snapshot_epochs):
+        x, y = build_snapshots(records, splits["supervised"], teacher, cfg,
+                               cfg.snapshots_per_query, cfg.seed + 201 + epoch,
+                               epoch=epoch, augmented=True)
+        loader = make_loader(x, y, cfg.batch_size)
         model.train()
         total = 0.
         for bx, by in loader:
@@ -714,8 +900,13 @@ def fit_snapshot(records, splits, teacher, cfg, device):
     logits = predict_array(model, vx, device)
     temps = fit_temperatures(logits, vy, cfg)
     print(f"Snapshot selected epoch {best_epoch}; development Top-1 {best[0]:.1%}.")
+    off_per_query = cfg.snapshots_per_query - max(1, round(cfg.snapshots_per_query * cfg.snapshot_reachable_fraction))
+    covered = min(catalog_size, len(history) * len(splits["supervised"]) * off_per_query)
+    print(f"Coherent structural catalog visited during training: {covered}/{catalog_size} "
+          f"(shared across questions; development remains reachable-only).")
     return {"weights": weights, "temperatures": temps, "history": history,
             "best_epoch": best_epoch, "input_dim": cfg.input_dim,
+            "structural_catalog_size": catalog_size, "structural_visited": covered,
             "dev_summary": snapshot_summary(logits / temperature_vector(temps, cfg), vy, cfg)}
 
 
@@ -1061,6 +1252,10 @@ def stage_snapshot_audit(records, ids, teacher, predictor, cfg):
         metrics[name + "_recall"] = float(positive[true].mean()) if true.any() else None
     metrics["predicted_max_without_safe"] = float(((p[:, 3*cfg.n+1] >= cfg.stop_threshold)
                                                     & (p[:, 3*cfg.n] < cfg.stop_threshold)).mean())
+    sx, sy = build_snapshots(records, ids, teacher, cfg, cfg.dev_snapshots_per_query,
+                             cfg.seed + 402, augmented=True)
+    stress_logits = predict_array(predictor.model, sx, predictor.device) / predictor.temperatures
+    metrics["augmented_stress"] = snapshot_summary(stress_logits, sy, cfg)
     return metrics
 
 

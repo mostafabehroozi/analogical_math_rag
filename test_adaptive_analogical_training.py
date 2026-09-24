@@ -52,7 +52,7 @@ def test_schema_counts_and_all_wrong_labels():
     r = a.parse_record(raw_record(0, cfg, all_wrong=True), 0, "train", cfg)
     assert not r.labels.any()
     assert a.teacher_features(r, cfg).shape == (8, 22)
-    assert a.observation(r, a.State(), cfg).shape == (213,)
+    assert a.observation(r, a.State(), cfg).shape == (223,)
     assert cfg.full_cost == 233
     assert a.state_cost(a.State(), cfg) == 11
     broken = raw_record(0, cfg)
@@ -71,6 +71,82 @@ def test_safe_max_is_fixed_prefix_not_all_correct_candidates():
     truth[0] = 0
     safe, maximum = a.teacher_labels(scores, truth, cfg)
     assert not safe.any() and not maximum.any()
+
+
+def test_all_coherent_structural_combinations_and_independent_source_roles():
+    cfg = a.Config()
+    catalog = a.structural_catalog(cfg.zero_shots, cfg.k)
+    assert len(catalog) == len(set(catalog)) == 24757
+    assert len(a.reachable_states(cfg)) == 186
+    # R3 generated a candidate but does not evaluate; R1 evaluates without
+    # generating its candidate. Both sources have been retrieved.
+    triple = (1 | (1 << (cfg.zero_shots + 2)), (1 << 0) | (1 << 2), 1 << 0)
+    assert triple in catalog
+    state = a.complete_snapshot_state(*triple, cfg)
+    assert state.retrieved == 5 and state.evaluators == 1
+    assert a.bit_array(state.ccs_observed, cfg.n * cfg.k).sum() == 2
+    assert a.state_cost(state, cfg) == 17
+    assert a.observation(record(cfg), state, cfg).shape == (223,)
+    # An evaluator or one-shot candidate without retrieval is contradictory.
+    with pytest.raises(ValueError, match="without retrieved source"):
+        a.complete_snapshot_state(1, 0, 1, cfg)
+    with pytest.raises(ValueError, match="without retrieved source"):
+        a.complete_snapshot_state(1 | (1 << cfg.zero_shots), 0, 0, cfg)
+
+
+def test_missing_measurements_do_not_reveal_future_values_or_change_truth():
+    cfg = a.Config()
+    r = record(cfg)
+    state = a.complete_snapshot_state(1 | (1 << cfg.zero_shots), 1, 1, cfg)
+    missing = a.SnapshotState(state.candidates, state.retrieved, state.evaluators,
+                              0, 1, 0, state.ccs_attempted, 0)
+    a.validate_snapshot_state(missing, cfg)
+    altered = copy.deepcopy(r)
+    altered.similarity[:] = .123
+    altered.baseline[:] = .456
+    altered.ccs[:] = .789
+    assert np.array_equal(a.observation(r, missing, cfg), a.observation(altered, missing, cfg))
+    assert a.state_cost(missing, cfg) == a.state_cost(state, cfg)
+    safe, maximum = np.zeros(cfg.n), np.zeros(cfg.n)
+    safe[cfg.zero_shots], maximum[cfg.zero_shots] = 1, 1
+    y = a.snapshot_target(r, safe, maximum, missing, cfg)
+    assert y[3*cfg.n] == y[3*cfg.n+1] == 1
+    assert np.array_equal(y[:cfg.n], r.labels)
+    unattempted = a.SnapshotState(missing.candidates, missing.retrieved, missing.evaluators,
+                                   0, 0, 0, 0, 0)
+    assert a.state_cost(unattempted, cfg) == 2
+
+
+def test_snapshot_permutation_preserves_evidence_and_label_alignment():
+    cfg = a.Config()
+    r = record(cfg)
+    state = a.complete_snapshot_state(1 | (1 << (cfg.zero_shots + 3)), 1 << 3, 0, cfg)
+    safe = np.arange(cfg.n) % 2
+    maximum = np.eye(1, cfg.n, 0).ravel()
+    pr, ps, py, pm = a.permute_snapshot(r, state, safe, maximum, cfg, np.random.RandomState(5))
+    assert pr.labels.sum() == r.labels.sum()
+    assert py.sum() == safe.sum() and pm.sum() == maximum.sum()
+    assert a.state_cost(ps, cfg) == a.state_cost(state, cfg)
+    assert pr.ccs.shape == r.ccs.shape
+    a.validate_snapshot_state(ps, cfg)
+    assert a.observation(pr, ps, cfg).shape == (cfg.input_dim,)
+
+
+def test_augmented_snapshot_dataset_changes_across_epochs_and_preserves_labels():
+    cfg = a.Config(snapshot_reachable_fraction=.5, snapshot_missing_fraction=1.,
+                   snapshot_permutation_fraction=0.)
+    r = record(cfg)
+    teacher = {"safe": np.ones((1, cfg.n), np.float32),
+               "maximum": np.eye(1, cfg.n, 0).astype(np.float32)}
+    x0, y0 = a.build_snapshots([r], [0], teacher, cfg, 8, 31, epoch=0, augmented=True)
+    x1, y1 = a.build_snapshots([r], [0], teacher, cfg, 8, 32, epoch=1, augmented=True)
+    assert x0.shape == x1.shape == (8, 223)
+    assert y0.shape == y1.shape == (8, 3*cfg.n+2+cfg.n)
+    assert not np.array_equal(x0, x1)
+    for row in y0:
+        assert np.array_equal(row[:cfg.n], r.labels)
+        assert row[3*cfg.n] == 1
+        assert row[3*cfg.n+1] <= row[3*cfg.n]
 
 
 def test_hidden_future_data_cannot_change_observation_or_action():
