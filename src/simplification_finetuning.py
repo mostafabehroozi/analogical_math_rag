@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -88,30 +89,14 @@ def _has_generation_failure(row: Mapping[str, Any]) -> bool:
     return False
 
 
-def load_simplification_data(
-    accepted_path: str | Path, log_path: str | Path,
-) -> Dict[str, Any]:
-    """Reconcile donor and run-log rows; expose every omission in the audit."""
-    accepted_path, log_path = Path(accepted_path), Path(log_path)
-    donors, logs = _json_list(accepted_path), _json_list(log_path)
+def load_simplification_data(log_path: str | Path) -> Dict[str, Any]:
+    """Build simplification and exact-copy labels from the Phase 1 run log."""
+    log_path = Path(log_path)
+    logs = _json_list(log_path)
     audit: list[dict] = []
     status_counts: Counter = Counter()
-    donor_by_index: dict[Any, list] = defaultdict(list)
-    donor_by_question: dict[str, list] = defaultdict(list)
-    for donor_position, donor in enumerate(donors):
-        if not isinstance(donor, Mapping) or donor.get("status") != _ACCEPTED:
-            audit.append({"source": "donor", "row": donor_position, "reason": "invalid_donor"})
-            continue
-        question = recover_original_question(donor)
-        if not question:
-            audit.append({"source": "donor", "row": donor_position, "reason": "missing_original"})
-            continue
-        if donor.get("original_index") is not None:
-            donor_by_index[donor["original_index"]].append((donor_position, donor, question))
-        donor_by_question[normalize_question(question)].append((donor_position, donor, question))
 
     records: list[dict] = []
-    matched_donor_positions: set[int] = set()
     for position, row in enumerate(logs):
         if not isinstance(row, Mapping):
             audit.append({"source": "log", "row": position, "reason": "invalid_record"})
@@ -121,7 +106,7 @@ def load_simplification_data(
         if status not in {_ACCEPTED, *_COPY_STATUSES}:
             audit.append({"source": "log", "row": position, "reason": f"excluded_status:{status}"})
             continue
-        if _has_generation_failure(row):
+        if status != _ACCEPTED and _has_generation_failure(row):
             audit.append({"source": "log", "row": position, "reason": "generation_failure_in_trace"})
             continue
         question = recover_original_question(row)
@@ -130,66 +115,58 @@ def load_simplification_data(
             continue
         question_id = normalize_question(question)
         if status == _ACCEPTED:
-            index = row.get("original_index")
-            matches = donor_by_index.get(index, []) if index is not None else donor_by_question.get(question_id, [])
-            matches = [item for item in matches if normalize_question(item[2]) == question_id]
-            if len(matches) != 1:
-                audit.append({"source": "log", "row": position, "reason": "donor_mismatch"})
+            proxy = row.get("proxy_question")
+            if not isinstance(proxy, str) or not proxy.strip():
+                audit.append({"source": "log", "row": position, "reason": "missing_proxy"})
                 continue
-            donor_position, donor, _ = matches[0]
-            log_proxy, donor_proxy = row.get("proxy_question"), donor.get("proxy_question")
-            if not isinstance(log_proxy, str) or not log_proxy.strip() or log_proxy != donor_proxy:
-                audit.append({"source": "log", "row": position, "reason": "proxy_mismatch"})
-                continue
-            matched_donor_positions.add(donor_position)
-            target, label_kind = log_proxy, "simplify"
-            ground_truth = row.get("ground_truth") or donor.get("ground_truth")
+            target, label_kind = proxy, "simplify"
         else:
             target, label_kind = question, "copy"
-            ground_truth = row.get("ground_truth")
         records.append({
             "record_id": f"log:{position}", "question": question, "question_id": question_id,
             "prompt": simplification_prompt(question), "label": target,
-            "label_kind": label_kind, "status": status, "ground_truth": ground_truth,
+            "label_kind": label_kind, "status": status, "ground_truth": row.get("ground_truth"),
             "original_index": row.get("original_index"),
         })
-
-    for position in range(len(donors)):
-        if position not in matched_donor_positions and not any(
-            item.get("source") == "donor" and item.get("row") == position for item in audit
-        ):
-            audit.append({"source": "donor", "row": position, "reason": "unmatched_donor"})
 
     by_question: dict[str, list[dict]] = defaultdict(list)
     for record in records:
         by_question[record["question_id"]].append(record)
     unique: list[dict] = []
     for group in by_question.values():
-        signatures = {(item["status"], item["label"]) for item in group}
-        if len(signatures) > 1:
-            audit.extend({"source": "log", "row": int(item["record_id"].split(":")[1]),
-                          "reason": "conflicting_outcomes"} for item in group)
-            continue
-        unique.append(group[0])
-        audit.extend({"source": "log", "row": int(item["record_id"].split(":")[1]),
-                      "reason": "duplicate_question"} for item in group[1:])
+        successes = [item for item in group if item["status"] == _ACCEPTED]
+
+        def improvement(item: dict) -> float:
+            row = logs[int(item["record_id"].split(":")[1])]
+            base, augmented = row.get("base_score"), row.get("augmented_score")
+            if (isinstance(base, (int, float)) and not isinstance(base, bool)
+                    and isinstance(augmented, (int, float)) and not isinstance(augmented, bool)
+                    and math.isfinite(base) and math.isfinite(augmented)):
+                return augmented - base
+            return float("-inf")
+
+        chosen = max(successes, key=improvement) if successes else group[0]
+        unique.append(chosen)
+        for item in group:
+            if item is chosen:
+                continue
+            reason = "superseded_by_success" if successes and item["status"] != _ACCEPTED else "duplicate_question"
+            audit.append({"source": "log", "row": int(item["record_id"].split(":")[1]),
+                          "reason": reason})
 
     return {
         "records": unique,
         "audit": audit,
-        "sources": [
-            {"path": str(path.resolve()), "sha256": _sha256(path), "rows": count}
-            for path, count in ((accepted_path, len(donors)), (log_path, len(logs)))
-        ],
+        "sources": [{"path": str(log_path.resolve()), "sha256": _sha256(log_path), "rows": len(logs)}],
         "status_counts": dict(status_counts),
     }
 
 
 def prepare_simplification_data(
-    accepted_path: str | Path, log_path: str | Path, output_dir: str | Path,
+    log_path: str | Path, output_dir: str | Path,
     *, tokenizer: Optional[Any] = None, max_length: int = 4096, seed: int = 42,
 ) -> Dict[str, Any]:
-    loaded = load_simplification_data(accepted_path, log_path)
+    loaded = load_simplification_data(log_path)
     splits = grouped_split(loaded["records"], seed=seed)
     manifest = {
         "format_version": 1, "seed": seed, "split_ratios": [0.8, 0.1, 0.1],

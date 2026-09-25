@@ -85,8 +85,10 @@ and adapted binary fusion trees. Install its isolated dependencies from
 ## Simplification-model fine-tuning
 
 `simplification_finetuning.ipynb` trains a Kaggle QLoRA adapter from an existing
-Phase 1 `core_simp_dataset.json` and its matching `<experiment_name>_run_log.json`.
-Configure their paths in a Hugging Face dataset repository before running the
-notebook. Accepted proxies become simplification targets; rejected and failsafe
-cases become exact-copy targets. The notebook saves an input audit and compares
-base and adapted simplification with a fixed local Qwen solver on held-out cases.
+Phase 1 `<experiment_name>_run_log.json`. Configure its path in a Hugging Face
+dataset repository before running the notebook. Accepted proxies become
+simplification targets; rejected and failsafe cases become exact-copy targets.
+Repeated questions receive one label: a successful proxy takes priority, and
+the loader chooses the largest recorded score gain among successful proxies. The
+notebook saves an input audit and compares base and adapted simplification with
+a fixed local Qwen solver on held-out cases.

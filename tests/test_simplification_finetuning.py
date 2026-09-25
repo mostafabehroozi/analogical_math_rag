@@ -38,15 +38,15 @@ class FakeTokenizer:
 
 
 class SimplificationDataTests(unittest.TestCase):
-    def test_targets_exclusions_and_donor_cross_check(self):
+    def test_targets_and_exclusions_from_run_log(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            donors = [{
+            success = {
                 "status": "SUCCESS", "original_index": 0,
                 "original_question": "Hard question", "proxy_question": "Easy question",
                 "ground_truth": "42",
-            }]
-            logs = donors + [
+            }
+            logs = [success,
                 {"status": "REJECTED_BY_FILTER", "original_index": 1,
                  "original_question": "Reject question", "proxy_question": "Bad proxy",
                  "ground_truth": "5"},
@@ -55,9 +55,8 @@ class SimplificationDataTests(unittest.TestCase):
                  "original_question": "Already easy"},
                 {"status": "FAILURE", "original_index": 4},
             ]
-            save(root / "donors.json", donors)
             save(root / "logs.json", logs)
-            loaded = load_simplification_data(root / "donors.json", root / "logs.json")
+            loaded = load_simplification_data(root / "logs.json")
             by_status = {row["status"]: row for row in loaded["records"]}
             self.assertEqual(by_status["SUCCESS"]["label"], "Easy question")
             self.assertEqual(by_status["REJECTED_BY_FILTER"]["label"], "Reject question")
@@ -65,6 +64,8 @@ class SimplificationDataTests(unittest.TestCase):
             self.assertIsNone(by_status["SKIPPED_FAILSAFE"]["ground_truth"])
             self.assertEqual(len(loaded["records"]), 3)
             self.assertIn("excluded_status:FAILURE", [a["reason"] for a in loaded["audit"]])
+            self.assertIn("excluded_status:SKIPPED_PERFECT_BASELINE", [a["reason"] for a in loaded["audit"]])
+            self.assertEqual(len(loaded["sources"]), 1)
 
     def test_missing_or_ambiguous_prompt_is_not_guessed(self):
         self.assertIsNone(recover_original_question({"status": "SKIPPED_FAILSAFE", "trace": []}))
@@ -77,24 +78,44 @@ class SimplificationDataTests(unittest.TestCase):
             "original_question": "A", "target_query_text": "B"
         }))
 
-    def test_conflicts_duplicates_and_donor_mismatch(self):
+    def test_success_takes_priority_and_only_one_label_survives(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            donors = [{"status": "SUCCESS", "original_index": 0,
-                       "original_question": "Q", "proxy_question": "P"}]
-            logs = [donors[0], {"status": "REJECTED_BY_FILTER", "original_question": "Q"},
+            success = {"status": "SUCCESS", "original_index": 0,
+                       "original_question": "Q", "proxy_question": "P",
+                       "base_score": 0.2, "augmented_score": 0.4}
+            logs = [success, {"status": "REJECTED_BY_FILTER", "original_question": "Q"},
+                    {"status": "SUCCESS", "original_question": "Q", "proxy_question": "Better P",
+                     "base_score": 0.2, "augmented_score": 0.8},
                     {"status": "REJECTED_BY_FILTER", "original_question": "Unique"},
                     {"status": "REJECTED_BY_FILTER", "original_question": "Unique"},
                     {"status": "SUCCESS", "original_index": 5,
-                     "original_question": "Missing donor", "proxy_question": "P"}]
-            save(root / "donors.json", donors)
+                     "original_question": "Missing proxy", "proxy_question": ""}]
             save(root / "logs.json", logs)
-            loaded = load_simplification_data(root / "donors.json", root / "logs.json")
-            self.assertEqual([r["question"] for r in loaded["records"]], ["Unique"])
+            loaded = load_simplification_data(root / "logs.json")
+            self.assertEqual([r["question"] for r in loaded["records"]], ["Q", "Unique"])
+            self.assertEqual(loaded["records"][0]["label"], "Better P")
+            self.assertEqual(loaded["records"][1]["label"], "Unique")
             reasons = [a["reason"] for a in loaded["audit"]]
-            self.assertIn("conflicting_outcomes", reasons)
+            self.assertIn("superseded_by_success", reasons)
             self.assertIn("duplicate_question", reasons)
-            self.assertIn("donor_mismatch", reasons)
+            self.assertIn("missing_proxy", reasons)
+
+    def test_success_with_failed_attempt_still_beats_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "logs.json"
+            save(path, [
+                {"status": "REJECTED_BY_FILTER", "original_question": "Same question"},
+                {"status": "SUCCESS", "original_question": "Same  question",
+                 "proxy_question": "Simpler question", "trace": [{
+                     "sub_step": "baseline_solve_attempt_1",
+                     "output_result": {"status": "FAILURE"},
+                 }]},
+            ])
+            loaded = load_simplification_data(path)
+            self.assertEqual(len(loaded["records"]), 1)
+            self.assertEqual(loaded["records"][0]["label"], "Simpler question")
+            self.assertEqual(loaded["records"][0]["label_kind"], "simplify")
 
     def test_grouped_split_and_completion_only_mask(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -103,10 +124,9 @@ class SimplificationDataTests(unittest.TestCase):
                 {"status": "REJECTED_BY_FILTER", "original_index": i,
                  "original_question": f"Question {i}"} for i in range(10)
             ]
-            save(root / "donors.json", [])
             save(root / "logs.json", logs)
             prepared = prepare_simplification_data(
-                root / "donors.json", root / "logs.json", root / "output", seed=9
+                root / "logs.json", root / "output", seed=9
             )
             groups = [
                 {r["question_id"] for r in rows} for rows in prepared["splits"].values()
@@ -121,13 +141,12 @@ class SimplificationDataTests(unittest.TestCase):
     def test_generation_failure_inside_rejected_log_is_excluded(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            save(root / "donors.json", [])
             save(root / "logs.json", [{
                 "status": "REJECTED_BY_FILTER", "original_question": "Q",
                 "trace": [{"sub_step": "baseline_solve_attempt_1",
                            "output_result": {"status": "FAILURE"}}],
             }])
-            loaded = load_simplification_data(root / "donors.json", root / "logs.json")
+            loaded = load_simplification_data(root / "logs.json")
             self.assertEqual(loaded["records"], [])
             self.assertIn("generation_failure_in_trace", [a["reason"] for a in loaded["audit"]])
 
