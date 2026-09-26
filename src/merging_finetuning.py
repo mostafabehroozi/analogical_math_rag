@@ -319,6 +319,7 @@ class QLoRAConfig:
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    checkpoint_steps: int = 20
     seed: int = 42
 
 
@@ -412,8 +413,10 @@ def train_qlora(
         bf16=bf16,
         fp16=not bf16,
         optim="paged_adamw_8bit",
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        eval_strategy="steps",
+        eval_steps=config.checkpoint_steps,
+        save_strategy="steps",
+        save_steps=config.checkpoint_steps,
         logging_steps=10,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
