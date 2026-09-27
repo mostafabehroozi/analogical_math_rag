@@ -73,7 +73,7 @@ CONFIG = {
     "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
     "API_REQUEST_TIMEOUT_SECONDS": 60.0,
     "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 1,            # N: Number of consecutive errors to trigger a pause (0 to disable)
-    "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 100.0,  # M: Seconds to sleep when the error limit is reached
+    "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 10.0,  # M: Seconds to sleep when the error limit is reached
     "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES": 30.0,  # X: Pause every X minutes (0 to disable)
     "GLOBAL_PERIODIC_PAUSE_DURATION_SECONDS": 10.0,  # Y: Seconds to sleep during the break
     "ENABLE_MIN_TIME_BETWEEN_API_CALLS": True,      # Master switch: Set to True to enforce minimum time between calls
