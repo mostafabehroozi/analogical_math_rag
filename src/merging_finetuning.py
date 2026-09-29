@@ -677,6 +677,69 @@ def load_adapter_for_inference(
     return model, tokenizer
 
 
+def load_or_build_exemplar_embeddings(
+    path: str | Path,
+    questions: Sequence[str],
+    embedding_model: Any,
+    batch_size: int = 64,
+) -> Any:
+    """Load aligned embeddings or build a disk-backed cache on CPU."""
+    import numpy as np
+
+    path = Path(path)
+    if not questions:
+        raise ValueError("The exemplar corpus is empty.")
+    if embedding_model is None:
+        raise ValueError("The embedding model did not load.")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if path.is_file():
+        embeddings = np.load(path, mmap_mode="r")
+        if embeddings.ndim != 2 or embeddings.shape[0] != len(questions):
+            raise ValueError(
+                f"Embedding cache {path} has shape {embeddings.shape}; "
+                f"expected {len(questions)} rows. Use a matching cache or remove it to rebuild."
+            )
+        return embeddings
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + f".{os.getpid()}.tmp.npy")
+    embedding_model.to("cpu")
+    try:
+        first = np.asarray(
+            embedding_model.encode(
+                list(questions[:batch_size]), batch_size=batch_size,
+                convert_to_numpy=True, show_progress_bar=False,
+            ), dtype=np.float32,
+        )
+        if first.ndim != 2 or first.shape[0] != min(batch_size, len(questions)):
+            raise ValueError(f"Unexpected first embedding batch shape: {first.shape}")
+        cache = np.lib.format.open_memmap(
+            temporary, mode="w+", dtype=np.float32,
+            shape=(len(questions), first.shape[1]),
+        )
+        cache[:len(first)] = first
+        for start in range(len(first), len(questions), batch_size):
+            stop = min(start + batch_size, len(questions))
+            batch = np.asarray(
+                embedding_model.encode(
+                    list(questions[start:stop]), batch_size=batch_size,
+                    convert_to_numpy=True, show_progress_bar=False,
+                ), dtype=np.float32,
+            )
+            if batch.shape != (stop - start, first.shape[1]):
+                raise ValueError(f"Unexpected embedding batch shape: {batch.shape}")
+            cache[start:stop] = batch
+            if stop % 10000 < batch_size or stop == len(questions):
+                print(f"Embedded {stop}/{len(questions)} exemplar questions")
+        cache.flush()
+        del cache
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return np.load(path, mmap_mode="r")
+
+
 def retrieve_exemplars_cpu(
     question: str,
     exemplar_questions: Sequence[str],
