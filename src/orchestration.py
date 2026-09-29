@@ -50,6 +50,7 @@ from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 from src.context_logger import tprint
 from src.benchmark_data import benchmark_name_for_target_index
+from src.api_manager import bind_api_managers
 
 
 from src.pipeline_steps import (
@@ -622,6 +623,7 @@ def run_pipeline_for_single_query(
     # essential for batch workers: sharing a mutable current benchmark would
     # make mixed exact-answer and rationale evaluation race-dependent.
     config = config.copy()
+    api_managers = bind_api_managers(api_managers, config)
     config["_TARGET_BENCHMARK_FOR_QUERY"] = benchmark_name_for_target_index(
         config, hard_list_idx
     )
@@ -655,6 +657,13 @@ def run_pipeline_for_single_query(
                     # managers as the original experiment-level configuration.
                     "API_PROVIDER_ADAPTATION", "API_PROVIDER_SOLVER",
                     "API_PROVIDER_EVALUATOR", "API_PROVIDER_SIMPLIFICATION",
+                    "OPENROUTER_MODEL_NAME_ADAPTATION", "OPENROUTER_MODEL_NAME_FINAL_SOLVER",
+                    "OPENROUTER_MODEL_NAME_EVALUATOR", "OPENROUTER_MODEL_NAME_SIMPLIFICATION",
+                    "OPENROUTER_PROVIDER_ROUTING", "OPENROUTER_MODEL_ROUTING",
+                    "OPENROUTER_MODEL_FALLBACKS", "OPENROUTER_REASONING_EFFORT",
+                    "OPENROUTER_REASONING_EFFORT_ADAPTATION",
+                    "OPENROUTER_REASONING_EFFORT_FINAL_SOLVER",
+                    "OPENROUTER_REASONING_EFFORT_EVALUATOR",
                     # Layer 1 Flags
                     "APPLY_LAYER1_BASE_EXECUTION", "LAYER1_ONLY_MODE", "LAYER1_CACHE_DIR",
                     "LAYER1_N_CANDIDATES", "LAYER1_ONE_SHOT_CANDIDATES_N", "LAYER1_DATASET_NAME",
@@ -1715,6 +1724,7 @@ def run_experiments(
 
         for exp_overrides in transformation_ds_configs:
             current_config = _merge_experiment_config(global_config, exp_overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             exp_name = current_config.get(
                 "experiment_name", "transformation_dataset_construction"
             )
@@ -1765,6 +1775,7 @@ def run_experiments(
         
         for exp_overrides in phase1_configs:
             current_config = _merge_experiment_config(global_config, exp_overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             exp_name = current_config.get("experiment_name", "core_simp_phase1")
             
             logger.info(f"--- Core Simplification Phase 1 '{exp_name}' starting ---")
@@ -1795,6 +1806,7 @@ def run_experiments(
         
         for exp_overrides in phase2_configs:
             current_config = _merge_experiment_config(global_config, exp_overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             exp_name = current_config.get("experiment_name", "core_simp_phase2")
             
             logger.info(f"--- Core Simplification Phase 2 '{exp_name}' starting ---")
@@ -1838,6 +1850,7 @@ def run_experiments(
         
         for exp_overrides in merging_ds_configs:
             current_config = _merge_experiment_config(global_config, exp_overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             exp_name = current_config.get("experiment_name", "merging_dataset_construction")
             
             logger.info(f"--- Merging Dataset Construction '{exp_name}' starting ---")
@@ -1875,6 +1888,7 @@ def run_experiments(
         # PHASE 1: Intermediate Steps for ALL experiments 
         for exp_overrides in experiment_configs:
             current_config = _merge_experiment_config(global_config, exp_overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
             
             # Only run intermediate steps for experiments that are actually deferred
@@ -1935,6 +1949,7 @@ def run_experiments(
         # --- PHASE 2: Final Solving Steps for ALL experiments ---
         for exp_overrides in experiment_configs:
             current_config = _merge_experiment_config(global_config, exp_overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
 
             # Only run solve steps for experiments that are deferred
@@ -2028,6 +2043,7 @@ def run_experiments(
         logger.info("Deferred mode is DISABLED. Running experiments sequentially.")
         for exp_overrides in experiment_configs:
             current_config = _merge_experiment_config(global_config, exp_overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             exp_name = current_config.get("experiment_name", "unnamed_experiment")
             logger.info(f"########## Starting Experiment: {exp_name} ##########")
             log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
@@ -2345,6 +2361,7 @@ def finalize_distributed_experiments(
         merged_results_dir = os.path.join(merged_root, "results")
         for overrides in experiment_configs:
             current_config = _merge_experiment_config(global_config, overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             if not current_config.get("APPLY_LAYER2_ANALYSIS", False):
                 continue
             current_config["RESULTS_DIR"] = merged_results_dir
@@ -2420,6 +2437,7 @@ def finalize_distributed_experiments(
 
         for overrides in experiment_configs:
             current_config = _merge_experiment_config(global_config, overrides)
+            api_managers = bind_api_managers(api_managers, current_config)
             if not current_config.get("APPLY_CORE_SIMP_PHASE2", False):
                 continue
             current_config["RESULTS_DIR"] = merged_results_dir

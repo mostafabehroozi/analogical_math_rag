@@ -30,7 +30,7 @@ from typing import List, Dict, Any, Tuple, Optional, TypedDict
 from collections import defaultdict
 
 from src.utils import save_json, load_json
-from src.api_manager import APIResponse, GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.api_manager import APIResponse, model_name_for
 from src.benchmark_data import benchmark_name_for_target_index, uses_exact_final_answers
 
 # Define a structured type for the result of a single LLM-based evaluation
@@ -107,14 +107,7 @@ def evaluate_single_answer_with_llm(
             template_name = "evaluator_v1"
 
     # MODIFIED: Determine which LLM model to use based on the type of the active manager
-    if isinstance(api_manager, GeminiAPIManager):
-        evaluator_model = config['GEMINI_MODEL_NAME_EVALUATOR']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        evaluator_model = config['AVALAI_MODEL_NAME_EVALUATOR']
-    elif isinstance(api_manager, OllamaAPIManager):
-        evaluator_model = config['OLLAMA_MODEL_NAME_EVALUATOR']
-    else:
-        raise TypeError(f"Unsupported API manager type for evaluation: {type(api_manager)}")
+    evaluator_model = model_name_for(api_manager, config, "evaluator")
         
     evaluator_temp = config['DEFAULT_EVALUATOR_TEMPERATURE']
 

@@ -144,6 +144,7 @@ def _solver_model_name(config: Dict[str, Any]) -> str:
     key_by_provider = {
         "gemini": "GEMINI_MODEL_NAME_FINAL_SOLVER",
         "avalai": "AVALAI_MODEL_NAME_FINAL_SOLVER",
+        "openrouter": "OPENROUTER_MODEL_NAME_FINAL_SOLVER",
         "ollama": "OLLAMA_MODEL_NAME_FINAL_SOLVER",
     }
     if provider not in key_by_provider:

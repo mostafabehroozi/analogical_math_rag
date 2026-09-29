@@ -1,8 +1,7 @@
-"""Offline contract and end-to-end tests; no provider/network access."""
-import copy
+"""Offline checks for the three supervised adaptive acquisition stages."""
 import ast
+import copy
 import json
-import xml.etree.ElementTree as ET
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,167 +24,160 @@ def raw_record(index, cfg, prefix="train", all_wrong=False):
                   for i, cid in enumerate(cids)}
     state = {
         "target_query_data": {"query_text": f"{prefix} unique mathematical question {index}"},
-        "retrieved_set": [{"corpus_index": int(e), "similarity_score": .9-.1*j} for j,e in enumerate(eids)],
+        "retrieved_set": [{"corpus_index": int(e), "similarity_score": .9-.1*j}
+                          for j,e in enumerate(eids)],
         "candidate_set": candidates,
         "ground_truth_labels": {cid: {"is_correct": bool(labels[i]), "evaluation_status": "SUCCESS"}
                                 for i,cid in enumerate(cids)},
-        "intrinsic_baselines": {e: float(rng.randint(cfg.repeats+1)/cfg.repeats) for e in eids},
-        "cross_evaluation_matrix": {cid: {e: float(rng.randint(cfg.repeats+1)/cfg.repeats) for e in eids}
-                                    for cid in cids},
+        "intrinsic_baselines": {e: float(rng.randint(cfg.repeats+1)/cfg.repeats)
+                                for e in eids},
+        "cross_evaluation_matrix": {cid: {e: float(rng.randint(cfg.repeats+1)/cfg.repeats)
+                                          for e in eids} for cid in cids},
     }
     return {"target_query_original_hard_list_idx": index,
-            "target_query_text": state["target_query_data"]["query_text"], "layer1_base_execution_state": state}
+            "target_query_text": state["target_query_data"]["query_text"],
+            "layer1_base_execution_state": state}
 
 
-def record(cfg, index=0):
-    return a.parse_record(raw_record(index, cfg), index, "train", cfg)
+def record(cfg, index=0, all_wrong=False):
+    return a.parse_record(raw_record(index, cfg, all_wrong=all_wrong), index, "train", cfg)
 
 
 def fake_predictor(cfg):
     torch.set_num_threads(1)
     a.seed_everything(7)
     model = a.ResNet(cfg.input_dim, 3*cfg.n+2, cfg)
-    return a.FrozenPredictor({"weights": a.cpu_state(model), "temperatures": np.ones(5)}, cfg, torch.device("cpu"))
+    return a.FrozenPredictor({"weights": a.cpu_state(model),
+                              "temperatures": np.ones(5)}, cfg, torch.device("cpu"))
 
 
-class ScriptedPredictor:
-    """Fixed predictions from visible candidate masks for reward accounting tests."""
-    device = torch.device("cpu")
-
-    def __init__(self, cfg, second_score=.9, safe_score=0., safe_on_second=False):
-        self.cfg, self.second_score, self.safe_score = cfg, second_score, safe_score
-        self.safe_on_second = safe_on_second
-
-    def predict(self, record, state):
-        p = np.zeros(3*self.cfg.n+2, np.float32)
-        p[0] = .8
-        if a.present_mask(state, self.cfg)[1]:
-            p[1] = self.second_score
-        p[3*self.cfg.n] = (self.safe_score if not self.safe_on_second
-                           or a.present_mask(state, self.cfg)[1] else 0.)
-        return np.zeros(self.cfg.hidden_dim, np.float32), p
-
-
-def scripted_episode(cfg, labels, actions, predictor=None, reward_weight=None):
-    r = record(cfg)
-    r.labels[:] = labels
-    env = a.CachedEnvironment(r, predictor or ScriptedPredictor(cfg), cfg, reward_weight)
-    rewards = []
-    for action in actions:
-        reward, done = env.step(action)
-        rewards.append(reward)
-    return env, rewards
-
-
-def test_schema_counts_and_all_wrong_labels():
+def test_retrieval_sorted_by_similarity_and_safe_prefix():
     cfg = a.Config()
-    r = a.parse_record(raw_record(0, cfg, all_wrong=True), 0, "train", cfg)
-    assert not r.labels.any()
-    assert a.teacher_features(r, cfg).shape == (8, 22)
-    assert a.observation(r, a.State(), cfg).shape == (223,)
-    assert cfg.full_cost == 233
-    assert a.state_cost(a.State(), cfg) == 11
-    broken = raw_record(0, cfg)
-    broken["layer1_base_execution_state"]["ground_truth_labels"]["zs_0"]["is_correct"] = None
-    with pytest.raises(ValueError, match="unknown_or_failed_label"):
-        a.parse_record(broken, 0, "train", cfg)
-
-
-def test_safe_max_is_fixed_prefix_not_all_correct_candidates():
-    cfg = a.Config()
-    scores = np.array([8, 5, 4, 7, 6, 3, 2, 1])
-    truth = np.array([1, 0, 1, 1, 1, 0, 0, 0])
+    raw = raw_record(0, cfg)
+    raw["layer1_base_execution_state"]["retrieved_set"].reverse()
+    r = a.parse_record(raw, 0, "train", cfg)
+    assert np.all(np.diff(r.similarity) <= 0)
+    assert r.evaluator_ids == [str(100+i) for i in range(cfg.k)]
+    scores = np.arange(cfg.n, 0, -1, dtype=np.float32)
+    truth = np.array([1, 1, 0, 1, 1, 1, 1, 1], np.float32)
     safe, maximum = a.teacher_labels(scores, truth, cfg)
-    assert np.flatnonzero(safe).tolist() == [0, 3, 4]
+    assert np.flatnonzero(safe).tolist() == [0, 1]
     assert np.flatnonzero(maximum).tolist() == [0]
     truth[0] = 0
     safe, maximum = a.teacher_labels(scores, truth, cfg)
     assert not safe.any() and not maximum.any()
 
 
-def test_all_coherent_structural_combinations_and_independent_source_roles():
+def test_retrieval_ties_keep_log_order_and_missing_similarity_is_auditable():
     cfg = a.Config()
-    catalog = a.structural_catalog(cfg.zero_shots, cfg.k)
-    assert len(catalog) == len(set(catalog)) == 24757
-    assert len(a.reachable_states(cfg)) == 186
-    # R3 generated a candidate but does not evaluate; R1 evaluates without
-    # generating its candidate. Both sources have been retrieved.
-    triple = (1 | (1 << (cfg.zero_shots + 2)), (1 << 0) | (1 << 2), 1 << 0)
-    assert triple in catalog
-    state = a.complete_snapshot_state(*triple, cfg)
-    assert state.retrieved == 5 and state.evaluators == 1
-    assert a.bit_array(state.ccs_observed, cfg.n * cfg.k).sum() == 2
-    assert a.state_cost(state, cfg) == 17
-    assert a.observation(record(cfg), state, cfg).shape == (223,)
-    # An evaluator or one-shot candidate without retrieval is contradictory.
-    with pytest.raises(ValueError, match="without retrieved source"):
-        a.complete_snapshot_state(1, 0, 1, cfg)
-    with pytest.raises(ValueError, match="without retrieved source"):
-        a.complete_snapshot_state(1 | (1 << cfg.zero_shots), 0, 0, cfg)
+    raw = raw_record(0, cfg)
+    samples = raw["layer1_base_execution_state"]["retrieved_set"]
+    samples.reverse()
+    for sample in samples:
+        sample["similarity_score"] = .8
+    r = a.parse_record(raw, 0, "train", cfg)
+    assert r.evaluator_ids == [str(sample["corpus_index"]) for sample in samples]
+    del samples[0]["similarity_score"]
+    with pytest.raises(ValueError, match="missing_or_invalid_measurement"):
+        a.parse_record(raw, 0, "train", cfg)
 
 
-def test_missing_measurements_do_not_reveal_future_values_or_change_truth():
+def test_initial_state_retrieval_order_one_shot_dependency_and_cost():
     cfg = a.Config()
+    assert cfg.full_cost == 233
+    assert a.state_cost(a.State(), cfg) == 1
+    assert len(a.reachable_states(cfg)) == 189
+    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0, 1]
+    first = a.advance(a.State(), 0, cfg)
+    assert first.evaluators == 1
+    assert 2 in np.flatnonzero(a.valid_actions(first, cfg))
+    with pytest.raises(ValueError, match="Unavailable"):
+        a.advance(a.State(), 2, cfg)
+    assert a.fixed_order_actions(cfg) == [0, 2, 1, 0, 3, 1, 0, 4, 0, 5, 0, 6]
+
+
+def test_independent_masks_include_training_only_hidden_source():
+    cfg = a.Config(candidate_mask_fraction=0, evaluator_mask_fraction=1,
+                   hidden_source_fraction=1)
     r = record(cfg)
-    state = a.complete_snapshot_state(1 | (1 << cfg.zero_shots), 1, 1, cfg)
-    missing = a.SnapshotState(state.candidates, state.retrieved, state.evaluators,
-                              0, 1, 0, state.ccs_attempted, 0)
-    a.validate_snapshot_state(missing, cfg)
-    altered = copy.deepcopy(r)
-    altered.similarity[:] = .123
-    altered.baseline[:] = .456
-    altered.ccs[:] = .789
-    assert np.array_equal(a.observation(r, missing, cfg), a.observation(altered, missing, cfg))
-    assert a.state_cost(missing, cfg) == a.state_cost(state, cfg)
-    safe, maximum = np.zeros(cfg.n), np.zeros(cfg.n)
-    safe[cfg.zero_shots], maximum[cfg.zero_shots] = 1, 1
-    y = a.snapshot_target(r, safe, maximum, missing, cfg)
-    assert y[3*cfg.n] == y[3*cfg.n+1] == 1
-    assert np.array_equal(y[:cfg.n], r.labels)
-    unattempted = a.SnapshotState(missing.candidates, missing.retrieved, missing.evaluators,
-                                   0, 0, 0, 0, 0)
-    assert a.state_cost(unattempted, cfg) == 2
+    state = a.complete_snapshot_state((1 << cfg.n)-1, (1 << cfg.k)-1,
+                                       (1 << cfg.k)-1, cfg)
+    hidden = a.augment_structure(state, cfg, np.random.RandomState(3))
+    assert hidden.retrieved == hidden.evaluators == 0
+    assert hidden.candidates & (1 << cfg.zero_shots)
+    with pytest.raises(ValueError, match="without retrieved source"):
+        a.validate_snapshot_state(hidden, cfg)
+    x = a.observation(r, hidden, cfg, allow_hidden_source=True)
+    assert x.shape == (cfg.input_dim,)
+    assert np.isfinite(x).all()
+    assert hidden.ccs_observed == 0 and hidden.baseline_observed == 0
 
 
-def test_snapshot_permutation_preserves_evidence_and_label_alignment():
-    cfg = a.Config()
-    r = record(cfg)
-    state = a.complete_snapshot_state(1 | (1 << (cfg.zero_shots + 3)), 1 << 3, 0, cfg)
-    safe = np.arange(cfg.n) % 2
-    maximum = np.eye(1, cfg.n, 0).ravel()
-    pr, ps, py, pm = a.permute_snapshot(r, state, safe, maximum, cfg, np.random.RandomState(5))
-    assert pr.labels.sum() == r.labels.sum()
-    assert py.sum() == safe.sum() and pm.sum() == maximum.sum()
-    assert a.state_cost(ps, cfg) == a.state_cost(state, cfg)
-    assert pr.ccs.shape == r.ccs.shape
-    a.validate_snapshot_state(ps, cfg)
-    assert a.observation(pr, ps, cfg).shape == (cfg.input_dim,)
-
-
-def test_augmented_snapshot_dataset_changes_across_epochs_and_preserves_labels():
-    cfg = a.Config(snapshot_reachable_fraction=.5, snapshot_missing_fraction=1.,
-                   snapshot_permutation_fraction=0.)
+def test_first_and_second_training_share_full_and_augmented_inputs():
+    cfg = a.Config(snapshots_per_query=6, candidate_mask_fraction=.5,
+                   evaluator_mask_fraction=.5)
     r = record(cfg)
     teacher = {"safe": np.ones((1, cfg.n), np.float32),
                "maximum": np.eye(1, cfg.n, 0).astype(np.float32)}
-    x0, y0 = a.build_snapshots([r], [0], teacher, cfg, 8, 31, epoch=0, augmented=True)
-    x1, y1 = a.build_snapshots([r], [0], teacher, cfg, 8, 32, epoch=1, augmented=True)
-    assert x0.shape == x1.shape == (8, 223)
-    assert y0.shape == y1.shape == (8, 3*cfg.n+2+cfg.n)
-    assert not np.array_equal(x0, x1)
-    for row in y0:
-        assert np.array_equal(row[:cfg.n], r.labels)
-        assert row[3*cfg.n] == 1
-        assert row[3*cfg.n+1] <= row[3*cfg.n]
+    first_x, first_y = a.build_snapshots([r], [0], None, cfg, 6, 1, augmented=True)
+    second_x, second_y = a.build_snapshots([r], [0], teacher, cfg, 6, 1, augmented=True)
+    full = a.observation(r, a.State((1 << cfg.n)-1, cfg.k), cfg)
+    assert first_x.shape == second_x.shape == (6, cfg.input_dim)
+    assert first_y.shape == (6, 2*cfg.n)
+    assert second_y.shape == (6, 4*cfg.n+2)
+    assert np.array_equal(first_x[0], full)
+    assert np.array_equal(second_x[0], full)
+    assert np.array_equal(first_x, second_x)
+    assert np.array_equal(first_y[0, cfg.n:], np.ones(cfg.n))
 
 
-def test_hidden_future_data_cannot_change_observation_or_action():
+@pytest.mark.parametrize("count,batch", [(3, 2), (9, 4), (129, 128)])
+def test_training_batches_keep_every_example_without_singletons(count, batch):
+    x = np.arange(count, dtype=np.float32)[:, None]
+    batches = list(a.make_loader(x, x.copy(), batch))
+    assert min(len(bx) for bx, _ in batches) >= 2
+    assert sorted(torch.cat([bx[:, 0] for bx, _ in batches]).tolist()) == list(range(count))
+
+
+def test_reference_score_ties_preserve_max_identity_after_slot_permutation():
+    cfg = a.Config(k=1, zero_shots=2)
+    r = record(cfg)
+    scores = np.array([.8, .8, .1])
+    safe, maximum = a.teacher_labels(scores, np.array([1, 0, 0]), cfg)
+    shuffled, _, _, new_max = a.permute_zero_shots(r, scores, safe, maximum, (1, 0), cfg)
+    order = a.permuted_reference_order(scores, (1, 0), cfg)
+    assert shuffled.candidate_ids[order[0]] == r.candidate_ids[0]
+    assert new_max[order[0]] == 1
+    # With no acquired evaluator, the head has no evidence about candidate identity.
+    assert a.visible_state_key(r, a.State(), cfg) == a.visible_state_key(shuffled, a.State(), cfg)
+
+
+def test_slot_permutation_keeps_measurements_provenance_and_labels_aligned():
+    cfg = a.Config()
+    r = record(cfg)
+    safe = np.arange(cfg.n, dtype=np.float32)
+    maximum = np.arange(cfg.n, dtype=np.float32) + 10
+    state = a.complete_snapshot_state((1 << cfg.n)-1, (1 << cfg.k)-1,
+                                       (1 << cfg.k)-1, cfg)
+    permuted, new_state, new_safe, new_max = a.permute_snapshot(
+        r, state, safe, maximum, cfg, np.random.RandomState(19))
+    original_candidates = {cid: i for i, cid in enumerate(r.candidate_ids)}
+    original_evaluators = {eid: j for j, eid in enumerate(r.evaluator_ids)}
+    for i, cid in enumerate(permuted.candidate_ids):
+        source_i = original_candidates[cid]
+        assert permuted.labels[i] == r.labels[source_i]
+        assert new_safe[i] == safe[source_i] and new_max[i] == maximum[source_i]
+        for j, eid in enumerate(permuted.evaluator_ids):
+            assert permuted.ccs[i,j] == r.ccs[source_i, original_evaluators[eid]]
+    assert a.observation(permuted, new_state, cfg).shape == (cfg.input_dim,)
+
+
+def test_hidden_future_measurements_and_labels_do_not_change_observation_or_action():
     cfg = a.Config(device="cpu", hidden_dim=8, residual_blocks=1)
     r, state = record(cfg), a.State()
     changed = copy.deepcopy(r)
-    changed.ccs[1:, :] = 0.123
-    changed.ccs[0, 1:] = .456
-    changed.baseline[1:] = .789
+    changed.ccs[:] = .123
+    changed.baseline[:] = .8
     changed.similarity[1:] = -.9
     changed.labels[:] = 1 - changed.labels
     assert np.array_equal(a.observation(r, state, cfg), a.observation(changed, state, cfg))
@@ -193,234 +185,236 @@ def test_hidden_future_data_cannot_change_observation_or_action():
     h1, p1 = predictor.predict(r, state)
     h2, p2 = predictor.predict(changed, state)
     assert np.array_equal(h1, h2) and np.array_equal(p1, p2)
-    for block in range(3):
-        assert not p1[block*cfg.n+1:(block+1)*cfg.n].any()
-    head = a.ActionHead(cfg)
+    head = a.SupervisedActionHead(cfg)
     valid = a.valid_actions(state, cfg)
     assert a.greedy_action(head, h1, valid, "cpu") == a.greedy_action(head, h2, valid, "cpu")
-    nxt = a.advance(state, 0, cfg)
-    assert not np.array_equal(a.observation(r, nxt, cfg), a.observation(changed, nxt, cfg))
 
 
-@pytest.mark.parametrize("unit,full,initial", [("solver_calls",233,11), ("total_calls",458,21)])
-def test_actions_cost_and_full_pool_order_invariance(unit, full, initial):
-    cfg = a.Config(cost_unit=unit)
-    assert cfg.full_cost == full and a.state_cost(a.State(), cfg) == initial
-    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0,1,2]
-    for seed in range(8):
-        state, rng, steps = a.State(), np.random.RandomState(seed), 0
-        total = initial
-        while a.valid_actions(state, cfg).any():
-            next_state = a.advance(state, int(rng.choice(np.flatnonzero(a.valid_actions(state, cfg)))), cfg)
-            total += a.state_cost(next_state, cfg) - a.state_cost(state, cfg)
-            state, steps = next_state, steps+1
-        assert total == full and steps == 11
-        assert state.candidates == 255 and state.evaluators == 5
+def test_no_max_fallback_and_strict_optional_later_filter():
+    cfg = a.Config(k=1, zero_shots=2)
+    order = [0, 1, 2]
+    p = np.zeros(3*cfg.n+2, np.float32)
+    full = np.array([.3, .7, .5], np.float32)
+    state = a.State(1, 0)
+    empty = np.zeros(cfg.n, np.float32)
+    p[0] = .7
+    assert not a.goal_condition(0, order, empty, empty, p, full, state, cfg)
+    p[0] = .70001
+    assert a.goal_condition(0, order, empty, empty, p, full, state, cfg)
+    present = a.State(3, 0)
+    p[1] = .5
+    assert not a.goal_condition(1, order, empty, empty, p, full, present, cfg)
+    disabled = copy.deepcopy(cfg)
+    disabled.later_rank_filter = False
+    assert a.goal_condition(1, order, empty, empty, p, full, present, disabled)
+    p[0] = .2
+    assert not a.goal_condition(0, order, empty, empty, p, full, state, disabled)
 
 
-def test_absent_candidates_have_no_supervised_gradient():
-    cfg = a.Config()
+def test_max_requires_all_four_correct_lights_and_previous_goal_is_preserved():
+    cfg = a.Config(k=1, zero_shots=2)
+    order = [0, 1, 2]
+    safe = np.array([1, 0, 0], np.float32)
+    maximum = np.array([1, 0, 0], np.float32)
+    p = np.zeros(3*cfg.n+2, np.float32)
+    for col in (cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1):
+        p[col] = .5
+    assert a.goal_condition(0, order, safe, maximum, p, p, a.State(), cfg)
+    p[2*cfg.n] = .4999
+    assert not a.goal_condition(0, order, safe, maximum, p, p, a.State(), cfg)
+
+    class Scripted:
+        device = torch.device("cpu")
+        def predict(self, rec, state, cfg_override=None):
+            q = np.zeros(3*cfg.n+2, np.float32)
+            if state.evaluators:
+                q[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+            if state.candidates & 2:
+                q[1] = .8
+            if state.candidates not in (1, 7):
+                q[2*cfg.n] = .1  # Either intermediate addition loses MAX; full state restores it.
+            return np.zeros(cfg.hidden_dim, np.float32), q
+        def predict_many(self, rec, states, allow_hidden_source=False):
+            values = [self.predict(rec, state) for state in states]
+            return np.stack([v[0] for v in values]), np.stack([v[1] for v in values])
     r = record(cfg)
-    safe = np.ones(cfg.n, np.float32)
-    maximum = np.zeros(cfg.n, np.float32)
-    maximum[0] = 1
-    y = torch.tensor(a.snapshot_target(r, safe, maximum, a.State(), cfg)[None])
-    z = torch.zeros((1,3*cfg.n+2), requires_grad=True)
-    a.snapshot_loss(z, y, cfg).backward()
-    for offset in (0, cfg.n, 2*cfg.n):
-        assert torch.equal(z.grad[0,offset+1:offset+cfg.n], torch.zeros(cfg.n-1))
-    assert z.grad[0,0] != 0
+    states = a.reachable_states(cfg)
+    scenario = a.decision_scenario(
+        r, np.array([.9,.8,.7]), safe, maximum, Scripted(), cfg, states)
+    after_first = states.index(a.State(1, 1))
+    assert scenario["goal"][after_first].tolist() == [True, False, False]
+    assert scenario["goal"][states.index(a.State(7, 1)), 0]
+    rows, skipped = a.aggregate_decision_rows([scenario], cfg, roots={a.State(1, 1)})
+    assert not rows and skipped == 1
 
 
-def test_safe_presence_must_match_returned_candidate_when_gated():
-    cfg = a.Config(stop_mode="safe", stop_threshold=.9, member_threshold=.8)
-    state = a.advance(a.State(), 1, cfg)
-    probabilities = np.zeros(3*cfg.n+2, np.float32)
-    probabilities[:2] = [.9,.5]
-    probabilities[3*cfg.n] = .99
-    probabilities[cfg.n+1] = .99   # Some SAFE candidate exists, but it is not selected.
-    assert a.stopping_reason(probabilities, state, cfg) is None
-    probabilities[cfg.n] = .9
-    assert a.stopping_reason(probabilities, state, cfg) == "safe"
+def test_planner_shares_future_actions_until_zero_shot_evidence_is_observed():
+    cfg = a.Config(k=2, zero_shots=3, repeats=1, hidden_dim=4)
+    r = record(cfg)
+    r.ccs[1, :] = 1  # B can be recognized only after it is acquired and measured.
+    r.ccs[2, :] = 0  # C supplies different observed evidence.
+    root = a.State(1, 1)
+    states = a.states_from(root, cfg)
+    scores = np.arange(cfg.n, 0, -1, dtype=float)
+    safe = maximum = np.array([1, 0, 0, 0, 0], np.float32)
+
+    class Scripted:
+        deterministic_route = True
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            both_sources = state.candidates & 24 == 24
+            measured_b = bool(state.candidates & 2) and rec.ccs[1, 0] == 1
+            if state.evaluators == 2 and (measured_b or (self.deterministic_route and both_sources)):
+                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+            return np.zeros(cfg.hidden_dim, np.float32), p
+        def predict_many(self, rec, states, allow_hidden_source=False):
+            values = [self.predict(rec, state) for state in states]
+            return np.stack([v[0] for v in values]), np.stack([v[1] for v in values])
+
+    predictor = Scripted()
+    def scenarios():
+        result = []
+        for order in ((0, 1, 2), (0, 2, 1)):
+            rec, s, sf, mx = a.permute_zero_shots(r, scores, safe, maximum, order, cfg)
+            result.append(a.decision_scenario(rec, s, sf, mx, predictor, cfg, states,
+                          reference_order=a.permuted_reference_order(scores, order, cfg)))
+        return result
+
+    cases = scenarios()
+    oracle_costs = [a.aggregate_decision_rows([case], cfg, roots={root})[0][0]["action_expected_cost"][0]
+                    for case in cases]
+    rows, missing = a.aggregate_decision_rows(cases, cfg, roots={root})
+    assert missing == 0 and len(rows) == 1
+    assert np.mean(oracle_costs) == 6.5  # Knows whether to generate B or use both sources.
+    assert rows[0]["action_expected_cost"][0] == 8  # Must decide before B/C is known.
+    assert rows[0]["action_reach"][0] == 1
+
+    predictor.deterministic_route = False
+    rows, _ = a.aggregate_decision_rows(scenarios(), cfg, roots={root})
+    assert rows[0]["action_reach"][0] == .5
+    assert rows[0]["action_expected_cost"][0] == 9.5  # Includes calls in the failed order.
+    impossible = scenarios()[1]
+    rows, missing = a.aggregate_decision_rows([impossible], cfg, roots={root})
+    assert not rows and missing == 1
+    rows, missing = a.aggregate_decision_rows([impossible], cfg,
+                                              roots={a.State((1 << cfg.n)-1, cfg.k)})
+    assert not rows and missing == 1  # Exhausted unmet goals remain visible in the audit.
+
+    predictor.deterministic_route = True
+    cfg.max_cost = 11
+    states = a.states_from(root, cfg)
+    rows, _ = a.aggregate_decision_rows(scenarios(), cfg, roots={root})
+    row = rows[0]
+    assert row["action_reach"][1] == .5 and row["action_reach"][0] == 1
+    assert row["action_expected_cost"][1] < row["action_expected_cost"][0]
+    assert row["target"][1] == 0  # Cheaper expected calls cannot outrank better reachability.
+    assert row["target"][0] == row["target"][2] == .5  # A genuine order-of-additions tie.
 
 
-def test_bellman_masks_terminals_and_double_dqn():
-    reward = torch.tensor([.1, .2])
-    done = torch.tensor([False, True])
-    valid = torch.tensor([[True,False,True],[False,False,False]])
-    target = torch.tensor([[2.,999.,3.],[9.,9.,9.]])
-    assert torch.allclose(a.bellman_target(reward, done, valid, target, 1), torch.tensor([3.1,.2]))
-    online = torch.tensor([[4.,999.,1.],[2.,2.,2.]])
-    assert torch.allclose(a.bellman_target(reward, done, valid, target, 1, online), torch.tensor([2.1,.2]))
-    with pytest.raises(ValueError, match="no valid"):
-        a.bellman_target(reward, torch.tensor([False,False]), valid, target, 1)
+def test_fixed_policy_does_not_skip_an_unaffordable_step():
+    cfg = a.Config(max_cost=29)
+    class NoStop:
+        def predict(self, rec, state, cfg_override=None):
+            return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
+    row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed", trace=True)
+    assert [step["action"] for step in row["trajectory"] if step["action"] is not None] == [0, 2, 1]
+    assert row["cost"] == 23 and row["reason"] == "budget"
 
 
-def test_terminal_reward_selects_actual_answer_and_charges_cost():
-    cfg = a.Config(device="cpu", hidden_dim=8, residual_blocks=1, max_cost=17,
-                   stop_threshold=1, member_threshold=1, early_quality_weight=0)
-    r, predictor = record(cfg), fake_predictor(cfg)
-    env = a.CachedEnvironment(r, predictor, cfg)
-    assert np.flatnonzero(a.valid_actions(env.state, cfg)).tolist() == [1,2]
-    reward, done = env.step(1)
-    selected = a.selected_candidate(env.probabilities, env.state, cfg)
-    assert done and env.reason == "budget"
-    assert reward == pytest.approx(r.labels[selected] - cfg.cost_weight*6/cfg.full_cost)
-    with pytest.raises(ValueError, match="termination"):
-        env.step(0)
+def test_no_max_evaluation_keeps_false_predicted_max_and_separate_stratum():
+    rows = [dict(uid="a", correct=0, exact_max=None, has_max=False, cost=1,
+                 saved_fraction=.9, reason="predicted_max"),
+            dict(uid="b", correct=1, exact_max=True, has_max=True, cost=10,
+                 saved_fraction=0, reason="predicted_max")]
+    summary = a.policy_summary(rows)
+    assert summary["n"] == 2 and summary["top1_correct"] == .5
+    assert summary["exact_max_recovery"] == 1
+    assert summary["no_max_false_predicted_max"] == 1
 
 
-def test_early_quality_reward_prefers_earlier_correct_selection():
-    cfg = a.Config(k=1, zero_shots=2, repeats=1, stop_threshold=1,
-                   member_threshold=1, early_quality_weight=.1)
-    early, er = scripted_episode(cfg, [0, 1, 0], [1, 2])
-    late, lr = scripted_episode(cfg, [0, 1, 0], [2, 1])
-    assert early.reason == late.reason == "pool_exhaustion"
-    assert early.early_quality() == pytest.approx(.5)
-    assert late.early_quality() == pytest.approx(0)
-    assert sum(er) == pytest.approx(1 - cfg.cost_weight*4/cfg.full_cost + .1*.5)
-    assert sum(lr) == pytest.approx(1 - cfg.cost_weight*4/cfg.full_cost)
-    _, old = scripted_episode(cfg, [0, 1, 0], [1, 2], reward_weight=0)
-    assert sum(old) == pytest.approx(1 - cfg.cost_weight*4/cfg.full_cost)
-    assert old[0] == pytest.approx(-cfg.cost_weight*2/cfg.full_cost)
-    assert old[1] == pytest.approx(1 - cfg.cost_weight*2/cfg.full_cost)
+def test_continuation_counts_all_orders_and_rejects_recovery_after_a_broken_goal(monkeypatch):
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
+    class Predictor:
+        device = "cpu"
+        def predict(self, rec, state, cfg_override=None):
+            return np.zeros(cfg.hidden_dim, np.float32), np.zeros(3*cfg.n+2)
+    class Head(torch.nn.Module):
+        def forward(self, hidden):
+            return torch.tensor([[0., 2., 1.]]).repeat(len(hidden), 1)
+    # Initial rank recognized; adding ZS2 loses it; the final pool would restore all goals.
+    def flags(rank, order, safe, maximum, probabilities, full_probabilities, state, config):
+        return state.candidates == 7 or (rank == 0 and state.candidates == 1)
+    monkeypatch.setattr(a, "goal_condition", flags)
+    teacher = {"scores": np.array([[.9, .8, .7]]),
+               "safe": np.array([[1, 0, 0]]), "maximum": np.array([[1, 0, 0]])}
+    result = a.continuation_diagnostic([record(cfg)], [0], teacher, Predictor(), cfg, Head())
+    assert result["orders_per_question"] == 2
+    assert result["mean_rank_prefix_reached"] == 1
+    assert result["per_rank_reach"] == [1., 0., 0.]
+    assert result["prior_goal_loss_rate"] == 1
+    assert result["questions_with_prior_goal_lost"] == 1
 
 
-def test_early_quality_handles_early_stop_immediate_stop_and_wrong_pools():
-    cfg = a.Config(k=1, zero_shots=2, repeats=1, stop_threshold=.95,
-                   member_threshold=.9, early_quality_weight=.1)
-    early, rewards = scripted_episode(cfg, [0, 1, 0], [1],
-                                      ScriptedPredictor(cfg, safe_score=.99, safe_on_second=True))
-    # A selected-member gate is still required, so SAFE alone cannot stop.
-    assert early.reason is None
-    cfg.require_selected_member = False
-    early, rewards = scripted_episode(cfg, [0, 1, 0], [1],
-                                      ScriptedPredictor(cfg, safe_score=.99, safe_on_second=True))
-    assert early.reason == "safe" and early.early_quality() == pytest.approx(.5)
-    assert sum(rewards) == pytest.approx(1 - cfg.cost_weight*2/cfg.full_cost + .1*.5)
-    immediate = a.CachedEnvironment(record(cfg), ScriptedPredictor(cfg, safe_score=.99), cfg)
-    assert immediate.reason == "safe"
-    assert immediate.early_quality() == float(immediate.record.labels[0])
-    wrong, rewards = scripted_episode(cfg, [0, 0, 0], [1, 2],
-                                      ScriptedPredictor(cfg, safe_score=0))
-    assert wrong.early_quality() == 0 and sum(rewards) == pytest.approx(-cfg.cost_weight*4/cfg.full_cost)
-    lost, rewards = scripted_episode(cfg, [1, 0, 0], [1, 2],
-                                     ScriptedPredictor(cfg, safe_score=0))
-    assert lost.early_quality() == pytest.approx(.5)
-    assert sum(rewards) == pytest.approx(-cfg.cost_weight*4/cfg.full_cost + .1*.5)
-    capped = a.Config(k=1, zero_shots=2, repeats=1, max_cost=5,
-                      stop_threshold=1, member_threshold=1)
-    budget, rewards = scripted_episode(capped, [0, 1, 0], [1])
-    assert budget.reason == "budget" and budget.early_quality() == 0
-    assert sum(rewards) == pytest.approx(1 - capped.cost_weight*2/capped.full_cost)
-
-
-def test_confidence_changes_do_not_change_reward_and_accuracy_ranks_first():
-    cfg = a.Config(k=1, zero_shots=2, repeats=1, stop_threshold=1,
-                   member_threshold=1)
-    _, low = scripted_episode(cfg, [0, 1, 0], [1, 2], ScriptedPredictor(cfg, safe_score=.1))
-    _, high = scripted_episode(cfg, [0, 1, 0], [1, 2], ScriptedPredictor(cfg, safe_score=.9))
-    assert low == high
-    accurate = {"top1": .8, "early_quality": .2, "mean_cost": cfg.full_cost}
-    cheaper = {"top1": .7, "early_quality": 1., "mean_cost": 0}
-    assert a.policy_rank(accurate, cfg) > a.policy_rank(cheaper, cfg)
-    assert not (a.policy_rank(accurate.copy(), cfg) > a.policy_rank(accurate, cfg))
-    with pytest.raises(AssertionError):
-        a.Config(gamma=.9).validate()
-    a.Config(gamma=.9, early_quality_weight=0).validate()
-
-
-def test_unchanged_correct_selection_ignores_action_bundle_partition():
-    cfg = a.Config(k=2, zero_shots=2, max_cost=32, stop_threshold=1,
-                   member_threshold=1)
-    predictor = ScriptedPredictor(cfg, second_score=.1)
-    first, reward_first = scripted_episode(cfg, [1, 0, 0, 0], [0, 1], predictor)
-    second, reward_second = scripted_episode(cfg, [1, 0, 0, 0], [1, 0], predictor)
-    assert first.reason == second.reason == "budget"
-    assert first.early_quality() == second.early_quality() == 1
-    assert sum(reward_first) == pytest.approx(sum(reward_second))
-
-
-def test_query_splits_and_streamed_cache_envelope(tmp_path):
-    cfg = a.Config(train_file=str(tmp_path/"train.json"), test_files=[], teacher_folds=2)
-    records = [record(cfg,i) for i in range(40)]
-    splits = a.split_records(records, cfg)
-    sets = [set(v) for v in splits.values()]
-    assert sum(map(len, sets)) == len(set.union(*sets)) == 40
-    path = tmp_path/"cache.json"
-    path.write_text(json.dumps({"queries": {"13": raw_record(13,cfg)["layer1_base_execution_state"]}}))
-    pairs = list(a.iter_log(path))
-    assert pairs[0][0] == "13"
-    assert a.parse_record(pairs[0][1], "13", "cache", cfg).uid == "cache::13"
-
-
-def test_all_wrong_metrics_not_dropped():
-    cfg = a.Config()
-    r = a.parse_record(raw_record(0,cfg,all_wrong=True),0,"train",cfg)
-    metrics = a.ranking_metrics([r],[0],{0:np.arange(cfg.n)},cfg)
-    assert metrics["n"] == 1 and metrics["top1"] == 0 and metrics["ap"] == 0
-    assert metrics["conditional_ap"] is None
-
-
-def test_complete_pipeline_checkpoint_resume_and_oof(tmp_path):
-    train, test = tmp_path/"train.json", tmp_path/"test.json"
-    cfg = a.Config(train_file=str(train), test_files=[str(test)], output_dir=str(tmp_path/"run"),
-                   device="cpu", cpu_threads=1, teacher_folds=2, hidden_dim=8, residual_blocks=1,
-                   batch_size=16, teacher_epochs=2, snapshot_epochs=2, patience=2,
-                   snapshots_per_query=3, dev_snapshots_per_query=3,
-                   rl_steps=24, rl_batch_size=4, warmup=4, replay_size=64,
-                   target_update=2, eval_every=12, bootstrap_samples=20,
-                   stop_threshold=1, member_threshold=1, max_cost=45)
+def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path):
+    train, external = tmp_path/"train.json", tmp_path/"external.json"
+    cfg = a.Config(train_file=str(train), test_files=[str(external)],
+                   output_dir=str(tmp_path/"run"), device="cpu", cpu_threads=1,
+                   k=2, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
+                   batch_size=16, teacher_epochs=2, snapshot_epochs=2, decision_epochs=2,
+                   patience=2, snapshots_per_query=4, dev_snapshots_per_query=4,
+                   decision_batch_size=16, recognition_threshold=.1,
+                   bootstrap_samples=20)
     train.write_text(json.dumps([raw_record(i,cfg) for i in range(40)]))
-    test.write_text(json.dumps([raw_record(i,cfg,prefix="external",all_wrong=(i==0)) for i in range(5)]))
+    external.write_text(json.dumps([raw_record(i,cfg,prefix="external",all_wrong=(i==0))
+                                    for i in range(3)]))
     work = a.run_pipeline(cfg)
-    assert work.results["test"]["adaptive"]["policies"]["rl"]["n"] == 5
-    assert {"rl_baseline", "rl_refined", "rl"} <= set(
-        work.results["test"]["adaptive"]["policies"])
-    assert (tmp_path/"run"/"accuracy_vs_cost_audit.svg").exists()
-    assert ET.parse(tmp_path/"run"/"accuracy_vs_cost_audit.svg").getroot().tag.endswith("svg")
-    assert (tmp_path/"run"/"rl_baseline_completed.pt").exists()
-    assert (tmp_path/"run"/"rl_refined_completed.pt").exists()
-    selected = work.selection["exported"]
-    assert work.results["test"]["adaptive"]["policies"]["rl"] == (
-        work.results["test"]["adaptive"]["policies"][selected])
-    saved = [json.loads(line) for line in (tmp_path/"run"/"final_trajectories.jsonl")
-             .read_text(encoding="utf-8").splitlines()]
-    for method in ("evaluator_first", "candidate_first", "random", "cheapest",
-                   "rl_baseline", "rl_refined"):
-        row = next(row for row in saved if row["benchmark"] == "test" and row["method"] == method)
-        assert row["trajectory"][0]["cost"] == a.state_cost(a.State(), cfg)
-        assert row["trajectory"][-1]["cost"] == row["cost"]
-        assert "offline_selected_correct" in row["trajectory"][-1]
+    assert set(work.results["external"]["adaptive"]["policies"]) == {
+        "full", "fixed", "supervised"}
+    assert work.results["external"]["adaptive"]["policies"]["supervised"]["n"] == 3
+    assert (tmp_path/"run"/"decision_head_completed.pt").exists()
+    saved_rows = a.load_checkpoint(tmp_path/"run"/"decision_dataset_policy.pt")["rows"]
+    assert saved_rows and {"uid", "state_key", "h", "target", "valid", "goal_rank"} <= set(saved_rows[0])
+    assert not {"truth", "teacher_scores", "future_measurements"} & set(saved_rows[0])
+    ordinary = [row for row in saved_rows if row["weight"] == 1.]
+    artificial = [row for row in saved_rows if row["weight"] < 1.]
+    assert len(artificial) <= int(.1 * len(ordinary))
+    assert all(np.isclose(row["target"].sum(), 1) and not row["target"][~row["valid"]].any()
+               for row in saved_rows)
+    role_uids = {role: {work.records[i].uid for i in ids} for role, ids in work.splits.items()}
+    assert {row["uid"] for row in saved_rows} <= role_uids["policy"]
+    dev_rows = a.load_checkpoint(tmp_path/"run"/"decision_dataset_dev.pt")["rows"]
+    assert {row["uid"] for row in dev_rows} <= role_uids["dev"]
+    for role, uids in role_uids.items():
+        assert all(not uids & other for name, other in role_uids.items() if name != role)
+    assert (tmp_path/"run"/"results.json").exists()
+    assert (tmp_path/"run"/"final_trajectories.jsonl").exists()
     for fold in work.teacher["folds"]:
-        assert not set(fold["heldout_ids"]) & (set(fold["train_ids"]) | set(fold["validation_ids"]))
-    assert len(set.union(*(set(f["heldout_ids"]) for f in work.teacher["folds"]))) == len(work.splits["supervised"])
+        assert not set(fold["heldout_ids"]) & (set(fold["train_ids"]) |
+                                               set(fold["validation_ids"]))
     frozen = a.cpu_state(work.predictor.model)
     assert not any(p.requires_grad for p in work.predictor.model.parameters())
     restored_cfg, predictor, head = a.load_inference_bundle(tmp_path/"run"/"inference_bundle.pt")
     assert all(torch.equal(frozen[k], v.cpu()) for k,v in predictor.model.state_dict().items())
-    r = work.records[work.splits["test"][0]]
-    assert a.rollout(r,predictor,restored_cfg,head=head)["selected"] == a.rollout(r,work.predictor,cfg,head=work.head)["selected"]
-    resumed = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_rl()
-    assert resumed.teacher["scores"].shape == (45,8)
+    assert not predictor.model.training
+    assert np.array_equal(predictor.temperatures, work.predictor.temperatures)
+    r = work.records[work.splits["external"][0]]
+    maximum = work.teacher["maximum"][work.splits["external"][0]]
+    assert a.rollout(r,maximum,predictor,restored_cfg,head=head)["selected"] == (
+        a.rollout(r,maximum,work.predictor,cfg,head=work.head)["selected"])
+    resumed = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
+    assert resumed.decision_checkpoint["best_epoch"] == work.decision_checkpoint["best_epoch"]
+    contract_path = tmp_path/"run"/"contract.json"
+    contract = json.loads(contract_path.read_text())
+    assert contract.pop("implementation_revision") == a.PIPELINE_REVISION
+    contract_path.write_text(json.dumps(contract))
+    with pytest.raises(ValueError, match="different config/data contract"):
+        a.Workflow(cfg)
+    contract["implementation_revision"] = a.PIPELINE_REVISION
+    contract_path.write_text(json.dumps(contract))
     changed = copy.deepcopy(cfg)
-    changed.stop_threshold = .90
+    changed.recognition_threshold = .5
     with pytest.raises(ValueError, match="different config"):
         a.Workflow(changed)
-
-
-def test_missing_labels_and_exact_overlap_are_audited(tmp_path):
-    train, test = tmp_path/"train.json", tmp_path/"test.json"
-    cfg = a.Config(train_file=str(train), test_files=[str(test)])
-    good = raw_record(0,cfg,all_wrong=True)
-    bad = raw_record(1,cfg)
-    del bad["layer1_base_execution_state"]["ground_truth_labels"]["zs_0"]
-    train.write_text(json.dumps([good,bad]))
-    test.write_text(json.dumps([good]))
-    records, audit = a.load_records(cfg)
-    assert len(records) == 1 and not records[0].labels.any()
-    assert audit["train"]["unknown_or_failed_label"] == 1
-    assert audit["test"]["duplicate_or_cross_file_overlap"] == 1
 
 
 def test_notebook_is_self_contained_compiles_and_matches_module():

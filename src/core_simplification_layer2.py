@@ -13,7 +13,7 @@ from src.utils import load_json, save_json, save_json_atomic, create_trace_entry
 from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
 from src.benchmark_data import benchmark_name_for_target_index
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.api_manager import model_name_for
 
 # Import shared prompts
 from src.prompts import (
@@ -140,15 +140,8 @@ def run_parallel_evaluation_branches(
     temp_solve = config.get("CORE_SIMP_TEMPERATURE_SOLVE", 1.0)
     
     # Model Selection
-    if isinstance(api_manager_solve, GeminiAPIManager):
-        m_gen = config.get('GEMINI_MODEL_NAME_ADAPTATION')
-        m_solve = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
-    elif isinstance(api_manager_solve, AvalAIAPIManager):
-        m_gen = config.get('AVALAI_MODEL_NAME_ADAPTATION')
-        m_solve = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
-    elif isinstance(api_manager_solve, OllamaAPIManager):
-        m_gen = config.get('OLLAMA_MODEL_NAME_ADAPTATION')
-        m_solve = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
+    m_gen = model_name_for(api_manager_solve, config, "adaptation")
+    m_solve = model_name_for(api_manager_solve, config, "final_solver")
     
     local_trace = []
     results = {"test_idx": test_item["test_idx"], "donor_idx": test_item["linked_donor_original_idx"]}

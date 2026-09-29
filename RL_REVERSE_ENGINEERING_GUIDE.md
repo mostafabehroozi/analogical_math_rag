@@ -1,5 +1,7 @@
 # Reinforcement learning in this project: from the broad view to the training loop
 
+> Historical note: This guide describes the former DQN implementation. The current adaptive training pipeline uses a supervised decision head; see [the current guide](ADAPTIVE_ANALOGICAL_TRAINING_GUIDE.md). Code references below describe the earlier version.
+
 This guide is for an AI engineer who knows supervised learning and wants to understand the reinforcement learning (RL) part of this repository step by step. The implementation is in [`adaptive_analogical_training.py`](adaptive_analogical_training.py), and Stage 3 of [`adaptive_analogical_training_kaggle.ipynb`](adaptive_analogical_training_kaggle.ipynb) runs it. The notebook contains its own copy of the implementation.
 
 ## Level 0: The broad picture

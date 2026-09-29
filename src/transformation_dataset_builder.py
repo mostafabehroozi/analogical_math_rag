@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
 
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.api_manager import model_name_for
 from src.benchmark_data import benchmark_name_for_target_index
 from src.batching import BatchCoordinator, QuestionResult, QuestionWorkItem
 from src.distributed_execution import (
@@ -46,22 +46,11 @@ def _result_completed(result: Dict[str, Any]) -> bool:
 
 def _model_name(manager: Any, config: Dict[str, Any], role: str) -> str:
     """Resolve a model name while retaining support for lightweight test managers."""
-    suffix = {
-        "adaptation": "ADAPTATION",
-        "solver": "FINAL_SOLVER",
-        "evaluator": "EVALUATOR",
-    }[role]
-    if isinstance(manager, GeminiAPIManager):
-        prefix = "GEMINI"
-    elif isinstance(manager, AvalAIAPIManager):
-        prefix = "AVALAI"
-    elif isinstance(manager, OllamaAPIManager):
-        prefix = "OLLAMA"
-    else:
-        prefix = str(config.get(f"API_PROVIDER_{role.upper()}", "gemini")).upper()
-        if prefix == "SOLVER":
-            prefix = "GEMINI"
-    return config.get(f"{prefix}_MODEL_NAME_{suffix}", config.get("GEMINI_MODEL_NAME_FINAL_SOLVER"))
+    if getattr(manager, "provider_name", None) in {"gemini", "avalai", "openrouter", "ollama"}:
+        return model_name_for(manager, config, role)
+    # Lightweight test managers do not always expose provider_name.
+    provider = config.get(f"API_PROVIDER_{'SOLVER' if role == 'solver' else role.upper()}", "gemini")
+    return config.get(f"{str(provider).upper()}_MODEL_NAME_{'FINAL_SOLVER' if role == 'solver' else role.upper()}", config.get("GEMINI_MODEL_NAME_FINAL_SOLVER"))
 
 
 def _transformation_candidate_specs(config: Dict[str, Any]) -> List[Dict[str, Any]]:

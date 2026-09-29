@@ -29,7 +29,7 @@ CONFIG = {
     "ENABLE_API_RETRY": True,          
     "MAX_API_RETRIES": 200,  # Maximum total attempts per API call, including the first.
     "API_RETRY_DELAY_SECONDS": 20.0,
-    "RETRY_ALL_API_ERRORS": True,  # Retry every API error type; local session deadlines still stop execution.
+    "RETRY_ALL_API_ERRORS": True,  # Retry API failures except terminal request/auth/payment errors and local deadlines.
     "API_RESPONSE_TRUNCATION_LENGTH": 70,
     # Batch execution is intentionally opt-in until quotas are configured and
     # the existing experiment has been validated with a small batch.
@@ -101,7 +101,8 @@ CONFIG = {
     "GEMINI_MODEL_QUOTAS": {
         "models/gemma-3-27b-it": [{"api_key": None, "rpm": 30, "rpd": 1000}],
     },
-    "GLOBAL_API_CALL_DELAY_SECONDS": 5,
+    # Minimum time between outgoing calls to each provider (0 disables this delay).
+    "GLOBAL_API_CALL_DELAY_SECONDS": {"gemini": 5.0, "avalai": 5.0, "openrouter": 5.0, "ollama": 0.0},
 
     "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-3-27b-it",
     "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-3-27b-it",
@@ -129,6 +130,26 @@ CONFIG = {
     "AVALAI_REASONING_EFFORT_FINAL_SOLVER": None,
     "AVALAI_REASONING_EFFORT_EVALUATOR": None,
     "AVALAI_ENABLE_THINKING": None,  # Options: None (default), True, False (controls chat_template_kwargs enable_thinking in extra_body)
+
+    # OpenRouter is opt-in. Set its model names when selecting it for a role.
+    "OPENROUTER_API_KEY": "",
+    "OPENROUTER_BASE_URL": "https://openrouter.ai/api/v1",
+    "OPENROUTER_HTTP_REFERER": None,  # Optional app attribution
+    "OPENROUTER_APP_TITLE": None,
+    "OPENROUTER_MODEL_QUOTAS": {"default": {"rpm": 60}},
+    "OPENROUTER_MODEL_NAME_ADAPTATION": None,
+    "OPENROUTER_MODEL_NAME_FINAL_SOLVER": None,
+    "OPENROUTER_MODEL_NAME_EVALUATOR": None,
+    "OPENROUTER_MODEL_NAME_SIMPLIFICATION": None,
+    "OPENROUTER_REASONING_EFFORT": None,
+    "OPENROUTER_REASONING_EFFORT_ADAPTATION": None,
+    "OPENROUTER_REASONING_EFFORT_FINAL_SOLVER": None,
+    "OPENROUTER_REASONING_EFFORT_EVALUATOR": None,
+    # Provider objects are passed directly to OpenRouter. Model entries replace
+    # the default object; experiments may override these dictionaries.
+    "OPENROUTER_PROVIDER_ROUTING": {},
+    "OPENROUTER_MODEL_ROUTING": {},
+    "OPENROUTER_MODEL_FALLBACKS": {},
 
     # Ollama (Local LLM) Settings
     "OLLAMA_BASE_URL": "http://127.0.0.1:11434",

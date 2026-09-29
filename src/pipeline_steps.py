@@ -30,7 +30,7 @@ from src.prompts import (
 )
 from src.utils import create_trace_entry
 from src.parallel_utils import run_parallel_api_calls
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.api_manager import model_name_for
 from src.evaluation import evaluate_single_answer_with_llm
 # Global cache for embedding norms to massively speed up retrieval and save RAM
 _NORMS_CACHE = {}
@@ -240,9 +240,7 @@ def _calculate_baseline_difficulty(
     
     # Determine Model Name
     # FIX: Changed 'api_manager' to 'api_manager_solve'
-    if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    model_name = model_name_for(api_manager_solve, config, "final_solver")
     
     # Load Template
     template_name = config.get("PROMPT_TEMPLATE_MIRROR_BASELINE", "mirror_baseline_zero_shot_v1")
@@ -313,9 +311,7 @@ def _generate_hypotheses(
     Phase 1: Generates a Hypothesis (H) for the target query using each candidate.
     Returns a dict mapping {candidate_index: hypothesis_text}.
     """
-    if isinstance(api_manager, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    model_name = model_name_for(api_manager, config, "final_solver")
     
     hypotheses = {}
     
@@ -403,9 +399,7 @@ def _evaluate_mirror_consistency(
     
     # Determine Model Name
     # FIX: Changed 'api_manager' to 'api_manager_solve'
-    if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
+    model_name = model_name_for(api_manager_solve, config, "final_solver")
     
     # Load Template
     tmpl_verify = PROMPT_TEMPLATES.get(
@@ -573,14 +567,7 @@ def simplify_retrieved_samples(
     successful_simplifications = []
     failed_indices = []
 
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config.get('GEMINI_MODEL_NAME_SIMPLIFICATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config.get('AVALAI_MODEL_NAME_SIMPLIFICATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config.get('OLLAMA_MODEL_NAME_SIMPLIFICATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
-    else:
-        raise TypeError(f"Unsupported API manager type: {type(api_manager)}")
+    model_name = model_name_for(api_manager, config, "simplification")
         
     temp = config.get("DEFAULT_SIMPLIFICATION_TEMPERATURE", 0.3)
 
@@ -660,14 +647,7 @@ def adapt(
     successful_texts = []
     failed_adaptations = []
     
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-    else:
-        raise TypeError(f"Unsupported API manager type for adaptation: {type(api_manager)}")
+    model_name = model_name_for(api_manager, config, "adaptation")
         
     temperature = config['DEFAULT_ADAPTATION_TEMPERATURE']
 
@@ -817,14 +797,7 @@ def solve(
 
         prompt = create_duplicate_check_prompt(target_query, retrieved_questions)
         
-        if isinstance(api_manager, GeminiAPIManager):
-            model_name = config['GEMINI_MODEL_NAME_ADAPTATION']
-        elif isinstance(api_manager, AvalAIAPIManager):
-            model_name = config['AVALAI_MODEL_NAME_ADAPTATION']
-        elif isinstance(api_manager, OllamaAPIManager):
-            model_name = config['OLLAMA_MODEL_NAME_ADAPTATION']
-        else:
-            raise TypeError(f"Unsupported API manager type for duplicate check: {type(api_manager)}")
+        model_name = model_name_for(api_manager, config, "adaptation")
             
         temperature = 0.0 
         
@@ -861,14 +834,7 @@ def solve(
 
     n_attempts = config.get("N_PASS_ATTEMPTS", 1)
     
-    if isinstance(api_manager, GeminiAPIManager):
-        model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager type for solver: {type(api_manager)}")
+    model_name = model_name_for(api_manager, config, "final_solver")
         
     temperature = config.get('DEFAULT_PASS_N_SOLVER_TEMPERATURE', 1.0)
     
@@ -915,17 +881,8 @@ def solve_via_main_simplification(
     logger.info("Starting Solver via Main Question Simplification.")
     local_trace = []
     
-    if isinstance(api_manager, GeminiAPIManager):
-        model_simp = config.get('GEMINI_MODEL_NAME_SIMPLIFICATION', config['GEMINI_MODEL_NAME_ADAPTATION'])
-        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_simp = config.get('AVALAI_MODEL_NAME_SIMPLIFICATION', config['AVALAI_MODEL_NAME_ADAPTATION'])
-        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_simp = config.get('OLLAMA_MODEL_NAME_SIMPLIFICATION', config['OLLAMA_MODEL_NAME_ADAPTATION'])
-        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError("Unsupported API manager type.")
+    model_simp = model_name_for(api_manager, config, "simplification")
+    model_solve = model_name_for(api_manager, config, "final_solver")
 
     temp_simp = config.get("DEFAULT_SIMPLIFICATION_TEMPERATURE", 0.3)
     temp_solve = config.get("DEFAULT_FINAL_SOLVER_TEMPERATURE", 1.0)
@@ -1016,17 +973,8 @@ def reverse_transform_and_solve(
     logger.info("Starting Reverse Transformation step.")
     local_trace = []
     
-    if isinstance(api_manager, GeminiAPIManager):
-        model_transform = config['GEMINI_MODEL_NAME_ADAPTATION']
-        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        model_transform = config['AVALAI_MODEL_NAME_ADAPTATION']
-        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager):
-        model_transform = config['OLLAMA_MODEL_NAME_ADAPTATION']
-        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager type for reverse transformation: {type(api_manager)}")
+    model_transform = model_name_for(api_manager, config, "adaptation")
+    model_solve = model_name_for(api_manager, config, "final_solver")
     
     temp_transform = config.get('REVERSE_TRANSFORMATION_TEMPERATURE', 0.3)
     temp_solve = config.get('REVERSE_TRANSFORMATION_SOLVER_TEMPERATURE', 1.0)
@@ -1569,10 +1517,7 @@ def solve_with_analogical_consistency(
     k_validators = config.get("REVERSE_VALIDATION_RETRIEVAL_K", 3)
     n_validation_attempts = config.get("REVERSE_VALIDATION_ATTEMPTS_N", 5)
     
-    if isinstance(api_manager_solve, GeminiAPIManager): model_name = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_solve, AvalAIAPIManager): model_name = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_solve, OllamaAPIManager): model_name = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else: raise TypeError(f"Unsupported API manager: {type(api_manager_solve)}")
+    model_name = model_name_for(api_manager_solve, config, "final_solver")
     
     candidates = []
     validator_indices = []
@@ -1993,17 +1938,8 @@ def select_best_transformations(
     mirror_eval_attempts = config.get("BEST_OF_TRANSFORMATION_MIRROR_EVAL_ATTEMPTS", 3)
     
     # Determine model names
-    if isinstance(api_manager_adapt, GeminiAPIManager):
-        model_adapt = config['GEMINI_MODEL_NAME_ADAPTATION']
-        model_solve = config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_adapt, AvalAIAPIManager):
-        model_adapt = config['AVALAI_MODEL_NAME_ADAPTATION']
-        model_solve = config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager_adapt, OllamaAPIManager):
-        model_adapt = config['OLLAMA_MODEL_NAME_ADAPTATION']
-        model_solve = config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager: {type(api_manager_adapt)}")
+    model_adapt = model_name_for(api_manager_adapt, config, "adaptation")
+    model_solve = model_name_for(api_manager_solve, config, "final_solver")
     
     temp_transform = config.get("DEFAULT_ADAPTATION_TEMPERATURE", 0.0)
     temp_solve = config.get("BEST_OF_TRANSFORMATION_SOLVER_TEMPERATURE", 1.0)

@@ -15,7 +15,7 @@ from src.prompts import (
     EXEMPLAR_FORMAT
 )
 from src.evaluation import evaluate_single_answer_with_llm
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager, OllamaAPIManager
+from src.api_manager import model_name_for
 from src.benchmark_data import benchmark_name_for_target_index
 from src.distributed_execution import (
     apply_distributed_run_log_contract,
@@ -33,14 +33,7 @@ def _result_completed(result: Dict[str, Any]) -> bool:
 
 def _get_model_name(api_manager: Any, config: Dict[str, Any]) -> str:
     """Helper to extract the correct solver model name based on the API manager."""
-    if isinstance(api_manager, GeminiAPIManager):
-        return config['GEMINI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, AvalAIAPIManager):
-        return config['AVALAI_MODEL_NAME_FINAL_SOLVER']
-    elif isinstance(api_manager, OllamaAPIManager):
-        return config['OLLAMA_MODEL_NAME_FINAL_SOLVER']
-    else:
-        raise TypeError(f"Unsupported API manager: {type(api_manager)}")
+    return model_name_for(api_manager, config, "final_solver")
 
 def process_single_question(
     target_query: str,

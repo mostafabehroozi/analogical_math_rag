@@ -29,7 +29,7 @@ import time
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import numpy as np
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager
+from src.api_manager import model_name_for
 from src.utils import save_json, load_json, create_trace_entry
 from src.parallel_utils import run_parallel_api_calls
 from src.pipeline_steps import (
@@ -403,12 +403,7 @@ def _execute_candidate_generation(
                 return []
 
             from src.prompts import PROMPT_TEMPLATES
-            if isinstance(api_manager, GeminiAPIManager):
-                model_name = config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
-            elif isinstance(api_manager, AvalAIAPIManager):
-                model_name = config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
-            else:
-                model_name = config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
+            model_name = model_name_for(api_manager, config, "final_solver")
 
             tmpl_name = config.get("PROMPT_TEMPLATE_MIRROR_HYPOTHESIS_ZEROSHOT", "mirror_hypothesis_gen_zero_shot_v1")
             tmpl_zero = PROMPT_TEMPLATES.get(tmpl_name, "{target_query}")

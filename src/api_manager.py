@@ -13,6 +13,7 @@ import threading
 import time
 import inspect
 import os
+import copy
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,7 +43,7 @@ RETRYABLE_ERROR_TYPES = {
     "OllamaConnectionError", "UnknownError", "APIStatusError",
     "RateLimitError", 
 }
-NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "InvalidArgument", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit", "SessionDeadline"}
+NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "PermissionDeniedError", "PaymentRequired", "InvalidArgument", "InvalidModel", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit", "SessionDeadline"}
 
 class APIResponse(TypedDict, total=False):
     status: str
@@ -173,6 +174,18 @@ class _ProviderRatePacer:
 
 # Global pacer instance shared across all threads / all API managers
 provider_pacer = _ProviderRatePacer()
+
+
+def _pace_provider_call(config: Dict[str, Any], provider_name: str) -> None:
+    """Apply the configured gap between outgoing calls to this provider."""
+    configured_delay = config.get("GLOBAL_API_CALL_DELAY_SECONDS", 0.0)
+    # Accept the former single numeric value for existing callers.
+    if isinstance(configured_delay, dict):
+        configured_delay = configured_delay.get(provider_name, 0.0)
+    delay = float(configured_delay)
+    if config.get("ENABLE_MIN_TIME_BETWEEN_API_CALLS", False):
+        delay = max(delay, float(config.get("MIN_TIME_BETWEEN_API_CALLS_SECONDS", 0.0)))
+    provider_pacer.pace(provider_name, delay)
 
 
 @dataclass(frozen=True)
@@ -344,12 +357,6 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         if api_deadline_due(config):
             return deadline_response()
         
-        # --- NEW: Enforce minimum time between consecutive API calls per provider ---
-        if config.get("ENABLE_MIN_TIME_BETWEEN_API_CALLS", False):
-            _min_gap = float(config.get("MIN_TIME_BETWEEN_API_CALLS_SECONDS", 0.0))
-            if _min_gap > 0:
-                provider_pacer.pace(provider_name, _min_gap)
-        
         # 1. Start the Timer
         start_time = time.monotonic()
         
@@ -388,6 +395,8 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         
         # A session deadline is a local stop signal, not a failed API call.
         if error_type == "SessionDeadline":
+            retryable = False
+        elif error_type in NON_RETRYABLE_ERROR_TYPES:
             retryable = False
         elif retry_all:
             retryable = True
@@ -459,13 +468,39 @@ class _KeyedAPIManager:
             tprint(f"[API {self.provider_name}] {message}", level="DEBUG")
 
 
+_MODEL_ROLE_SUFFIX = {
+    "adaptation": "ADAPTATION",
+    "final_solver": "FINAL_SOLVER",
+    "solver": "FINAL_SOLVER",
+    "evaluator": "EVALUATOR",
+    "simplification": "SIMPLIFICATION",
+}
+
+
+def model_name_for(manager: Any, config: Dict[str, Any], role: str) -> str:
+    """Resolve a role's model for any configured API provider."""
+    provider = getattr(manager, "provider_name", None)
+    if provider not in {"gemini", "avalai", "openrouter", "ollama"}:
+        raise TypeError(f"Unsupported API manager: {type(manager)}")
+    suffix = _MODEL_ROLE_SUFFIX[role]
+    prefix = provider.upper()
+    model = config.get(f"{prefix}_MODEL_NAME_{suffix}")
+    if role == "simplification" and not model:
+        model = config.get(f"{prefix}_MODEL_NAME_ADAPTATION")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError(f"{prefix}_MODEL_NAME_{suffix} must be configured.")
+    return model
+
+
 class GeminiAPIManager(_KeyedAPIManager):
     """Gemini manager upgraded to use the new google-genai SDK with Thinking support."""
 
     provider_name = "gemini"
 
-    def __init__(self, api_keys: List[str], model_quotas: Dict[str, Any], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, api_keys: List[str], model_quotas: Dict[str, Any], global_delay_seconds: Union[float, Dict[str, float]] = 0, config: Optional[Dict[str, Any]] = None):
         super().__init__(api_keys, model_quotas, config)
+        if "GLOBAL_API_CALL_DELAY_SECONDS" not in self.config:
+            self.config["GLOBAL_API_CALL_DELAY_SECONDS"] = global_delay_seconds
         if genai is None:
             raise ImportError("GeminiAPIManager requires the 'google-genai' package. Run: pip install google-genai")
         
@@ -477,9 +512,6 @@ class GeminiAPIManager(_KeyedAPIManager):
             ) for key in self.api_keys_list
         }
         
-        if global_delay_seconds:
-            self.logger.info("GLOBAL_API_CALL_DELAY_SECONDS is ignored by the RPM scheduler.")
-
     def _get_max_tokens(self, model_name: str) -> Optional[int]:
         if model_name == self.config.get("GEMINI_MODEL_NAME_FINAL_SOLVER"):
             return self.config.get("DEFAULT_FINAL_SOLVER_MAX_TOKENS", 8192)
@@ -519,6 +551,7 @@ class GeminiAPIManager(_KeyedAPIManager):
             try:
                 clean_model_name = model_name.replace("models/", "")
                 client = self.clients[lease.api_key]
+                _pace_provider_call(self.config, self.provider_name)
                 response = client.models.generate_content(
                     model=clean_model_name,
                     contents=prompt,
@@ -561,13 +594,15 @@ class GeminiAPIManager(_KeyedAPIManager):
 class AvalAIAPIManager(_KeyedAPIManager):
     provider_name = "avalai"
 
-    def __init__(self, api_key_or_list: Union[str, List[str]], base_url: str, model_quotas: Dict[str, Any], global_delay_seconds: int = 0, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, api_key_or_list: Union[str, List[str]], base_url: str, model_quotas: Dict[str, Any], global_delay_seconds: Union[float, Dict[str, float]] = 0, config: Optional[Dict[str, Any]] = None):
         if openai is None:
             raise ImportError("AvalAIAPIManager requires the optional 'openai' package.")
         keys = [api_key_or_list] if isinstance(api_key_or_list, str) else list(api_key_or_list)
         if not base_url:
             raise ValueError("base_url cannot be empty for AvalAIAPIManager.")
         super().__init__(keys, model_quotas, config)
+        if "GLOBAL_API_CALL_DELAY_SECONDS" not in self.config:
+            self.config["GLOBAL_API_CALL_DELAY_SECONDS"] = global_delay_seconds
         
         timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0))
         self.clients = {
@@ -578,9 +613,6 @@ class AvalAIAPIManager(_KeyedAPIManager):
             ) for key in self.api_keys_list
         }
         
-        if global_delay_seconds:
-            self.logger.info("GLOBAL_API_CALL_DELAY_SECONDS is ignored by the RPM scheduler.")
-
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
         self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
 
@@ -617,6 +649,7 @@ class AvalAIAPIManager(_KeyedAPIManager):
                         }
                     }
                 
+                _pace_provider_call(self.config, self.provider_name)
                 completion = self.clients[lease.api_key].chat.completions.create(**kwargs)
                 returned_model = getattr(completion, "model", None)
                 if returned_model and returned_model != model_name:
@@ -642,8 +675,143 @@ class AvalAIAPIManager(_KeyedAPIManager):
         return execute_with_retry(self.config, self.provider_name, model_name, prompt, attempt)
 
 
+class OpenRouterAPIManager(_KeyedAPIManager):
+    """OpenRouter chat completions with per-model endpoint preferences."""
+
+    provider_name = "openrouter"
+
+    def __init__(self, api_key_or_list: Union[str, List[str]], model_quotas: Dict[str, Any], config: Optional[Dict[str, Any]] = None):
+        if openai is None:
+            raise ImportError("OpenRouterAPIManager requires the optional 'openai' package.")
+        keys = [api_key_or_list] if isinstance(api_key_or_list, str) else list(api_key_or_list)
+        if not keys or any(not isinstance(key, str) or not key.strip() or "YOUR_" in key.upper() for key in keys):
+            raise ValueError("OPENROUTER_API_KEY must contain a usable key.")
+        super().__init__(keys, model_quotas, config)
+        base_url = self.config.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        if not base_url:
+            raise ValueError("OPENROUTER_BASE_URL cannot be empty.")
+        headers = {"X-OpenRouter-Metadata": "enabled"}
+        if self.config.get("OPENROUTER_HTTP_REFERER"):
+            headers["HTTP-Referer"] = self.config["OPENROUTER_HTTP_REFERER"]
+        if self.config.get("OPENROUTER_APP_TITLE"):
+            headers["X-OpenRouter-Title"] = self.config["OPENROUTER_APP_TITLE"]
+        self.clients = {
+            key: openai.OpenAI(
+                api_key=key,
+                base_url=base_url,
+                timeout=float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0)),
+                default_headers=headers,
+                max_retries=0,
+            ) for key in self.api_keys_list
+        }
+
+    def for_config(self, config: Dict[str, Any]) -> "OpenRouterAPIManager":
+        """Use experiment options while sharing clients and quota state."""
+        bound = copy.copy(self)
+        bound.config = config
+        return bound
+
+    def _extra_body(self, model_name: str, role: Optional[str]) -> Dict[str, Any]:
+        config = self.config
+        model_routing = config.get("OPENROUTER_MODEL_ROUTING") or {}
+        default_routing = config.get("OPENROUTER_PROVIDER_ROUTING") or {}
+        model_fallbacks = config.get("OPENROUTER_MODEL_FALLBACKS") or {}
+        if not isinstance(default_routing, dict) or not isinstance(model_routing, dict) or not isinstance(model_fallbacks, dict):
+            raise ValueError("OpenRouter routing and fallback settings must be dictionaries.")
+        provider = model_routing.get(model_name, default_routing)
+        if not isinstance(provider, dict):
+            raise ValueError(f"OpenRouter provider routing for {model_name!r} must be a dictionary.")
+        body: Dict[str, Any] = {}
+        if provider:
+            body["provider"] = copy.deepcopy(provider)
+        fallbacks = model_fallbacks.get(model_name)
+        if fallbacks is not None:
+            if not isinstance(fallbacks, list) or not all(isinstance(item, str) and item.strip() for item in fallbacks):
+                raise ValueError(f"OpenRouter model fallbacks for {model_name!r} must be a list of model IDs.")
+            if fallbacks:
+                body["models"] = list(fallbacks)
+        role_key = {
+            "adaptation": "OPENROUTER_REASONING_EFFORT_ADAPTATION",
+            "final_solver": "OPENROUTER_REASONING_EFFORT_FINAL_SOLVER",
+            "evaluator": "OPENROUTER_REASONING_EFFORT_EVALUATOR",
+        }.get(role)
+        effort = config.get(role_key) if role_key else None
+        if effort is None:
+            effort = config.get("OPENROUTER_REASONING_EFFORT")
+        if effort is not None:
+            body["reasoning"] = {"effort": effort}
+        return body
+
+    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
+        self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
+        extra_body = self._extra_body(model_name, avalai_role)
+
+        def attempt() -> APIResponse:
+            lease = self.scheduler.acquire(model_name)
+            if lease is None:
+                return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": f"No eligible OpenRouter key for {model_name}.", "error_details": self.scheduler.snapshot()}
+            meta = self._request_meta(lease)
+            meta["requested_model"] = model_name
+            kwargs: Dict[str, Any] = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+            try:
+                _pace_provider_call(self.config, self.provider_name)
+                completion = self.clients[lease.api_key].chat.completions.create(**kwargs)
+                meta["returned_model"] = getattr(completion, "model", None)
+                router_meta = getattr(completion, "openrouter_metadata", None)
+                if router_meta is None:
+                    router_meta = (getattr(completion, "model_extra", None) or {}).get("openrouter_metadata")
+                if hasattr(router_meta, "model_dump"):
+                    router_meta = router_meta.model_dump()
+                if isinstance(router_meta, dict) and router_meta:
+                    endpoints = router_meta.get("endpoints") or {}
+                    for endpoint in endpoints.get("available") or []:
+                        if isinstance(endpoint, dict) and endpoint.get("selected"):
+                            meta["routed_provider"] = endpoint.get("provider")
+                            break
+                choices = getattr(completion, "choices", [])
+                content = choices[0].message.content if choices else None
+                if not content:
+                    return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": "OpenRouter returned no completion text.", "request_meta": meta}
+                return {"status": "SUCCESS", "text": content, "error_type": None, "error_message": None, "request_meta": meta}
+            except openai.RateLimitError as error:
+                self.scheduler.cooldown(lease.api_key, model_name)
+                return {"status": "RATE_LIMITED", "text": None, "error_type": "RateLimitError", "error_message": str(error), "request_meta": meta}
+            except openai.APIStatusError as error:
+                code = error.status_code
+                if code in (401, 402, 403):
+                    self.scheduler.disable(lease.api_key, f"HTTP {code}")
+                elif code >= 500:
+                    self.scheduler.cooldown(lease.api_key, model_name)
+                error_type = {400: "InvalidArgument", 401: "AuthenticationError", 402: "PaymentRequired", 403: "PermissionDeniedError", 404: "InvalidModel", 422: "InvalidArgument"}.get(code, type(error).__name__)
+                return {"status": "ERROR", "text": None, "error_type": error_type, "error_message": str(error), "request_meta": meta}
+            except Exception as error:
+                self.scheduler.cooldown(lease.api_key, model_name)
+                return {"status": "ERROR", "text": None, "error_type": type(error).__name__, "error_message": str(error), "request_meta": meta}
+
+        return execute_with_retry(self.config, self.provider_name, model_name, prompt, attempt)
+
+
+def bind_api_managers(api_managers: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """Bind OpenRouter request settings to one experiment without shared mutation."""
+    manager = api_managers.get("openrouter")
+    if not isinstance(manager, OpenRouterAPIManager):
+        return api_managers
+    bound = dict(api_managers)
+    bound["openrouter"] = manager.for_config(config)
+    return bound
+
+
 class OllamaAPIManager:
     """Local manager retaining the same response contract (no API-key scheduler)."""
+
+    provider_name = "ollama"
 
     def __init__(self, config: Dict[str, Any]):
         if ollama is None:
@@ -666,6 +834,7 @@ class OllamaAPIManager:
                         options["temperature"] = temperature
                     if self.config.get("OLLAMA_THINK_MODE"):
                         options["think"] = self.config["OLLAMA_THINK_MODE"]
+                    _pace_provider_call(self.config, "ollama")
                     response = self.client.generate(model=model_name, prompt=prompt, options=options)
                     return {"status": "SUCCESS", "text": response["response"], "error_type": None, "error_message": None, "error_details": None}
                 except ollama.ResponseError as error:

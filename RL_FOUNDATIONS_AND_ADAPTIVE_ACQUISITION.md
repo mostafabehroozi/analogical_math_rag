@@ -1,5 +1,7 @@
 # Reinforcement learning, then our adaptive acquisition task
 
+> Historical note: This guide describes the former DQN implementation. The current adaptive training pipeline uses a supervised decision head; see [the current guide](ADAPTIVE_ANALOGICAL_TRAINING_GUIDE.md). Code references below describe the earlier version.
+
 This is an onboarding lesson for an AI engineer who knows supervised learning but is new to reinforcement learning (RL). Read Parts I and II in order. Part I explains the algorithm independently of this project. Part II maps every part to the code and notebook.
 
 ## First, locate the RL work

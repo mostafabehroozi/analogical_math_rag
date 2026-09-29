@@ -17,6 +17,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from src.evaluation import evaluate_single_answer_with_llm
+from src.api_manager import bind_api_managers
 from src.orchestration import run_pipeline_for_single_query
 from src.utils import load_json, save_json
 from src.hf_sync import periodic_sync_check, sync_workspace_to_hub
@@ -518,7 +519,7 @@ def retry_failed_evaluations(
                 experiment_config.update(logged_config)
 
         provider_for_eval = experiment_config.get('API_PROVIDER_EVALUATOR', 'gemini')
-        manager_for_eval = api_managers[provider_for_eval]
+        manager_for_eval = bind_api_managers(api_managers, experiment_config)[provider_for_eval]
 
         # Find all attempts across all queries that did not succeed
         retries_needed = []

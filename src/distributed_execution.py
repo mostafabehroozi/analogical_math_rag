@@ -25,11 +25,17 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 MANIFEST_SCHEMA_VERSION = 2
 STATUS_SCHEMA_VERSION = 1
 ASSIGNMENT_STRATEGY = "contiguous_balanced_chunks"
-MODEL_ROTATION_CONFIG_KEYS = frozenset({
+AVALAI_MODEL_ROTATION_CONFIG_KEYS = frozenset({
     "AVALAI_MODEL_NAME_ADAPTATION",
     "AVALAI_MODEL_NAME_FINAL_SOLVER",
     "AVALAI_MODEL_NAME_EVALUATOR",
 })
+OPENROUTER_MODEL_ROTATION_CONFIG_KEYS = frozenset({
+    "OPENROUTER_MODEL_NAME_ADAPTATION",
+    "OPENROUTER_MODEL_NAME_FINAL_SOLVER",
+    "OPENROUTER_MODEL_NAME_EVALUATOR",
+})
+MODEL_ROTATION_CONFIG_KEYS = AVALAI_MODEL_ROTATION_CONFIG_KEYS | OPENROUTER_MODEL_ROTATION_CONFIG_KEYS
 # These optional settings use ``None`` to mean "inherit AVALAI_REASONING_EFFORT".
 # Omitting such a key has exactly the same runtime behavior.  Keeping this
 # allowlist explicit prevents unrelated new ``None`` defaults from silently
@@ -38,6 +44,9 @@ INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS = frozenset({
     "AVALAI_REASONING_EFFORT_ADAPTATION",
     "AVALAI_REASONING_EFFORT_FINAL_SOLVER",
     "AVALAI_REASONING_EFFORT_EVALUATOR",
+    "OPENROUTER_REASONING_EFFORT_ADAPTATION",
+    "OPENROUTER_REASONING_EFFORT_FINAL_SOLVER",
+    "OPENROUTER_REASONING_EFFORT_EVALUATOR",
 })
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -262,6 +271,7 @@ _RUNTIME_EXACT = {
     "GLOBAL_API_CALL_DELAY_SECONDS", "GLOBAL_CONSECUTIVE_ERROR_LIMIT",
     "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS", "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES",
     "GLOBAL_PERIODIC_PAUSE_DURATION_SECONDS", "OFFLINE_MODE", "HARD_QUESTIONS_LENGTH",
+    "OPENROUTER_BASE_URL", "OPENROUTER_HTTP_REFERER", "OPENROUTER_APP_TITLE",
 }
 
 
@@ -285,10 +295,16 @@ def _is_runtime_or_secret_key(key: str) -> bool:
 def sanitize_scientific_config(value: Any) -> Any:
     """Return canonical JSON-safe scientific settings for manifest hashing."""
     if isinstance(value, Mapping):
+        is_experiment_config = any(str(key).startswith("API_PROVIDER_") for key in value)
+        uses_openrouter = any(
+            str(key).startswith("API_PROVIDER_") and provider == "openrouter"
+            for key, provider in value.items()
+        )
         return {
             str(key): sanitize_scientific_config(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
             if not _is_runtime_or_secret_key(str(key))
+            and not (is_experiment_config and not uses_openrouter and str(key).startswith("OPENROUTER_"))
             and not (
                 str(key) in INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS
                 and item is None
@@ -305,8 +321,12 @@ def active_avalai_models(config: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the model settings whose rotation can be explicitly authorized."""
     return {
         key: config.get(key)
-        for key in sorted(MODEL_ROTATION_CONFIG_KEYS)
+        for key in sorted(AVALAI_MODEL_ROTATION_CONFIG_KEYS)
     }
+
+
+def active_openrouter_models(config: Mapping[str, Any]) -> Dict[str, Any]:
+    return {key: config.get(key) for key in sorted(OPENROUTER_MODEL_ROTATION_CONFIG_KEYS)}
 
 
 def record_avalai_model_provenance(
@@ -323,6 +343,17 @@ def record_avalai_model_provenance(
     history = run_log.setdefault("avalai_model_config_history", [])
     if isinstance(history, list) and (not history or history[-1] != record):
         history.append(record)
+    if any(config.get(key) == "openrouter" for key in (
+        "API_PROVIDER_ADAPTATION", "API_PROVIDER_SOLVER",
+        "API_PROVIDER_EVALUATOR", "API_PROVIDER_SIMPLIFICATION",
+    )):
+        openrouter_models = active_openrouter_models(config)
+        if isinstance(flags, dict):
+            flags.update(openrouter_models)
+        openrouter_record = {"run_mode": str(run_mode), "models": openrouter_models}
+        openrouter_history = run_log.setdefault("openrouter_model_config_history", [])
+        if isinstance(openrouter_history, list) and (not openrouter_history or openrouter_history[-1] != openrouter_record):
+            openrouter_history.append(openrouter_record)
 
 
 def _manifest_without_rotatable_models(
@@ -388,7 +419,7 @@ def validate_manifest_compatibility(
     allow_model_rotation: bool = False,
     allow_legacy_code_fingerprint: bool = False,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Validate identity while treating the three role model names as runtime state.
+    """Validate identity while treating selected provider role models as runtime state.
 
     ``allow_model_rotation`` is retained for call-site compatibility, but model-name-only
     drift is always accepted.  The separate legacy-code-fingerprint bridge remains
@@ -861,6 +892,12 @@ def write_worker_status(
     payload["model_rotation"] = {
         "enabled": True,
         "active_avalai_models": active_avalai_models(config),
+        "active_openrouter_models": active_openrouter_models(config) if any(
+            config.get(key) == "openrouter" for key in (
+                "API_PROVIDER_ADAPTATION", "API_PROVIDER_SOLVER",
+                "API_PROVIDER_EVALUATOR", "API_PROVIDER_SIMPLIFICATION",
+            )
+        ) else {},
         "runtime_code_fingerprint": config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"),
     }
     if message:
@@ -1194,7 +1231,7 @@ def merge_distributed_run(
 
 __all__ = [
     "ASSIGNMENT_STRATEGY", "MODEL_ROTATION_CONFIG_KEYS", "DistributedExecutionError", "DistributedManifestMismatch",
-    "active_avalai_models", "apply_distributed_run_log_contract",
+    "active_avalai_models", "active_openrouter_models", "apply_distributed_run_log_contract",
     "indexed_output_artifacts", "record_avalai_model_provenance",
     "DistributedMergeError", "api_deadline_due", "assigned_indices", "build_run_manifest",
     "configure_worker_paths", "distributed_enabled", "fingerprint_exemplar_data", "layer1_cache_filename",

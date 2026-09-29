@@ -1,4 +1,4 @@
-"""Kaggle-compatible teacher -> snapshot -> frozen-encoder DQN training.
+"""Kaggle-compatible ranking -> snapshot -> supervised acquisition training.
 
 The companion notebook embeds this module: uploading the notebook alone is enough.
 No provider calls are made. Acquisition is simulated from recorded Layer-1 data.
@@ -15,6 +15,7 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
+from itertools import permutations
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +23,8 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+
+PIPELINE_REVISION = 2  # Common decisions across indistinguishable zero-shot futures.
 
 
 # %% Configuration and compact data
@@ -34,7 +37,7 @@ class Config:
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ])
-    output_dir: str = "/kaggle/working/adaptive_analogical_early_run"
+    output_dir: str = "/kaggle/working/adaptive_analogical_supervised_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
     device: str = "auto"
@@ -58,28 +61,20 @@ class Config:
     snapshot_reachable_fraction: float = .50
     snapshot_missing_fraction: float = .25
     snapshot_permutation_fraction: float = .10
+    candidate_mask_fraction: float = .25
+    evaluator_mask_fraction: float = .25
+    hidden_source_fraction: float = .10
     auxiliary_weight: float = .25
     calibrate: bool = True          # Development-only temperature selection.
-    stop_mode: str = "safe"         # safe / max / reliability
-    stop_threshold: float = .95
-    member_threshold: float = .90
-    require_selected_member: bool = True
+    recognition_threshold: float = .50
+    later_rank_filter: bool = True
     cost_unit: str = "solver_calls" # solver_calls / total_calls (incl. evaluator graders)
     max_cost: Optional[float] = None # None = cost of the complete pool.
-    cost_weight: float = .20
-    early_quality_weight: float = .10
-    rl_steps: int = 20000
-    rl_hidden: int = 64
-    rl_lr: float = 1e-4
-    rl_batch_size: int = 64
-    replay_size: int = 50000
-    warmup: int = 1000
-    target_update: int = 500
-    eval_every: int = 1000
-    exploration_fraction: float = .30
-    epsilon_end: float = .05
-    gamma: float = 1.0
-    double_dqn: bool = False
+    decision_hidden: int = 64
+    decision_epochs: int = 100
+    decision_lr: float = 1e-4
+    decision_batch_size: int = 128
+    decision_augmented_fraction: float = .10
     bootstrap_samples: int = 1000
     print_every: int = 10
 
@@ -108,24 +103,22 @@ class Config:
     def validate(self):
         assert self.k >= 1 and self.zero_shots >= 1 and self.repeats >= 1
         assert self.hidden_dim >= 2 and self.batch_size >= 2 and self.teacher_folds >= 2
-        assert self.stop_mode in {"safe", "max", "reliability"}
         assert self.cost_unit in {"solver_calls", "total_calls"}
-        assert 0 < self.stop_threshold <= 1 and 0 < self.member_threshold <= 1
+        assert 0 < self.recognition_threshold < 1
         assert len(self.split_fractions) == 4 and min(self.split_fractions) > 0
         assert abs(sum(self.split_fractions) - 1) < 1e-8
-        assert acquisition_cost(1, 1, self) <= self.budget <= self.full_cost
+        assert 1 <= self.budget <= self.full_cost
         assert self.teacher_epochs > 0 and self.snapshot_epochs > 0 and self.patience > 0
-        assert self.rl_steps > 0 and self.rl_batch_size > 0 and self.eval_every > 0
-        assert self.replay_size >= self.rl_batch_size and self.target_update > 0
-        assert self.warmup >= 0 and self.snapshots_per_query >= 2
-        assert self.dev_snapshots_per_query >= 2 and self.cost_weight >= 0
-        assert self.early_quality_weight >= 0
-        assert self.early_quality_weight == 0 or self.gamma == 1.0
+        assert self.decision_epochs > 0 and self.decision_batch_size >= 2 and self.decision_lr > 0
+        assert self.snapshots_per_query >= 2 and self.dev_snapshots_per_query >= 2
         assert 0 <= self.snapshot_reachable_fraction <= 1
         assert 0 <= self.snapshot_missing_fraction <= 1
         assert 0 <= self.snapshot_permutation_fraction <= 1
-        assert 0 < self.gamma <= 1 and 0 < self.exploration_fraction <= 1
-        assert 0 <= self.epsilon_end <= 1 and self.print_every > 0
+        assert all(0 <= p <= 1 for p in (self.candidate_mask_fraction,
+                                         self.evaluator_mask_fraction,
+                                         self.hidden_source_fraction))
+        assert 0 <= self.decision_augmented_fraction <= .10
+        assert self.print_every > 0
 
 
 @dataclass
@@ -241,6 +234,11 @@ def parse_record(item, fallback, benchmark, cfg):
     labels = state.get("ground_truth_labels", {})
     if len(retrieved) != cfg.k or not isinstance(candidates, dict):
         raise ValueError("pool_shape")
+    # Retrieval actions expose sources in descending similarity order.
+    try:
+        retrieved = sorted(retrieved, key=lambda row: -float(row["similarity_score"]))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("missing_or_invalid_measurement") from None
     eids = [str(x.get("corpus_index", x.get("retrieval_index"))) for x in retrieved]
     if "None" in eids or len(set(eids)) != cfg.k:
         raise ValueError("evaluator_ids")
@@ -382,19 +380,6 @@ class ResNet(nn.Module):
         return self.output_layer(self.encode(x))
 
 
-def teacher_features(r, cfg):
-    x = np.zeros((cfg.n, 2 + 4 * cfg.k), np.float32)
-    x[:cfg.zero_shots, 0] = 1
-    x[:, 2:2 + cfg.k] = r.similarity
-    x[:, 2 + cfg.k:2 + 2 * cfg.k] = r.baseline
-    x[:, 2 + 2 * cfg.k:2 + 3 * cfg.k] = r.ccs
-    for j in range(cfg.k):
-        i = cfg.zero_shots + j
-        x[i, 1] = r.similarity[j]
-        x[i, 2 + 3 * cfg.k + j] = 1
-    return x
-
-
 def retrieval_order(cfg):
     return list(range(cfg.zero_shots, cfg.n)) + list(range(cfg.zero_shots))
 
@@ -442,13 +427,15 @@ def heuristic_scores(r, cfg, mode, mask, strategy):
 
 
 def make_loader(x, y, batch_size, shuffle=True):
-    # Avoid singleton training batches with the original BatchNorm architecture.
+    # Keep every complete-state example while avoiding singleton BatchNorm batches.
     size = min(batch_size, len(x))
     if size < 2 and shuffle:
         raise ValueError("BatchNorm training requires at least two samples.")
-    return DataLoader(TensorDataset(torch.from_numpy(x), torch.from_numpy(y)),
-                      batch_size=max(1, size), shuffle=shuffle,
-                      drop_last=shuffle and len(x) % size == 1)
+    order = torch.randperm(len(x)).tolist() if shuffle else list(range(len(x)))
+    batches = [order[start:start + max(1, size)] for start in range(0, len(x), max(1, size))]
+    if shuffle and len(batches) > 1 and len(batches[-1]) == 1:
+        batches[-2].extend(batches.pop())
+    return DataLoader(TensorDataset(torch.from_numpy(x), torch.from_numpy(y)), batch_sampler=batches)
 
 
 def predict_array(model, x, device, batch=1024, hidden=False):
@@ -463,23 +450,26 @@ def predict_array(model, x, device, batch=1024, hidden=False):
 
 def train_teacher(records, train_ids, val_ids, cfg, device, seed, name):
     seed_everything(seed)
-    x = np.concatenate([teacher_features(records[i], cfg) for i in train_ids])
-    y = np.concatenate([records[i].labels for i in train_ids])[:, None]
-    mean, std = x.mean(0), x.std(0)
-    std[std < 1e-6] = 1
-    vx = np.concatenate([teacher_features(records[i], cfg) for i in val_ids])
-    model = ResNet(x.shape[1], 1, cfg).to(device)
+    full = State((1 << cfg.n)-1, cfg.k)
+    vx = np.stack([observation(records[i], full, cfg) for i in val_ids])
+    model = ResNet(cfg.input_dim, cfg.n, cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    loader = make_loader((x - mean) / std, y, cfg.batch_size)
     best, best_state, stale, best_epoch = -1.0, None, 0, 0
     for epoch in range(cfg.teacher_epochs):
+        x, targets = build_snapshots(records, train_ids, None, cfg,
+                                     cfg.snapshots_per_query, seed + epoch,
+                                     epoch=epoch, augmented=True)
+        loader = make_loader(x, targets, cfg.batch_size)
         model.train()
         for bx, by in loader:
             opt.zero_grad(set_to_none=True)
-            loss = nn.functional.binary_cross_entropy_with_logits(model(bx.to(device)), by.to(device))
+            present = by[:, cfg.n:].to(device)
+            raw = nn.functional.binary_cross_entropy_with_logits(
+                model(bx.to(device)), by[:, :cfg.n].to(device), reduction="none")
+            loss = ((raw * present).sum(1) / present.sum(1).clamp_min(1)).mean()
             loss.backward()
             opt.step()
-        pred = predict_array(model, (vx - mean) / std, device).reshape(-1, cfg.n)
+        pred = predict_array(model, vx, device)
         score = np.mean([ap_score(ranked_indices(p, retrieval_order(cfg)), records[i].labels)
                          for p, i in zip(pred, val_ids)])
         if score > best + 1e-8:
@@ -490,16 +480,18 @@ def train_teacher(records, train_ids, val_ids, cfg, device, seed, name):
             break
     model.load_state_dict(best_state)
     print(f"{name:<24} | epochs {epoch+1:3d} | best {best_epoch:3d} | development AP {best:.4f}")
-    return {"weights": best_state, "mean": mean, "std": std, "best_epoch": best_epoch,
+    return {"weights": best_state, "best_epoch": best_epoch,
             "train_ids": [records[i].uid for i in train_ids],
             "validation_ids": [records[i].uid for i in val_ids]}
 
 
 def teacher_predict(checkpoint, records, ids, cfg, device):
-    model = ResNet(2 + 4 * cfg.k, 1, cfg).to(device)
+    model = ResNet(cfg.input_dim, cfg.n, cfg).to(device)
     model.load_state_dict(checkpoint["weights"])
-    x = np.concatenate([teacher_features(records[i], cfg) for i in ids])
-    return predict_array(model, (x - checkpoint["mean"]) / checkpoint["std"], device).reshape(-1, cfg.n)
+    full = State((1 << cfg.n)-1, cfg.k)
+    x = np.stack([observation(records[i], full, cfg) for i in ids])
+    logits = predict_array(model, x, device)
+    return 1 / (1 + np.exp(-np.clip(logits, -40, 40)))
 
 
 def teacher_labels(scores, truth, cfg):
@@ -548,7 +540,7 @@ def fit_teachers(records, splits, cfg, device, out):
 @dataclass(frozen=True)
 class State:
     candidates: int = 1             # Bit mask; ZS1 initially exists.
-    evaluators: int = 1             # Active retrieval prefix.
+    evaluators: int = 0             # Add R1 through the normal acquisition action.
 
 
 @dataclass(frozen=True)
@@ -585,7 +577,7 @@ def complete_snapshot_state(candidates, retrieved, evaluators, cfg):
     return state
 
 
-def validate_snapshot_state(state, cfg):
+def validate_snapshot_state(state, cfg, allow_hidden_source=False):
     """Enforce causal availability, including source without evaluator."""
     if min(state.candidates, state.retrieved, state.evaluators,
            state.similarity_observed, state.baseline_attempted,
@@ -597,7 +589,7 @@ def validate_snapshot_state(state, cfg):
         raise ValueError("retrieval/evaluator mask out of range")
     if state.evaluators & ~state.retrieved:
         raise ValueError("evaluator without retrieved source")
-    if state.candidates >> cfg.zero_shots & ~state.retrieved:
+    if not allow_hidden_source and state.candidates >> cfg.zero_shots & ~state.evaluators:
         raise ValueError("one-shot candidate without retrieved source")
     if state.similarity_observed & ~state.retrieved:
         raise ValueError("similarity without retrieved source")
@@ -609,29 +601,35 @@ def validate_snapshot_state(state, cfg):
         raise ValueError("invalid CCS masks")
 
 
-def as_snapshot_state(state, cfg):
+def as_snapshot_state(state, cfg, allow_hidden_source=False):
     if isinstance(state, SnapshotState):
         return state
     if not isinstance(state, State):
         raise TypeError("Expected State or SnapshotState")
     active = (1 << state.evaluators) - 1
+    if allow_hidden_source:
+        cells = sum(active << (i * cfg.k) for i in range(cfg.n)
+                    if state.candidates & (1 << i))
+        result = SnapshotState(state.candidates, active, active, active,
+                               active, active, cells, cells)
+        validate_snapshot_state(result, cfg, allow_hidden_source=True)
+        return result
     return complete_snapshot_state(state.candidates, active, active, cfg)
 
 
 @lru_cache(maxsize=4)
 def structural_catalog(zero_shots, k):
-    """Every nonempty, logically valid candidate/retrieval/evaluator structure."""
+    """Every nonempty structure with an active evaluator for each one-shot source."""
     rows = []
     for zero_mask in range(1 << zero_shots):
-        for code in range(5 ** k):
+        for code in range(3 ** k):
             candidates, retrieved, evaluators, rest = zero_mask, 0, 0, code
             for i in range(k):
-                choice, rest = rest % 5, rest // 5
+                choice, rest = rest % 3, rest // 3
                 if choice:
                     retrieved |= 1 << i
-                if choice in (2, 4):
                     evaluators |= 1 << i
-                if choice in (3, 4):
+                if choice == 2:
                     candidates |= 1 << (zero_shots + i)
             if candidates:
                 rows.append((candidates, retrieved, evaluators))
@@ -696,10 +694,10 @@ def advance(state, action, cfg):
     return raw_next_state(state, action, cfg)
 
 
-def observation(record, state, cfg):
+def observation(record, state, cfg, allow_hidden_source=False):
     """Only observed entries are indexed; no labels/teacher scores enter x."""
-    state = as_snapshot_state(state, cfg)
-    validate_snapshot_state(state, cfg)
+    state = as_snapshot_state(state, cfg, allow_hidden_source)
+    validate_snapshot_state(state, cfg, allow_hidden_source=allow_hidden_source)
     cm = present_mask(state, cfg)
     rm = bit_array(state.retrieved, cfg.k)
     em = bit_array(state.evaluators, cfg.k)
@@ -718,7 +716,7 @@ def observation(record, state, cfg):
     ccs = np.zeros((cfg.n, cfg.k), np.float32)
     ccs[co] = record.ccs[co]
     spent = state_cost(state, cfg)
-    context = [spent / cfg.full_cost, (cfg.budget - spent) / cfg.full_cost,
+    context = [spent / cfg.full_cost, max(0., cfg.budget - spent) / cfg.full_cost,
                 cm.mean(), em.mean()]
     x = np.concatenate([cm, sources.ravel(), ordinal, rm, em, sim, sm,
                         base, bm, ba, ccs.ravel(), co.ravel(), ca.ravel(), context]).astype(np.float32)
@@ -732,6 +730,30 @@ def snapshot_target(record, safe, maximum, state, cfg):
     return np.r_[record.labels, safe, maximum,
                  float(np.any(safe * cm)), float(np.any(maximum * cm)), cm].astype(np.float32)
 
+
+def augment_structure(state, cfg, rng):
+    """Independently hide candidates/evaluators, including occasional OS sources."""
+    state = as_snapshot_state(state, cfg)
+    candidates, evaluators = state.candidates, state.evaluators
+    for i in range(cfg.n):
+        if candidates & (1 << i) and rng.rand() < cfg.candidate_mask_fraction:
+            candidates &= ~(1 << i)
+    for j in range(cfg.k):
+        if evaluators & (1 << j) and rng.rand() < cfg.evaluator_mask_fraction:
+            evaluators &= ~(1 << j)
+            if candidates & (1 << (cfg.zero_shots + j)) and rng.rand() >= cfg.hidden_source_fraction:
+                candidates &= ~(1 << (cfg.zero_shots + j))
+    if not candidates:
+        original = np.flatnonzero(bit_array(state.candidates, cfg.n))
+        i = int(rng.choice(original))
+        candidates = 1 << i
+        if i >= cfg.zero_shots:
+            evaluators |= 1 << (i - cfg.zero_shots)
+    cells = sum(evaluators << (i * cfg.k) for i in range(cfg.n) if candidates & (1 << i))
+    result = SnapshotState(candidates, evaluators, evaluators, evaluators,
+                           evaluators, evaluators, cells, cells)
+    validate_snapshot_state(result, cfg, allow_hidden_source=True)
+    return result
 
 def augment_measurements(state, cfg, rng):
     """Hide real measurements or mark recorded calls as failed; never invent values."""
@@ -769,7 +791,7 @@ def augment_measurements(state, cfg, rng):
         similarity &= ~(1 << int(rng.choice(sim_cells)))
     result = SnapshotState(state.candidates, state.retrieved, state.evaluators,
                            similarity, base_attempted, base_observed, attempted, observed)
-    validate_snapshot_state(result, cfg)
+    validate_snapshot_state(result, cfg, allow_hidden_source=True)
     return result
 
 
@@ -794,7 +816,7 @@ def permute_snapshot(record, state, safe, maximum, cfg, rng):
                         [record.evaluator_ids[i] for i in eorder],
                         record.similarity[eorder], record.baseline[eorder],
                         record.ccs[np.ix_(corder, eorder)], record.labels[corder])
-    validate_snapshot_state(new_state, cfg)
+    validate_snapshot_state(new_state, cfg, allow_hidden_source=True)
     return new_record, new_state, safe[corder], maximum[corder]
 
 
@@ -803,26 +825,34 @@ def build_snapshots(records, ids, teacher, cfg, per_query, seed, epoch=0, augmen
     xs, ys = [], []
     reachable = reachable_states(cfg)
     catalog = structural_catalog(cfg.zero_shots, cfg.k) if augmented else ()
-    n_reachable = max(1, round(per_query * cfg.snapshot_reachable_fraction)) if augmented else per_query
+    others = per_query - 1
+    n_reachable = round(others * cfg.snapshot_reachable_fraction) if augmented else others
     for rank, idx in enumerate(ids):
-        states = [State()]
-        for j in range(n_reachable - 1):
-            position = (epoch * len(ids) + rank) * (n_reachable - 1) + j
+        states = [State((1 << cfg.n)-1, cfg.k)]
+        for j in range(n_reachable):
+            position = (epoch * len(ids) + rank) * max(1, n_reachable) + j
             states.append(reachable[(position * 53) % len(reachable)])
-        # The coprime stride cycles through the entire catalog across questions
-        # and epochs, rather than sampling only the common structures.
-        for j in range(per_query - n_reachable):
-            position = ((epoch * len(ids) + rank) * (per_query - n_reachable) + j)
+        for j in range(others - n_reachable):
+            position = ((epoch * len(ids) + rank) * max(1, others - n_reachable) + j)
             candidates, retrieved, evaluators = catalog[(position * 7919) % len(catalog)]
             states.append(complete_snapshot_state(candidates, retrieved, evaluators, cfg))
-        for state in states:
-            r, safe, maximum = records[idx], teacher["safe"][idx], teacher["maximum"][idx]
-            if augmented and rng.rand() < cfg.snapshot_missing_fraction:
-                state = augment_measurements(state, cfg, rng)
-            if augmented and rng.rand() < cfg.snapshot_permutation_fraction:
-                r, state, safe, maximum = permute_snapshot(r, state, safe, maximum, cfg, rng)
-            xs.append(observation(r, state, cfg))
-            ys.append(snapshot_target(r, safe, maximum, state, cfg))
+        for position, state in enumerate(states):
+            r = records[idx]
+            safe = teacher["safe"][idx] if teacher is not None else None
+            maximum = teacher["maximum"][idx] if teacher is not None else None
+            if augmented and position:
+                state = augment_structure(state, cfg, rng)
+                if rng.rand() < cfg.snapshot_missing_fraction:
+                    state = augment_measurements(state, cfg, rng)
+                if rng.rand() < cfg.snapshot_permutation_fraction:
+                    if teacher is None:
+                        dummy = np.zeros(cfg.n, np.float32)
+                        r, state, _, _ = permute_snapshot(r, state, dummy, dummy, cfg, rng)
+                    else:
+                        r, state, safe, maximum = permute_snapshot(r, state, safe, maximum, cfg, rng)
+            xs.append(observation(r, state, cfg, allow_hidden_source=augmented))
+            ys.append((np.r_[r.labels, present_mask(state, cfg)].astype(np.float32)
+                       if teacher is None else snapshot_target(r, safe, maximum, state, cfg)))
     return np.stack(xs), np.stack(ys)
 
 
@@ -904,7 +934,8 @@ def fit_snapshot(records, splits, teacher, cfg, device):
     logits = predict_array(model, vx, device)
     temps = fit_temperatures(logits, vy, cfg)
     print(f"Snapshot selected epoch {best_epoch}; development Top-1 {best[0]:.1%}.")
-    off_per_query = cfg.snapshots_per_query - max(1, round(cfg.snapshots_per_query * cfg.snapshot_reachable_fraction))
+    off_per_query = (cfg.snapshots_per_query - 1) - round(
+        (cfg.snapshots_per_query - 1) * cfg.snapshot_reachable_fraction)
     covered = min(catalog_size, len(history) * len(splits["supervised"]) * off_per_query)
     print(f"Coherent structural catalog visited during training: {covered}/{catalog_size} "
           f"(shared across questions; development remains reachable-only).")
@@ -924,18 +955,28 @@ class FrozenPredictor:
         self.temperatures = temperature_vector(checkpoint["temperatures"], cfg)
 
     def predict(self, record, state, cfg_override=None):
-        # No global prediction cache: hidden outcome changes cannot be hidden by stale keys.
-        x = torch.as_tensor(observation(record, state, cfg_override or self.cfg)[None], device=self.device)
+        h, p = self.predict_many(record, [state], cfg_override)
+        return h[0], p[0]
+
+    def predict_many(self, record, states, cfg_override=None, allow_hidden_source=False):
+        """Batch frozen inference; only visible measurements enter the network."""
+        cfg = cfg_override or self.cfg
+        xs = np.stack([observation(record, s, cfg, allow_hidden_source)
+                       for s in states])
+        hs, ps = [], []
+        self.model.eval()
         with torch.no_grad():
-            h = self.model.encode(x)
-            logits = self.model.output_layer(h)[0].cpu().numpy()
-        p = 1 / (1 + np.exp(-np.clip(logits / self.temperatures, -40, 40)))
-        # Public prediction lights for nonexistent candidates are OFF. Their logits
-        # remain excluded, rather than treated as negatives, in supervised training.
-        absent = ~present_mask(state, self.cfg)
-        for block in range(3):
-            p[block*self.cfg.n:(block+1)*self.cfg.n][absent] = 0
-        return h[0].cpu().numpy(), p
+            for start in range(0, len(xs), 1024):
+                h = self.model.encode(torch.as_tensor(xs[start:start+1024], device=self.device))
+                logits = self.model.output_layer(h).cpu().numpy()
+                hs.append(h.cpu().numpy())
+                ps.append(1 / (1 + np.exp(-np.clip(logits / self.temperatures, -40, 40))))
+        hidden, probabilities = np.concatenate(hs), np.concatenate(ps)
+        for row, state in enumerate(states):
+            absent = ~present_mask(state, self.cfg)
+            for block in range(3):
+                probabilities[row, block*self.cfg.n:(block+1)*self.cfg.n][absent] = 0
+        return hidden, probabilities
 
 
 def selected_candidate(probabilities, state, cfg):
@@ -944,298 +985,285 @@ def selected_candidate(probabilities, state, cfg):
 
 def stopping_reason(probabilities, state, cfg):
     i, n = selected_candidate(probabilities, state, cfg), cfg.n
-    confident = False
-    if cfg.stop_mode == "reliability":
-        confident = probabilities[i] >= cfg.stop_threshold
-    elif cfg.stop_mode == "safe":
-        confident = probabilities[3*n] >= cfg.stop_threshold
-        if cfg.require_selected_member:
-            confident = confident and probabilities[n+i] >= cfg.member_threshold
-    elif cfg.stop_mode == "max":
-        confident = probabilities[3*n] >= cfg.stop_threshold and probabilities[3*n+1] >= cfg.stop_threshold
-        if cfg.require_selected_member:
-            confident = confident and probabilities[2*n+i] >= cfg.member_threshold
-    if confident:
-        return cfg.stop_mode
+    threshold = cfg.recognition_threshold
+    if all(probabilities[j] >= threshold for j in (3*n, 3*n+1, n+i, 2*n+i)):
+        return "predicted_max"
     if not valid_actions(state, cfg).any():
         full = state.candidates == (1 << cfg.n)-1 and state.evaluators == cfg.k
         return "pool_exhaustion" if full else "budget"
     return None
 
-
-# %% Cached acquisition environment and head-only DQN
-class CachedEnvironment:
-    def __init__(self, record, predictor, cfg, early_quality_weight=None):
-        self.record, self.predictor, self.cfg = record, predictor, cfg
-        self.early_quality_weight = (cfg.early_quality_weight if early_quality_weight is None
-                                     else early_quality_weight)
-        self.initial_cost = state_cost(State(), cfg)
-        self.early_area = 0.0
-        self.state = State()
-        self.h, self.probabilities = predictor.predict(record, self.state)
-        self.reason = stopping_reason(self.probabilities, self.state, cfg)
-
-    def step(self, action):
-        if self.reason is not None:
-            raise ValueError("Cannot acquire after application termination.")
-        previous = state_cost(self.state, self.cfg)
-        previous_correct = int(self.record.labels[selected_candidate(
-            self.probabilities, self.state, self.cfg)])
-        self.state = advance(self.state, action, self.cfg)
-        self.h, self.probabilities = self.predictor.predict(self.record, self.state)
-        self.reason = stopping_reason(self.probabilities, self.state, self.cfg)
-        cost = state_cost(self.state, self.cfg) - previous
-        span = self.cfg.budget - self.initial_cost
-        self.early_area += previous_correct * cost
-        reward = -self.cfg.cost_weight * cost / self.cfg.full_cost
-        if self.early_quality_weight and span > 0:
-            reward += self.early_quality_weight * previous_correct * cost / span
-        if self.reason is not None:
-            final_correct = int(self.record.labels[selected_candidate(
-                self.probabilities, self.state, self.cfg)])
-            reward += float(final_correct)
-            if self.early_quality_weight and span > 0:
-                reward += self.early_quality_weight * final_correct * (
-                    self.cfg.budget - state_cost(self.state, self.cfg)) / span
-        return reward, self.reason is not None
-
-    def early_quality(self):
-        final_correct = int(self.record.labels[selected_candidate(
-            self.probabilities, self.state, self.cfg)])
-        span = self.cfg.budget - self.initial_cost
-        if span <= 0:
-            return float(final_correct)
-        return float((self.early_area + final_correct * (
-            self.cfg.budget - state_cost(self.state, self.cfg))) / span)
+def greedy_action(head, hidden, valid, device):
+    if not valid.any():
+        raise ValueError("No valid acquisition action.")
+    with torch.no_grad():
+        logits = head(torch.as_tensor(hidden[None], device=device))[0].cpu().numpy()
+    return int(np.where(valid, logits, -np.inf).argmax())
 
 
-class ActionHead(nn.Module):
+# %% Supervised acquisition labels and frozen-encoder decision head
+def permute_zero_shots(record, scores, safe, maximum, order, cfg):
+    slots = list(order) + list(range(cfg.zero_shots, cfg.n))
+    return (Record(record.uid, record.group, record.benchmark,
+                   [record.candidate_ids[i] for i in slots], record.evaluator_ids,
+                   record.similarity, record.baseline, record.ccs[slots], record.labels[slots]),
+            scores[slots], safe[slots], maximum[slots])
+
+def permuted_reference_order(scores, zero_order, cfg):
+    """Move the original ranking intact, including its deterministic score ties."""
+    slots = list(zero_order) + list(range(cfg.zero_shots, cfg.n))
+    inverse = {original: current for current, original in enumerate(slots)}
+    return [inverse[i] for i in ranked_indices(scores, retrieval_order(cfg))]
+
+
+def goal_condition(rank, order, safe, maximum, probabilities, full_probabilities, state, cfg):
+    """The recorded teacher defines a goal, while only the frozen model supplies lights."""
+    i = order[rank]
+    if not state.candidates & (1 << i):
+        return False
+    n, threshold = cfg.n, cfg.recognition_threshold
+    if rank == 0 and maximum.any():
+        return all(probabilities[j] >= threshold for j in
+                   (3*n, 3*n+1, n+i, 2*n+i))
+    compare = rank == 0 or cfg.later_rank_filter
+    if compare and rank < n - 1:
+        if not probabilities[i] > max(full_probabilities[j] for j in order[rank+1:]):
+            return False
+    if rank > 0 and safe[i] and probabilities[n+i] < threshold:
+        return False
+    return True
+
+def states_from(start, cfg):
+    seen, pending = {start}, [start]
+    for state in pending:
+        for action in np.flatnonzero(valid_actions(state, cfg)):
+            nxt = advance(state, int(action), cfg)
+            if nxt not in seen:
+                seen.add(nxt)
+                pending.append(nxt)
+    return pending
+
+def decision_scenario(record, scores, safe, maximum, predictor, cfg, states,
+                      allow_hidden_source=False, reference_order=None):
+    """Cache frozen evidence and goals without optimizing a clairvoyant path."""
+    hidden, probabilities = predictor.predict_many(
+        record, states, allow_hidden_source=allow_hidden_source)
+    full_cfg = copy.deepcopy(cfg)
+    full_cfg.max_cost = None
+    _, full_probability = predictor.predict(record, State((1 << cfg.n)-1, cfg.k), full_cfg)
+    order = reference_order if reference_order is not None else ranked_indices(scores, retrieval_order(cfg))
+    goal = np.asarray([[goal_condition(rank, order, safe, maximum, p,
+                                       full_probability, state, cfg)
+                        for rank in range(cfg.n)]
+                       for state, p in zip(states, probabilities)], bool)
+    keys = [visible_state_key(record, state, cfg, allow_hidden_source) for state in states]
+    return {"record": record, "states": states, "hidden": hidden, "goal": goal,
+            "keys": keys, "index": {state: j for j, state in enumerate(states)}}
+
+
+def visible_state_key(record, state, cfg, allow_hidden_source=False):
+    # Candidate IDs and hidden order are audit information, not model features.
+    observed = observation(record, state, cfg, allow_hidden_source)
+    return (state.candidates, state.evaluators, hashlib.sha256(observed.tobytes()).hexdigest())
+
+
+def aggregate_decision_rows(scenarios, cfg, roots=None, artificial=()):
+    """Choose common actions until acquired evidence distinguishes the futures.
+
+    Each recursive group contains equiprobable historical orders with the same
+    visible observation. Goals never split a group or enter the head's input.
+    Search cost ends at goal attainment, a broken prior goal, or action exhaustion.
+    """
+    groups = {}
+    artificial = set(artificial)
+    for sid, scenario in enumerate(scenarios):
+        for j, state in enumerate(scenario["states"]):
+            if roots is not None and state not in roots:
+                continue
+            rank = next((r for r, met in enumerate(scenario["goal"][j]) if not met), cfg.n)
+            if rank < cfg.n:
+                groups.setdefault(scenario["keys"][j], []).append((sid, j, rank))
+
+    transitions = {}
+    for sid, scenario in enumerate(scenarios):
+        for j, state in enumerate(scenario["states"]):
+            transitions[sid, j] = {
+                int(action): scenario["index"][advance(state, int(action), cfg)]
+                for action in np.flatnonzero(valid_actions(state, cfg))}
+
+    @lru_cache(maxsize=None)
+    def solve(members):
+        first_sid, first_j, _ = members[0]
+        valid = np.zeros(cfg.action_count, bool)
+        valid[list(transitions[first_sid, first_j])] = True
+        values = np.zeros((cfg.action_count, 3), np.float64)
+        values[:, 1:] = np.inf
+        if not valid.any():
+            return (0., 0., 0.), (), values
+        for action in np.flatnonzero(valid):
+            branches = {}
+            reach, cost, steps = 0., 0., 0.
+            for sid, j, rank in members:
+                scenario = scenarios[sid]
+                successor = transitions[sid, j][int(action)]
+                state, nxt = scenario["states"][j], scenario["states"][successor]
+                cost += state_cost(nxt, cfg) - state_cost(state, cfg)
+                steps += 1
+                flags = scenario["goal"][successor]
+                if not flags[:rank].all():
+                    continue  # This historical branch violates an earlier goal.
+                if flags[rank]:
+                    reach += 1
+                else:
+                    branches.setdefault(scenario["keys"][successor], []).append((sid, successor, rank))
+            for branch in branches.values():
+                continuation, _, _ = solve(tuple(branch))
+                reach += len(branch) * continuation[0]
+                cost += len(branch) * continuation[1]
+                steps += len(branch) * continuation[2]
+            values[action] = np.asarray([reach, cost, steps]) / len(members)
+        preferred = np.flatnonzero(valid)
+        for column, maximize in ((0, True), (1, False), (2, False)):
+            scores = values[preferred, column]
+            best = scores.max() if maximize else scores.min()
+            preferred = preferred[np.isclose(scores, best, rtol=0, atol=1e-9)]
+        # Keep genuine ties as soft targets; a concrete continuation uses the first index.
+        return tuple(values[preferred[0]]), tuple(int(a) for a in preferred), values
+
+    rows, skipped = [], 0
+    for key, group in groups.items():
+        sid, j, _ = group[0]
+        scenario = scenarios[sid]
+        hidden, state = scenario["hidden"][j], scenario["states"][j]
+        valid = valid_actions(state, cfg)
+        if not all(np.allclose(hidden, scenarios[s]["hidden"][index], atol=1e-6)
+                   for s, index, _ in group):
+            raise ValueError("One visible state has inconsistent frozen features.")
+        (reach, cost, steps), preferred, values = solve(tuple(group))
+        if reach <= 0:
+            skipped += 1
+            continue
+        target = np.zeros(cfg.action_count, np.float32)
+        target[list(preferred)] = 1 / len(preferred)
+        ranks = Counter(row[2] for row in group)
+        rows.append({"uid": scenario["record"].uid, "state_key": key,
+                     "h": hidden, "target": target, "valid": valid,
+                     "weight": .1 if state in artificial else 1.,
+                     "goal_rank": next(iter(ranks)) if len(ranks) == 1 else -1,
+                     "goal_rank_distribution": dict(ranks), "reach": float(reach),
+                     "expected_cost": float(cost), "expected_steps": float(steps),
+                     "action_reach": values[:, 0], "action_expected_cost": values[:, 1]})
+    solve.cache_clear()
+    return rows, skipped
+
+
+def build_decision_rows(record, scores, safe, maximum, predictor, cfg, augmented=False):
+    base_states = reachable_states(cfg)
+    chosen = []
+    if augmented and cfg.decision_augmented_fraction:
+        rng = np.random.RandomState(cfg.seed + int(record.group[:8], 16))
+        possible = []
+        for state in base_states:
+            sources = [j for j in range(cfg.k)
+                       if state.candidates & (1 << (cfg.zero_shots+j)) and j < state.evaluators]
+            if sources:
+                artificial = State(state.candidates, int(rng.choice(sources)))
+                if valid_actions(artificial, cfg).any():
+                    possible.append(artificial)
+        rng.shuffle(possible)
+        chosen = list(dict.fromkeys(possible))[:round(len(base_states) * cfg.decision_augmented_fraction)]
+    states = list(dict.fromkeys(list(base_states) + [s for root in chosen for s in states_from(root, cfg)]))
+    scenarios = []
+    for zero_order in permutations(range(cfg.zero_shots)):
+        r, s, y_safe, y_max = permute_zero_shots(record, scores, safe, maximum, zero_order, cfg)
+        scenarios.append(decision_scenario(
+            r, s, y_safe, y_max, predictor, cfg, states, allow_hidden_source=bool(chosen),
+            reference_order=permuted_reference_order(scores, zero_order, cfg)))
+    rows, skipped = aggregate_decision_rows(scenarios, cfg,
+                                           roots=set(base_states) | set(chosen), artificial=chosen)
+    ordinary = [row for row in rows if row["weight"] == 1.]
+    extra = [row for row in rows if row["weight"] < 1.]
+    if extra:
+        rng.shuffle(extra)
+    return ordinary + extra[:int(len(ordinary) * cfg.decision_augmented_fraction)], skipped
+
+class SupervisedActionHead(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(cfg.hidden_dim, cfg.rl_hidden), nn.ReLU(),
-                                 nn.Linear(cfg.rl_hidden, cfg.action_count))
+        self.net = nn.Sequential(nn.Linear(cfg.hidden_dim, cfg.decision_hidden), nn.ReLU(),
+                                 nn.Linear(cfg.decision_hidden, cfg.action_count))
 
-    def forward(self, h):
-        return self.net(h)
+    def forward(self, hidden):
+        return self.net(hidden)
 
-
-class Replay:
-    def __init__(self, cfg):
-        size = cfg.replay_size
-        self.h = np.zeros((size, cfg.hidden_dim), np.float32)
-        self.nh = np.zeros_like(self.h)
-        self.actions = np.zeros(size, np.int64)
-        self.rewards = np.zeros(size, np.float32)
-        self.done = np.zeros(size, bool)
-        self.next_valid = np.zeros((size, cfg.action_count), bool)
-        self.position, self.count = 0, 0
-
-    def add(self, h, action, reward, next_h, done, next_valid):
-        j = self.position
-        self.h[j], self.nh[j] = h, next_h
-        self.actions[j], self.rewards[j], self.done[j] = action, reward, done
-        self.next_valid[j] = next_valid
-        self.position = (j + 1) % len(self.actions)
-        self.count = min(self.count + 1, len(self.actions))
-
-
-def bellman_target(reward, done, next_valid, target_values, gamma, online_values=None):
-    values = target_values.masked_fill(~next_valid, -torch.inf)
-    if torch.any((~done) & (~next_valid.any(dim=1))):
-        raise ValueError("Nonterminal transition has no valid next action.")
-    if online_values is None:
-        future = values.max(dim=1).values
-    else:
-        best = online_values.masked_fill(~next_valid, -torch.inf).argmax(dim=1)
-        future = target_values.gather(1, best[:, None]).squeeze(1)
-    future = torch.where(done, torch.zeros_like(future), future)
-    return reward + gamma * future
-
-
-def greedy_action(head, h, valid, device):
-    with torch.no_grad():
-        q = head(torch.as_tensor(h[None], device=device))[0].cpu().numpy()
-    return int(np.where(valid, q, -np.inf).argmax())
-
-
-def snapshot_audit_row(env, trace=False):
-    cfg, record = env.cfg, env.record
-    selected = selected_candidate(env.probabilities, env.state, cfg)
-    present = present_mask(env.state, cfg)
-    row = {"cost": state_cost(env.state, cfg),
-           "offline_selected_correct": int(record.labels[selected]),
-           "offline_acquired_oracle": bool(record.labels[present].any())}
-    if trace:
-        row.update({"candidate_mask": int(env.state.candidates),
-                    "evaluators": int(env.state.evaluators),
-                    "selected": record.candidate_ids[selected], "action": None,
-                    "valid_actions": [],
-                    "predictions": env.probabilities.tolist(), "reason": env.reason})
-    return row
-
-
-def budget_curve(snapshots, cfg):
-    initial = state_cost(State(), cfg)
-    points = {}
-    for fraction in (0., .25, .50, .75, 1.):
-        limit = initial + fraction * (cfg.budget - initial)
-        current = snapshots[0]
-        for state in snapshots[1:]:
-            if state["cost"] > limit + 1e-6:
-                break
-            current = state
-        points[str(fraction)] = {
-            "selected_correct": current["offline_selected_correct"],
-            "acquired_oracle": int(current["offline_acquired_oracle"])}
-    return points
-
-
-def rollout(record, predictor, cfg, policy="rl", head=None, rng=None, trace=False):
-    env = CachedEnvironment(record, predictor, cfg)
-    snapshots = [snapshot_audit_row(env, trace=trace)]
-    while env.reason is None:
-        valid = valid_actions(env.state, cfg)
-        available = np.flatnonzero(valid)
-        if policy == "rl":
-            action = greedy_action(head, env.h, valid, predictor.device)
-        elif policy == "random":
-            action = int(rng.choice(available))
-        elif policy == "evaluator_first":
-            action = int(available[0])
-        elif policy == "candidate_first":
-            priority = list(range(1, cfg.action_count)) + [0]
-            action = next(a for a in priority if valid[a])
-        elif policy == "cheapest":
-            action = min(available, key=lambda a: state_cost(advance(env.state, int(a), cfg), cfg))
-        else:
-            raise ValueError(policy)
-        if trace:
-            snapshots[-1]["action"] = int(action)
-            snapshots[-1]["valid_actions"] = available.tolist()
-        env.step(action)
-        snapshots.append(snapshot_audit_row(env, trace=trace))
-    chosen = selected_candidate(env.probabilities, env.state, cfg)
-    cost = state_cost(env.state, cfg)
-    return {"uid": record.uid, "group": record.group, "selected": record.candidate_ids[chosen],
-            "correct": int(record.labels[chosen]), "cost": cost,
-            "utility": float(record.labels[chosen] - cfg.cost_weight*cost/cfg.full_cost),
-            "early_quality": env.early_quality(), "budget_curve": budget_curve(snapshots, cfg),
-            "reason": env.reason, "confidence": float(env.probabilities[chosen]),
-            "safe_probability": float(env.probabilities[3*cfg.n]),
-            "max_probability": float(env.probabilities[3*cfg.n+1]),
-            "candidates": int(present_mask(env.state, cfg).sum()), "evaluators": env.state.evaluators,
-            "acquired_oracle": bool(record.labels[present_mask(env.state, cfg)].any()),
-            "full_oracle": bool(record.labels.any()), "zero_shot": chosen < cfg.zero_shots,
-            "trajectory": snapshots if trace else []}
-
-
-def policy_summary(rows):
-    if not rows:
-        return None
-    correct = np.asarray([r["correct"] for r in rows], float)
-    costs = np.asarray([r["cost"] for r in rows], float)
-    confident = np.asarray([r["reason"] in {"safe", "max", "reliability"} for r in rows])
-    return {"n": len(rows), "top1": float(correct.mean()), "mean_cost": float(costs.mean()),
-            "median_cost": float(np.median(costs)), "p90_cost": float(np.percentile(costs, 90)),
-            "p95_cost": float(np.percentile(costs, 95)),
-            "utility": float(np.mean([r["utility"] for r in rows])),
-            "early_quality": (float(np.mean([r["early_quality"] for r in rows]))
-                              if all("early_quality" in r for r in rows) else None),
-            "budget_curve": ({key: {
-                field: float(np.mean([r["budget_curve"][key][field] for r in rows]))
-                for field in ("selected_correct", "acquired_oracle")}
-                for key in rows[0]["budget_curve"]}
-                if all("budget_curve" in r for r in rows) else None),
-            "confident_n": int(confident.sum()), "confident_errors": int((1-correct[confident]).sum()),
-            "confident_error": float((1-correct[confident]).mean()) if confident.any() else None,
-            "forced_fraction": float((~confident).mean()),
-            "acquired_oracle": float(np.mean([r["acquired_oracle"] for r in rows])),
-            "full_oracle": float(np.mean([r["full_oracle"] for r in rows])),
-            "zero_shot_fraction": float(np.mean([r["zero_shot"] for r in rows])),
-            "stop_reasons": dict(Counter(r["reason"] for r in rows))}
-
-
-def evaluate_policy(records, ids, predictor, cfg, head=None, policy="rl", trace=False):
-    rows = []
-    for idx in ids:
-        # Same target gets the same random baseline independent of file/report ordering.
-        salt = int(records[idx].group[:8], 16)
-        rng = np.random.RandomState((cfg.seed + salt) % (2**32-1))
-        rows.append(rollout(records[idx], predictor, cfg, policy, head, rng, trace))
-    return rows
-
-
-def policy_rank(metrics, cfg):
-    return (metrics["top1"],
-            cfg.early_quality_weight * metrics["early_quality"]
-            - cfg.cost_weight * metrics["mean_cost"] / cfg.full_cost)
-
-
-def fit_dqn(records, splits, predictor, cfg, out, variant="refined"):
-    if variant not in {"baseline", "refined"}:
-        raise ValueError(variant)
-    reward_weight = 0.0 if variant == "baseline" else cfg.early_quality_weight
+def train_decision_head(records, splits, teacher, predictor, cfg, device, out=None):
     seed_everything(cfg.seed + 300)
+    datasets, coverage = {}, {}
+    for role, augment in (("policy", True), ("dev", False)):
+        rows, unreachable = [], 0
+        for idx in splits[role]:
+            record_rows, missing = build_decision_rows(
+                records[idx], teacher["scores"][idx], teacher["safe"][idx],
+                teacher["maximum"][idx], predictor, cfg, augmented=augment)
+            rows.extend(record_rows)
+            unreachable += missing
+        coverage[role] = {"questions": len(splits[role]), "labeled": len(rows),
+                          "unreachable": unreachable,
+                          "by_goal_rank": dict(Counter(row["goal_rank"] for row in rows))}
+        if out is not None:
+            atomic_json(out / "decision_label_coverage.json", coverage)
+        if not rows:
+            raise ValueError(f"No reachable decision labels for {role}: "
+                             f"{unreachable} unreachable states across {len(splits[role])} questions "
+                             f"at recognition threshold {cfg.recognition_threshold:.2f}.")
+        datasets[role] = rows
+        if out is not None:
+            atomic_torch(out / f"decision_dataset_{role}.pt",
+                         {"schema_version": 2, "implementation_revision": PIPELINE_REVISION,
+                          "rows": rows, "coverage": coverage[role]})
+    def arrays(rows):
+        return (np.stack([row["h"] for row in rows]).astype(np.float32),
+                np.stack([row["target"] for row in rows]).astype(np.float32),
+                np.stack([row["valid"] for row in rows]),
+                np.asarray([row["weight"] for row in rows], np.float32))
+    train_h, train_y, train_v, train_w = arrays(datasets["policy"])
+    dev_h, dev_y, dev_v, dev_w = arrays(datasets["dev"])
+    del datasets
+    model = SupervisedActionHead(cfg).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.decision_lr, weight_decay=cfg.weight_decay)
+    best, weights, stale, history = math.inf, None, 0, []
     rng = np.random.RandomState(cfg.seed + 301)
-    device = predictor.device
-    online = ActionHead(cfg).to(device)
-    target = copy.deepcopy(online).eval().requires_grad_(False)
-    opt = torch.optim.Adam(online.parameters(), lr=cfg.rl_lr)
-    replay = Replay(cfg)
-    before = cpu_state(predictor.model)
-    active = [i for i in splits["policy"]
-              if CachedEnvironment(records[i], predictor, cfg, reward_weight).reason is None]
-    if not active:
-        raise ValueError("Every policy-training initial state already stops. Adjust stopping settings "
-                         "on development data and use a new output directory; there is no RL decision to train.")
-    best, best_weights, updates, history = (-math.inf, -math.inf), cpu_state(online), 0, []
-    env = CachedEnvironment(records[int(rng.choice(active))], predictor, cfg, reward_weight)
-    for step in range(1, cfg.rl_steps + 1):
-        valid = valid_actions(env.state, cfg)
-        eps = 1 - (1-cfg.epsilon_end)*min(1., step/(cfg.rl_steps*cfg.exploration_fraction))
-        action = int(rng.choice(np.flatnonzero(valid))) if rng.rand() < eps else greedy_action(online, env.h, valid, device)
-        h = env.h.copy()
-        reward, done = env.step(action)
-        replay.add(h, action, reward, env.h, done, valid_actions(env.state, cfg))
-        if replay.count >= max(cfg.warmup, cfg.rl_batch_size):
-            b = rng.choice(replay.count, cfg.rl_batch_size, replace=False)
-            tensor = lambda x: torch.as_tensor(x, device=device)
-            bh, nh = tensor(replay.h[b]), tensor(replay.nh[b])
-            with torch.no_grad():
-                y = bellman_target(tensor(replay.rewards[b]), tensor(replay.done[b]),
-                                   tensor(replay.next_valid[b]), target(nh), cfg.gamma,
-                                   online(nh) if cfg.double_dqn else None)
-            q = online(bh).gather(1, tensor(replay.actions[b])[:, None]).squeeze(1)
-            loss = nn.functional.smooth_l1_loss(q, y)
+    for epoch in range(cfg.decision_epochs):
+        model.train()
+        for batch in np.array_split(rng.permutation(len(train_h)),
+                                    max(1, math.ceil(len(train_h) / cfg.decision_batch_size))):
+            h = torch.as_tensor(train_h[batch], device=device)
+            y = torch.as_tensor(train_y[batch], device=device)
+            valid = torch.as_tensor(train_v[batch], device=device)
+            weight = torch.as_tensor(train_w[batch], device=device)
+            logits = model(h).masked_fill(~valid, -1e9)
+            loss = (-(y * nn.functional.log_softmax(logits, dim=1)).sum(1) * weight).sum() / weight.sum()
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(online.parameters(), 10)
             opt.step()
-            updates += 1
-            if updates % cfg.target_update == 0:
-                target.load_state_dict(online.state_dict())
-        if done:
-            env = CachedEnvironment(records[int(rng.choice(active))], predictor, cfg, reward_weight)
-        if step % cfg.eval_every == 0 or step == cfg.rl_steps:
-            metrics = policy_summary(evaluate_policy(records, splits["dev"], predictor, cfg, online))
-            history.append({"step": step, "updates": updates, **metrics})
-            print(f"{variant} DQN step {step:6d} | dev accuracy {metrics['top1']:.1%} | "
-                  f"cost {metrics['mean_cost']:.1f}/{cfg.full_cost:.0f} | "
-                  f"early quality {metrics['early_quality']:.3f}")
-            rank = policy_rank(metrics, cfg)
-            if rank > best:
-                best, best_weights, best_step = rank, cpu_state(online), step
-                atomic_torch(out / f"rl_{variant}_in_progress.pt", {"weights": best_weights,
-                             "step": step, "completed": False, "variant": variant})
-    if updates == 0:
-        raise ValueError("No RL updates occurred: lower warmup/batch size or increase rl_steps.")
-    for key, value in predictor.model.state_dict().items():
-        if not torch.equal(value.detach().cpu(), before[key]):
-            raise AssertionError("Frozen snapshot predictor changed during RL.")
-    return {"weights": best_weights, "best_step": best_step, "updates": updates,
-            "variant": variant, "reward_weight": reward_weight, "dev_rank": best,
-            "history": history, "frozen_verified": True, "completed": True}
-
+        model.eval()
+        with torch.no_grad():
+            logits = model(torch.as_tensor(dev_h, device=device)).masked_fill(
+                ~torch.as_tensor(dev_v, device=device), -1e9)
+            y = torch.as_tensor(dev_y, device=device)
+            weight = torch.as_tensor(dev_w, device=device)
+            dev_loss = float((-(y * nn.functional.log_softmax(logits, dim=1)).sum(1) * weight).sum()
+                             / weight.sum())
+        history.append({"epoch": epoch+1, "dev_loss": dev_loss})
+        if dev_loss < best - 1e-7:
+            best, weights, stale, best_epoch = dev_loss, cpu_state(model), 0, epoch+1
+        else:
+            stale += 1
+        if stale >= cfg.patience:
+            break
+    return {"weights": weights, "best_epoch": best_epoch, "dev_loss": best,
+            "coverage": coverage, "history": history,
+            "input_dim": cfg.hidden_dim, "action_count": cfg.action_count}
 
 # %% Reports, artifacts, and stage orchestration
 def wilson_interval(errors, total):
@@ -1253,33 +1281,16 @@ def paired_interval(a, b, repetitions, seed):
         return None
     if [r["uid"] for r in a] != [r["uid"] for r in b]:
         raise ValueError("Paired reports have different target universes.")
-    difference = np.array([x["correct"]-y["correct"] for x, y in zip(a, b)], float)
+    grouped = {}
+    for x, y in zip(a, b):
+        grouped.setdefault(x["uid"], []).append(x["correct"]-y["correct"])
+    difference = np.asarray([np.mean(values) for values in grouped.values()], float)
     rng = np.random.RandomState(seed)
     sampled = [float(rng.choice(difference, len(difference), replace=True).mean())
                for _ in range(max(1, repetitions))]
     return {"delta": float(difference.mean()),
             "ci95": np.percentile(sampled, [2.5, 97.5]).tolist(),
             "benefits": int((difference > 0).sum()), "harms": int((difference < 0).sum())}
-
-
-def full_snapshot_rows(records, ids, predictor, cfg):
-    full_cfg = copy.deepcopy(cfg)
-    full_cfg.max_cost = None
-    state = State((1 << cfg.n)-1, cfg.k)
-    rows = []
-    scores = {}
-    for idx in ids:
-        _, p = predictor.predict(records[idx], state, full_cfg)
-        scores[idx] = p[:cfg.n]
-        i = selected_candidate(p, state, cfg)
-        r = records[idx]
-        rows.append({"uid": r.uid, "group": r.group, "selected": r.candidate_ids[i],
-                     "correct": int(r.labels[i]), "cost": cfg.full_cost,
-                     "utility": float(r.labels[i] - cfg.cost_weight), "reason": "full_budget_reference",
-                     "confidence": float(p[i]), "candidates": cfg.n, "evaluators": cfg.k,
-                     "acquired_oracle": bool(r.labels.any()), "full_oracle": bool(r.labels.any()),
-                     "zero_shot": i < cfg.zero_shots, "trajectory": []})
-    return rows, scores
 
 
 def select_heuristics(records, ids, cfg):
@@ -1318,124 +1329,187 @@ def teacher_report(records, ids, cfg, scores, heuristics, title):
     return metrics
 
 
+def fixed_order_actions(cfg):
+    order = []
+    for source in range(cfg.k):
+        order.extend((0, 2 + source))
+        if source < cfg.zero_shots - 1:
+            order.append(1)
+    order.extend([1] * max(0, cfg.zero_shots - cfg.k - 1))
+    return order
+
+def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, trace=False):
+    if policy == "full":
+        full_cfg = copy.deepcopy(cfg)
+        full_cfg.max_cost = None
+        state = State((1 << cfg.n)-1, cfg.k)
+        _, probabilities = predictor.predict(record, state, full_cfg)
+        reason, trajectory = "full_budget_reference", []
+    else:
+        state, reason, trajectory = State(), None, []
+        sequence = fixed_order_actions(cfg) if policy == "fixed" else None
+        while reason is None:
+            hidden, probabilities = predictor.predict(record, state)
+            reason = stopping_reason(probabilities, state, cfg)
+            if reason is not None:
+                if trace:
+                    trajectory.append({"candidate_mask": int(state.candidates),
+                                       "evaluators": int(state.evaluators),
+                                       "cost": state_cost(state, cfg), "action": None,
+                                       "reason": reason})
+                break
+            valid = valid_actions(state, cfg)
+            if policy == "fixed":
+                action = sequence[0] if sequence else None
+                if action is None or not valid[action]:
+                    reason = "budget"
+                    if trace:
+                        trajectory.append({"candidate_mask": int(state.candidates),
+                                           "evaluators": int(state.evaluators),
+                                           "cost": state_cost(state, cfg), "action": None,
+                                           "reason": reason, "blocked_fixed_action": action})
+                    break
+                sequence.pop(0)
+            elif policy == "supervised":
+                action = greedy_action(head, hidden, valid, predictor.device)
+            else:
+                raise ValueError(f"Unknown policy: {policy}")
+            if trace:
+                trajectory.append({"candidate_mask": int(state.candidates),
+                                   "evaluators": int(state.evaluators),
+                                   "cost": state_cost(state, cfg), "action": int(action),
+                                   "valid_actions": np.flatnonzero(valid).tolist()})
+            state = advance(state, action, cfg)
+    selected = selected_candidate(probabilities, state, cfg)
+    has_max = bool(maximum.any())
+    exact_max = bool(maximum[selected]) if has_max else None
+    return {"uid": record.uid, "group": record.group,
+            "selected": record.candidate_ids[selected],
+            "correct": int(record.labels[selected]), "has_max": has_max,
+            "exact_max": exact_max, "cost": state_cost(state, cfg),
+            "saved_fraction": 1 - state_cost(state, cfg)/cfg.full_cost,
+            "reason": reason, "trajectory": trajectory}
+
+def evaluate_policy(records, ids, teacher, predictor, cfg, head=None,
+                    policy="supervised", trace=False):
+    rows = []
+    for idx in ids:
+        record = records[idx]
+        for order in permutations(range(cfg.zero_shots)):
+            scenario, _, _, maximum = permute_zero_shots(
+                record, teacher["scores"][idx], teacher["safe"][idx],
+                teacher["maximum"][idx], order, cfg)
+            row = rollout(scenario, maximum, predictor, cfg, policy, head, trace)
+            row["zero_shot_order"] = list(order)
+            rows.append(row)
+    return rows
+
+def policy_summary(rows):
+    if not rows:
+        return None
+    by_question = {}
+    for row in rows:
+        by_question.setdefault(row["uid"], []).append(row)
+    means = [{"correct": np.mean([r["correct"] for r in group]),
+              "cost": np.mean([r["cost"] for r in group]),
+              "saved": np.mean([r["saved_fraction"] for r in group]),
+              "has_max": group[0]["has_max"],
+              "exact_max": np.mean([r["exact_max"] for r in group]) if group[0]["has_max"] else None,
+              "false_max": np.mean([r["reason"] == "predicted_max" for r in group])
+              if not group[0]["has_max"] else None}
+             for group in by_question.values()]
+    with_max = [m for m in means if m["has_max"]]
+    without_max = [m for m in means if not m["has_max"]]
+    costs = np.asarray([m["cost"] for m in means])
+    return {"n": len(means), "top1_correct": float(np.mean([m["correct"] for m in means])),
+            "exact_max_recovery": (float(np.mean([m["exact_max"] for m in with_max]))
+                                   if with_max else None),
+            "max_present_n": len(with_max), "no_max_n": len(without_max),
+            "no_max_top1_correct": (float(np.mean([m["correct"] for m in without_max]))
+                                    if without_max else None),
+            "no_max_false_predicted_max": (float(np.mean([m["false_max"] for m in without_max]))
+                                           if without_max else None),
+            "mean_cost": float(costs.mean()), "median_cost": float(np.median(costs)),
+            "p90_cost": float(np.percentile(costs, 90)),
+            "p95_cost": float(np.percentile(costs, 95)),
+            "mean_saved_fraction": float(np.mean([m["saved"] for m in means])),
+            "stop_reasons": dict(Counter(r["reason"] for r in rows))}
+
+def continuation_diagnostic(records, ids, teacher, predictor, cfg, head):
+    reached, broken = [], []
+    per_rank = []
+    for idx in ids:
+        question_prefix, question_lost = [], []
+        for zero_order in permutations(range(cfg.zero_shots)):
+            record, _, safe, maximum = permute_zero_shots(
+                records[idx], teacher["scores"][idx], teacher["safe"][idx],
+                teacher["maximum"][idx], zero_order, cfg)
+            order = permuted_reference_order(teacher["scores"][idx], zero_order, cfg)
+            full_cfg = copy.deepcopy(cfg)
+            full_cfg.max_cost = None
+            _, full = predictor.predict(record, State((1 << cfg.n)-1, cfg.k), full_cfg)
+            state, best_prefix, lost = State(), 0, False
+            while True:
+                hidden, probabilities = predictor.predict(record, state)
+                flags = [goal_condition(rank, order, safe, maximum, probabilities,
+                                        full, state, cfg) for rank in range(cfg.n)]
+                prefix = next((rank for rank, good in enumerate(flags) if not good), cfg.n)
+                if prefix < best_prefix:
+                    lost = True
+                    break  # A later recovery cannot repair an invalid intermediate step.
+                best_prefix = prefix
+                valid = valid_actions(state, cfg)
+                if not valid.any() or prefix == cfg.n:
+                    break
+                state = advance(state, greedy_action(head, hidden, valid, predictor.device), cfg)
+            question_prefix.append(best_prefix)
+            question_lost.append(lost)
+        reached.append(float(np.mean(question_prefix)))
+        broken.append(float(np.mean(question_lost)))
+        per_rank.append([float(np.mean(np.asarray(question_prefix) >= rank))
+                         for rank in range(1, cfg.n+1)])
+    return {"n": len(ids), "orders_per_question": math.factorial(cfg.zero_shots),
+            "mean_rank_prefix_reached": float(np.mean(reached)) if reached else None,
+            "per_rank_reach": np.mean(per_rank, axis=0).tolist() if per_rank else None,
+            "prior_goal_loss_rate": float(np.mean(broken)) if broken else None,
+            "questions_with_prior_goal_lost": int(np.count_nonzero(broken))}
+
 def stage_snapshot_audit(records, ids, teacher, predictor, cfg):
     if not ids:
         return None
-    x, y = build_snapshots(records, ids, teacher, cfg, cfg.dev_snapshots_per_query, cfg.seed + 401)
+    x, y = build_snapshots(records, ids, teacher, cfg, cfg.dev_snapshots_per_query,
+                           cfg.seed + 401)
     logits = predict_array(predictor.model, x, predictor.device) / predictor.temperatures
     metrics = snapshot_summary(logits, y, cfg)
     p = 1/(1+np.exp(-np.clip(logits, -40, 40)))
     for name, col in (("safe", 3*cfg.n), ("max", 3*cfg.n+1)):
-        positive = p[:, col] >= cfg.stop_threshold
+        positive = p[:, col] >= cfg.recognition_threshold
         true = y[:, col].astype(bool)
         metrics[name + "_precision"] = float(true[positive].mean()) if positive.any() else None
         metrics[name + "_recall"] = float(positive[true].mean()) if true.any() else None
-    metrics["predicted_max_without_safe"] = float(((p[:, 3*cfg.n+1] >= cfg.stop_threshold)
-                                                    & (p[:, 3*cfg.n] < cfg.stop_threshold)).mean())
     sx, sy = build_snapshots(records, ids, teacher, cfg, cfg.dev_snapshots_per_query,
                              cfg.seed + 402, augmented=True)
-    stress_logits = predict_array(predictor.model, sx, predictor.device) / predictor.temperatures
-    metrics["augmented_stress"] = snapshot_summary(stress_logits, sy, cfg)
+    stress = predict_array(predictor.model, sx, predictor.device) / predictor.temperatures
+    metrics["augmented_stress"] = snapshot_summary(stress, sy, cfg)
     return metrics
 
-
-def policy_report(records, ids, teacher, predictor, cfg, head, title,
-                  baseline_head=None, refined_head=None):
+def policy_report(records, ids, teacher, predictor, cfg, head, title):
     section(title)
     if not ids:
-        print("No eligible questions: report is unavailable, not zero-filled.")
+        print("No eligible questions; metrics are unavailable.")
         return None, {}
-    rows = {p: evaluate_policy(records, ids, predictor, cfg, policy=p, trace=True)
-            for p in ("evaluator_first", "candidate_first", "random", "cheapest")}
-    rows["rl_baseline"] = evaluate_policy(records, ids, predictor, cfg,
-                                            baseline_head or head, trace=True)
-    rows["rl_refined"] = evaluate_policy(records, ids, predictor, cfg,
-                                           refined_head or head, trace=True)
-    selected_variant = "rl_refined" if head is refined_head else "rl_baseline"
-    rows["rl"] = rows[selected_variant]
-    rows["full_snapshot"], scores = full_snapshot_rows(records, ids, predictor, cfg)
-    summary = {p: policy_summary(v) for p, v in rows.items()}
-    print(f"Questions: {len(ids)} | Stop mode: {cfg.stop_mode} | Budget: {cfg.budget:.0f} {cfg.cost_unit}")
-    print(f"{'Acquisition policy':<23} | {'Top-1':>7} | {'Mean cost':>10} | {'P90 cost':>8} | {'Early':>7} | {'Conf.err':>8}")
-    print("-"*91)
-    for name in ("full_snapshot", "evaluator_first", "candidate_first", "random",
-                 "cheapest", "rl_baseline", "rl_refined", "rl"):
-        m = summary[name]
-        err = "--" if m["confident_error"] is None else f"{m['confident_error']:.1%}"
-        early = "--" if m["early_quality"] is None else f"{m['early_quality']:.3f}"
-        print(f"{name:<23} | {m['top1']:6.1%} | {m['mean_cost']:10.1f} | {m['p90_cost']:8.1f} | "
-              f"{early:>7} | {err:>8}")
-    rl = summary["rl"]
-    interval = wilson_interval(rl["confident_errors"], rl["confident_n"])
-    if interval:
-        print(f"RL confident-stop errors: {rl['confident_errors']}/{rl['confident_n']} "
-              f"(Wilson 95% interval {interval[0]:.1%}..{interval[1]:.1%}); "
-              f"forced stops: {rl['forced_fraction']:.1%}.")
-    else:
-        print("RL had no confidence-triggered stops; all stops were forced by budget/pool exhaustion.")
-    paired = {name: paired_interval(rows["rl"], rows[name], cfg.bootstrap_samples, cfg.seed)
-              for name in ("random", "full_snapshot")}
-    d = paired["full_snapshot"]
-    print(f"RL vs full: accuracy delta {100*d['delta']:+.2f}pp "
-          f"[95% paired bootstrap {100*d['ci95'][0]:+.2f}, {100*d['ci95'][1]:+.2f}pp].")
-    if cfg.budget < cfg.full_cost:
-        print("Full-snapshot reference exceeds the acquisition cap; compare accuracy and cost together.")
-    return {"policies": summary, "paired": paired,
-            "full_snapshot_ranking": ranking_metrics(records, ids, scores, cfg, list(range(cfg.n))),
-            "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg)}, rows
-
-
-def plot_budget_curves(summary, cfg, best_simple, path):
-    """Offline last-completed-snapshot curves; full evidence is an endpoint only."""
-    initial = state_cost(State(), cfg)
-    fractions = (0., .25, .50, .75, 1.)
-    xs = [initial + f * (cfg.budget - initial) for f in fractions]
-    colors = {best_simple: "#64748b", "rl_baseline": "#2563eb", "rl_refined": "#ea580c"}
-    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="370" '
-             'viewBox="0 0 1000 370">', '<rect width="1000" height="370" fill="white"/>']
-    xmax = max(cfg.full_cost, cfg.budget)
-    for panel, (field, title, full_field) in enumerate((
-            ("selected_correct", "Selected answer correct", "top1"),
-            ("acquired_oracle", "Correct candidate available", "acquired_oracle"))):
-        left = 68 + 495 * panel
-        right, top, bottom = left + 390, 55, 285
-        xcoord = lambda value: left + (value - initial) * (right - left) / max(1, xmax - initial)
-        ycoord = lambda value: bottom - value * (bottom - top)
-        parts.append(f'<text x="{left}" y="27" font-size="17" font-family="sans-serif">{title}</text>')
-        for value in (0., .25, .5, .75, 1.):
-            y = ycoord(value)
-            parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" '
-                         'stroke="#e2e8f0"/>')
-            parts.append(f'<text x="{left-8}" y="{y+4:.1f}" text-anchor="end" '
-                         f'font-size="11" font-family="sans-serif">{value:.0%}</text>')
-        parts.append(f'<line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" stroke="#475569"/>')
-        for value in sorted({initial, cfg.budget, cfg.full_cost}):
-            x = xcoord(value)
-            parts.append(f'<text x="{x:.1f}" y="{bottom+18}" text-anchor="middle" '
-                         f'font-size="11" font-family="sans-serif">{value:g}</text>')
-        for name, color in colors.items():
-            curve = summary[name]["budget_curve"]
-            if curve is None:
-                continue
-            pairs = [(xcoord(x), ycoord(curve[str(f)][field])) for x, f in zip(xs, fractions)]
-            coords = " ".join(f"{x:.1f},{y:.1f}" for x, y in pairs)
-            parts.append(f'<polyline points="{coords}" fill="none" stroke="{color}" stroke-width="2"/>')
-            parts.extend(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{color}"/>'
-                         for x, y in pairs)
-        full_y = ycoord(summary["full_snapshot"][full_field])
-        full_x = xcoord(cfg.full_cost)
-        parts.append(f'<text x="{full_x:.1f}" y="{full_y+5:.1f}" text-anchor="middle" '
-                     'font-size="18" fill="black">×</text>')
-        parts.append(f'<text x="{(left+right)/2:.1f}" y="{bottom+42}" text-anchor="middle" '
-                     f'font-size="12" font-family="sans-serif">Completed cost ({cfg.cost_unit})</text>')
-    for j, (name, color) in enumerate(colors.items()):
-        x = 85 + 220 * j
-        parts.append(f'<line x1="{x}" y1="350" x2="{x+18}" y2="350" stroke="{color}" stroke-width="3"/>')
-        parts.append(f'<text x="{x+24}" y="354" font-size="12" font-family="sans-serif">{name}</text>')
-    parts.append('<text x="750" y="354" font-size="12" font-family="sans-serif">× full evidence endpoint</text>')
-    parts.append('</svg>')
-    path.write_text("\n".join(parts), encoding="utf-8")
-
+    rows = {name: evaluate_policy(records, ids, teacher, predictor, cfg, head,
+                                  policy=name, trace=True)
+            for name in ("full", "fixed", "supervised")}
+    summary = {name: policy_summary(data) for name, data in rows.items()}
+    print(f"{'Method':<16} | {'Top-1 correct':>13} | {'Exact MAX':>9} | {'Mean calls':>10} | {'Saved':>7}")
+    for name, item in summary.items():
+        exact = "--" if item["exact_max_recovery"] is None else f"{item['exact_max_recovery']:.1%}"
+        print(f"{name:<16} | {item['top1_correct']:>12.1%} | {exact:>9} | "
+              f"{item['mean_cost']:>10.1f} | {item['mean_saved_fraction']:>6.1%}")
+    return {"policies": summary,
+            "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg),
+            "continuation": continuation_diagnostic(records, ids, teacher, predictor, cfg, head)}, rows
 
 class Workflow:
     """Notebook stages; completed checkpoints resume, interrupted stages restart safely."""
@@ -1452,7 +1526,8 @@ class Workflow:
             contract_cfg.pop(key)
         sources = [{"path": str(Path(p).resolve()), "bytes": Path(p).stat().st_size,
                     "mtime_ns": Path(p).stat().st_mtime_ns} for p in [cfg.train_file] + cfg.test_files]
-        contract = {"schema_version": 2, "config": contract_cfg, "sources": sources}
+        contract = {"schema_version": 3, "implementation_revision": PIPELINE_REVISION,
+                    "config": contract_cfg, "sources": sources}
         path = self.out / "contract.json"
         if path.exists():
             old = json.loads(path.read_text(encoding="utf-8"))
@@ -1501,7 +1576,7 @@ class Workflow:
     def train_teacher(self):
         if self.records is None:
             self.prepare()
-        section("STAGE 1 | Full-evidence ResNet teacher and out-of-fold SAFE/MAX labels")
+        section("STAGE 1 | Masked joint correctness model and out-of-fold ranking")
         path = self.out / "teacher_completed.pt"
         if self.cfg.resume and path.exists():
             self.teacher = load_checkpoint(path)
@@ -1532,138 +1607,110 @@ class Workflow:
         self.predictor = FrozenPredictor(checkpoint, self.cfg, self.device)
         print("Encoder and prediction heads frozen. Development temperature calibration: "
               + ("enabled." if self.cfg.calibrate else "disabled."))
-        print(f"Application stopping: {self.cfg.stop_mode}, threshold={self.cfg.stop_threshold}, "
-              f"selected-member gate={self.cfg.require_selected_member}.")
+        print(f"Recognition threshold for supervised goals: {self.cfg.recognition_threshold:.2f}.")
         return self
 
-    def train_rl(self):
+    def train_decision_head(self):
         if not hasattr(self, "predictor"):
             self.train_snapshot()
-        section("STAGE 3 | Baseline and early-quality masked "
-                + ("Double DQN" if self.cfg.double_dqn else "DQN"))
-        checkpoints, heads = {}, {}
-        for variant in ("baseline", "refined"):
-            path = self.out / f"rl_{variant}_completed.pt"
-            if self.cfg.resume and path.exists():
-                checkpoints[variant] = load_checkpoint(path)
-                print(f"Loaded completed {variant} RL stage.")
-            else:
-                checkpoints[variant] = fit_dqn(self.records, self.splits,
-                                               self.predictor, self.cfg, self.out, variant)
-                atomic_torch(path, checkpoints[variant])
-            heads[variant] = ActionHead(self.cfg).to(self.device)
-            heads[variant].load_state_dict(checkpoints[variant]["weights"])
-            heads[variant].eval()
-        self.baseline_head, self.refined_head = heads["baseline"], heads["refined"]
-        dev = {name: policy_summary(evaluate_policy(self.records, self.splits["dev"],
-                                                 self.predictor, self.cfg, policy=name))
-               for name in ("evaluator_first", "candidate_first", "random", "cheapest")}
-        dev["rl_baseline"] = policy_summary(evaluate_policy(
-            self.records, self.splits["dev"], self.predictor, self.cfg, self.baseline_head))
-        dev["rl_refined"] = policy_summary(evaluate_policy(
-            self.records, self.splits["dev"], self.predictor, self.cfg, self.refined_head))
-        reference = max(("evaluator_first", "candidate_first", "random", "cheapest",
-                         "rl_baseline"), key=lambda name: policy_rank(dev[name], self.cfg))
-        accepted = policy_rank(dev["rl_refined"], self.cfg) > policy_rank(dev[reference], self.cfg)
-        selected = "refined" if accepted else "baseline"
-        self.head = heads[selected]
-        checkpoint = checkpoints[selected]
-        self.selection = {"accepted": accepted, "exported": f"rl_{selected}",
-                          "strongest_reference": reference,
-                          "best_simple": max(("evaluator_first", "candidate_first", "random",
-                                              "cheapest"), key=lambda name: policy_rank(dev[name], self.cfg)),
-                          "development": dev}
-        atomic_json(self.out / "rl_selection.json", self.selection)
-        atomic_torch(self.out / "rl_completed.pt", checkpoint)
-        print(f"Refined accepted: {accepted}; development reference: {reference}; "
-              f"best simple policy: {self.selection['best_simple']}; "
-              f"exported: rl_{selected} at step {checkpoint['best_step']}.")
-        # Self-contained inference bundle; only this head is learned by RL.
+        section("STAGE 3 | Supervised acquisition labels and frozen-encoder head")
+        path = self.out / "decision_head_completed.pt"
+        if self.cfg.resume and path.exists():
+            checkpoint = load_checkpoint(path)
+            print("Loaded completed supervised decision head.")
+        else:
+            checkpoint = train_decision_head(self.records, self.splits, self.teacher,
+                                             self.predictor, self.cfg, self.device, self.out)
+            atomic_torch(path, checkpoint)
+        self.head = SupervisedActionHead(self.cfg).to(self.device)
+        self.head.load_state_dict(checkpoint["weights"])
+        self.head.eval()
+        self.decision_checkpoint = checkpoint
+        if not all(torch.equal(value.cpu(), self.predictor.model.state_dict()[key].cpu())
+                   for key, value in load_checkpoint(self.out / "snapshot_completed.pt")["weights"].items()):
+            raise AssertionError("Frozen snapshot predictor changed during head training.")
         atomic_torch(self.out / "inference_bundle.pt", {
-            "schema_version": 2, "config": asdict(self.cfg),
+            "schema_version": 3, "implementation_revision": PIPELINE_REVISION,
+            "config": asdict(self.cfg),
             "snapshot": load_checkpoint(self.out / "snapshot_completed.pt"),
-            "rl": checkpoint, "rl_variants": checkpoints, "selection": self.selection,
-            "action_names": ["add_evaluator", "add_zero_shot"] +
+            "decision_head": checkpoint,
+            "action_names": ["add_next_retrieved", "add_zero_shot"] +
             [f"one_shot_source_{j+1}" for j in range(self.cfg.k)],
             "cost_note": "Fixed-m cached bundles; no target-grading cost at deployment."})
+        print(f"Decision head: epoch {checkpoint['best_epoch']}, "
+              f"development loss {checkpoint['dev_loss']:.4f}.")
         return self
 
     def report(self):
         if not hasattr(self, "head"):
-            self.train_rl()
-        results = {"rl_selection": self.selection}
-        external = [Path(p).stem for p in self.cfg.test_files]
+            self.train_decision_head()
+        results = {"decision_training": {"best_epoch": self.decision_checkpoint["best_epoch"],
+                                         "dev_loss": self.decision_checkpoint["dev_loss"],
+                                         "coverage": self.decision_checkpoint["coverage"]}}
+        external = [Path(path).stem for path in self.cfg.test_files]
         names = ["audit"] + external
         trajectory_path = self.out / "final_trajectories.jsonl"
         tmp = trajectory_path.with_suffix(".jsonl.tmp")
         with tmp.open("w", encoding="utf-8") as handle:
             for name in names:
                 ids = self.splits[name]
-                ranking = teacher_report(self.records, ids, self.cfg, self.teacher["scores"], self.heuristics,
-                                         f"TEACHER | {name} ({len(ids)} eligible questions)")
-                policy, rows = policy_report(self.records, ids, self.teacher, self.predictor, self.cfg,
-                                             self.head, f"ADAPTIVE EVALUATION | {name}",
-                                             self.baseline_head, self.refined_head)
+                ranking = teacher_report(self.records, ids, self.cfg,
+                                         self.teacher["scores"], self.heuristics,
+                                         f"RANKING | {name} ({len(ids)} eligible questions)")
+                policy, rows = policy_report(self.records, ids, self.teacher, self.predictor,
+                                             self.cfg, self.head,
+                                             f"ACQUISITION | {name}")
                 results[name] = {"ranking": ranking, "adaptive": policy}
+                if rows:
+                    results[name]["paired_top1"] = {
+                        baseline: paired_interval(rows["supervised"], rows[baseline],
+                                                   self.cfg.bootstrap_samples, self.cfg.seed)
+                        for baseline in ("full", "fixed")}
                 for method, method_rows in rows.items():
                     for row in method_rows:
-                        handle.write(json.dumps({"benchmark": name, "method": method, **row}, allow_nan=False) + "\n")
+                        handle.write(json.dumps({"benchmark": name, "method": method, **row},
+                                                allow_nan=False) + "\n")
         os.replace(tmp, trajectory_path)
         available = [name for name in external if results[name]["adaptive"] is not None]
         if available:
-            section(f"TEACHER EXTERNAL MEAN | {len(available)}/{len(external)} nonempty eligible benchmarks")
-            print(f"{'Ranking method':<43} | {'Mean AP':>8} | {'Top-1':>8} | {'AP delta':>9}")
-            ranking_macro = {}
-            base = np.mean([results[b]["ranking"]["Baseline (Retrieval Order)"]["ap"] for b in available])
-            for method in results[available[0]]["ranking"]:
-                ap = float(np.mean([results[b]["ranking"][method]["ap"] for b in available]))
-                acc = float(np.mean([results[b]["ranking"][method]["top1"] for b in available]))
-                ranking_macro[method] = {"ap": ap, "top1": acc}
-                print(f"{method:<43} | {ap:8.4f} | {acc:7.1%} | {100*(ap-base):+8.2f}pp")
-            results["teacher_external_macro"] = {"included": available, "methods": ranking_macro}
-            section(f"EQUAL-WEIGHT EXTERNAL MEAN | {len(available)}/{len(external)} nonempty eligible benchmarks")
-            print(f"{'Acquisition policy':<23} | {'Top-1':>8} | {'Mean cost':>10} | {'Saving':>8}")
-            macro = {}
-            for method in ("full_snapshot", "evaluator_first", "candidate_first", "random",
-                           "cheapest", "rl_baseline", "rl_refined", "rl"):
-                vals = [results[b]["adaptive"]["policies"][method] for b in available]
-                acc = float(np.mean([v["top1"] for v in vals]))
-                cost = float(np.mean([v["mean_cost"] for v in vals]))
-                macro[method] = {"top1": acc, "mean_cost": cost}
-                print(f"{method:<23} | {acc:7.1%} | {cost:10.1f} | {1-cost/self.cfg.full_cost:7.1%}")
-            results["external_macro"] = {"included": available,
-                                         "excluded_empty": sorted(set(external)-set(available)), "methods": macro}
-            weights = np.array([len(self.splits[b]) for b in available], float)
-            results["external_micro"] = {method: {
-                "top1": float(np.average([results[b]["adaptive"]["policies"][method]["top1"]
-                                           for b in available], weights=weights)),
-                "mean_cost": float(np.average([results[b]["adaptive"]["policies"][method]["mean_cost"]
-                                                for b in available], weights=weights))}
-                for method in macro}
+            results["external_macro"] = {
+                "included": available,
+                "methods": {method: {
+                    "top1_correct": float(np.mean([
+                        results[name]["adaptive"]["policies"][method]["top1_correct"]
+                        for name in available])),
+                    "exact_max_recovery": float(np.mean([
+                        results[name]["adaptive"]["policies"][method]["exact_max_recovery"]
+                        for name in available
+                        if results[name]["adaptive"]["policies"][method]["exact_max_recovery"] is not None]))
+                    if any(results[name]["adaptive"]["policies"][method]["exact_max_recovery"] is not None
+                           for name in available) else None,
+                    "mean_cost": float(np.mean([
+                        results[name]["adaptive"]["policies"][method]["mean_cost"]
+                        for name in available]))}
+                    for method in ("full", "fixed", "supervised")}}
         atomic_json(self.out / "results.json", results)
-        if results["audit"]["adaptive"] is not None:
-            plot_budget_curves(results["audit"]["adaptive"]["policies"], self.cfg,
-                               self.selection["best_simple"], self.out / "accuracy_vs_cost_audit.svg")
-        print(f"\nSaved compact reports, trajectories, stage checkpoints, and inference bundle to {self.out}")
-        print("Accuracy is over eligible complete records; cached policy evaluation is not live API validation.")
-        print("Prior benchmark use is not erased by the new split. SAFE/MAX thresholds are not certainty guarantees.")
+        print(f"Saved reports, trajectories, checkpoints, and inference bundle to {self.out}")
+        print("These are cached historical outcomes, not live API or Kaggle evidence.")
         self.results = results
         return results
 
 
 def load_inference_bundle(path, device="cpu"):
     bundle = load_checkpoint(path)
+    if bundle.get("schema_version") != 3:
+        raise ValueError("Expected a version 3 supervised-acquisition bundle; old DQN bundles are incompatible.")
     cfg = Config(**bundle["config"])
     predictor = FrozenPredictor(bundle["snapshot"], cfg, torch.device(device))
-    head = ActionHead(cfg).to(device)
-    head.load_state_dict(bundle["rl"]["weights"])
+    head = SupervisedActionHead(cfg).to(device)
+    head.load_state_dict(bundle["decision_head"]["weights"])
     head.eval()
     return cfg, predictor, head
 
 
 def run_pipeline(cfg=None):
     work = Workflow(cfg or Config())
-    work.prepare().train_teacher().train_snapshot().train_rl()
+    work.prepare().train_teacher().train_snapshot().train_decision_head()
     work.report()
     return work
 

@@ -48,6 +48,36 @@ directory.
 5. Replace the Hugging Face placeholder values or set
    `PERSIST_RESULTS_ONLINE` to `False`.
 
+## OpenRouter
+
+Set `OPENROUTER_API_KEY` as an environment variable or Kaggle Secret. In the
+notebook control panel, set the model names for the roles you will use and
+select `"openrouter"` with `API_PROVIDER_ADAPTATION`, `API_PROVIDER_SOLVER`,
+`API_PROVIDER_EVALUATOR`, or `API_PROVIDER_SIMPLIFICATION`. For example:
+
+```python
+CONFIG["OPENROUTER_MODEL_NAME_FINAL_SOLVER"] = "author/model-slug"
+CONFIG["OPENROUTER_PROVIDER_ROUTING"] = {
+    "order": ["provider-a", "provider-b"],
+    "allow_fallbacks": True,
+}
+CONFIG["OPENROUTER_MODEL_ROUTING"] = {
+    "author/model-slug": {"only": ["provider-a"]},
+}
+CONFIG["OPENROUTER_MODEL_FALLBACKS"] = {
+    "author/model-slug": ["other/model-slug"],
+}
+experiment_configurations[0]["API_PROVIDER_SOLVER"] = "openrouter"
+```
+
+Replace the example model IDs and provider slugs with entries from OpenRouter's
+catalog. The model-specific routing object replaces the default routing object
+for that model. An experiment may override either routing dictionary without
+changing another experiment's requests. Optional global and per-role
+`OPENROUTER_REASONING_EFFORT` settings control reasoning where the model
+supports it. OpenRouter uses the existing request retry, quota, and provider
+delay settings.
+
 ## Layer-1 grouping companion run
 
 Run grouping as its own experiment so its JSON can later be paired with the

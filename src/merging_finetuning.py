@@ -511,6 +511,73 @@ def upload_adapter_to_hub(
     }
 
 
+def download_adapter_from_hub(
+    adapter_path: os.PathLike[str] | str,
+    token: str,
+    repo_id: Optional[str] = None,
+    *,
+    api: Optional[Any] = None,
+    download_fn: Optional[Callable[..., str]] = None,
+) -> Optional[Dict[str, str]]:
+    """Restore a completed PEFT adapter, or return None when its repo is absent.
+
+    Other Hub failures propagate so an unavailable private repo or network problem
+    cannot silently start a new training run.
+    """
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("A non-empty Hugging Face token is required.")
+    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub.errors import RepositoryNotFoundError
+
+    api = api or HfApi(token=token)
+    download_fn = download_fn or snapshot_download
+    resolved_repo_id = repo_id.strip() if isinstance(repo_id, str) else ""
+    if not resolved_repo_id:
+        identity = api.whoami()
+        username = identity.get("name") if isinstance(identity, Mapping) else None
+        if not username:
+            raise RuntimeError("Could not determine the authenticated Hugging Face username.")
+        resolved_repo_id = f"{username}/merging-qwen3-4b-qlora"
+    if "/" not in resolved_repo_id:
+        raise ValueError("repo_id must use the 'owner/repository' format.")
+
+    try:
+        info = api.model_info(repo_id=resolved_repo_id)
+    except RepositoryNotFoundError:
+        if repo_id:
+            raise RuntimeError(
+                f"Hugging Face adapter repository {resolved_repo_id} was not found or is inaccessible."
+            ) from None
+        return None
+
+    remote_files = {item.rfilename for item in info.siblings}
+    if "adapter_config.json" not in remote_files or not remote_files.intersection(
+        {"adapter_model.safetensors", "adapter_model.bin"}
+    ):
+        raise RuntimeError(f"Hugging Face repository {resolved_repo_id} lacks a complete PEFT adapter.")
+    if not remote_files.intersection({"tokenizer_config.json", "tokenizer.json"}):
+        raise RuntimeError(f"Hugging Face repository {resolved_repo_id} lacks tokenizer files.")
+
+    adapter_dir = Path(adapter_path).expanduser().resolve() / info.sha
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    download_fn(
+        repo_id=resolved_repo_id, repo_type="model", revision=info.sha,
+        local_dir=str(adapter_dir), token=token,
+    )
+    if not (adapter_dir / "adapter_config.json").is_file() or not any(
+        (adapter_dir / name).is_file()
+        for name in ("adapter_model.safetensors", "adapter_model.bin")
+    ):
+        raise RuntimeError(f"Hugging Face repository {resolved_repo_id} lacks a complete PEFT adapter.")
+    if not any((adapter_dir / name).is_file() for name in ("tokenizer_config.json", "tokenizer.json")):
+        raise RuntimeError(f"Hugging Face repository {resolved_repo_id} lacks tokenizer files.")
+    return {
+        "repo_id": resolved_repo_id,
+        "revision": info.sha,
+        "adapter_path": str(adapter_dir),
+    }
+
+
 class LocalFusionGenerator:
     """Generate with either the disabled base model or the active trained adapter."""
 

@@ -35,7 +35,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from src.utils import save_json
-from src.api_manager import GeminiAPIManager, AvalAIAPIManager
+from src.api_manager import model_name_for
 from src.evaluation import evaluate_single_answer_with_llm
 from src.hf_sync import periodic_sync_check
 from src.parallel_utils import run_parallel_api_calls
@@ -896,12 +896,7 @@ class ActiveInferenceEngine:
         self.global_config = global_config if global_config is not None else GLOBAL_CONFIG
         
         # Determine which model to use based on the API Manager type
-        if isinstance(self.api_manager_solve, GeminiAPIManager):
-            self.model_name = self.global_config.get('GEMINI_MODEL_NAME_FINAL_SOLVER')
-        elif isinstance(self.api_manager_solve, AvalAIAPIManager):
-            self.model_name = self.global_config.get('AVALAI_MODEL_NAME_FINAL_SOLVER')
-        else:
-            self.model_name = self.global_config.get('OLLAMA_MODEL_NAME_FINAL_SOLVER')
+        self.model_name = model_name_for(self.api_manager_solve, self.global_config, "final_solver")
 
     def execute_and_evaluate(self, target_query: str, ground_truth: str, context_texts: List[str], n_attempts: int, use_mirror_baseline_template: bool = False, target_index: Optional[int] = None):
         # NEW: Deduplicate text strings to save tokens and prevent redundant context
