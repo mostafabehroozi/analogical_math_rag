@@ -51,6 +51,7 @@ from sentence_transformers import SentenceTransformer
 from src.context_logger import tprint
 from src.benchmark_data import benchmark_name_for_target_index
 from src.api_manager import bind_api_managers
+from src.distributed_code_compatibility import worker_code_unchanged_since_manifest
 
 
 from src.pipeline_steps import (
@@ -157,10 +158,9 @@ def _auto_pin_local_legacy_code_fingerprint(
     manifest_path: str,
     requested_manifest: Dict[str, Any],
 ) -> bool:
-    """Pin a valid local pre-patch manifest only when model names are the sole drift."""
+    """Pin only a Git-authenticated change outside worker execution code."""
     if (
-        not global_config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False)
-        or global_config.get("DISTRIBUTED_CODE_FINGERPRINT")
+        global_config.get("DISTRIBUTED_CODE_FINGERPRINT")
         or not os.path.exists(manifest_path)
     ):
         return False
@@ -169,12 +169,6 @@ def _auto_pin_local_legacy_code_fingerprint(
         raise DistributedExecutionError(
             f"Malformed existing distributed manifest: {manifest_path}"
         )
-    model_changes = validate_manifest_compatibility(
-        existing_manifest,
-        requested_manifest,
-        allow_model_rotation=True,
-        allow_legacy_code_fingerprint=True,
-    )
     stored_code_fingerprint = existing_manifest.get("code_fingerprint")
     if stored_code_fingerprint == requested_manifest.get("code_fingerprint"):
         return False
@@ -182,13 +176,23 @@ def _auto_pin_local_legacy_code_fingerprint(
         raise DistributedExecutionError(
             "The existing distributed manifest has no usable code_fingerprint."
         )
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    authenticated_code_match = worker_code_unchanged_since_manifest(
+        project_root, stored_code_fingerprint
+    )
+    if not authenticated_code_match:
+        logging.getLogger(__name__).warning(
+            "Worker code compatibility could not be proven from %s; "
+            "resume requires the original checkout or a new run ID.",
+            manifest_path,
+        )
+        return False
     global_config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
     global_config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
     logging.getLogger(__name__).warning(
-        "Automatically pinned the pre-patch code fingerprint from %s after "
-        "verifying that only approved model names changed: %s",
+        "Automatically pinned the authenticated compatible code fingerprint "
+        "from %s; worker execution code is unchanged.",
         manifest_path,
-        model_changes,
     )
     return True
 
@@ -2300,38 +2304,39 @@ def finalize_distributed_experiments(
     paths = configure_worker_paths(global_config)
     run_root = download_distributed_run_for_merge(global_config)
 
-    # Match worker semantics: role model names are runtime provenance, while
-    # every other manifest field remains strict during finalization.
+    # Completed shards are validated against the immutable worker manifest.
+    # The finalizer may run newer code, but data and experiment identity stay strict.
     allow_model_rotation = True
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
         resolve_code_fingerprint(project_root)
     )
-    requested_manifest = _build_requested_distributed_manifest(
-        global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
-    )
     manifest_path = os.path.join(run_root, "manifest.json")
-    if _auto_pin_local_legacy_code_fingerprint(
-        global_config, manifest_path, requested_manifest
-    ):
-        requested_manifest = _build_requested_distributed_manifest(
-            global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
-        )
-    write_or_validate_manifest(
-        manifest_path,
-        requested_manifest,
-        allow_model_rotation=allow_model_rotation,
-    )
     expected_manifest = load_json(manifest_path)
     if not isinstance(expected_manifest, dict):
         raise DistributedExecutionError(
             f"Malformed authoritative distributed manifest: {manifest_path}"
         )
+    manifest_config = dict(global_config)
+    manifest_config["DISTRIBUTED_CODE_FINGERPRINT"] = expected_manifest.get(
+        "code_fingerprint"
+    )
+    requested_manifest = _build_requested_distributed_manifest(
+        manifest_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
+    )
     model_changes = validate_manifest_compatibility(
         expected_manifest,
         requested_manifest,
         allow_model_rotation=allow_model_rotation,
     )
+    if expected_manifest["code_fingerprint"] != global_config[
+        "_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"
+    ]:
+        logging.getLogger(__name__).warning(
+            "Finalizer code differs from worker code for run %s; worker artifacts "
+            "remain bound to the immutable manifest.",
+            expected_manifest["run_id"],
+        )
     _announce_authorized_model_rotation(model_changes, context="finalizer")
 
     merged_root = os.path.join(run_root, "merged")
@@ -2423,6 +2428,9 @@ def finalize_distributed_experiments(
                 "state": state,
                 "run_id": expected_manifest["run_id"],
                 "manifest_sha256": expected_manifest["manifest_sha256"],
+                "runtime_code_fingerprint": global_config[
+                    "_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"
+                ],
                 "experiment_name": experiment_name,
                 "expected_query_count": len(hard_questions),
                 "completed_query_count": len(completed_indices),
@@ -2479,6 +2487,9 @@ def finalize_distributed_experiments(
                 "state": state,
                 "run_id": expected_manifest["run_id"],
                 "manifest_sha256": expected_manifest["manifest_sha256"],
+                "runtime_code_fingerprint": global_config[
+                    "_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"
+                ],
                 "experiment_name": experiment_name,
                 "expected_test_count": len(expected_indices),
                 "completed_test_count": len(completed_indices & expected_indices),

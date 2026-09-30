@@ -41,6 +41,7 @@ from src.distributed_execution import (
     DistributedManifestMismatch,
     validate_manifest_compatibility,
 )
+from src.distributed_code_compatibility import worker_code_unchanged_since_manifest
 
 
 class DistributedSyncError(RuntimeError):
@@ -366,44 +367,61 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
             )
             if remote_manifest_record is not None:
                 remote_manifest, remote_hash = remote_manifest_record
-                # Role model names are runtime provenance, so model-only drift
-                # is always compatible. The opt-in flag now controls only the
-                # pre-patch code-fingerprint bootstrap below.
-                allow_model_rotation = True
-                auto_pin_legacy_code = (
-                    bool(config.get("DISTRIBUTED_ALLOW_MODEL_ROTATION", False))
-                    and not config.get("DISTRIBUTED_CODE_FINGERPRINT")
+                stored_code_fingerprint = remote_manifest.get("code_fingerprint")
+                compatible_code = (
+                    stored_code_fingerprint != expected_manifest.get("code_fingerprint")
+                    and worker_code_unchanged_since_manifest(
+                        Path(__file__).resolve().parents[1], stored_code_fingerprint
+                    )
                 )
+                if compatible_code:
+                    pinned_expected = dict(expected_manifest)
+                    pinned_expected["code_fingerprint"] = stored_code_fingerprint
+                    unsigned = dict(pinned_expected)
+                    unsigned.pop("manifest_sha256", None)
+                    pinned_expected["manifest_sha256"] = hashlib.sha256(
+                        json.dumps(
+                            unsigned, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    try:
+                        validate_manifest_compatibility(
+                            remote_manifest, pinned_expected, allow_model_rotation=True
+                        )
+                    except DistributedManifestMismatch as exc:
+                        raise DistributedManifestMismatchError(
+                            "The remote distributed manifest has different inputs/config: "
+                            f"{exc}"
+                        ) from exc
+                    config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
+                    config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
+                    logger.warning(
+                        "Pinned authenticated compatible worker code from immutable "
+                        "manifest %s; execution source outside finalizer and checkpoint "
+                        "plumbing is unchanged.",
+                        remote_path,
+                    )
+                    return remote_hash
+                if stored_code_fingerprint != expected_manifest.get("code_fingerprint"):
+                    logger.warning(
+                        "Worker code compatibility could not be proven from %s; "
+                        "resume requires the original checkout or a new run ID.",
+                        remote_path,
+                    )
+                # Role model names are runtime provenance. Code changes need
+                # the authenticated proof above or an explicit reviewed pin.
                 try:
                     model_changes = validate_manifest_compatibility(
                         remote_manifest,
                         expected_manifest,
-                        allow_model_rotation=allow_model_rotation,
-                        allow_legacy_code_fingerprint=auto_pin_legacy_code,
+                        allow_model_rotation=True,
                     )
                 except DistributedManifestMismatch as exc:
                     raise DistributedManifestMismatchError(
                         "The remote distributed manifest already exists with different content "
                         f"(expected {expected_hash}, found {remote_hash}): {exc}"
                     ) from exc
-                if (
-                    auto_pin_legacy_code
-                    and remote_manifest.get("code_fingerprint")
-                    != expected_manifest.get("code_fingerprint")
-                ):
-                    stored_code_fingerprint = remote_manifest.get("code_fingerprint")
-                    if not isinstance(stored_code_fingerprint, str) or not stored_code_fingerprint:
-                        raise DistributedSyncError(
-                            "The authoritative remote manifest has no usable code_fingerprint."
-                        )
-                    config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
-                    config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
-                    logger.warning(
-                        "Automatically pinned the pre-patch code fingerprint from immutable "
-                        "manifest %s for this model-rotation resume. The actual runtime "
-                        "fingerprint remains recorded separately.",
-                        remote_path,
-                    )
                 if model_changes:
                     logger.warning(
                         "Authorized distributed model rotation against immutable manifest %s: %s",
