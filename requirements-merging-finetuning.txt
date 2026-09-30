@@ -1,5 +1,5 @@
 # Kaggle already supplies CUDA-enabled PyTorch. Do not replace it here.
-transformers>=4.51,<5
+transformers==4.55.4
 peft>=0.14,<1
 accelerate>=1.2,<2
 bitsandbytes>=0.45,<1
