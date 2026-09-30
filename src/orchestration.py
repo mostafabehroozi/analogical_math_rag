@@ -51,7 +51,7 @@ from sentence_transformers import SentenceTransformer
 from src.context_logger import tprint
 from src.benchmark_data import benchmark_name_for_target_index
 from src.api_manager import bind_api_managers
-from src.distributed_code_compatibility import worker_code_unchanged_since_manifest
+from src.distributed_code_compatibility import diagnose_worker_code_compatibility
 
 
 from src.pipeline_steps import (
@@ -177,14 +177,15 @@ def _auto_pin_local_legacy_code_fingerprint(
             "The existing distributed manifest has no usable code_fingerprint."
         )
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    authenticated_code_match = worker_code_unchanged_since_manifest(
+    authenticated_code_match, code_reason = diagnose_worker_code_compatibility(
         project_root, stored_code_fingerprint
     )
     if not authenticated_code_match:
         logging.getLogger(__name__).warning(
-            "Worker code compatibility could not be proven from %s; "
-            "resume requires the original checkout or a new run ID.",
+            "Worker code compatibility could not be proven from %s: %s "
+            "Resume requires the original checkout or a new run ID.",
             manifest_path,
+            code_reason,
         )
         return False
     global_config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint

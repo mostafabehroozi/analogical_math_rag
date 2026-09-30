@@ -12,6 +12,7 @@ from unittest.mock import patch
 from src.distributed_code_compatibility import (
     _committed_python,
     _legacy_source_hash,
+    diagnose_worker_code_compatibility,
     worker_code_unchanged_since_manifest,
 )
 from src.distributed_execution import (
@@ -81,7 +82,7 @@ class FinalizerManifestTests(unittest.TestCase):
             with patch("src.hf_sync.HfApi") as api, patch(
                 "src.hf_sync._remote_manifest_at_revision", return_value=(saved, "remote-hash")
             ), patch(
-                "src.hf_sync.worker_code_unchanged_since_manifest", return_value=True
+                "src.hf_sync.diagnose_worker_code_compatibility", return_value=(True, "match")
             ):
                 api.return_value.repo_info.return_value = SimpleNamespace(sha="repo-head")
                 self.assertEqual(
@@ -106,7 +107,7 @@ class FinalizerManifestTests(unittest.TestCase):
             with patch("src.hf_sync.HfApi") as api, patch(
                 "src.hf_sync._remote_manifest_at_revision", return_value=(saved, "remote-hash")
             ), patch(
-                "src.hf_sync.worker_code_unchanged_since_manifest", return_value=True
+                "src.hf_sync.diagnose_worker_code_compatibility", return_value=(True, "match")
             ):
                 api.return_value.repo_info.return_value = SimpleNamespace(sha="repo-head")
                 with self.assertRaises(DistributedManifestMismatchError):
@@ -127,7 +128,7 @@ class FinalizerManifestTests(unittest.TestCase):
             with patch("src.hf_sync.HfApi") as api, patch(
                 "src.hf_sync._remote_manifest_at_revision", return_value=(saved, "remote-hash")
             ), patch(
-                "src.hf_sync.worker_code_unchanged_since_manifest", return_value=False
+                "src.hf_sync.diagnose_worker_code_compatibility", return_value=(False, "changed")
             ):
                 api.return_value.repo_info.return_value = SimpleNamespace(sha="repo-head")
                 with self.assertRaises(DistributedManifestMismatchError):
@@ -146,7 +147,7 @@ class FinalizerManifestTests(unittest.TestCase):
             manifest_path = Path(temporary) / "manifest.json"
             manifest_path.write_text(json.dumps(saved), encoding="utf-8")
             with patch.object(
-                orchestration, "worker_code_unchanged_since_manifest", return_value=True
+                orchestration, "diagnose_worker_code_compatibility", return_value=(True, "match")
             ):
                 self.assertTrue(orchestration._auto_pin_local_legacy_code_fingerprint(
                     self.config, str(manifest_path), current
@@ -214,6 +215,9 @@ class WorkerCodeCompatibilityTests(unittest.TestCase):
             (root / "src" / "pipeline_steps.py").write_text(
                 "def solve():\n    return 1\n", encoding="utf-8"
             )
+            (root / "src" / "merging_finetuning.py").write_text(
+                "def train():\n    return 1\n", encoding="utf-8"
+            )
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
             subprocess.run(["git", "add", "."], cwd=root, check=True)
             subprocess.run(
@@ -232,6 +236,9 @@ class WorkerCodeCompatibilityTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "test_new.py").write_text("assert True\n", encoding="utf-8")
+            (root / "src" / "merging_finetuning.py").write_text(
+                "def train():\n    return 2\n", encoding="utf-8"
+            )
             self.assertTrue(worker_code_unchanged_since_manifest(root, saved))
             wrong_hash = saved[:-1] + ("0" if saved[-1] != "0" else "1")
             self.assertFalse(worker_code_unchanged_since_manifest(root, wrong_hash))
@@ -240,6 +247,10 @@ class WorkerCodeCompatibilityTests(unittest.TestCase):
                 "def solve():\n    return 2\n", encoding="utf-8"
             )
             self.assertFalse(worker_code_unchanged_since_manifest(root, saved))
+            self.assertIn(
+                "src/pipeline_steps.py",
+                diagnose_worker_code_compatibility(root, saved)[1],
+            )
 
 
 if __name__ == "__main__":

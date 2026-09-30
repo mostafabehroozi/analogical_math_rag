@@ -17,7 +17,12 @@ import subprocess
 
 
 _LEGACY_FINGERPRINT = re.compile(r"^git:([0-9a-f]{40}):source:([0-9a-f]{64})$")
-_IGNORED_MODULE = "src/distributed_code_compatibility.py"
+_IGNORED_MODULES = {
+    "src/distributed_code_compatibility.py",
+    # This module is used by the separate fine-tuning notebooks.  The
+    # distributed experiment worker does not import it.
+    "src/merging_finetuning.py",
+}
 _INFRASTRUCTURE_FUNCTIONS = {
     "src/orchestration.py": {
         "finalize_distributed_experiments",
@@ -73,7 +78,7 @@ def _legacy_source_hash(sources: dict[str, bytes]) -> str:
 
 
 def _worker_source_ast(relative: str, source: bytes) -> str | None:
-    if relative == _IGNORED_MODULE or Path(relative).name.startswith("test_"):
+    if relative in _IGNORED_MODULES or Path(relative).name.startswith("test_"):
         return None
     tree = ast.parse(source, filename=relative)
     excluded = _INFRASTRUCTURE_FUNCTIONS.get(relative, set())
@@ -88,18 +93,21 @@ def _worker_source_ast(relative: str, source: bytes) -> str | None:
     return ast.dump(tree, include_attributes=False)
 
 
-def worker_code_unchanged_since_manifest(
+def diagnose_worker_code_compatibility(
     project_root: str | Path, saved_fingerprint: str
-) -> bool:
-    """Accept only a Git-authenticated legacy source with unchanged worker AST."""
+) -> tuple[bool, str]:
+    """Explain whether the saved Git source matches the active worker code."""
     match = _LEGACY_FINGERPRINT.fullmatch(str(saved_fingerprint))
     if match is None:
-        return False
+        return False, "The saved fingerprint has no Git revision and source hash."
     root = Path(project_root).resolve()
     try:
         original = _committed_python(root, match.group(1))
-        if _legacy_source_hash(original) != match.group(2):
-            return False
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return False, "The saved Git revision is unavailable in this checkout."
+    if _legacy_source_hash(original) != match.group(2):
+        return False, "The saved source hash differs from the Git revision's Python files."
+    try:
         current = _working_python(root)
         original_worker = {
             path: _worker_source_ast(path, source)
@@ -109,10 +117,22 @@ def worker_code_unchanged_since_manifest(
             path: _worker_source_ast(path, source)
             for path, source in current.items()
         }
-        return {
-            path: value for path, value in original_worker.items() if value is not None
-        } == {
-            path: value for path, value in current_worker.items() if value is not None
-        }
-    except (OSError, UnicodeError, SyntaxError, subprocess.SubprocessError):
-        return False
+    except (OSError, UnicodeError, SyntaxError):
+        return False, "A Python source file could not be read or parsed."
+    changed = sorted(
+        path for path in original_worker.keys() | current_worker.keys()
+        if original_worker.get(path) != current_worker.get(path)
+        and (original_worker.get(path) is not None or current_worker.get(path) is not None)
+    )
+    if changed:
+        shown = ", ".join(changed[:8])
+        more = f" (and {len(changed) - 8} more)" if len(changed) > 8 else ""
+        return False, f"Worker source changed in: {shown}{more}."
+    return True, "The Git source and worker execution code match."
+
+
+def worker_code_unchanged_since_manifest(
+    project_root: str | Path, saved_fingerprint: str
+) -> bool:
+    """Preserve the boolean interface for callers needing only a verdict."""
+    return diagnose_worker_code_compatibility(project_root, saved_fingerprint)[0]

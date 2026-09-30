@@ -41,7 +41,7 @@ from src.distributed_execution import (
     DistributedManifestMismatch,
     validate_manifest_compatibility,
 )
-from src.distributed_code_compatibility import worker_code_unchanged_since_manifest
+from src.distributed_code_compatibility import diagnose_worker_code_compatibility
 
 
 class DistributedSyncError(RuntimeError):
@@ -368,12 +368,12 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
             if remote_manifest_record is not None:
                 remote_manifest, remote_hash = remote_manifest_record
                 stored_code_fingerprint = remote_manifest.get("code_fingerprint")
-                compatible_code = (
-                    stored_code_fingerprint != expected_manifest.get("code_fingerprint")
-                    and worker_code_unchanged_since_manifest(
+                code_reason = ""
+                compatible_code = False
+                if stored_code_fingerprint != expected_manifest.get("code_fingerprint"):
+                    compatible_code, code_reason = diagnose_worker_code_compatibility(
                         Path(__file__).resolve().parents[1], stored_code_fingerprint
                     )
-                )
                 if compatible_code:
                     pinned_expected = dict(expected_manifest)
                     pinned_expected["code_fingerprint"] = stored_code_fingerprint
@@ -405,9 +405,10 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
                     return remote_hash
                 if stored_code_fingerprint != expected_manifest.get("code_fingerprint"):
                     logger.warning(
-                        "Worker code compatibility could not be proven from %s; "
-                        "resume requires the original checkout or a new run ID.",
+                        "Worker code compatibility could not be proven from %s: %s "
+                        "Resume requires the original checkout or a new run ID.",
                         remote_path,
+                        code_reason,
                     )
                 # Role model names are runtime provenance. Code changes need
                 # the authenticated proof above or an explicit reviewed pin.
