@@ -451,21 +451,11 @@ def validate_manifest_compatibility(
         )
         if existing_manifest.get(key) != expected_manifest.get(key)
     ]
-    legacy_rotation_guidance = ""
-    if (
-        not allow_legacy_code_fingerprint
-        and "code_fingerprint" in changed
-    ):
-        legacy_rotation_guidance = (
-            " For a pre-patch run, set DISTRIBUTED_CODE_FINGERPRINT to the exact "
-            "code_fingerprint stored in the existing manifest."
-        )
     raise DistributedManifestMismatch(
         "Existing run manifest does not match this invocation"
         + (f" (changed: {', '.join(changed)})" if changed else "")
         + "."
-        + legacy_rotation_guidance
-        + " Otherwise use the original inputs/config or choose a new DISTRIBUTED_RUN_ID."
+        + " Restore the original code and inputs/config, or choose a new DISTRIBUTED_RUN_ID."
     )
 
 

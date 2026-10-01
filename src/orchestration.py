@@ -156,13 +156,11 @@ def _build_requested_distributed_manifest(
 def _auto_pin_local_legacy_code_fingerprint(
     global_config: Dict[str, Any],
     manifest_path: str,
-    requested_manifest: Dict[str, Any],
 ) -> bool:
     """Pin only a Git-authenticated change outside worker execution code."""
-    if (
-        global_config.get("DISTRIBUTED_CODE_FINGERPRINT")
-        or not os.path.exists(manifest_path)
-    ):
+    from src.distributed_execution import DistributedManifestMismatch
+
+    if not os.path.exists(manifest_path):
         return False
     existing_manifest = load_json(manifest_path)
     if not isinstance(existing_manifest, dict):
@@ -170,24 +168,25 @@ def _auto_pin_local_legacy_code_fingerprint(
             f"Malformed existing distributed manifest: {manifest_path}"
         )
     stored_code_fingerprint = existing_manifest.get("code_fingerprint")
-    if stored_code_fingerprint == requested_manifest.get("code_fingerprint"):
-        return False
     if not isinstance(stored_code_fingerprint, str) or not stored_code_fingerprint:
         raise DistributedExecutionError(
             "The existing distributed manifest has no usable code_fingerprint."
         )
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    runtime_code_fingerprint = global_config.get(
+        "_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"
+    ) or resolve_code_fingerprint(project_root)
+    if stored_code_fingerprint == runtime_code_fingerprint:
+        return False
     authenticated_code_match, code_reason = diagnose_worker_code_compatibility(
         project_root, stored_code_fingerprint
     )
     if not authenticated_code_match:
-        logging.getLogger(__name__).warning(
-            "Worker code compatibility could not be proven from %s: %s "
-            "Resume requires the original checkout or a new run ID.",
-            manifest_path,
-            code_reason,
+        raise DistributedManifestMismatch(
+            f"Worker code compatibility could not be proven from {manifest_path}: "
+            f"{code_reason} Restore the original checkout or use a new "
+            "DISTRIBUTED_RUN_ID."
         )
-        return False
     global_config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
     global_config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
     logging.getLogger(__name__).warning(
@@ -499,11 +498,15 @@ def _prepare_distributed_worker(
     global_config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = (
         resolve_code_fingerprint(project_root)
     )
+    # A value left in CONFIG by a previous worker session (or supplied by hand)
+    # is not proof that the current source can resume that manifest.
+    global_config.pop("DISTRIBUTED_CODE_FINGERPRINT", None)
+    global_config.pop("_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED", None)
     requested_manifest = _build_requested_distributed_manifest(
         global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
     )
     if _auto_pin_local_legacy_code_fingerprint(
-        global_config, paths["manifest_path"], requested_manifest
+        global_config, paths["manifest_path"]
     ):
         requested_manifest = _build_requested_distributed_manifest(
             global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data

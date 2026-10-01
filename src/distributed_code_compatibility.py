@@ -27,8 +27,10 @@ _INFRASTRUCTURE_FUNCTIONS = {
     "src/orchestration.py": {
         "finalize_distributed_experiments",
         "_auto_pin_local_legacy_code_fingerprint",
+        "_prepare_distributed_worker",
     },
     "src/hf_sync.py": {"ensure_distributed_manifest"},
+    "src/distributed_execution.py": {"validate_manifest_compatibility"},
 }
 
 

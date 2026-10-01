@@ -323,6 +323,8 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
 
     Returns the canonical SHA-256 hash of the authoritative remote manifest.
     """
+    from src.distributed_execution import resolve_code_fingerprint
+
     if not _distributed_execution_enabled(config):
         raise ValueError("ensure_distributed_manifest requires DISTRIBUTED_EXECUTION_ENABLED=True.")
 
@@ -368,11 +370,26 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
             if remote_manifest_record is not None:
                 remote_manifest, remote_hash = remote_manifest_record
                 stored_code_fingerprint = remote_manifest.get("code_fingerprint")
+                # A local manifest can already contain a manually pinned legacy
+                # fingerprint.  Authenticate it against the actual source before
+                # accepting even an exact match with the remote manifest.
+                project_root = Path(__file__).resolve().parents[1]
+                local_code_fingerprint = expected_manifest.get("code_fingerprint")
+                if local_code_fingerprint != resolve_code_fingerprint(project_root):
+                    local_code_match, local_code_reason = diagnose_worker_code_compatibility(
+                        project_root, local_code_fingerprint
+                    )
+                    if not local_code_match:
+                        raise DistributedManifestMismatchError(
+                            "The local manifest code_fingerprint does not match the "
+                            "current worker source: " + local_code_reason + " "
+                            "Restore the original checkout or use a new DISTRIBUTED_RUN_ID."
+                        )
                 code_reason = ""
                 compatible_code = False
                 if stored_code_fingerprint != expected_manifest.get("code_fingerprint"):
                     compatible_code, code_reason = diagnose_worker_code_compatibility(
-                        Path(__file__).resolve().parents[1], stored_code_fingerprint
+                        project_root, stored_code_fingerprint
                     )
                 if compatible_code:
                     pinned_expected = dict(expected_manifest)

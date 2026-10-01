@@ -135,6 +135,58 @@ class FinalizerManifestTests(unittest.TestCase):
                     ensure_distributed_manifest(self.config, manifest_path)
             self.assertNotIn("DISTRIBUTED_CODE_FINGERPRINT", self.config)
 
+    def test_matching_manifests_do_not_authenticate_a_manual_code_pin(self):
+        saved = self.manifest("worker-code")
+        self.config.update({
+            "PERSIST_RESULTS_ONLINE": True,
+            "HF_SYNC_TOKEN": "test-token",
+            "DISTRIBUTED_CODE_FINGERPRINT": "worker-code",
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = Path(temporary) / "manifest.json"
+            manifest_path.write_text(json.dumps(saved), encoding="utf-8")
+            with patch("src.hf_sync.HfApi") as api, patch(
+                "src.hf_sync._remote_manifest_at_revision", return_value=(saved, "remote-hash")
+            ), patch(
+                "src.distributed_execution.resolve_code_fingerprint", return_value="changed-runtime-code"
+            ), patch(
+                "src.hf_sync.diagnose_worker_code_compatibility",
+                return_value=(False, "worker source changed"),
+            ):
+                api.return_value.repo_info.return_value = SimpleNamespace(sha="repo-head")
+                with self.assertRaisesRegex(
+                    DistributedManifestMismatchError, "current worker source"
+                ):
+                    ensure_distributed_manifest(self.config, manifest_path)
+                api.return_value.create_commit.assert_not_called()
+
+    def test_worker_drops_manual_code_pin_before_building_manifest(self):
+        sentence_transformers = ModuleType("sentence_transformers")
+        sentence_transformers.SentenceTransformer = type("SentenceTransformer", (), {})
+        with patch.dict(sys.modules, {"sentence_transformers": sentence_transformers}):
+            from src import orchestration
+
+        self.config["DISTRIBUTED_CODE_FINGERPRINT"] = "old-code"
+        self.config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            orchestration, "_validate_distributed_scope"
+        ), patch.object(
+            orchestration, "configure_worker_paths",
+            return_value={"manifest_path": str(Path(temporary) / "manifest.json")},
+        ), patch.object(
+            orchestration, "resolve_code_fingerprint", return_value="current-code"
+        ), patch(
+            "src.distributed_execution.resolve_code_fingerprint", return_value="current-code"
+        ), patch.object(
+            orchestration, "write_or_validate_manifest", side_effect=RuntimeError("stop")
+        ) as write_manifest:
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                orchestration._prepare_distributed_worker(
+                    self.config, [self.experiment], ["question"], ["answer"], {}
+                )
+        self.assertEqual(write_manifest.call_args.args[1]["code_fingerprint"], "current-code")
+        self.assertNotIn("DISTRIBUTED_CODE_FINGERPRINT", self.config)
+
     def test_existing_local_worker_manifest_pins_only_authenticated_code(self):
         sentence_transformers = ModuleType("sentence_transformers")
         sentence_transformers.SentenceTransformer = type("SentenceTransformer", (), {})
@@ -142,7 +194,6 @@ class FinalizerManifestTests(unittest.TestCase):
             from src import orchestration
 
         saved = self.manifest("worker-code")
-        current = self.manifest("current-code")
         with tempfile.TemporaryDirectory() as temporary:
             manifest_path = Path(temporary) / "manifest.json"
             manifest_path.write_text(json.dumps(saved), encoding="utf-8")
@@ -150,12 +201,35 @@ class FinalizerManifestTests(unittest.TestCase):
                 orchestration, "diagnose_worker_code_compatibility", return_value=(True, "match")
             ):
                 self.assertTrue(orchestration._auto_pin_local_legacy_code_fingerprint(
-                    self.config, str(manifest_path), current
+                    self.config, str(manifest_path)
                 ))
             self.assertEqual(self.config["DISTRIBUTED_CODE_FINGERPRINT"], "worker-code")
             validate_manifest_compatibility(
                 saved, self.manifest(self.config["DISTRIBUTED_CODE_FINGERPRINT"])
             )
+
+    def test_existing_local_manifest_rejects_stale_manual_pin(self):
+        sentence_transformers = ModuleType("sentence_transformers")
+        sentence_transformers.SentenceTransformer = type("SentenceTransformer", (), {})
+        with patch.dict(sys.modules, {"sentence_transformers": sentence_transformers}):
+            from src import orchestration
+
+        self.config["DISTRIBUTED_CODE_FINGERPRINT"] = "worker-code"
+        self.config["_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"] = "changed-runtime-code"
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = Path(temporary) / "manifest.json"
+            manifest_path.write_text(json.dumps(self.manifest("worker-code")), encoding="utf-8")
+            with patch.object(
+                orchestration, "diagnose_worker_code_compatibility",
+                return_value=(False, "worker source changed"),
+            ):
+                with self.assertRaisesRegex(
+                    DistributedManifestMismatch, "worker source changed"
+                ):
+                    orchestration._auto_pin_local_legacy_code_fingerprint(
+                        self.config, str(manifest_path)
+                    )
+        self.assertEqual(self.config["DISTRIBUTED_CODE_FINGERPRINT"], "worker-code")
 
     def test_finalizer_uses_saved_code_identity_and_current_runtime_provenance(self):
         sentence_transformers = ModuleType("sentence_transformers")
@@ -209,7 +283,13 @@ class WorkerCodeCompatibilityTests(unittest.TestCase):
             (root / "src").mkdir()
             (root / "src" / "orchestration.py").write_text(
                 "def run_experiments():\n    return 1\n\n"
+                "def _prepare_distributed_worker():\n    return 1\n\n"
                 "def finalize_distributed_experiments():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "distributed_execution.py").write_text(
+                "def validate_manifest_compatibility():\n    return 1\n\n"
+                "def build_run_manifest():\n    return 1\n",
                 encoding="utf-8",
             )
             (root / "src" / "pipeline_steps.py").write_text(
@@ -232,7 +312,13 @@ class WorkerCodeCompatibilityTests(unittest.TestCase):
 
             (root / "src" / "orchestration.py").write_text(
                 "def run_experiments():\n    return 1\n\n"
+                "def _prepare_distributed_worker():\n    return 2\n\n"
                 "def finalize_distributed_experiments():\n    return 2\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "distributed_execution.py").write_text(
+                "def validate_manifest_compatibility():\n    return 2\n\n"
+                "def build_run_manifest():\n    return 1\n",
                 encoding="utf-8",
             )
             (root / "test_new.py").write_text("assert True\n", encoding="utf-8")
