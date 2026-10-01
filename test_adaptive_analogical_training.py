@@ -86,14 +86,55 @@ def test_initial_state_retrieval_order_one_shot_dependency_and_cost():
     cfg = a.Config()
     assert cfg.full_cost == 233
     assert a.state_cost(a.State(), cfg) == 1
-    assert len(a.reachable_states(cfg)) == 189
-    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0, 1]
+    assert len(a.reachable_states(cfg)) == 729
+    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0, 1, 2, 3, 4, 5]
     first = a.advance(a.State(), 0, cfg)
-    assert first.evaluators == 1
-    assert 2 in np.flatnonzero(a.valid_actions(first, cfg))
+    assert first.evaluator_mask == 1
+    assert 6 in np.flatnonzero(a.valid_actions(first, cfg))
     with pytest.raises(ValueError, match="Unavailable"):
-        a.advance(a.State(), 2, cfg)
-    assert a.fixed_order_actions(cfg) == [0, 2, 1, 0, 3, 1, 0, 4, 0, 5, 0, 6]
+        a.advance(a.State(), 6, cfg)
+    assert a.fixed_order_actions(cfg) == [0, 6, 5, 1, 7, 5, 2, 8, 3, 9, 4, 10]
+
+
+def test_exhaustive_catalog_matches_independent_enumerator_and_transition_graph():
+    cfg = a.Config()
+    independent = {(candidate_mask, evaluator_mask)
+                   for candidate_mask in range(1, 1 << cfg.n)
+                   for evaluator_mask in range(1 << cfg.k)
+                   if not candidate_mask >> cfg.zero_shots & ~evaluator_mask}
+    states, graph = a.structural_graph(cfg.zero_shots, cfg.k)
+    assert len(independent) == len(states) == 1912
+    assert {(s.candidate_mask, s.evaluator_mask) for s in states} == independent
+    assert len(states) * 6 == 11472
+    for state, edges in zip(states, graph):
+        assert len(edges) == len(set(edges.values()))
+        for action, successor in edges.items():
+            nxt = states[successor]
+            assert nxt == a.raw_next_state(state, action, cfg)
+            assert nxt.candidate_mask | state.candidate_mask == nxt.candidate_mask
+            assert nxt.evaluator_mask | state.evaluator_mask == nxt.evaluator_mask
+
+
+def test_arbitrary_evaluator_subsets_zero_shot_and_exact_budget_cost():
+    cfg = a.Config(k=3, zero_shots=3, max_cost=17)
+    state = a.State(1, 4)  # ZS1 with only R3 active.
+    assert a.state_cost(state, cfg) == 11
+    assert np.flatnonzero(a.valid_actions(state, cfg)).tolist() == [3, 6]
+    zs = a.advance(state, 3, cfg)
+    os = a.advance(state, 6, cfg)
+    assert zs == a.State(3, 4) and os == a.State(1 | (1 << 5), 4)
+    snapshot = a.as_snapshot_state(os, cfg)
+    assert snapshot.baseline_attempted == snapshot.baseline_observed == 4
+    assert snapshot.ccs_attempted == snapshot.ccs_observed == (4 | (4 << (5*cfg.k)))
+    with pytest.raises(ValueError, match="without retrieved source"):
+        a.as_snapshot_state(a.State(1 << 5, 0), cfg)
+    assert a.state_cost(zs, cfg) - a.state_cost(state, cfg) == 6
+    assert a.state_cost(os, cfg) - a.state_cost(state, cfg) == 6
+    with pytest.raises(ValueError, match="Unavailable"):
+        a.advance(state, 4, cfg)  # R1 is not active.
+    cfg.max_cost = 16
+    assert not a.valid_actions(state, cfg).any()
+    assert a.state_cost(a.State((1 << a.Config().n)-1, (1 << a.Config().k)-1), a.Config()) == 233
 
 
 def test_independent_masks_include_training_only_hidden_source():
@@ -121,7 +162,7 @@ def test_first_and_second_training_share_full_and_augmented_inputs():
                "maximum": np.eye(1, cfg.n, 0).astype(np.float32)}
     first_x, first_y = a.build_snapshots([r], [0], None, cfg, 6, 1, augmented=True)
     second_x, second_y = a.build_snapshots([r], [0], teacher, cfg, 6, 1, augmented=True)
-    full = a.observation(r, a.State((1 << cfg.n)-1, cfg.k), cfg)
+    full = a.observation(r, a.State((1 << cfg.n)-1, (1 << cfg.k)-1), cfg)
     assert first_x.shape == second_x.shape == (6, cfg.input_dim)
     assert first_y.shape == (6, 2*cfg.n)
     assert second_y.shape == (6, 4*cfg.n+2)
@@ -211,6 +252,89 @@ def test_no_max_fallback_and_strict_optional_later_filter():
     assert not a.goal_condition(0, order, empty, empty, p, full, state, disabled)
 
 
+def test_recognition_can_require_evaluator_or_prerequisite_path():
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
+    r = record(cfg)
+    class EvaluatorRecognition:
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            if state.evaluator_mask:
+                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+            return np.zeros(cfg.hidden_dim, np.float32), p
+        def predict_many(self, rec, states, allow_hidden_source=False):
+            values = [self.predict(rec, state) for state in states]
+            return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
+    states = a.structural_states(cfg.zero_shots, cfg.k)
+    safe = maximum = np.array([1, 0, 0], np.float32)
+    scenario = a.decision_scenario(r, np.array([.9, .8, .7]), safe, maximum,
+                                   EvaluatorRecognition(), cfg, states)
+    root = next(j for j, state in enumerate(states) if state == a.State())
+    assert not scenario["goal"][root, 0]  # Presence alone is insufficient.
+    assert scenario["goal"][scenario["index"][a.State(1, 1)], 0]
+    rows, cases = a.aggregate_decision_rows([scenario], cfg)
+    case = next(c for c in cases if c["candidate_mask"] == 1 and c["evaluator_mask"] == 0)
+    assert case["status"] == "ACTION"
+    assert rows[case["training_row"]]["target"][0] == 1  # Only R1 is needed.
+
+    # Rank one is now the one-shot candidate, so source acquisition precedes generation.
+    one_shot_safe = one_shot_max = np.array([0, 0, 1], np.float32)
+    class OneShotRecognition(EvaluatorRecognition):
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            if state.candidate_mask & 4 and state.evaluator_mask:
+                p[[cfg.n+2, 2*cfg.n+2, 3*cfg.n, 3*cfg.n+1]] = .9
+            return np.zeros(cfg.hidden_dim, np.float32), p
+    scenario = a.decision_scenario(r, np.array([.8, .7, .9]), one_shot_safe,
+                                   one_shot_max, OneShotRecognition(), cfg, states)
+    rows, cases = a.aggregate_decision_rows([scenario], cfg)
+    case = next(c for c in cases if c["candidate_mask"] == 1 and c["evaluator_mask"] == 0)
+    assert case["status"] == "ACTION"
+    assert rows[case["training_row"]]["target"][0] == 1
+    assert not a.valid_actions(a.State(), cfg)[2]
+    assert a.valid_actions(a.State(1, 1), cfg)[2]
+
+
+def test_explicit_status_precedence_and_case_reconciliation():
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
+    r = record(cfg)
+    scores = np.array([.9, .7, .3])
+    empty = np.zeros(cfg.n, np.float32)
+    class Scripted:
+        def __init__(self, values):
+            self.values = values
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            for i in range(cfg.n):
+                if state.candidate_mask & (1 << i):
+                    p[i] = self.values[i]
+            return np.zeros(cfg.hidden_dim, np.float32), p
+        def predict_many(self, rec, states, allow_hidden_source=False):
+            values = [self.predict(rec, state) for state in states]
+            return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
+    rows, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([.9, .7, .3]), cfg)
+    assert len(cases) == 20
+    assert a.Counter(c["status"] for c in cases)["COMPLETE"] > 0
+    rank_by_mask = {c["candidate_mask"]: c for c in cases
+                    if c["scenario"] == 0 and c["evaluator_mask"] == 0}
+    assert rank_by_mask[1]["goal_rank"] == 1 and rank_by_mask[1]["status"] == "ACTION"
+    assert rank_by_mask[3]["goal_rank"] == 2 and rank_by_mask[3]["status"] == "ACTION"
+    assert next(c for c in cases if c["scenario"] == 0 and c["candidate_mask"] == 7
+                and c["evaluator_mask"] == 1)["status"] == "COMPLETE"
+    assert all((c["training_row"] is not None) == (c["status"] == "ACTION") for c in cases)
+    assert all(np.isclose(row["target"].sum(), 1) and not row["target"][~row["valid"]].any()
+               for row in rows)
+    rows, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([0, 0, 0]), cfg)
+    assert a.Counter(c["status"] for c in cases)["EXHAUSTED"] == 2
+    assert a.Counter(c["status"] for c in cases)["UNREACHABLE"] > 0
+    assert not rows
+    cfg.max_cost = 1
+    _, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([0, 0, 0]), cfg)
+    counts = a.Counter(c["status"] for c in cases)
+    assert counts["OUT_OF_BUDGET"] > 0 and counts["BUDGET"] > 0
+    assert counts["EXHAUSTED"] == 0  # Full state exceeds the budget first.
+    assert sum(counts.values()) == 20
+
+
 def test_max_requires_all_four_correct_lights_and_previous_goal_is_preserved():
     cfg = a.Config(k=1, zero_shots=2)
     order = [0, 1, 2]
@@ -227,11 +351,11 @@ def test_max_requires_all_four_correct_lights_and_previous_goal_is_preserved():
         device = torch.device("cpu")
         def predict(self, rec, state, cfg_override=None):
             q = np.zeros(3*cfg.n+2, np.float32)
-            if state.evaluators:
+            if state.evaluator_mask:
                 q[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
-            if state.candidates & 2:
+            if state.candidate_mask & 2:
                 q[1] = .8
-            if state.candidates not in (1, 7):
+            if state.candidate_mask not in (1, 7):
                 q[2*cfg.n] = .1  # Either intermediate addition loses MAX; full state restores it.
             return np.zeros(cfg.hidden_dim, np.float32), q
         def predict_many(self, rec, states, allow_hidden_source=False):
@@ -244,71 +368,77 @@ def test_max_requires_all_four_correct_lights_and_previous_goal_is_preserved():
     after_first = states.index(a.State(1, 1))
     assert scenario["goal"][after_first].tolist() == [True, False, False]
     assert scenario["goal"][states.index(a.State(7, 1)), 0]
-    rows, skipped = a.aggregate_decision_rows([scenario], cfg, roots={a.State(1, 1)})
-    assert not rows and skipped == 1
+    rows, cases = a.aggregate_decision_rows([scenario], cfg)
+    assert next(case for case in cases if case["candidate_mask"] == 1 and case["evaluator_mask"] == 1)["status"] == "UNREACHABLE"
 
 
 def test_planner_shares_future_actions_until_zero_shot_evidence_is_observed():
-    cfg = a.Config(k=2, zero_shots=3, repeats=1, hidden_dim=4)
+    cfg = a.Config(k=1, zero_shots=2, repeats=1, hidden_dim=4)
     r = record(cfg)
-    r.ccs[1, :] = 1  # B can be recognized only after it is acquired and measured.
-    r.ccs[2, :] = 0  # C supplies different observed evidence.
-    root = a.State(1, 1)
-    states = a.states_from(root, cfg)
-    scores = np.arange(cfg.n, 0, -1, dtype=float)
-    safe = maximum = np.array([1, 0, 0, 0, 0], np.float32)
+    r.ccs[:, 0] = [1, 0, 0]
+    states = a.structural_states(cfg.zero_shots, cfg.k)
+    scores = np.array([.9, .7, .3])
+    safe = maximum = np.array([1, 0, 0], np.float32)
 
     class Scripted:
-        deterministic_route = True
         def predict(self, rec, state, cfg_override=None):
             p = np.zeros(3*cfg.n+2, np.float32)
-            both_sources = state.candidates & 24 == 24
-            measured_b = bool(state.candidates & 2) and rec.ccs[1, 0] == 1
-            if state.evaluators == 2 and (measured_b or (self.deterministic_route and both_sources)):
-                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+            if state.evaluator_mask:
+                for i in range(cfg.n):
+                    if state.candidate_mask & (1 << i) and rec.ccs[i, 0] == 1:
+                        p[[cfg.n+i, 2*cfg.n+i, 3*cfg.n, 3*cfg.n+1]] = .9
             return np.zeros(cfg.hidden_dim, np.float32), p
         def predict_many(self, rec, states, allow_hidden_source=False):
             values = [self.predict(rec, state) for state in states]
             return np.stack([v[0] for v in values]), np.stack([v[1] for v in values])
 
-    predictor = Scripted()
-    def scenarios():
-        result = []
-        for order in ((0, 1, 2), (0, 2, 1)):
-            rec, s, sf, mx = a.permute_zero_shots(r, scores, safe, maximum, order, cfg)
-            result.append(a.decision_scenario(rec, s, sf, mx, predictor, cfg, states,
+    scenarios = []
+    for order in ((0, 1), (1, 0)):
+        rec, s, sf, mx = a.permute_zero_shots(r, scores, safe, maximum, order, cfg)
+        scenarios.append(a.decision_scenario(rec, s, sf, mx, Scripted(), cfg, states,
                           reference_order=a.permuted_reference_order(scores, order, cfg)))
-        return result
+    rows, cases = a.aggregate_decision_rows(scenarios, cfg)
+    roots = [case for case in cases if case["candidate_mask"] == 1 and case["evaluator_mask"] == 0]
+    assert len(roots) == 2 and all(case["status"] == "ACTION" for case in roots)
+    assert roots[0]["training_row"] == roots[1]["training_row"]
+    row = rows[roots[0]["training_row"]]
+    assert np.isclose(row["target"].sum(), 1)
+    assert np.isclose(row["reach"], 1)
+    assert not row["target"][~row["valid"]].any()
+    # Before the evaluator is acquired, swapping unseen answer identities leaves the input unchanged.
+    assert scenarios[0]["keys"][scenarios[0]["index"][a.State()]] == scenarios[1]["keys"][scenarios[1]["index"][a.State()]]
+    future = [case for case in cases if case["candidate_mask"] == 3 and case["evaluator_mask"] == 0]
+    assert len(future) == 2 and future[0]["training_row"] == future[1]["training_row"]
 
-    cases = scenarios()
-    oracle_costs = [a.aggregate_decision_rows([case], cfg, roots={root})[0][0]["action_expected_cost"][0]
-                    for case in cases]
-    rows, missing = a.aggregate_decision_rows(cases, cfg, roots={root})
-    assert missing == 0 and len(rows) == 1
-    assert np.mean(oracle_costs) == 6.5  # Knows whether to generate B or use both sources.
-    assert rows[0]["action_expected_cost"][0] == 8  # Must decide before B/C is known.
-    assert rows[0]["action_reach"][0] == 1
 
-    predictor.deterministic_route = False
-    rows, _ = a.aggregate_decision_rows(scenarios(), cfg, roots={root})
-    assert rows[0]["action_reach"][0] == .5
-    assert rows[0]["action_expected_cost"][0] == 9.5  # Includes calls in the failed order.
-    impossible = scenarios()[1]
-    rows, missing = a.aggregate_decision_rows([impossible], cfg, roots={root})
-    assert not rows and missing == 1
-    rows, missing = a.aggregate_decision_rows([impossible], cfg,
-                                              roots={a.State((1 << cfg.n)-1, cfg.k)})
-    assert not rows and missing == 1  # Exhausted unmet goals remain visible in the audit.
-
-    predictor.deterministic_route = True
-    cfg.max_cost = 11
-    states = a.states_from(root, cfg)
-    rows, _ = a.aggregate_decision_rows(scenarios(), cfg, roots={root})
-    row = rows[0]
-    assert row["action_reach"][1] == .5 and row["action_reach"][0] == 1
-    assert row["action_expected_cost"][1] < row["action_expected_cost"][0]
-    assert row["target"][1] == 0  # Cheaper expected calls cannot outrank better reachability.
-    assert row["target"][0] == row["target"][2] == .5  # A genuine order-of-additions tie.
+def test_future_group_stays_shared_when_only_one_scenario_has_reached_its_goal():
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
+    r = record(cfg)
+    states = a.structural_states(cfg.zero_shots, cfg.k)
+    safe = maximum = np.array([1, 0, 0], np.float32)
+    class Scripted:
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            if state.candidate_mask & 3 == 3:
+                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+                if state.evaluator_mask:
+                    p[[cfg.n+1, 2*cfg.n+1]] = .9
+            return np.zeros(cfg.hidden_dim, np.float32), p
+        def predict_many(self, rec, states, allow_hidden_source=False):
+            values = [self.predict(rec, state) for state in states]
+            return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
+    scenarios = []
+    scores = np.array([.9, .8, .3])
+    for order in ((0, 1), (1, 0)):
+        rec, s, sf, mx = a.permute_zero_shots(r, scores, safe, maximum, order, cfg)
+        scenarios.append(a.decision_scenario(rec, s, sf, mx, Scripted(), cfg, states,
+                          reference_order=a.permuted_reference_order(scores, order, cfg)))
+    rows, cases = a.aggregate_decision_rows(scenarios, cfg)
+    future = [case for case in cases if case["candidate_mask"] == 3 and case["evaluator_mask"] == 0]
+    assert len(future) == 2
+    assert sorted(case["goal_rank"] for case in future) == [0, 1]
+    assert future[0]["training_row"] == future[1]["training_row"]
+    assert rows[future[0]["training_row"]]["target"][0] == 1
 
 
 def test_fixed_policy_does_not_skip_an_unaffordable_step():
@@ -317,7 +447,7 @@ def test_fixed_policy_does_not_skip_an_unaffordable_step():
         def predict(self, rec, state, cfg_override=None):
             return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
     row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed", trace=True)
-    assert [step["action"] for step in row["trajectory"] if step["action"] is not None] == [0, 2, 1]
+    assert [step["action"] for step in row["trajectory"] if step["action"] is not None] == [0, 6, 5]
     assert row["cost"] == 23 and row["reason"] == "budget"
 
 
@@ -340,10 +470,10 @@ def test_continuation_counts_all_orders_and_rejects_recovery_after_a_broken_goal
             return np.zeros(cfg.hidden_dim, np.float32), np.zeros(3*cfg.n+2)
     class Head(torch.nn.Module):
         def forward(self, hidden):
-            return torch.tensor([[0., 2., 1.]]).repeat(len(hidden), 1)
+            return torch.tensor([[0., 1., 2.]]).repeat(len(hidden), 1)
     # Initial rank recognized; adding ZS2 loses it; the final pool would restore all goals.
     def flags(rank, order, safe, maximum, probabilities, full_probabilities, state, config):
-        return state.candidates == 7 or (rank == 0 and state.candidates == 1)
+        return state.candidate_mask == 7 or (rank == 0 and state.candidate_mask == 1)
     monkeypatch.setattr(a, "goal_condition", flags)
     teacher = {"scores": np.array([[.9, .8, .7]]),
                "safe": np.array([[1, 0, 0]]), "maximum": np.array([[1, 0, 0]])}
@@ -372,17 +502,23 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path):
         "full", "fixed", "supervised"}
     assert work.results["external"]["adaptive"]["policies"]["supervised"]["n"] == 3
     assert (tmp_path/"run"/"decision_head_completed.pt").exists()
-    saved_rows = a.load_checkpoint(tmp_path/"run"/"decision_dataset_policy.pt")["rows"]
+    manifest = json.loads((tmp_path/"run"/"decision_dataset_manifest.json").read_text())
+    assert manifest["schema_version"] == 3
+    policy_shards = [a.load_checkpoint(tmp_path/"run"/path) for path in manifest["roles"]["policy"]]
+    saved_rows = [row for shard in policy_shards for row in shard["rows"]]
     assert saved_rows and {"uid", "state_key", "h", "target", "valid", "goal_rank"} <= set(saved_rows[0])
     assert not {"truth", "teacher_scores", "future_measurements"} & set(saved_rows[0])
-    ordinary = [row for row in saved_rows if row["weight"] == 1.]
-    artificial = [row for row in saved_rows if row["weight"] < 1.]
-    assert len(artificial) <= int(.1 * len(ordinary))
+    assert all("weight" not in row for row in saved_rows)
     assert all(np.isclose(row["target"].sum(), 1) and not row["target"][~row["valid"]].any()
                for row in saved_rows)
+    assert all(len(shard["cases"]) == len(a.structural_states(cfg.zero_shots, cfg.k)) * 2
+               for shard in policy_shards)
+    assert all(sum(a.Counter(case["status"] for case in shard["cases"]).values()) == shard["expected_cases"]
+               for shard in policy_shards)
     role_uids = {role: {work.records[i].uid for i in ids} for role, ids in work.splits.items()}
     assert {row["uid"] for row in saved_rows} <= role_uids["policy"]
-    dev_rows = a.load_checkpoint(tmp_path/"run"/"decision_dataset_dev.pt")["rows"]
+    dev_rows = [row for path in manifest["roles"]["dev"]
+                for row in a.load_checkpoint(tmp_path/"run"/path)["rows"]]
     assert {row["uid"] for row in dev_rows} <= role_uids["dev"]
     for role, uids in role_uids.items():
         assert all(not uids & other for name, other in role_uids.items() if name != role)
@@ -403,6 +539,24 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path):
         a.rollout(r,maximum,work.predictor,cfg,head=work.head)["selected"])
     resumed = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
     assert resumed.decision_checkpoint["best_epoch"] == work.decision_checkpoint["best_epoch"]
+    # Interrupted shard construction rebuilds only the missing question.
+    keep = tmp_path/"run"/manifest["roles"]["policy"][0]
+    missing = tmp_path/"run"/manifest["roles"]["policy"][1]
+    kept_mtime = keep.stat().st_mtime_ns
+    missing.unlink()
+    (tmp_path/"run"/"decision_head_completed.pt").unlink()
+    repaired = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
+    assert missing.exists() and keep.stat().st_mtime_ns == kept_mtime
+    assert repaired.decision_checkpoint["coverage"]["policy"]["state_order_cases"] == (
+        len(a.structural_states(cfg.zero_shots, cfg.k)) * 2 * len(work.splits["policy"]))
+    shard = a.load_checkpoint(keep)
+    shard["schema_version"] = 2
+    a.atomic_torch(keep, shard)
+    (tmp_path/"run"/"decision_head_completed.pt").unlink()
+    with pytest.raises(ValueError, match="Incompatible decision shard"):
+        a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
+    shard["schema_version"] = 3
+    a.atomic_torch(keep, shard)
     contract_path = tmp_path/"run"/"contract.json"
     contract = json.loads(contract_path.read_text())
     assert contract.pop("implementation_revision") == a.PIPELINE_REVISION
