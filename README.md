@@ -115,6 +115,11 @@ Run the notebook setup cell before the imports. If it detects loaded packages
 whose versions differ from the installed files, restart the kernel/session and
 run from the top. This prevents stale Transformers tokenizer registries from
 requesting missing modules such as `transformers.models.audioflamingo3`.
+Evaluation uses one row per normalized question, keeping the first benchmark
+index and reference solution. Duplicate corpus rows, reference variants, and
+held-out deduplication counts are saved to `evaluation_population_audit.json`
+in the notebook work directory. Questions in any merging split are excluded
+from the remaining-benchmark population, including all duplicate occurrences.
 
 ## Simplification-model fine-tuning
 

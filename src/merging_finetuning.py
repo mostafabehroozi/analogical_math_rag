@@ -1203,24 +1203,68 @@ def build_evaluation_populations(
     prepared: Mapping[str, Any],
     benchmark_questions: Sequence[str],
     benchmark_ground_truths: Sequence[str],
+    *,
+    audit: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Build held-out accepted and non-accepted benchmark populations safely."""
+    """Build populations with one evaluation row per normalized question.
+
+    Distinct corpus indices can contain the same question. Keep the first
+    benchmark index and reference solution for both model arms, and retain all
+    source indices in ``benchmark_indices``. An optional audit records removed
+    rows and their references; differing solution text does not establish that
+    the final answers disagree. Held-out merging records are also grouped by
+    question, while every accepted split remains excluded from the remainder.
+    """
     if len(benchmark_questions) != len(benchmark_ground_truths):
         raise ValueError("Benchmark questions and ground truths must align.")
     benchmark: Dict[str, Dict[str, Any]] = {}
+    duplicates: List[Dict[str, Any]] = []
     for index, (question, ground_truth) in enumerate(zip(benchmark_questions, benchmark_ground_truths)):
         key = normalize_question(question)
         if key in benchmark:
-            raise ValueError(f"Duplicate normalized benchmark question at index {index}.")
-        benchmark[key] = {"question": question, "ground_truth": ground_truth, "benchmark_index": index}
+            canonical = benchmark[key]
+            canonical["benchmark_indices"].append(index)
+            duplicates.append({
+                "benchmark_index": index,
+                "canonical_benchmark_index": canonical["benchmark_index"],
+                "question": question,
+                "ground_truth": ground_truth,
+                "canonical_ground_truth": canonical["ground_truth"],
+                "reference_matches_canonical": (
+                    " ".join(str(ground_truth).split())
+                    == " ".join(str(canonical["ground_truth"]).split())
+                ),
+            })
+            continue
+        benchmark[key] = {
+            "question": question, "ground_truth": ground_truth,
+            "benchmark_index": index, "benchmark_indices": [index],
+        }
     splits = prepared["splits"]
     accepted_ids = {record["question_id"] for values in splits.values() for record in values}
     heldout: List[Dict[str, Any]] = []
+    heldout_ids = set()
     for record in splits["test"]:
         if record["question_id"] not in benchmark:
             raise ValueError(f"Held-out accepted question is absent from benchmark: {record['question'][:80]!r}")
-        heldout.append({**dict(record), **benchmark[record["question_id"]]})
+        if record["question_id"] not in heldout_ids:
+            heldout.append({**dict(record), **benchmark[record["question_id"]]})
+            heldout_ids.add(record["question_id"])
     remaining = [value for key, value in benchmark.items() if key not in accepted_ids]
+    if audit is not None:
+        audit.update({
+            "reference_policy": "first_benchmark_occurrence",
+            "benchmark_rows": len(benchmark_questions),
+            "unique_benchmark_questions": len(benchmark),
+            "duplicate_benchmark_rows_removed": len(duplicates),
+            "duplicate_rows_with_different_reference_text": sum(
+                not row["reference_matches_canonical"] for row in duplicates
+            ),
+            "duplicate_benchmark_rows": duplicates,
+            "heldout_records": len(splits["test"]),
+            "unique_heldout_questions": len(heldout),
+            "duplicate_heldout_records_removed": len(splits["test"]) - len(heldout),
+        })
     return {"heldout_accepted": heldout, "remaining_benchmark": remaining}
 
 

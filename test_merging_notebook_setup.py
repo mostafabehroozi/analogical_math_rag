@@ -26,7 +26,9 @@ class MergingNotebookSetupTests(TestCase):
 
     def run_guard(self, loaded, installed=None):
         versions = {"transformers": self.expected, **(installed or {})}
-        modules = {name: SimpleNamespace(__version__=value) for name, value in loaded.items()}
+        packages = ("transformers", "tokenizers", "peft", "accelerate", "datasets", "bitsandbytes", "huggingface_hub")
+        # Isolate every checked package from real imports made by other tests.
+        modules = {name: SimpleNamespace(__version__=loaded.get(name)) for name in packages}
         with patch.dict("sys.modules", modules), patch(
             "importlib.metadata.version", side_effect=lambda name: versions.get(name, "1.0")
         ), patch.object(Path, "read_text", return_value=self.requirements), redirect_stdout(StringIO()):
