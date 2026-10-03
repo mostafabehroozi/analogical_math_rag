@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import importlib.util
 import subprocess
 import sys
@@ -12,8 +14,6 @@ print("Streaming JSON reader ready. Enable Kaggle Internet only if installation 
 The companion notebook embeds this module: uploading the notebook alone is enough.
 No provider calls are made. Acquisition is simulated from recorded Layer-1 data.
 """
-from __future__ import annotations
-
 import copy
 import hashlib
 import json
@@ -44,7 +44,7 @@ class Config:
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ])
-    output_dir: str = "/kaggle/working/adaptive_analogical_early_run"
+    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_rl_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
     device: str = "auto"
@@ -52,7 +52,8 @@ class Config:
     k: int = 5
     zero_shots: int = 3
     repeats: int = 5                # Must match the stored CCS denominator.
-    split_fractions: tuple = (.60, .20, .10, .10)  # supervised / policy / dev / audit
+    use_test_files_for_dev_and_audit: bool = True
+    split_fractions: tuple = (.80, .10, .10)  # shared training / dev / audit; used only when False above
     teacher_folds: int = 5
     hidden_dim: int = 128
     residual_blocks: int = 2
@@ -121,8 +122,13 @@ class Config:
         assert self.stop_mode in {"safe", "max", "reliability"}
         assert self.cost_unit in {"solver_calls", "total_calls"}
         assert 0 < self.stop_threshold <= 1 and 0 < self.member_threshold <= 1
-        assert len(self.split_fractions) == 4 and min(self.split_fractions) > 0
-        assert abs(sum(self.split_fractions) - 1) < 1e-8
+        assert type(self.use_test_files_for_dev_and_audit) is bool
+        if self.use_test_files_for_dev_and_audit:
+            if not self.test_files:
+                raise ValueError("test_files must be provided when using them for dev and audit.")
+        else:
+            assert len(self.split_fractions) == 3 and min(self.split_fractions) > 0
+            assert abs(sum(self.split_fractions) - 1) < 1e-8
         assert acquisition_cost(1, 1, self) <= self.budget <= self.full_cost
         assert self.teacher_epochs > 0 and self.snapshot_epochs > 0 and self.patience > 0
         assert self.rl_steps > 0 and self.rl_batch_size > 0 and self.eval_every > 0
@@ -333,20 +339,45 @@ def load_records(cfg):
 
 
 def split_records(records, cfg):
+    names = [Path(p).stem for p in [cfg.train_file] + cfg.test_files]
+    if len(set(names)) != len(names) or set(names) & {"supervised", "policy", "dev", "audit"}:
+        raise ValueError("Data filenames need unique stems distinct from supervised/policy/dev/audit.")
     train = [i for i, r in enumerate(records) if r.benchmark == Path(cfg.train_file).stem]
     if len(train) < max(20, cfg.teacher_folds * 3):
-        raise ValueError("Too few eligible training questions for four disjoint roles and teacher folds.")
+        raise ValueError("Too few eligible training questions for teacher folds.")
     rng = np.random.RandomState(cfg.seed)
     rng.shuffle(train)
-    cuts = np.rint(np.cumsum(cfg.split_fractions)[:-1] * len(train)).astype(int)
-    parts = np.split(np.asarray(train), cuts)
-    if min(map(len, parts)) < 2:
-        raise ValueError("Every internal role must contain at least two question groups.")
-    result = {name: p.tolist() for name, p in zip(("supervised", "policy", "dev", "audit"), parts)}
-    for path in cfg.test_files:
-        name = Path(path).stem
-        result[name] = [i for i, r in enumerate(records) if r.benchmark == name]
+    external = {Path(path).stem: [i for i, r in enumerate(records)
+                                 if r.benchmark == Path(path).stem]
+                for path in cfg.test_files}
+    if cfg.use_test_files_for_dev_and_audit:
+        evaluation = [i for ids in external.values() for i in ids]
+        if len(evaluation) < 2:
+            raise ValueError("test_files must supply at least two eligible questions for dev and audit.")
+        result = {"supervised": train, "dev": evaluation, "audit": evaluation.copy()}
+    else:
+        cuts = np.rint(np.cumsum(cfg.split_fractions)[:-1] * len(train)).astype(int)
+        parts = np.split(np.asarray(train), cuts)
+        if min(map(len, parts)) < 2:
+            raise ValueError("Shared training, dev, and audit each need at least two question groups.")
+        result = {name: p.tolist() for name, p in zip(("supervised", "dev", "audit"), parts)}
+    if len(result["supervised"]) < cfg.teacher_folds * 3:
+        raise ValueError("Too few shared training questions for the configured teacher folds.")
+    # The historical policy role is an alias, never a separate training partition.
+    result["policy"] = result["supervised"].copy()
+    result.update(external)
     return result
+
+
+def split_protocol(cfg, splits):
+    overlap = len(set(splits["dev"]) & set(splits["audit"]))
+    return {"training_roles": {"teacher": "supervised", "snapshot": "supervised",
+                               "acquisition": "supervised (policy alias)"},
+            "use_test_files_for_dev_and_audit": cfg.use_test_files_for_dev_and_audit,
+            "dev_audit_overlap_questions": overlap,
+            "audit_used_for_model_selection": bool(overlap),
+            "external_files_used_for_model_selection": (
+                list(cfg.test_files) if cfg.use_test_files_for_dev_and_audit else [])}
 
 
 def data_digest(records):
@@ -373,14 +404,15 @@ CFG = Config(
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ],
-    output_dir="/kaggle/working/adaptive_analogical_early_run",
+    output_dir="/kaggle/working/adaptive_analogical_shared_training_rl_run",
     resume=True,
     device="auto",                       # GPU if available; CPU also supported.
     seed=75,
     k=5, zero_shots=3, repeats=5,
 
-    # Disjoint question roles: supervised / RL policy / development / final internal audit.
-    split_fractions=(0.60, 0.20, 0.10, 0.10),
+    # All stages share training questions; test files supply both dev and audit.
+    use_test_files_for_dev_and_audit=True,
+    split_fractions=(0.80, 0.10, 0.10),  # Used only when the option above is False.
     teacher_folds=5,
     hidden_dim=128, residual_blocks=2, dropout=0.10,
     learning_rate=0.0003, weight_decay=1e-4, batch_size=128,
@@ -1248,6 +1280,8 @@ def policy_rank(metrics, cfg):
 
 
 def fit_dqn(records, splits, predictor, cfg, out, variant="refined"):
+    if splits["policy"] != splits["supervised"]:
+        raise ValueError("Stage 3 policy questions must match the Stage 1/2 supervised questions.")
     if variant not in {"baseline", "refined"}:
         raise ValueError(variant)
     reward_weight = 0.0 if variant == "baseline" else cfg.early_quality_weight
@@ -1566,11 +1600,15 @@ class Workflow:
             if excluded:
                 print("  Exclusions: " + ", ".join(f"{k}={v}" for k,v in sorted(excluded.items())))
         print("Roles: " + ", ".join(f"{k}={len(self.splits[k])}" for k in ("supervised", "policy", "dev", "audit")))
+        print("All three stages train on the same supervised questions; policy is an alias.")
+        print("Dev/audit source: " + ("pooled test_files, shared for model selection and reporting."
+              if self.cfg.use_test_files_for_dev_and_audit else "separate held-out training-file partitions."))
         print("Strict complete-pool analysis; exclusions are reported, never silently counted as wrong.")
         print("CCS uses recorded rates/configured attempts; per-trial API validity is not inferred from rates.")
         print("Exact normalized-text duplicates removed; near-duplicate/corpus contamination requires a separate audit.")
         atomic_json(self.out / "data_audit.json", self.audit)
         atomic_json(self.out / "split_manifest.json", {"data_sha256": data_digest(self.records),
+                    "evaluation_protocol": split_protocol(self.cfg, self.splits),
                     "roles": {k: [self.records[i].uid for i in ids] for k,ids in self.splits.items()},
                     "groups": {r.uid: r.group for r in self.records}})
         return self
@@ -1668,7 +1706,8 @@ class Workflow:
     def report(self):
         if not hasattr(self, "head"):
             self.train_rl()
-        results = {"rl_selection": self.selection}
+        results = {"evaluation_protocol": split_protocol(self.cfg, self.splits),
+                   "rl_selection": self.selection}
         external = [Path(p).stem for p in self.cfg.test_files]
         names = ["audit"] + external
         trajectory_path = self.out / "final_trajectories.jsonl"

@@ -24,7 +24,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-PIPELINE_REVISION = 3  # Exhaustive structural acquisition states.
+PIPELINE_REVISION = 4  # Shared training questions across all three stages.
 
 
 # %% Configuration and compact data
@@ -37,7 +37,7 @@ class Config:
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ])
-    output_dir: str = "/kaggle/working/adaptive_analogical_exhaustive_v3_run"
+    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v4_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
     device: str = "auto"
@@ -45,7 +45,8 @@ class Config:
     k: int = 5
     zero_shots: int = 3
     repeats: int = 5                # Must match the stored CCS denominator.
-    split_fractions: tuple = (.60, .20, .10, .10)  # supervised / policy / dev / audit
+    use_test_files_for_dev_and_audit: bool = True
+    split_fractions: tuple = (.80, .10, .10)  # shared training / dev / audit; used only when False above
     teacher_folds: int = 5
     hidden_dim: int = 128
     residual_blocks: int = 2
@@ -74,6 +75,12 @@ class Config:
     decision_epochs: int = 100
     decision_lr: float = 1e-4
     decision_batch_size: int = 128
+    # Evaluation only: built-in order names or explicit [ZS1, R1, OS1, ...] sequences.
+    fixed_acquisition_orders: dict = field(default_factory=lambda: {
+        "fixed": "interleaved",
+        "fixed_evaluators_first": "evaluators_first",
+        "fixed_zero_shots_first": "zero_shots_first",
+    })
     bootstrap_samples: int = 1000
     print_every: int = 10
 
@@ -104,8 +111,13 @@ class Config:
         assert self.hidden_dim >= 2 and self.batch_size >= 2 and self.teacher_folds >= 2
         assert self.cost_unit in {"solver_calls", "total_calls"}
         assert 0 < self.recognition_threshold < 1
-        assert len(self.split_fractions) == 4 and min(self.split_fractions) > 0
-        assert abs(sum(self.split_fractions) - 1) < 1e-8
+        assert type(self.use_test_files_for_dev_and_audit) is bool
+        if self.use_test_files_for_dev_and_audit:
+            if not self.test_files:
+                raise ValueError("test_files must be provided when using them for dev and audit.")
+        else:
+            assert len(self.split_fractions) == 3 and min(self.split_fractions) > 0
+            assert abs(sum(self.split_fractions) - 1) < 1e-8
         assert 1 <= self.budget <= self.full_cost
         assert self.teacher_epochs > 0 and self.snapshot_epochs > 0 and self.patience > 0
         assert self.decision_epochs > 0 and self.decision_batch_size >= 2 and self.decision_lr > 0
@@ -117,6 +129,7 @@ class Config:
                                          self.evaluator_mask_fraction,
                                          self.hidden_source_fraction))
         assert self.print_every > 0
+        fixed_acquisition_sequences(self)
 
 
 @dataclass
@@ -319,20 +332,45 @@ def load_records(cfg):
 
 
 def split_records(records, cfg):
+    names = [Path(p).stem for p in [cfg.train_file] + cfg.test_files]
+    if len(set(names)) != len(names) or set(names) & {"supervised", "policy", "dev", "audit"}:
+        raise ValueError("Data filenames need unique stems distinct from supervised/policy/dev/audit.")
     train = [i for i, r in enumerate(records) if r.benchmark == Path(cfg.train_file).stem]
     if len(train) < max(20, cfg.teacher_folds * 3):
-        raise ValueError("Too few eligible training questions for four disjoint roles and teacher folds.")
+        raise ValueError("Too few eligible training questions for teacher folds.")
     rng = np.random.RandomState(cfg.seed)
     rng.shuffle(train)
-    cuts = np.rint(np.cumsum(cfg.split_fractions)[:-1] * len(train)).astype(int)
-    parts = np.split(np.asarray(train), cuts)
-    if min(map(len, parts)) < 2:
-        raise ValueError("Every internal role must contain at least two question groups.")
-    result = {name: p.tolist() for name, p in zip(("supervised", "policy", "dev", "audit"), parts)}
-    for path in cfg.test_files:
-        name = Path(path).stem
-        result[name] = [i for i, r in enumerate(records) if r.benchmark == name]
+    external = {Path(path).stem: [i for i, r in enumerate(records)
+                                 if r.benchmark == Path(path).stem]
+                for path in cfg.test_files}
+    if cfg.use_test_files_for_dev_and_audit:
+        evaluation = [i for ids in external.values() for i in ids]
+        if len(evaluation) < 2:
+            raise ValueError("test_files must supply at least two eligible questions for dev and audit.")
+        result = {"supervised": train, "dev": evaluation, "audit": evaluation.copy()}
+    else:
+        cuts = np.rint(np.cumsum(cfg.split_fractions)[:-1] * len(train)).astype(int)
+        parts = np.split(np.asarray(train), cuts)
+        if min(map(len, parts)) < 2:
+            raise ValueError("Shared training, dev, and audit each need at least two question groups.")
+        result = {name: p.tolist() for name, p in zip(("supervised", "dev", "audit"), parts)}
+    if len(result["supervised"]) < cfg.teacher_folds * 3:
+        raise ValueError("Too few shared training questions for the configured teacher folds.")
+    # The historical policy role is an alias, never a separate training partition.
+    result["policy"] = result["supervised"].copy()
+    result.update(external)
     return result
+
+
+def split_protocol(cfg, splits):
+    overlap = len(set(splits["dev"]) & set(splits["audit"]))
+    return {"training_roles": {"teacher": "supervised", "snapshot": "supervised",
+                               "acquisition": "supervised (policy alias)"},
+            "use_test_files_for_dev_and_audit": cfg.use_test_files_for_dev_and_audit,
+            "dev_audit_overlap_questions": overlap,
+            "audit_used_for_model_selection": bool(overlap),
+            "external_files_used_for_model_selection": (
+                list(cfg.test_files) if cfg.use_test_files_for_dev_and_audit else [])}
 
 
 def data_digest(records):
@@ -345,8 +383,14 @@ def data_digest(records):
 
 
 def acquisition_cost(n, k, cfg):
+    return float(acquisition_call_counts(n, k, cfg)[cfg.cost_unit])
+
+
+def acquisition_call_counts(n, k, cfg):
     probes = cfg.repeats * k * (n + 1)
-    return float(n + probes * (2 if cfg.cost_unit == "total_calls" else 1))
+    return {"generation_calls": n, "measurement_solver_calls": probes,
+            "grading_calls": probes, "solver_calls": n + probes,
+            "total_calls": n + 2 * probes}
 
 
 # %% Teacher network, metrics, and cross-fitted labels
@@ -1249,7 +1293,8 @@ def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
     digest = hashlib.sha256()
     digest.update(json.dumps({"schema": 3, "revision": PIPELINE_REVISION,
                               "config": {key: value for key, value in asdict(cfg).items()
-                                         if key not in {"resume", "output_dir", "device", "cpu_threads", "print_every"}},
+                                         if key not in {"resume", "output_dir", "device", "cpu_threads", "print_every",
+                                                        "fixed_acquisition_orders"}},
                               "predictor": predictor_fingerprint(predictor),
                               "data_sha256": data_digest(records),
                               "roles": {role: [records[i].uid for i in splits[role]]
@@ -1331,6 +1376,8 @@ def masked_action_loss(model, rows, order, cfg, device, optimizer=None):
 
 
 def train_decision_head(records, splits, teacher, predictor, cfg, device, out=None):
+    if splits["policy"] != splits["supervised"]:
+        raise ValueError("Stage 3 policy questions must match the Stage 1/2 supervised questions.")
     seed_everything(cfg.seed + 300)
     if out is None:
         raise ValueError("Stage 3 requires an output directory for question-sized shards.")
@@ -1477,16 +1524,69 @@ def teacher_report(records, ids, cfg, scores, heuristics, title):
     return metrics
 
 
-def fixed_order_actions(cfg):
-    order = []
+def fixed_order_items(cfg, order="interleaved"):
+    if not isinstance(order, str):
+        if not isinstance(order, (list, tuple)):
+            raise ValueError("A fixed order must be a built-in name or a list of acquisition items.")
+        return list(order)
+    evaluators = [f"R{i+1}" for i in range(cfg.k)]
+    one_shots = [f"OS{i+1}" for i in range(cfg.k)]
+    zero_shots = [f"ZS{i+1}" for i in range(cfg.zero_shots)]
+    if order == "evaluators_first":
+        return ["ZS1"] + evaluators + zero_shots[1:] + one_shots
+    if order == "zero_shots_first":
+        return zero_shots + [item for pair in zip(evaluators, one_shots) for item in pair]
+    if order != "interleaved":
+        raise ValueError(f"Unknown fixed acquisition order: {order}")
+    items = ["ZS1"]
     for source in range(cfg.k):
-        order.extend((source, cfg.k + 1 + source))
+        items.extend((evaluators[source], one_shots[source]))
         if source < cfg.zero_shots - 1:
-            order.append(cfg.k)
-    order.extend([cfg.k] * max(0, cfg.zero_shots - cfg.k - 1))
-    return order
+            items.append(zero_shots[source+1])
+    items.extend(zero_shots[cfg.k+1:])
+    return items
+
+
+def fixed_order_actions(cfg, order="interleaved"):
+    items = fixed_order_items(cfg, order)
+    if not items or items[0] != "ZS1":
+        raise ValueError("Every fixed sequence must start with the initial ZS1 candidate.")
+    state, actions = State(), []
+    for item in items[1:]:
+        match = re.fullmatch(r"(ZS|R|OS)([1-9][0-9]*)", item) if isinstance(item, str) else None
+        if match is None:
+            raise ValueError(f"Invalid fixed acquisition item: {item!r}; use ZS2, R1, OS1, etc.")
+        kind, number = match.group(1), int(match.group(2))
+        limit = cfg.zero_shots if kind == "ZS" else cfg.k
+        if number > limit:
+            raise ValueError(f"Fixed acquisition item {item} exceeds the configured pool.")
+        action = cfg.k if kind == "ZS" else number-1 if kind == "R" else cfg.k+number
+        nxt = raw_next_state(state, action, cfg)
+        if nxt is None or (kind == "ZS" and (nxt.candidate_mask ^ state.candidate_mask) != 1 << (number-1)):
+            raise ValueError(f"Invalid fixed acquisition order at {item}: duplicates, missing evaluator, or out-of-order zero-shot.")
+        actions.append(action)
+        state = nxt
+    return actions
+
+
+def fixed_acquisition_sequences(cfg):
+    if not isinstance(cfg.fixed_acquisition_orders, dict):
+        raise ValueError("fixed_acquisition_orders must map method names to acquisition orders.")
+    sequences = {}
+    for name, order in cfg.fixed_acquisition_orders.items():
+        if not isinstance(name, str) or re.fullmatch(r"fixed(?:_[a-z][a-z0-9_]*)?", name) is None:
+            raise ValueError("Fixed method names must be 'fixed' or start with 'fixed_' using lowercase letters/numbers.")
+        sequences[name] = {"items": fixed_order_items(cfg, order),
+                           "actions": fixed_order_actions(cfg, order)}
+    return sequences
+
+
+def evaluation_methods(cfg):
+    return ("full", *cfg.fixed_acquisition_orders, "supervised")
 
 def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, trace=False):
+    if policy not in evaluation_methods(cfg):
+        raise ValueError(f"Unknown policy: {policy}")
     if policy == "full":
         full_cfg = copy.deepcopy(cfg)
         full_cfg.max_cost = None
@@ -1495,7 +1595,8 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
         reason, trajectory = "full_budget_reference", []
     else:
         state, reason, trajectory = State(), None, []
-        sequence = fixed_order_actions(cfg) if policy == "fixed" else None
+        sequence = (fixed_acquisition_sequences(cfg)[policy]["actions"].copy()
+                    if policy in cfg.fixed_acquisition_orders else None)
         while reason is None:
             hidden, probabilities = predictor.predict(record, state)
             reason = stopping_reason(probabilities, state, cfg)
@@ -1508,10 +1609,10 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
                                        "reason": reason})
                 break
             valid = valid_actions(state, cfg)
-            if policy == "fixed":
+            if sequence is not None:
                 action = sequence[0] if sequence else None
                 if action is None or not valid[action]:
-                    reason = "budget"
+                    reason = "fixed_sequence_exhaustion" if action is None else "budget"
                     if trace:
                         trajectory.append({"candidate_mask": int(state.candidate_mask),
                                            "evaluator_mask": int(state.evaluator_mask),
@@ -1524,14 +1625,24 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
                 action = greedy_action(head, hidden, valid, predictor.device)
             else:
                 raise ValueError(f"Unknown policy: {policy}")
+            nxt = advance(state, action, cfg)
             if trace:
+                acquired = np.flatnonzero(present_mask(nxt, cfg) & ~present_mask(state, cfg))
+                slot = int(acquired[0]) if len(acquired) else None
+                item = (f"ZS{slot+1}" if slot is not None and slot < cfg.zero_shots else
+                        f"OS{slot-cfg.zero_shots+1}" if slot is not None else f"R{action+1}")
                 trajectory.append({"candidate_mask": int(state.candidate_mask),
                                    "evaluator_mask": int(state.evaluator_mask),
                                    "evaluators": evaluator_names(state.evaluator_mask, cfg),
                                    "cost": state_cost(state, cfg), "action": int(action),
                                    "action_name": action_names(cfg)[action],
+                                   "acquired_item": item,
+                                   "acquired_candidate": record.candidate_ids[slot] if slot is not None else None,
+                                   "acquired_evaluator": record.evaluator_ids[action] if slot is None else None,
+                                   "cost_after": state_cost(nxt, cfg),
+                                   "incremental_cost": state_cost(nxt, cfg) - state_cost(state, cfg),
                                    "valid_actions": np.flatnonzero(valid).tolist()})
-            state = advance(state, action, cfg)
+            state = nxt
     selected = selected_candidate(probabilities, state, cfg)
     has_max = bool(maximum.any())
     exact_max = bool(maximum[selected]) if has_max else None
@@ -1539,6 +1650,10 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
             "selected": record.candidate_ids[selected],
             "correct": int(record.labels[selected]), "has_max": has_max,
             "exact_max": exact_max, "cost": state_cost(state, cfg),
+            "full_cost": cfg.full_cost,
+            "call_counts": acquisition_call_counts(bin(state.candidate_mask).count("1"),
+                                                   bin(state.evaluator_mask).count("1"), cfg),
+            "full_call_counts": acquisition_call_counts(cfg.n, cfg.k, cfg),
             "saved_fraction": 1 - state_cost(state, cfg)/cfg.full_cost,
             "reason": reason, "trajectory": trajectory}
 
@@ -1556,6 +1671,28 @@ def evaluate_policy(records, ids, teacher, predictor, cfg, head=None,
             rows.append(row)
     return rows
 
+def call_savings_summary(question_means):
+    groups = {"all": question_means,
+              "max_present": [row for row in question_means if row["has_max"]]}
+    result = {}
+    for name, group in groups.items():
+        with_max = [row for row in group if row["has_max"]]
+        metrics = {"n": len(group),
+                   "exact_max_recovery": float(np.mean([row["exact_max"] for row in with_max])) if with_max else None,
+                   "predicted_max_stop_rate": float(np.mean([row["predicted_max"] for row in group])) if group else None,
+                   "wrong_predicted_max_stop_rate": float(np.mean([row["wrong_predicted_max"] for row in group])) if group else None}
+        for unit in ("solver_calls", "total_calls"):
+            used = np.asarray([row["call_counts"][unit] for row in group])
+            full = np.asarray([row["full_call_counts"][unit] for row in group])
+            metrics[unit] = {"mean_full": float(full.mean()) if group else None,
+                             "mean_used": float(used.mean()) if group else None,
+                             "mean_saved": float((full-used).mean()) if group else None,
+                             "total_saved": float((full-used).sum()) if group else None,
+                             "saved_fraction": float((full-used).sum()/full.sum()) if group else None}
+        result[name] = metrics
+    return result
+
+
 def policy_summary(rows):
     if not rows:
         return None
@@ -1565,8 +1702,14 @@ def policy_summary(rows):
     means = [{"correct": np.mean([r["correct"] for r in group]),
               "cost": np.mean([r["cost"] for r in group]),
               "saved": np.mean([r["saved_fraction"] for r in group]),
+              "call_counts": {unit: np.mean([r["call_counts"][unit] for r in group])
+                              for unit in ("solver_calls", "total_calls")},
+              "full_call_counts": {unit: np.mean([r["full_call_counts"][unit] for r in group])
+                                   for unit in ("solver_calls", "total_calls")},
               "has_max": group[0]["has_max"],
               "exact_max": np.mean([r["exact_max"] for r in group]) if group[0]["has_max"] else None,
+              "predicted_max": np.mean([r["reason"] == "predicted_max" for r in group]),
+              "wrong_predicted_max": np.mean([r["reason"] == "predicted_max" and not r["exact_max"] for r in group]),
               "false_max": np.mean([r["reason"] == "predicted_max" for r in group])
               if not group[0]["has_max"] else None}
              for group in by_question.values()]
@@ -1585,6 +1728,7 @@ def policy_summary(rows):
             "p90_cost": float(np.percentile(costs, 90)),
             "p95_cost": float(np.percentile(costs, 95)),
             "mean_saved_fraction": float(np.mean([m["saved"] for m in means])),
+            "call_savings": call_savings_summary(means),
             "stop_reasons": dict(Counter(r["reason"] for r in rows))}
 
 def continuation_diagnostic(records, ids, teacher, predictor, cfg, head):
@@ -1652,14 +1796,29 @@ def policy_report(records, ids, teacher, predictor, cfg, head, title):
         return None, {}
     rows = {name: evaluate_policy(records, ids, teacher, predictor, cfg, head,
                                   policy=name, trace=True)
-            for name in ("full", "fixed", "supervised")}
+            for name in evaluation_methods(cfg)}
     summary = {name: policy_summary(data) for name, data in rows.items()}
-    print(f"{'Method':<16} | {'Top-1 correct':>13} | {'Exact MAX':>9} | {'Mean calls':>10} | {'Saved':>7}")
+    print(f"{'Method':<26} | {'Top-1 correct':>13} | {'Exact MAX':>9} | {'Mean cost':>10} | {'Saved':>7}")
     for name, item in summary.items():
         exact = "--" if item["exact_max_recovery"] is None else f"{item['exact_max_recovery']:.1%}"
-        print(f"{name:<16} | {item['top1_correct']:>12.1%} | {exact:>9} | "
+        print(f"{name:<26} | {item['top1_correct']:>12.1%} | {exact:>9} | "
               f"{item['mean_cost']:>10.1f} | {item['mean_saved_fraction']:>6.1%}")
-    return {"policies": summary,
+    print(f"Cost unit: {cfg.cost_unit}. Early stopping uses predicted MAX, not historical MAX labels.")
+    print("API-call savings versus the complete pool (generation + measurement solves + their graders):")
+    print(f"{'Method':<26} | {'Questions':<12} | {'N':>5} | {'Mean API':>9} | {'Saved API/q':>11} | {'Saved':>7} | {'Exact MAX':>9}")
+    for name, item in summary.items():
+        for cohort, metrics in item["call_savings"].items():
+            calls = metrics["total_calls"]
+            values = ["--" if calls[key] is None else f"{calls[key]:.1f}"
+                      for key in ("mean_used", "mean_saved")]
+            saved = "--" if calls["saved_fraction"] is None else f"{calls['saved_fraction']:.1%}"
+            exact = "--" if metrics["exact_max_recovery"] is None else f"{metrics['exact_max_recovery']:.1%}"
+            print(f"{name:<26} | {cohort:<12} | {metrics['n']:>5} | {values[0]:>9} | {values[1]:>11} | {saved:>7} | {exact:>9}")
+    return {"policies": summary, "cost_unit": cfg.cost_unit,
+            "fixed_acquisition_sequences": fixed_acquisition_sequences(cfg),
+            "early_stop_rule": {"reason": "predicted_max", "threshold": cfg.recognition_threshold,
+                                "signals": ["global_MAX", "global_SAFE", "selected_MAX", "selected_SAFE"]},
+            "call_accounting": "Recorded generation, baseline/cross measurement solves, and their grading calls; excludes retrieval and target-answer grading.",
             "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg),
             "continuation": continuation_diagnostic(records, ids, teacher, predictor, cfg, head)}, rows
 
@@ -1674,7 +1833,7 @@ class Workflow:
         self.out = Path(cfg.output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         contract_cfg = asdict(cfg)
-        for key in ("resume", "output_dir", "device", "cpu_threads", "print_every"):
+        for key in ("resume", "output_dir", "device", "cpu_threads", "print_every", "fixed_acquisition_orders"):
             contract_cfg.pop(key)
         sources = [{"path": str(Path(p).resolve()), "bytes": Path(p).stat().st_size,
                     "mtime_ns": Path(p).stat().st_mtime_ns} for p in [cfg.train_file] + cfg.test_files]
@@ -1716,11 +1875,15 @@ class Workflow:
             if excluded:
                 print("  Exclusions: " + ", ".join(f"{k}={v}" for k,v in sorted(excluded.items())))
         print("Roles: " + ", ".join(f"{k}={len(self.splits[k])}" for k in ("supervised", "policy", "dev", "audit")))
+        print("All three stages train on the same supervised questions; policy is an alias.")
+        print("Dev/audit source: " + ("pooled test_files, shared for model selection and reporting."
+              if self.cfg.use_test_files_for_dev_and_audit else "separate held-out training-file partitions."))
         print("Strict complete-pool analysis; exclusions are reported, never silently counted as wrong.")
         print("CCS uses recorded rates/configured attempts; per-trial API validity is not inferred from rates.")
         print("Exact normalized-text duplicates removed; near-duplicate/corpus contamination requires a separate audit.")
         atomic_json(self.out / "data_audit.json", self.audit)
         atomic_json(self.out / "split_manifest.json", {"data_sha256": data_digest(self.records),
+                    "evaluation_protocol": split_protocol(self.cfg, self.splits),
                     "roles": {k: [self.records[i].uid for i in ids] for k,ids in self.splits.items()},
                     "groups": {r.uid: r.group for r in self.records}})
         return self
@@ -1799,7 +1962,8 @@ class Workflow:
     def report(self):
         if not hasattr(self, "head"):
             self.train_decision_head()
-        results = {"decision_training": {"best_epoch": self.decision_checkpoint["best_epoch"],
+        results = {"evaluation_protocol": split_protocol(self.cfg, self.splits),
+                   "decision_training": {"best_epoch": self.decision_checkpoint["best_epoch"],
                                          "dev_loss": self.decision_checkpoint["dev_loss"],
                                          "coverage": self.decision_checkpoint["coverage"],
                                          "action_names": action_names(self.cfg)}}
@@ -1821,7 +1985,7 @@ class Workflow:
                     results[name]["paired_top1"] = {
                         baseline: paired_interval(rows["supervised"], rows[baseline],
                                                    self.cfg.bootstrap_samples, self.cfg.seed)
-                        for baseline in ("full", "fixed")}
+                        for baseline in rows if baseline != "supervised"}
                 for method, method_rows in rows.items():
                     for row in method_rows:
                         handle.write(json.dumps({"benchmark": name, "method": method, **row},
@@ -1844,7 +2008,7 @@ class Workflow:
                     "mean_cost": float(np.mean([
                         results[name]["adaptive"]["policies"][method]["mean_cost"]
                         for name in available]))}
-                    for method in ("full", "fixed", "supervised")}}
+                    for method in evaluation_methods(self.cfg)}}
         atomic_json(self.out / "results.json", results)
         print(f"Saved reports, trajectories, checkpoints, and inference bundle to {self.out}")
         print("These are cached historical outcomes, not live API or Kaggle evidence.")
@@ -1854,8 +2018,8 @@ class Workflow:
 
 def load_inference_bundle(path, device="cpu"):
     bundle = load_checkpoint(path)
-    if bundle.get("schema_version") != 4 or bundle.get("implementation_revision") != 3:
-        raise ValueError("Expected a version 4 inference bundle with revision 3 state/action contract; old bundles are incompatible.")
+    if bundle.get("schema_version") != 4 or bundle.get("implementation_revision") != PIPELINE_REVISION:
+        raise ValueError(f"Expected a version 4 inference bundle with revision {PIPELINE_REVISION} training contract; old bundles are incompatible.")
     cfg = Config(**bundle["config"])
     cfg.validate()
     if (bundle.get("action_names") != action_names(cfg) or

@@ -169,10 +169,10 @@ The current default is **standard masked DQN**. An optional `double_dqn=True` se
 
 The RL head can work only after a predictor can interpret partial evidence. The notebook therefore proceeds in stages:
 
-1. **Prepare records.** Parse eligible complete historical pools and divide questions into supervised, policy, development, and audit roles.
+1. **Prepare records.** Parse eligible complete historical pools. All three stages share supervised training questions; policy is an alias. The configurable development/audit source is either the pooled external test files (default) or separate internal held-out groups.
 2. **Train a full-evidence teacher.** It learns candidate rankings. Together with offline correctness labels, those rankings create retrospective `SAFE` and `MAX` supervised targets.
 3. **Train the partial-snapshot predictor.** It learns from snapshots that reveal only some candidates and measurements, then is frozen.
-4. **Train the RL action head.** It practices acquisition sequences on the separate policy questions using the cached environment.
+4. **Train the RL action head.** It practices acquisition sequences on the same supervised questions used by the teacher and snapshot model, through the policy alias, using the cached environment.
 5. **Evaluate.** Compare the learned acquisition policy with evaluator-first, candidate-first, random, and cheapest-action policies on held-out questions.
 
 `SAFE` and `MAX` are **supervised targets for the predictor**, not RL rewards or guarantees that an answer is correct. The application uses predicted values and thresholds to decide when to stop; the DQN has no STOP action. See [`teacher_labels()`](adaptive_analogical_training.py#L505), [`stopping_reason()`](adaptive_analogical_training.py#L945), and the [workflow stages](adaptive_analogical_training.py#L1470).

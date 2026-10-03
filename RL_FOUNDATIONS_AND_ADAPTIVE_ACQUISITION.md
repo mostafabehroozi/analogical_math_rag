@@ -242,7 +242,7 @@ If the stop rule never fires, acquisition continues until no budget-valid action
 
 ### 17. Where the data go, and how to read the notebook
 
-The default `Config` points to a Numina-Hard run log for training and four external run logs for reporting. Eligible complete records from the training log are divided into **supervised 60%**, **policy 20%**, **development 10%**, and **internal audit 10%**. The supervised role trains the teacher and snapshot model. The policy role supplies RL episodes. Development selects settings/checkpoints. Audit is reserved for reporting. External logs are reported separately; no external benchmark becomes a new RL episode during training.
+The teacher, snapshot model, and acquisition head now share the same training questions: `policy` is an alias of `supervised`. With `use_test_files_for_dev_and_audit=True` (the default), all eligible training-log questions train all three stages, and the configured external `test_files` are pooled for both development and audit. Development selects checkpoints and calibration, so these audit/benchmark scores are also influenced by model selection. With the option set to `False`, `split_fractions=(0.80, 0.10, 0.10)` gives shared training, development, and audit groups, while external files remain separate for reporting. External benchmark questions never supply RL training episodes in either mode.
 
 Read these pieces in this order:
 
@@ -258,7 +258,7 @@ The notebook is self-contained for Kaggle; the `.py` module mirrors its implemen
 
 Compare RL with evaluator-first, candidate-first, random, and cheapest-next-action policies under the **same** frozen predictor, stop rule, and budget. The full-snapshot policy is a complete-evidence reference; if the adaptive budget is below full cost, it lies outside that cap. The main practical outcome is **selected-answer Top-1 accuracy versus mean and tail acquisition cost**, together with confident-stop errors and forced-stop frequency. A low cost is unhelpful if answer accuracy collapses.
 
-Inspect `results.json` for aggregate reports and `final_trajectories.jsonl` for question-level selected answers, costs, stop reasons, and RL action traces. A high Q-value alone is not experimental success. A single successful hypothetical trajectory is not evidence either. Compare policies on the same eligible questions and report uncertainty for accuracy differences. Audit/external performance must stay separate from development tuning; earlier benchmark use is not erased by a new split.
+Inspect `results.json` for aggregate reports and `final_trajectories.jsonl` for question-level selected answers, costs, stop reasons, and RL action traces. A high Q-value alone is not experimental success. A single successful hypothetical trajectory is not evidence either. Compare policies on the same eligible questions and report uncertainty for accuracy differences. The evaluation protocol records whether audit/external questions were also used for development tuning; earlier benchmark use is not erased by a new split.
 
 This notebook evaluates **cached acquisition** from recorded complete pools. It does not validate live API execution, changing prompts, unrecorded alternatives, actual runtime, or clinical/real-world reliability. SAFE/MAX labels are retrospective and their predicted probabilities are not certainty guarantees. The code's local tests check mechanics such as masks, targets, and freezing; a full Kaggle run is needed to learn whether the policy improves the measured task.
 

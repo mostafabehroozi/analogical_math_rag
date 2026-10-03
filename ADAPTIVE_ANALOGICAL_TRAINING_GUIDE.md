@@ -113,8 +113,41 @@ never enter the head input.
 
 ## Training, artifacts, and evaluation
 
-The disjoint roles are `supervised` (60%), `policy` (20%), `dev` (10%), and
-`audit` (10%). Stage 3 writes atomic question-sized shards in
+All three stages train on exactly the same question group: `supervised`.
+The historical `policy` role is an alias containing the same IDs in the same
+order, so it no longer takes a separate fraction of the training data.
+
+`use_test_files_for_dev_and_audit=True` is enabled by default in the module
+and editable Kaggle configuration. It uses every eligible question from
+`train_file` for training and pools every eligible question from `test_files`
+for both `dev` and `audit`. Exact normalized-text duplicates across files are
+still excluded. Internal `split_fractions` are ignored in this mode.
+
+| Stage | Weight training | Development checks |
+| --- | --- | --- |
+| 1: teacher | Shared `supervised` questions | `dev`: final teacher checkpoint selection and heuristic selection |
+| 2: snapshot encoder and prediction heads | Same `supervised` questions | Same `dev`: checkpoint selection and temperature calibration |
+| 3: acquisition head | Same `supervised` questions, through the `policy` alias | Same `dev`: acquisition-head checkpoint selection |
+
+The teacher's fold models still use internal training/validation folds and
+produce out-of-fold labels for all shared training questions. The final
+teacher trains on all shared training questions. The snapshot predictor
+stays frozen while the acquisition head trains.
+
+Set `use_test_files_for_dev_and_audit=False` for separate internal development
+and audit groups. `split_fractions=(0.80, 0.10, 0.10)` then means **shared
+training / dev / audit**. All stages use the same 80%; `policy` is still an
+alias. External test logs are used only for reporting in this mode. The old
+four-fraction configuration is no longer used.
+
+With test-file development enabled, audit and external benchmark scores are
+on questions also used for checkpoint selection and calibration. They are
+not an independent held-out test. `evaluation_protocol` in both
+`split_manifest.json` and `results.json` records the development/audit overlap
+and the external files used for model selection. Final reports include the
+pooled audit set and each benchmark separately.
+
+Stage 3 writes atomic question-sized shards in
 `decision_shards/policy` and `decision_shards/dev`, with
 `decision_dataset_manifest.json` and `decision_label_coverage.json`. The
 manifest and shards bind to the config, split, teacher labels, and frozen
@@ -125,13 +158,56 @@ order are shuffled deterministically each epoch, one shard is read at a time,
 and dev shards are read in stable order for masked-loss checkpoint selection.
 The frozen Stage 2 state is checked after training.
 
-Offline reports compare the complete-pool baseline, the fixed sequence
-`ZS1 → R1 → OS1 → ZS2 → R2 → OS2 → ZS3 → R3 → OS3 → R4 → OS4 → R5 → OS5`,
-and learned acquisitions. Fixed order stops at its next unaffordable scheduled
-action. Learned and fixed rollouts otherwise use the same application rule:
+Offline reports compare the complete-pool baseline, configurable fixed
+sequences, and learned acquisitions. Defaults for five evaluators and three
+zero-shot candidates are:
+
+| Method | Fixed acquisition order |
+| --- | --- |
+| `fixed` (`interleaved`) | ZS1, R1, OS1, ZS2, R2, OS2, ZS3, R3, OS3, R4, OS4, R5, OS5 |
+| `fixed_evaluators_first` | ZS1, R1, R2, R3, R4, R5, ZS2, ZS3, OS1, OS2, OS3, OS4, OS5 |
+| `fixed_zero_shots_first` | ZS1, ZS2, ZS3, R1, OS1, R2, OS2, R3, OS3, R4, OS4, R5, OS5 |
+
+Edit `fixed_acquisition_orders` in the Kaggle configuration cell to select
+these built-ins or add a method such as
+`"fixed_custom": ["ZS1", "R2", "OS2", "ZS2", "R1", "OS1", "ZS3"]`.
+`Rj` adds the evaluator at retrieval rank j; `OSj` generates its one-shot
+candidate. Every sequence starts with the already generated `ZS1`, and
+unseen zero-shots arrive in slot order. Duplicates, out-of-range items, and
+one-shots before their evaluators are rejected. A custom sequence may be a
+partial pool; ending it produces `fixed_sequence_exhaustion` rather than
+claiming successful recognition. Fixed order stops at its next unaffordable
+scheduled action and never skips ahead.
+
+Learned and fixed rollouts use the same application rule after the initial
+ZS1 and after **every single evaluator or candidate acquisition**:
 stop when global MAX/SAFE and the selected candidate's MAX-i/SAFE-i signals
 reach the threshold, or no affordable action remains. This runtime rule is
-separate from offline Stage 3 labels.
+separate from offline Stage 3 labels. A historical MAX label is never read
+to decide whether to stop. The full-pool reference acquires the complete
+pool without early stopping, even when it exceeds the adaptive budget.
+
+The additional API-savings table has two rows per method: **all questions**
+and **MAX-present questions** (nonempty historical teacher MAX labels).
+It shows question counts, mean API calls used, mean calls saved per question
+versus the full pool, savings percentage, and exact MAX recovery. Savings
+include failed/incorrect stops; they are not conditional on successful MAX
+recovery. JSON `policies[method].call_savings` stores these cohorts, both
+`solver_calls` and `total_calls`, expected total savings across questions,
+predicted-MAX stopping rates, and wrong predicted-MAX stopping rates.
+
+Total API calls include candidate generations, repeated baseline/cross
+measurement solves, and their grading calls. With default settings the
+complete pool uses 233 solver calls and 225 graders: **458 API calls**.
+Retrieval and target-answer grading are excluded. This accounting follows
+the recorded-pool simulator, not observed live traffic. Costs and savings
+are averaged across zero-shot orders within each question before aggregating,
+so a question is counted once. Empty MAX-present cohorts have null metrics.
+Trajectories name each acquired evaluator/candidate and its incremental cost.
+
+Fixed comparison orders affect evaluation only. They are excluded from
+training/checkpoint fingerprints, so matching revision-4 checkpoints can
+be reused when changing orders and rerunning reports.
 
 Reports keep answer correctness, exact reference-MAX recovery, no-MAX results,
 costs and savings, and preservation of earlier recognition goals separate.
@@ -139,9 +215,10 @@ They also expose exhaustive status counts, actionable coverage by target
 rank, evaluator masks, and action names. The run saves teacher/snapshot/head
 checkpoints, an inference bundle, trajectories, and `results.json`.
 
-This implementation uses **revision 3**, **contract/inference schema 4**, and
+This implementation uses **revision 4**, **contract/inference schema 4**, and
 **decision-dataset schema 3**. Older action/state bundles and checkpoints are
-rejected. Use the new default output directory for a fresh run; old runs are
+rejected. Use the new default output directory
+`/kaggle/working/adaptive_analogical_shared_training_v4_run` for a fresh run; old runs are
 not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
 quality. Recorded outcomes cannot establish live provider behavior or the
 results of newly generated candidates.

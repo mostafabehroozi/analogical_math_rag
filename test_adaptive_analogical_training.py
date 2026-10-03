@@ -453,13 +453,122 @@ def test_fixed_policy_does_not_skip_an_unaffordable_step():
 
 def test_no_max_evaluation_keeps_false_predicted_max_and_separate_stratum():
     rows = [dict(uid="a", correct=0, exact_max=None, has_max=False, cost=1,
-                 saved_fraction=.9, reason="predicted_max"),
+                 saved_fraction=.9, reason="predicted_max",
+                 call_counts={"solver_calls": 1, "total_calls": 1},
+                 full_call_counts={"solver_calls": 10, "total_calls": 19}),
             dict(uid="b", correct=1, exact_max=True, has_max=True, cost=10,
-                 saved_fraction=0, reason="predicted_max")]
+                 saved_fraction=0, reason="predicted_max",
+                 call_counts={"solver_calls": 10, "total_calls": 19},
+                 full_call_counts={"solver_calls": 10, "total_calls": 19})]
     summary = a.policy_summary(rows)
     assert summary["n"] == 2 and summary["top1_correct"] == .5
     assert summary["exact_max_recovery"] == 1
     assert summary["no_max_false_predicted_max"] == 1
+
+
+@pytest.mark.parametrize("k,zero_shots", [(1, 1), (1, 5), (5, 1), (5, 3)])
+def test_fixed_sequences_acquire_each_item_once_and_obey_prerequisites(k, zero_shots):
+    cfg = a.Config(k=k, zero_shots=zero_shots)
+    expected = {f"ZS{i+1}" for i in range(zero_shots)} | {
+        item for i in range(k) for item in (f"R{i+1}", f"OS{i+1}")}
+    for sequence in a.fixed_acquisition_sequences(cfg).values():
+        assert len(sequence["items"]) == len(set(sequence["items"])) == len(expected)
+        assert set(sequence["items"]) == expected
+        state = a.State()
+        for action in sequence["actions"]:
+            state = a.advance(state, action, cfg)
+        assert state == a.State((1 << cfg.n)-1, (1 << cfg.k)-1)
+    assert a.fixed_order_items(cfg, "evaluators_first")[1:k+1] == [f"R{i+1}" for i in range(k)]
+    assert a.fixed_order_items(cfg, "zero_shots_first")[:zero_shots] == [f"ZS{i+1}" for i in range(zero_shots)]
+
+
+@pytest.mark.parametrize("items", [[], ["R1"], ["ZS1", "OS1"], ["ZS1", "R1", "R1"],
+                                   ["ZS1", "ZS3"], ["ZS1", "ZS1"], ["ZS1", "R6"],
+                                   ["ZS1", "OS6"], ["ZS1", "ZS4"], ["ZS1", "X1"]])
+def test_custom_fixed_sequence_rejects_invalid_steps(items):
+    cfg = a.Config(fixed_acquisition_orders={"fixed_custom": items})
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+
+def test_fixed_and_learned_policies_stop_after_recognizing_generated_max():
+    cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={
+        "fixed_custom": ["ZS1", "R2", "OS2", "ZS2", "R1", "OS1"]})
+    r = record(cfg)
+    r.labels[:] = 0
+    r.labels[3] = 1
+    maximum = np.array([0, 0, 0, 1], np.float32)
+    class Predictor:
+        device = "cpu"
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2)
+            p[0] = .8
+            if state.candidate_mask & (1 << 3):
+                p[3] = .9
+                p[[cfg.n+3, 2*cfg.n+3, 3*cfg.n, 3*cfg.n+1]] = .9
+            return np.zeros(cfg.hidden_dim), p
+    class Head(torch.nn.Module):
+        def forward(self, hidden):
+            return torch.tensor([[0., 3., -1., -2., 2.]]).repeat(len(hidden), 1)
+    for method in ("fixed_custom", "supervised"):
+        row = a.rollout(r, maximum, Predictor(), cfg, policy=method, head=Head(), trace=True)
+        assert row["reason"] == "predicted_max" and row["exact_max"] and row["correct"] == 1
+        assert [step["acquired_item"] for step in row["trajectory"] if step["action"] is not None] == ["R2", "OS2"]
+        assert row["trajectory"][1]["acquired_candidate"] == r.candidate_ids[3]
+        assert row["trajectory"][0]["acquired_evaluator"] == r.evaluator_ids[1]
+        assert row["trajectory"][1]["cost_after"] == row["cost"] == 17
+        assert row["call_counts"]["total_calls"] == 32
+        summary = a.policy_summary([row])["call_savings"]
+        assert summary["max_present"]["total_calls"]["mean_saved"] == 104-32
+        assert summary["max_present"]["exact_max_recovery"] == 1
+
+
+def test_custom_fixed_sequence_exhaustion_is_separate_from_budget():
+    cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={"fixed_short": ["ZS1", "R2"]})
+    class NoStop:
+        def predict(self, rec, state, cfg_override=None):
+            return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
+    row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed_short", trace=True)
+    assert row["reason"] == "fixed_sequence_exhaustion"
+    assert row["cost"] == 11
+    cfg.max_cost = 5
+    row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed_short", trace=True)
+    assert row["reason"] == "budget" and row["cost"] == 1
+    assert row["trajectory"][-1]["blocked_fixed_action"] == 1
+
+
+def test_call_savings_average_orders_per_question_and_keep_max_cohort_separate():
+    cfg = a.Config(k=1, zero_shots=2)
+    full = a.acquisition_call_counts(cfg.n, cfg.k, cfg)
+    rows = []
+    for uid, has_max, states in (("max", True, [(1, 0), (2, 1)]),
+                                 ("no_max", False, [(2, 0), (3, 1)])):
+        for i, (n, k) in enumerate(states):
+            counts = a.acquisition_call_counts(n, k, cfg)
+            rows.append(dict(uid=uid, has_max=has_max, exact_max=bool(i) if has_max else None,
+                             correct=int(has_max and i), cost=counts[cfg.cost_unit],
+                             saved_fraction=1-counts[cfg.cost_unit]/cfg.full_cost,
+                             reason="predicted_max", call_counts=counts, full_call_counts=full))
+    savings = a.policy_summary(rows)["call_savings"]
+    assert savings["all"]["n"] == 2 and savings["max_present"]["n"] == 1
+    assert savings["all"]["total_calls"] == dict(mean_full=43., mean_used=19.5,
+                                                mean_saved=23.5, total_saved=47., saved_fraction=47/86)
+    assert savings["max_present"]["total_calls"] == dict(mean_full=43., mean_used=16.5,
+                                                        mean_saved=26.5, total_saved=26.5, saved_fraction=26.5/43)
+    assert savings["all"]["wrong_predicted_max_stop_rate"] == .75
+    assert savings["max_present"]["exact_max_recovery"] == .5
+    no_max = a.policy_summary([row for row in rows if not row["has_max"]])["call_savings"]["max_present"]
+    assert no_max["n"] == 0 and no_max["total_calls"]["mean_saved"] is None
+    assert no_max["exact_max_recovery"] is None
+
+
+def test_call_counts_include_grading_and_are_independent_of_selected_cost_unit():
+    cfg = a.Config()
+    assert a.acquisition_call_counts(cfg.n, cfg.k, cfg) == dict(
+        generation_calls=8, measurement_solver_calls=225, grading_calls=225,
+        solver_calls=233, total_calls=458)
+    cfg.cost_unit = "total_calls"
+    assert cfg.full_cost == 458
 
 
 def test_continuation_counts_all_orders_and_rejects_recovery_after_a_broken_goal(monkeypatch):
@@ -485,9 +594,11 @@ def test_continuation_counts_all_orders_and_rejects_recovery_after_a_broken_goal
     assert result["questions_with_prior_goal_lost"] == 1
 
 
-def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path):
-    train, external = tmp_path/"train.json", tmp_path/"external.json"
-    cfg = a.Config(train_file=str(train), test_files=[str(external)],
+@pytest.mark.parametrize("external_dev_audit", [False, True])
+def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, external_dev_audit, monkeypatch):
+    train, external, second = tmp_path/"train.json", tmp_path/"external.json", tmp_path/"second.json"
+    cfg = a.Config(train_file=str(train), test_files=[str(external), str(second)],
+                   use_test_files_for_dev_and_audit=external_dev_audit,
                    output_dir=str(tmp_path/"run"), device="cpu", cpu_threads=1,
                    k=2, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
                    batch_size=16, teacher_epochs=2, snapshot_epochs=2, decision_epochs=2,
@@ -497,10 +608,36 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path):
     train.write_text(json.dumps([raw_record(i,cfg) for i in range(40)]))
     external.write_text(json.dumps([raw_record(i,cfg,prefix="external",all_wrong=(i==0))
                                     for i in range(3)]))
+    duplicates = [raw_record(0,cfg), raw_record(0,cfg,prefix="external")]
+    for i, duplicate in enumerate(duplicates):
+        duplicate["target_query_original_hard_list_idx"] = 100 + i
+    second.write_text(json.dumps([raw_record(i,cfg,prefix="second") for i in range(2)] + duplicates))
+    snapshot_training_ids = []
+    build_snapshots = a.build_snapshots
+    def track_snapshot_training(*args, **kwargs):
+        if "epoch" in kwargs and args[2] is not None:
+            snapshot_training_ids.append(list(args[1]))
+        return build_snapshots(*args, **kwargs)
+    monkeypatch.setattr(a, "build_snapshots", track_snapshot_training)
     work = a.run_pipeline(cfg)
+    assert snapshot_training_ids and all(ids == work.splits["supervised"] for ids in snapshot_training_ids)
     assert set(work.results["external"]["adaptive"]["policies"]) == {
-        "full", "fixed", "supervised"}
+        "full", "fixed", "fixed_evaluators_first", "fixed_zero_shots_first", "supervised"}
     assert work.results["external"]["adaptive"]["policies"]["supervised"]["n"] == 3
+    assert work.results["second"]["adaptive"]["policies"]["supervised"]["n"] == 2
+    for name in ("audit", "external", "second"):
+        report = work.results[name]["adaptive"]
+        assert set(report["fixed_acquisition_sequences"]) == set(cfg.fixed_acquisition_orders)
+        assert set(work.results[name]["paired_top1"]) == {"full", *cfg.fixed_acquisition_orders}
+        for method, summary in report["policies"].items():
+            savings = summary["call_savings"]
+            assert savings["all"]["n"] == summary["n"]
+            assert savings["max_present"]["n"] == summary["max_present_n"]
+            assert savings["all"]["total_calls"]["mean_full"] == a.acquisition_call_counts(cfg.n, cfg.k, cfg)["total_calls"]
+            if method == "full":
+                assert savings["all"]["total_calls"]["mean_saved"] == 0
+    assert set(work.results["external_macro"]["methods"]) == set(a.evaluation_methods(cfg))
+    assert work.audit["second"]["duplicate_or_cross_file_overlap"] == 2
     assert (tmp_path/"run"/"decision_head_completed.pt").exists()
     manifest = json.loads((tmp_path/"run"/"decision_dataset_manifest.json").read_text())
     assert manifest["schema_version"] == 3
@@ -516,17 +653,40 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path):
     assert all(sum(a.Counter(case["status"] for case in shard["cases"]).values()) == shard["expected_cases"]
                for shard in policy_shards)
     role_uids = {role: {work.records[i].uid for i in ids} for role, ids in work.splits.items()}
-    assert {row["uid"] for row in saved_rows} <= role_uids["policy"]
+    assert {shard["uid"] for shard in policy_shards} == role_uids["supervised"] == role_uids["policy"]
+    assert work.splits["policy"] == work.splits["supervised"]
+    assert {row["uid"] for row in saved_rows} <= role_uids["supervised"]
     dev_rows = [row for path in manifest["roles"]["dev"]
                 for row in a.load_checkpoint(tmp_path/"run"/path)["rows"]]
     assert {row["uid"] for row in dev_rows} <= role_uids["dev"]
-    for role, uids in role_uids.items():
-        assert all(not uids & other for name, other in role_uids.items() if name != role)
+    external_uids = role_uids["external"] | role_uids["second"]
+    assert not role_uids["supervised"] & (role_uids["dev"] | role_uids["audit"] | external_uids)
+    protocol = work.results["evaluation_protocol"]
+    assert protocol["audit_used_for_model_selection"] is external_dev_audit
+    split_manifest = json.loads((tmp_path/"run"/"split_manifest.json").read_text())
+    assert split_manifest["evaluation_protocol"] == protocol
+    assert split_manifest["roles"]["supervised"] == split_manifest["roles"]["policy"]
+    if external_dev_audit:
+        assert len(role_uids["supervised"]) == 40
+        assert work.splits["dev"] == work.splits["audit"] == work.splits["external"] + work.splits["second"]
+        assert role_uids["dev"] == external_uids
+        assert protocol["dev_audit_overlap_questions"] == 5
+        assert protocol["external_files_used_for_model_selection"] == cfg.test_files
+        assert work.results["audit"]["adaptive"]["policies"]["supervised"]["n"] == 5
+    else:
+        assert [len(role_uids[role]) for role in ("supervised", "dev", "audit")] == [32, 4, 4]
+        assert not role_uids["dev"] & role_uids["audit"]
+        assert not (role_uids["dev"] | role_uids["audit"]) & external_uids
+        assert protocol["dev_audit_overlap_questions"] == 0
+        assert protocol["external_files_used_for_model_selection"] == []
     assert (tmp_path/"run"/"results.json").exists()
     assert (tmp_path/"run"/"final_trajectories.jsonl").exists()
     for fold in work.teacher["folds"]:
         assert not set(fold["heldout_ids"]) & (set(fold["train_ids"]) |
                                                set(fold["validation_ids"]))
+    assert {uid for fold in work.teacher["folds"] for uid in fold["heldout_ids"]} == role_uids["supervised"]
+    assert set(work.teacher["teacher"]["train_ids"]) == role_uids["supervised"]
+    assert set(work.teacher["teacher"]["validation_ids"]) == role_uids["dev"]
     frozen = a.cpu_state(work.predictor.model)
     assert not any(p.requires_grad for p in work.predictor.model.parameters())
     restored_cfg, predictor, head = a.load_inference_bundle(tmp_path/"run"/"inference_bundle.pt")
@@ -539,6 +699,12 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path):
         a.rollout(r,maximum,work.predictor,cfg,head=work.head)["selected"])
     resumed = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
     assert resumed.decision_checkpoint["best_epoch"] == work.decision_checkpoint["best_epoch"]
+    comparison_cfg = copy.deepcopy(cfg)
+    comparison_cfg.fixed_acquisition_orders = {"fixed_short": ["ZS1", "R2", "OS2"]}
+    comparison = a.Workflow(comparison_cfg).prepare().train_teacher().train_snapshot().train_decision_head()
+    assert comparison.decision_checkpoint["dataset_fingerprint"] == work.decision_checkpoint["dataset_fingerprint"]
+    comparison_report = comparison.report()["external"]["adaptive"]
+    assert set(comparison_report["policies"]) == {"full", "fixed_short", "supervised"}
     # Interrupted shard construction rebuilds only the missing question.
     keep = tmp_path/"run"/manifest["roles"]["policy"][0]
     missing = tmp_path/"run"/manifest["roles"]["policy"][1]
@@ -569,6 +735,50 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path):
     changed.recognition_threshold = .5
     with pytest.raises(ValueError, match="different config"):
         a.Workflow(changed)
+    changed = copy.deepcopy(cfg)
+    changed.use_test_files_for_dev_and_audit = not external_dev_audit
+    with pytest.raises(ValueError, match="different config"):
+        a.Workflow(changed)
+    old_bundle = a.load_checkpoint(tmp_path/"run"/"inference_bundle.pt")
+    old_bundle["implementation_revision"] = 3
+    a.atomic_torch(tmp_path/"old_bundle.pt", old_bundle)
+    with pytest.raises(ValueError, match="training contract"):
+        a.load_inference_bundle(tmp_path/"old_bundle.pt")
+
+
+def test_external_development_requires_eligible_questions_and_unique_role_names():
+    cfg = a.Config(train_file="train.json", test_files=[])
+    with pytest.raises(ValueError, match="test_files must be provided"):
+        cfg.validate()
+    cfg.test_files = ["external.json"]
+    records = [record(cfg, i) for i in range(40)]
+    with pytest.raises(ValueError, match="at least two eligible questions"):
+        a.split_records(records, cfg)
+    cfg.test_files = ["audit.json"]
+    with pytest.raises(ValueError, match="unique stems"):
+        a.split_records(records, cfg)
+    cfg.test_files = ["train.json"]
+    with pytest.raises(ValueError, match="unique stems"):
+        a.split_records(records, cfg)
+
+
+def test_internal_fractions_and_stage3_shared_training_requirement(tmp_path):
+    cfg = a.Config(train_file="train.json", test_files=[], use_test_files_for_dev_and_audit=False,
+                   split_fractions=(.70, .20, .10))
+    cfg.validate()
+    records = [record(cfg, i) for i in range(40)]
+    splits = a.split_records(records, cfg)
+    assert [len(splits[role]) for role in ("supervised", "policy", "dev", "audit")] == [28, 28, 8, 4]
+    assert splits == a.split_records(records, cfg)
+    splits["policy"] = splits["policy"][:-1]
+    with pytest.raises(ValueError, match="must match"):
+        a.train_decision_head(records, splits, None, None, cfg, "cpu", tmp_path)
+    cfg.split_fractions = (.60, .20, .10, .10)
+    with pytest.raises(AssertionError):
+        cfg.validate()
+    cfg.use_test_files_for_dev_and_audit = True
+    cfg.test_files = ["external.json"]
+    cfg.validate()  # Internal fractions are ignored in external-development mode.
 
 
 def test_notebook_is_self_contained_compiles_and_matches_module():
@@ -585,3 +795,29 @@ def test_notebook_is_self_contained_compiles_and_matches_module():
     original = (root/"adaptive_analogical_training.py").read_text(encoding="utf-8").split("# %% CLI")[0]
     assert ast.dump(ast.parse("\n".join(embedded))) == ast.dump(ast.parse(original))
     assert not any(cell.get("outputs") for cell in nb["cells"])
+
+
+@pytest.mark.parametrize("external_dev_audit", [False, True])
+def test_legacy_rl_script_uses_the_same_training_and_evaluation_questions(external_dev_audit):
+    # Load definitions without running the legacy script's installation or training cells.
+    root = Path(__file__).parent
+    source = (root/"rl_script.py").read_text(encoding="utf-8")
+    compile(source, "rl_script.py", "exec")
+    nodes = [node for node in ast.parse(source).body
+             if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+             and node.name in {"Config", "split_records", "split_protocol", "fit_dqn"}]
+    namespace = dict(vars(a))
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "legacy_split_definitions", "exec"), namespace)
+    kwargs = dict(train_file="train.json", test_files=["external.json"],
+                  use_test_files_for_dev_and_audit=external_dev_audit)
+    cfg, legacy_cfg = a.Config(**kwargs), namespace["Config"](**kwargs)
+    legacy_cfg.validate()
+    records = [record(cfg, i) for i in range(40)]
+    records += [a.parse_record(raw_record(i, cfg, prefix="external"), i, "external", cfg)
+                for i in range(3)]
+    splits = a.split_records(records, cfg)
+    assert namespace["split_records"](records, legacy_cfg) == splits
+    assert namespace["split_protocol"](legacy_cfg, splits) == a.split_protocol(cfg, splits)
+    splits["policy"] = []
+    with pytest.raises(ValueError, match="must match"):
+        namespace["fit_dqn"](records, splits, None, legacy_cfg, None)
