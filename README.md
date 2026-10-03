@@ -111,6 +111,10 @@ merging JSON files, QLoRA fine-tuning Qwen3-4B-Instruct-2507, and comparing base
 and adapted binary fusion trees. Install its isolated dependencies from
 `requirements-merging-finetuning.txt`. The reusable implementation is in
 `src/merging_finetuning.py`.
+Run the notebook setup cell before the imports. If it detects loaded packages
+whose versions differ from the installed files, restart the kernel/session and
+run from the top. This prevents stale Transformers tokenizer registries from
+requesting missing modules such as `transformers.models.audioflamingo3`.
 
 ## Simplification-model fine-tuning
 
