@@ -115,11 +115,17 @@ Run the notebook setup cell before the imports. If it detects loaded packages
 whose versions differ from the installed files, restart the kernel/session and
 run from the top. This prevents stale Transformers tokenizer registries from
 requesting missing modules such as `transformers.models.audioflamingo3`.
-Evaluation uses one row per normalized question, keeping the first benchmark
-index and reference solution. Duplicate corpus rows, reference variants, and
-held-out deduplication counts are saved to `evaluation_population_audit.json`
-in the notebook work directory. Questions in any merging split are excluded
-from the remaining-benchmark population, including all duplicate occurrences.
+Evaluation runs all supported external benchmarks sequentially: MATH-500,
+GSM8K, AIME 2025, and AIME 2026. `numina_hard` is excluded because Numina is
+the construction source. `EVAL_BENCHMARKS` controls the ordered selection;
+`EVAL_QUESTION_LIMIT=None` evaluates every eligible question per benchmark.
+Each question is evaluated once, using its first reference, and exact normalized
+matches to every fine-tuning split are excluded. Under
+`WORK_DIR/evaluations/<benchmark>/`, `population_audit.json` records duplicate
+references and construction overlaps, `phase_1_results.json` and
+`phase_2_results.json` save raw runs, and `two_phase_evaluation_summary.json`
+reports accuracy, candidate/transition/resource metrics, and paired effects.
+`WORK_DIR/evaluations/benchmark_reports.json` indexes the separate reports.
 
 ## Simplification-model fine-tuning
 
@@ -130,4 +136,12 @@ simplification targets; rejected and failsafe cases become exact-copy targets.
 Repeated questions receive one label: a successful proxy takes priority, and
 the loader chooses the largest recorded score gain among successful proxies. The
 notebook saves an input audit and compares base and adapted simplification with
-a fixed local Qwen solver on held-out cases.
+a fixed local Qwen solver on the same four external benchmarks, sequentially.
+`MAX_EVAL_QUESTIONS=None` evaluates all eligible questions per benchmark;
+`EVAL_BENCHMARKS` controls the ordered selection. Exact normalized matches to
+every construction split are excluded. External questions have no copy/simplify
+target label, so copy/change rates are reported as unlabeled behavior alongside
+direct/base/adapted solver accuracy and paired effects. Each benchmark has
+`population_audit.json`, resumable `evaluation.json`, and `summary.json` under
+`WORK_DIR/evaluations/<benchmark>/`; the report index is
+`WORK_DIR/evaluations/benchmark_reports.json`.

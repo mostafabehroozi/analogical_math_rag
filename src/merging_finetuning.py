@@ -1205,6 +1205,7 @@ def build_evaluation_populations(
     benchmark_ground_truths: Sequence[str],
     *,
     audit: Optional[Dict[str, Any]] = None,
+    include_heldout: bool = True,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Build populations with one evaluation row per normalized question.
 
@@ -1214,6 +1215,8 @@ def build_evaluation_populations(
     rows and their references; differing solution text does not establish that
     the final answers disagree. Held-out merging records are also grouped by
     question, while every accepted split remains excluded from the remainder.
+    Set ``include_heldout=False`` for external benchmarks, whose questions need
+    not contain the construction dataset's held-out questions.
     """
     if len(benchmark_questions) != len(benchmark_ground_truths):
         raise ValueError("Benchmark questions and ground truths must align.")
@@ -1244,7 +1247,8 @@ def build_evaluation_populations(
     accepted_ids = {record["question_id"] for values in splits.values() for record in values}
     heldout: List[Dict[str, Any]] = []
     heldout_ids = set()
-    for record in splits["test"]:
+    test_records = splits["test"] if include_heldout else []
+    for record in test_records:
         if record["question_id"] not in benchmark:
             raise ValueError(f"Held-out accepted question is absent from benchmark: {record['question'][:80]!r}")
         if record["question_id"] not in heldout_ids:
@@ -1261,9 +1265,11 @@ def build_evaluation_populations(
                 not row["reference_matches_canonical"] for row in duplicates
             ),
             "duplicate_benchmark_rows": duplicates,
-            "heldout_records": len(splits["test"]),
+            "heldout_records": len(test_records),
             "unique_heldout_questions": len(heldout),
-            "duplicate_heldout_records_removed": len(splits["test"]) - len(heldout),
+            "duplicate_heldout_records_removed": len(test_records) - len(heldout),
+            "accepted_questions_excluded": len(benchmark) - len(remaining),
+            "eligible_external_questions": len(remaining),
         })
     return {"heldout_accepted": heldout, "remaining_benchmark": remaining}
 

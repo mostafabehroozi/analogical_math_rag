@@ -214,6 +214,9 @@ def evaluate_question(
         "label_kind": record["label_kind"], "status": record["status"],
         "ground_truth": record.get("ground_truth"), "arms": {},
     }
+    for field in ("source_benchmark", "benchmark_index", "benchmark_indices"):
+        if field in record:
+            result[field] = record[field]
 
     def generate(prompt: str, use_adapter: bool, max_new_tokens: int) -> Dict[str, Any]:
         return generator(
@@ -289,7 +292,10 @@ def summarize_evaluation(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "questions": len(rows), "behavior": {}, "solver": {},
         "solver_status_counts": dict(Counter(r.get("solver_status", "UNKNOWN") for r in rows)),
     }
-    for kind in ("copy", "simplify"):
+    kinds = ["copy", "simplify"]
+    if any(row["label_kind"] == "unlabeled" for row in rows):
+        kinds.append("unlabeled")
+    for kind in kinds:
         subset = [r for r in rows if r["label_kind"] == kind]
         summary["behavior"][kind] = {"questions": len(subset)}
         for arm in ("base", "adapted"):
