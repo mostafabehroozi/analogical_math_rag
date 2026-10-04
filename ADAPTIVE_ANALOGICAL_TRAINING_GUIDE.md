@@ -196,6 +196,28 @@ recovery. JSON `policies[method].call_savings` stores these cohorts, both
 `solver_calls` and `total_calls`, expected total savings across questions,
 predicted-MAX stopping rates, and wrong predicted-MAX stopping rates.
 
+The visible table also divides saved calls into **True MAX/q**, **Wrong
+MAX/q**, and **Other/q**. True MAX savings require a predicted-MAX stop
+that returns the historical MAX candidate. Wrong MAX savings come from an
+incorrect predicted-MAX stop, including questions with no historical MAX.
+Other savings come from budget limits or an ended custom sequence. These
+three contributions add up to total saved calls per question; each uses the
+whole row's question group as its denominator. Thus even a budget-limited
+run that happens to return MAX is counted under Other, not True MAX.
+
+A compact **predicted-MAX stops only** table makes the other meaning of
+"MAX enabled" explicit: the prediction gates actually triggered the stop.
+For both all questions and reference-MAX-present questions, it shows the
+MAX-stop rate, mean calls used/saved per such stop, and the fraction of those
+stops that returned the correct reference MAX. Incorrect stops are included.
+Question weights are equal before conditioning on the stop event, and all
+zero-shot orders are averaged within each question. When no MAX stop occurs,
+conditional savings and precision are unavailable (`null`/`--`). This differs
+from overall savings, which also include runs ending at a budget or sequence
+limit. The JSON keys are `predicted_max_stop_precision` and each cost unit's
+`mean_used_on_predicted_max_stop`, `mean_saved_on_predicted_max_stop`, and
+`saved_fraction_on_predicted_max_stop`.
+
 Total API calls include candidate generations, repeated baseline/cross
 measurement solves, and their grading calls. With default settings the
 complete pool uses 233 solver calls and 225 graders: **458 API calls**.
@@ -204,6 +226,9 @@ the recorded-pool simulator, not observed live traffic. Costs and savings
 are averaged across zero-shot orders within each question before aggregating,
 so a question is counted once. Empty MAX-present cohorts have null metrics.
 Trajectories name each acquired evaluator/candidate and its incremental cost.
+Every stopping check, including the initial ZS1 and the final state, records
+available candidate IDs, the selected candidate, the four MAX/SAFE signals,
+and the threshold. These make the reason for stopping inspectable.
 
 Fixed comparison orders affect evaluation only. They are excluded from
 training/checkpoint fingerprints, so matching revision-4 checkpoints can

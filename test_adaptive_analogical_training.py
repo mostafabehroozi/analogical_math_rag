@@ -552,10 +552,23 @@ def test_call_savings_average_orders_per_question_and_keep_max_cohort_separate()
     savings = a.policy_summary(rows)["call_savings"]
     assert savings["all"]["n"] == 2 and savings["max_present"]["n"] == 1
     assert savings["all"]["total_calls"] == dict(mean_full=43., mean_used=19.5,
-                                                mean_saved=23.5, total_saved=47., saved_fraction=47/86)
+                                                mean_saved=23.5, total_saved=47., saved_fraction=47/86,
+                                                mean_saved_by_correct_max_stop=2.75,
+                                                mean_saved_by_wrong_max_stop=20.75,
+                                                mean_saved_by_other_stop=0.,
+                                                mean_used_on_predicted_max_stop=19.5,
+                                                mean_saved_on_predicted_max_stop=23.5,
+                                                saved_fraction_on_predicted_max_stop=47/86)
     assert savings["max_present"]["total_calls"] == dict(mean_full=43., mean_used=16.5,
-                                                        mean_saved=26.5, total_saved=26.5, saved_fraction=26.5/43)
+                                                        mean_saved=26.5, total_saved=26.5, saved_fraction=26.5/43,
+                                                        mean_saved_by_correct_max_stop=5.5,
+                                                        mean_saved_by_wrong_max_stop=21.,
+                                                        mean_saved_by_other_stop=0.,
+                                                        mean_used_on_predicted_max_stop=16.5,
+                                                        mean_saved_on_predicted_max_stop=26.5,
+                                                        saved_fraction_on_predicted_max_stop=26.5/43)
     assert savings["all"]["wrong_predicted_max_stop_rate"] == .75
+    assert savings["all"]["predicted_max_stop_precision"] == .25
     assert savings["max_present"]["exact_max_recovery"] == .5
     no_max = a.policy_summary([row for row in rows if not row["has_max"]])["call_savings"]["max_present"]
     assert no_max["n"] == 0 and no_max["total_calls"]["mean_saved"] is None
@@ -569,6 +582,114 @@ def test_call_counts_include_grading_and_are_independent_of_selected_cost_unit()
         solver_calls=233, total_calls=458)
     cfg.cost_unit = "total_calls"
     assert cfg.full_cost == 458
+
+
+@pytest.mark.parametrize("method", ["fixed_custom", "supervised"])
+@pytest.mark.parametrize("trigger,target,steps,cost", [("initial", 0, 0, 1), ("R2", 0, 1, 11),
+                                                       ("ZS2", 1, 2, 17), ("OS2", 3, 3, 23)])
+def test_max_is_checked_at_initial_state_and_after_every_kind_of_acquisition(method, trigger, target, steps, cost):
+    cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={
+        "fixed_custom": ["ZS1", "R2", "ZS2", "OS2", "R1", "OS1"]})
+    rec = record(cfg)
+    rec.labels[:] = 0
+    rec.labels[target] = 1
+    maximum = np.zeros(cfg.n)
+    maximum[target] = 1
+    class Predictor:
+        device = "cpu"
+        def predict(self, rec, state, cfg_override=None):
+            ready = {"initial": True, "R2": bool(state.evaluator_mask & 2),
+                     "ZS2": bool(state.candidate_mask & 2), "OS2": bool(state.candidate_mask & 8)}[trigger]
+            p = np.zeros(3*cfg.n+2)
+            p[0] = .8
+            if ready:
+                p[target] = .95
+                p[[cfg.n+target, 2*cfg.n+target, 3*cfg.n, 3*cfg.n+1]] = cfg.recognition_threshold
+            return np.zeros(cfg.hidden_dim), p
+    class Head(torch.nn.Module):
+        def forward(self, hidden):
+            return torch.tensor([[0., 4., 3., 1., 2.]]).repeat(len(hidden), 1)
+    row = a.rollout(rec, maximum, Predictor(), cfg, policy=method, head=Head(), trace=True)
+    assert row["reason"] == "predicted_max" and row["cost"] == cost and row["exact_max"]
+    assert len(row["trajectory"]) == steps+1
+    assert [step["acquired_item"] for step in row["trajectory"][:-1]] == ["R2", "ZS2", "OS2"][:steps]
+    assert row["trajectory"][0]["candidates"] == [rec.candidate_ids[0]]
+    assert row["trajectory"][-1]["selected"] == rec.candidate_ids[target]
+    for step in row["trajectory"]:
+        recognized = all(value >= step["recognition_threshold"] for value in step["max_signals"].values())
+        assert recognized == (step["action"] is None)
+    # Historical MAX is used for scoring only; changing it cannot alter the decisions.
+    without_max = a.rollout(rec, np.zeros(cfg.n), Predictor(), cfg, policy=method, head=Head(), trace=True)
+    assert without_max["trajectory"] == row["trajectory"]
+    assert without_max["exact_max"] is None
+    calls = a.policy_summary([row])["call_savings"]["all"]["total_calls"]
+    assert calls["mean_saved_by_correct_max_stop"] == calls["mean_saved"]
+    assert calls["mean_saved_by_other_stop"] == 0
+
+
+@pytest.mark.parametrize("missing", ["global_MAX", "global_SAFE", "selected_MAX", "selected_SAFE"])
+def test_max_stop_requires_every_signal_for_the_selected_available_candidate(missing):
+    cfg = a.Config()
+    p = np.ones(3*cfg.n+2)
+    indices = {"global_MAX": 3*cfg.n+1, "global_SAFE": 3*cfg.n,
+               "selected_MAX": 2*cfg.n, "selected_SAFE": cfg.n}
+    p[indices[missing]] = cfg.recognition_threshold - .01
+    assert a.stopping_reason(p, a.State(), cfg) is None
+    p[indices[missing]] = cfg.recognition_threshold
+    assert a.stopping_reason(p, a.State(), cfg) == "predicted_max"
+
+
+def test_budget_and_short_sequence_savings_are_not_counted_as_max_stopping():
+    cfg = a.Config(k=1, zero_shots=2)
+    full = a.acquisition_call_counts(cfg.n, cfg.k, cfg)
+    rows = []
+    for i, (reason, exact, has_max) in enumerate([
+            ("predicted_max", True, True), ("predicted_max", False, True),
+            ("budget", True, True), ("fixed_sequence_exhaustion", None, False)]):
+        counts = a.acquisition_call_counts(1, 0, cfg)
+        rows.append(dict(uid=str(i), reason=reason, exact_max=exact, has_max=has_max,
+                         correct=int(bool(exact)), cost=1, saved_fraction=1-1/cfg.full_cost,
+                         call_counts=counts, full_call_counts=full))
+    savings = a.policy_summary(rows)["call_savings"]
+    overall = savings["all"]["total_calls"]
+    assert overall["mean_saved"] == 42
+    assert overall["mean_saved_by_correct_max_stop"] == 10.5
+    assert overall["mean_saved_by_wrong_max_stop"] == 10.5
+    assert overall["mean_saved_by_other_stop"] == 21
+    assert overall["mean_saved_on_predicted_max_stop"] == 42
+    assert overall["mean_used_on_predicted_max_stop"] == 1
+    assert savings["all"]["predicted_max_stop_rate"] == .5
+    assert savings["all"]["predicted_max_stop_precision"] == .5
+    assert savings["max_present"]["total_calls"]["mean_saved_by_other_stop"] == 14
+    for cohort in savings.values():
+        for unit in ("solver_calls", "total_calls"):
+            values = cohort[unit]
+            assert values["mean_saved"] == pytest.approx(sum(values[f"mean_saved_by_{stop}_stop"]
+                                                            for stop in ("correct_max", "wrong_max", "other")))
+
+
+def test_predicted_max_stop_savings_condition_on_stops_with_equal_question_weights():
+    cfg = a.Config(k=1, zero_shots=2)
+    full = a.acquisition_call_counts(cfg.n, cfg.k, cfg)
+    def row(uid, n, k, reason):
+        counts = a.acquisition_call_counts(n, k, cfg)
+        return dict(uid=uid, reason=reason, exact_max=True, has_max=True, correct=1,
+                    cost=counts[cfg.cost_unit], saved_fraction=1-counts[cfg.cost_unit]/cfg.full_cost,
+                    call_counts=counts, full_call_counts=full)
+    # First question stops in half of its orders; second stops in all its orders.
+    first = [row("a", 1, 0, "predicted_max"), row("a", 3, 1, "budget")]
+    second = [row("b", 2, 1, "predicted_max")] * 2
+    summary = a.policy_summary(first + second)["call_savings"]["all"]
+    assert summary["predicted_max_stop_rate"] == .75
+    assert summary["predicted_max_stop_precision"] == 1
+    assert summary["total_calls"]["mean_saved_on_predicted_max_stop"] == pytest.approx(64/3)
+    assert summary["total_calls"]["mean_used_on_predicted_max_stop"] == pytest.approx(65/3)
+    assert a.policy_summary(first + second * 3)["call_savings"]["all"] == summary
+    no_stops = a.policy_summary([row("a", 1, 0, "fixed_sequence_exhaustion")])["call_savings"]["all"]
+    assert no_stops["total_calls"]["mean_saved"] == 42
+    assert no_stops["predicted_max_stop_rate"] == 0
+    assert no_stops["predicted_max_stop_precision"] is None
+    assert no_stops["total_calls"]["mean_saved_on_predicted_max_stop"] is None
 
 
 def test_continuation_counts_all_orders_and_rejects_recovery_after_a_broken_goal(monkeypatch):

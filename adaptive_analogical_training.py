@@ -1049,10 +1049,16 @@ def selected_candidate(probabilities, state, cfg):
     return int(np.where(present_mask(state, cfg), probabilities[:cfg.n], -np.inf).argmax())
 
 
-def stopping_reason(probabilities, state, cfg):
+def max_recognition_signals(probabilities, state, cfg):
     i, n = selected_candidate(probabilities, state, cfg), cfg.n
-    threshold = cfg.recognition_threshold
-    if all(probabilities[j] >= threshold for j in (3*n, 3*n+1, n+i, 2*n+i)):
+    return {name: float(probabilities[j]) for name, j in (
+        ("global_MAX", 3*n+1), ("global_SAFE", 3*n),
+        ("selected_MAX", 2*n+i), ("selected_SAFE", n+i))}
+
+
+def stopping_reason(probabilities, state, cfg):
+    if all(value >= cfg.recognition_threshold
+           for value in max_recognition_signals(probabilities, state, cfg).values()):
         return "predicted_max"
     if not valid_actions(state, cfg).any():
         full = state.candidate_mask == (1 << cfg.n)-1 and state.evaluator_mask == (1 << cfg.k)-1
@@ -1600,13 +1606,18 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
         while reason is None:
             hidden, probabilities = predictor.predict(record, state)
             reason = stopping_reason(probabilities, state, cfg)
+            if trace:
+                step = {"candidate_mask": int(state.candidate_mask),
+                        "evaluator_mask": int(state.evaluator_mask),
+                        "evaluators": evaluator_names(state.evaluator_mask, cfg),
+                        "candidates": [record.candidate_ids[i] for i in np.flatnonzero(present_mask(state, cfg))],
+                        "selected": record.candidate_ids[selected_candidate(probabilities, state, cfg)],
+                        "max_signals": max_recognition_signals(probabilities, state, cfg),
+                        "recognition_threshold": cfg.recognition_threshold,
+                        "cost": state_cost(state, cfg)}
             if reason is not None:
                 if trace:
-                    trajectory.append({"candidate_mask": int(state.candidate_mask),
-                                       "evaluator_mask": int(state.evaluator_mask),
-                                       "evaluators": evaluator_names(state.evaluator_mask, cfg),
-                                       "cost": state_cost(state, cfg), "action": None,
-                                       "reason": reason})
+                    trajectory.append({**step, "action": None, "reason": reason})
                 break
             valid = valid_actions(state, cfg)
             if sequence is not None:
@@ -1614,10 +1625,7 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
                 if action is None or not valid[action]:
                     reason = "fixed_sequence_exhaustion" if action is None else "budget"
                     if trace:
-                        trajectory.append({"candidate_mask": int(state.candidate_mask),
-                                           "evaluator_mask": int(state.evaluator_mask),
-                                           "evaluators": evaluator_names(state.evaluator_mask, cfg),
-                                           "cost": state_cost(state, cfg), "action": None,
+                        trajectory.append({**step, "action": None,
                                            "reason": reason, "blocked_fixed_action": action})
                     break
                 sequence.pop(0)
@@ -1631,10 +1639,7 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
                 slot = int(acquired[0]) if len(acquired) else None
                 item = (f"ZS{slot+1}" if slot is not None and slot < cfg.zero_shots else
                         f"OS{slot-cfg.zero_shots+1}" if slot is not None else f"R{action+1}")
-                trajectory.append({"candidate_mask": int(state.candidate_mask),
-                                   "evaluator_mask": int(state.evaluator_mask),
-                                   "evaluators": evaluator_names(state.evaluator_mask, cfg),
-                                   "cost": state_cost(state, cfg), "action": int(action),
+                trajectory.append({**step, "action": int(action),
                                    "action_name": action_names(cfg)[action],
                                    "acquired_item": item,
                                    "acquired_candidate": record.candidate_ids[slot] if slot is not None else None,
@@ -1681,6 +1686,10 @@ def call_savings_summary(question_means):
                    "exact_max_recovery": float(np.mean([row["exact_max"] for row in with_max])) if with_max else None,
                    "predicted_max_stop_rate": float(np.mean([row["predicted_max"] for row in group])) if group else None,
                    "wrong_predicted_max_stop_rate": float(np.mean([row["wrong_predicted_max"] for row in group])) if group else None}
+        stop_weight = sum(row["predicted_max"] for row in group)
+        metrics["predicted_max_stop_precision"] = (
+            float(sum(row["predicted_max"] - row["wrong_predicted_max"] for row in group) / stop_weight)
+            if stop_weight else None)
         for unit in ("solver_calls", "total_calls"):
             used = np.asarray([row["call_counts"][unit] for row in group])
             full = np.asarray([row["full_call_counts"][unit] for row in group])
@@ -1689,6 +1698,20 @@ def call_savings_summary(question_means):
                              "mean_saved": float((full-used).mean()) if group else None,
                              "total_saved": float((full-used).sum()) if group else None,
                              "saved_fraction": float((full-used).sum()/full.sum()) if group else None}
+            for stop in ("correct_max", "wrong_max", "other"):
+                metrics[unit][f"mean_saved_by_{stop}_stop"] = (
+                    float(np.mean([row["savings_by_stop"][unit][stop] for row in group])) if group else None)
+            # Condition on predicted-MAX stops after weighting each question equally.
+            # A question's zero-shot orders must not multiply its influence.
+            full_on_stop = (sum(row["full_call_counts"][unit] * row["predicted_max"]
+                                for row in group) / stop_weight if stop_weight else None)
+            saved_on_stop = (sum(row["savings_by_stop"][unit]["correct_max"] +
+                                 row["savings_by_stop"][unit]["wrong_max"] for row in group) /
+                             stop_weight if stop_weight else None)
+            metrics[unit].update({
+                "mean_used_on_predicted_max_stop": float(full_on_stop - saved_on_stop) if stop_weight else None,
+                "mean_saved_on_predicted_max_stop": float(saved_on_stop) if stop_weight else None,
+                "saved_fraction_on_predicted_max_stop": float(saved_on_stop / full_on_stop) if stop_weight else None})
         result[name] = metrics
     return result
 
@@ -1706,6 +1729,11 @@ def policy_summary(rows):
                               for unit in ("solver_calls", "total_calls")},
               "full_call_counts": {unit: np.mean([r["full_call_counts"][unit] for r in group])
                                    for unit in ("solver_calls", "total_calls")},
+              "savings_by_stop": {unit: {stop: np.mean([
+                  (r["full_call_counts"][unit] - r["call_counts"][unit])
+                  if savings_stop_category(r) == stop else 0. for r in group])
+                  for stop in ("correct_max", "wrong_max", "other")}
+                  for unit in ("solver_calls", "total_calls")},
               "has_max": group[0]["has_max"],
               "exact_max": np.mean([r["exact_max"] for r in group]) if group[0]["has_max"] else None,
               "predicted_max": np.mean([r["reason"] == "predicted_max" for r in group]),
@@ -1730,6 +1758,12 @@ def policy_summary(rows):
             "mean_saved_fraction": float(np.mean([m["saved"] for m in means])),
             "call_savings": call_savings_summary(means),
             "stop_reasons": dict(Counter(r["reason"] for r in rows))}
+
+
+def savings_stop_category(row):
+    if row["reason"] != "predicted_max":
+        return "other"
+    return "correct_max" if row["exact_max"] else "wrong_max"
 
 def continuation_diagnostic(records, ids, teacher, predictor, cfg, head):
     reached, broken = [], []
@@ -1805,15 +1839,28 @@ def policy_report(records, ids, teacher, predictor, cfg, head, title):
               f"{item['mean_cost']:>10.1f} | {item['mean_saved_fraction']:>6.1%}")
     print(f"Cost unit: {cfg.cost_unit}. Early stopping uses predicted MAX, not historical MAX labels.")
     print("API-call savings versus the complete pool (generation + measurement solves + their graders):")
-    print(f"{'Method':<26} | {'Questions':<12} | {'N':>5} | {'Mean API':>9} | {'Saved API/q':>11} | {'Saved':>7} | {'Exact MAX':>9}")
+    print(f"{'Method':<26} | {'Questions':<12} | {'N':>5} | {'Mean API':>9} | {'Saved/q':>9} | {'True MAX/q':>10} | {'Wrong MAX/q':>11} | {'Other/q':>9} | {'Saved':>7} | {'Exact MAX':>9}")
     for name, item in summary.items():
         for cohort, metrics in item["call_savings"].items():
             calls = metrics["total_calls"]
             values = ["--" if calls[key] is None else f"{calls[key]:.1f}"
-                      for key in ("mean_used", "mean_saved")]
+                      for key in ("mean_used", "mean_saved", "mean_saved_by_correct_max_stop",
+                                  "mean_saved_by_wrong_max_stop", "mean_saved_by_other_stop")]
             saved = "--" if calls["saved_fraction"] is None else f"{calls['saved_fraction']:.1%}"
             exact = "--" if metrics["exact_max_recovery"] is None else f"{metrics['exact_max_recovery']:.1%}"
-            print(f"{name:<26} | {cohort:<12} | {metrics['n']:>5} | {values[0]:>9} | {values[1]:>11} | {saved:>7} | {exact:>9}")
+            print(f"{name:<26} | {cohort:<12} | {metrics['n']:>5} | {values[0]:>9} | {values[1]:>9} | {values[2]:>10} | {values[3]:>11} | {values[4]:>9} | {saved:>7} | {exact:>9}")
+    print("Saved/q = True MAX/q + Wrong MAX/q + Other/q; each uses all questions in that row as the denominator.")
+    print("Other/q includes budget limits and ended custom sequences; only True MAX/q reflects a correct MAX-triggered stop.")
+    print("On predicted-MAX stops only (including incorrect stops):")
+    print(f"{'Method':<26} | {'Questions':<12} | {'MAX stop %':>10} | {'API/stop':>9} | {'Saved/stop':>10} | {'Correct MAX':>11}")
+    for name, item in summary.items():
+        for cohort, metrics in item["call_savings"].items():
+            calls = metrics["total_calls"]
+            values = ["--" if calls[key] is None else f"{calls[key]:.1f}"
+                      for key in ("mean_used_on_predicted_max_stop", "mean_saved_on_predicted_max_stop")]
+            rate = "--" if metrics["predicted_max_stop_rate"] is None else f"{metrics['predicted_max_stop_rate']:.1%}"
+            precision = "--" if metrics["predicted_max_stop_precision"] is None else f"{metrics['predicted_max_stop_precision']:.1%}"
+            print(f"{name:<26} | {cohort:<12} | {rate:>10} | {values[0]:>9} | {values[1]:>10} | {precision:>11}")
     return {"policies": summary, "cost_unit": cfg.cost_unit,
             "fixed_acquisition_sequences": fixed_acquisition_sequences(cfg),
             "early_stop_rule": {"reason": "predicted_max", "threshold": cfg.recognition_threshold,
