@@ -170,6 +170,55 @@ Keep the same output directory and configuration to reuse completed shards
 after interruption. Head weights are saved only after Stage 3 finishes, so an
 interrupted head-training loop starts again from epoch 1.
 
+Audit shards are now gzip-compressed losslessly at level 1. This preserves
+every row, array dtype/value, state/order case, and fingerprint; it does not
+reduce coverage or change labels. `load_checkpoint` detects compressed and
+legacy uncompressed shards. Matching legacy shards are validated and then
+atomically compressed in place during resume. Packed training companions and
+public model checkpoints remain ordinary PyTorch files. Use this workflow's
+`load_checkpoint` rather than bare `torch.load` for compressed audit shards.
+
+A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
+write failure, commonly caused by exhausted disk space or a storage quota.
+It is not evidence of a GPU-memory failure. Stage 3 prints the output path
+and free filesystem space, removes known incomplete shard `.pt.tmp` files
+left by old interrupted runs, and preserves completed files on failed writes.
+Write errors report the affected path, free space, and original exception;
+free filesystem space alone does not rule out a quota or I/O problem.
+
+On Kaggle, check `shutil.disk_usage(CFG.output_dir)` and free unneeded files
+if the output filesystem is full. Compression still needs enough temporary
+space to write one shard, and packed companions consume additional space.
+To recover an existing run, use the updated notebook definitions with exactly
+the same `output_dir`, input files, and training configuration, including
+`resume=True`. Rerun configuration and Stage 0, then
+`WORK.train_decision_head()`: it loads completed Stages 1/2 and resumes matching
+shards. Do not create a fresh output directory for this storage-only update.
+
+The Stage 3 implementation reuses budget-specific structure/action tables
+across questions, computes each scenario's observation once for both inference
+and visible-state grouping, and evaluates the scalar goal rules in arrays.
+It still enumerates every state/order case and keeps the same tie rules,
+shared continuation decisions, and masked training objective.
+
+After validating each full shard, it writes a compact `.training.pt` companion
+containing only `h`, `target`, and `valid` tensors. Epochs read these companions
+instead of unpickling the cases and audit metadata repeatedly. Companions are
+regenerated from validated source rows on each Stage 3 invocation, so existing
+schema-3 shards and manifests remain usable with the same configuration and
+output directory. Training transfers one question's tensors to the device
+once, preserves the existing shuffled minibatch order and optimizer steps,
+and reads the accumulated loss back once per question. This uses additional
+disk space for the compact companions and device memory for one question,
+without loading the whole decision dataset into RAM or GPU memory.
+
+For a reproducible **synthetic CPU** comparison against the pre-optimization
+commit, run `python -B benchmark_adaptive_stage3.py`. It writes
+`stage3_performance_report.json`, checks every row field and exhaustive case
+for exact equality, checks head losses/weights, and measures label generation,
+shard loading, and head training separately. This is not evidence of a live
+Kaggle/GPU speedup or a full-run runtime estimate.
+
 Offline reports compare the complete-pool baseline, configurable fixed
 sequences, and learned acquisitions. Defaults for five evaluators and three
 zero-shot candidates are:

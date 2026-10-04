@@ -902,6 +902,70 @@ def test_internal_fractions_and_stage3_shared_training_requirement(tmp_path):
     cfg.validate()  # Internal fractions are ignored in external-development mode.
 
 
+@pytest.mark.parametrize("cost_unit", ["solver_calls", "total_calls"])
+@pytest.mark.parametrize("max_cost", [None, 25.])
+def test_cached_decision_structure_matches_public_action_contract(cost_unit, max_cost):
+    cfg = a.Config(k=2, zero_shots=2, repeats=3, cost_unit=cost_unit, max_cost=max_cost)
+    states, transitions, valid, costs = a.decision_structure(
+        cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    assert states == a.structural_states(cfg.zero_shots, cfg.k)
+    for state in states:
+        np.testing.assert_array_equal(valid[state], a.valid_actions(state, cfg))
+        assert costs[state] == a.state_cost(state, cfg)
+        assert transitions[state] == {int(action): a.advance(state, int(action), cfg)
+                                     for action in np.flatnonzero(a.valid_actions(state, cfg))}
+
+
+@pytest.mark.parametrize("later_rank_filter", [False, True])
+@pytest.mark.parametrize("has_maximum", [False, True])
+def test_vectorized_decision_goals_match_scalar_rules_at_boundaries(later_rank_filter, has_maximum):
+    cfg = a.Config(k=2, zero_shots=2, later_rank_filter=later_rank_filter)
+    states = a.structural_states(cfg.zero_shots, cfg.k)
+    rng = np.random.RandomState(76)
+    # Include exact recognition thresholds and tied correctness probabilities.
+    probabilities = rng.choice([0., .49, .50, .51, 1.], (len(states), 3*cfg.n+2))
+    full = rng.choice([.49, .50, .51], 3*cfg.n+2)
+    order = [2, 0, 3, 1]
+    safe = np.array([1, 0, 1, 0])
+    maximum = np.array([0, 0, int(has_maximum), 0])
+    expected = [[a.goal_condition(rank, order, safe, maximum, p, full, state, cfg)
+                 for rank in range(cfg.n)] for state, p in zip(states, probabilities)]
+    np.testing.assert_array_equal(a.decision_goals(order, safe, maximum, probabilities, full, states, cfg), expected)
+
+
+@pytest.mark.parametrize("train", [False, True])
+def test_packed_head_batches_preserve_losses_updates_and_row_order(train):
+    cfg = a.Config(hidden_dim=8, decision_batch_size=16)
+    rng = np.random.RandomState(91)
+    rows = []
+    for _ in range(73):
+        valid = rng.rand(cfg.action_count) > .4
+        valid[0] = True
+        target = valid.astype(np.float32) / valid.sum()
+        rows.append({"h": rng.randn(cfg.hidden_dim).astype(np.float32), "target": target, "valid": valid})
+    order = rng.permutation(len(rows))
+    reference = a.SupervisedActionHead(cfg)
+    optimized = copy.deepcopy(reference)
+    old_opt = torch.optim.Adam(reference.parameters(), lr=cfg.decision_lr) if train else None
+    new_opt = torch.optim.Adam(optimized.parameters(), lr=cfg.decision_lr) if train else None
+    total = 0.
+    for start in range(0, len(order), cfg.decision_batch_size):
+        batch = [rows[int(i)] for i in order[start:start+cfg.decision_batch_size]]
+        h = torch.tensor(np.stack([row["h"] for row in batch]), dtype=torch.float32)
+        target = torch.tensor(np.stack([row["target"] for row in batch]), dtype=torch.float32)
+        valid = torch.tensor(np.stack([row["valid"] for row in batch]), dtype=torch.bool)
+        loss = -(target * torch.log_softmax(reference(h).masked_fill(~valid, -1e9), dim=1)).sum(1).mean()
+        if train:
+            old_opt.zero_grad(set_to_none=True)
+            loss.backward()
+            old_opt.step()
+        total += float(loss.detach()) * len(batch)
+    actual, count = a.masked_action_loss(optimized, a.pack_decision_rows(rows, cfg), order, cfg, "cpu", new_opt)
+    assert count == len(rows) and actual == total
+    assert all(torch.equal(value, optimized.state_dict()[key]) for key, value in reference.state_dict().items())
+    assert a.masked_action_loss(optimized, [], [], cfg, "cpu") == (0., 0)
+
+
 def test_decision_progress_and_single_coverage_check_preserve_shard_resume(tmp_path, monkeypatch, capsys):
     cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1,
                    decision_epochs=1, decision_batch_size=16, recognition_threshold=.1)
@@ -926,13 +990,79 @@ def test_decision_progress_and_single_coverage_check_preserve_shard_resume(tmp_p
     assert "Stage 3 epoch 1 train: 1/1" in log
     assert "Stage 3 epoch 1 dev: 1/1" in log
     assert "train loss" in log and "dev loss" in log and "ETA" in log
+    # Resume a legacy uncompressed audit shard without regenerating its labels.
+    paths = a.decision_shard_paths(records, splits, tmp_path)
+    legacy = paths["policy"][0]
+    shard = a.load_checkpoint(legacy)
+    a.atomic_torch(legacy, shard)
+    assert not a.compressed_checkpoint(legacy)
+    interrupted = paths["dev"][0].with_suffix(".pt.tmp")
+    interrupted.write_bytes(b"leftover from failed dev shard")
     monkeypatch.setattr(a, "build_decision_rows", lambda *args: pytest.fail("Should reuse saved shards"))
     resumed = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
+    assert a.compressed_checkpoint(legacy)
+    assert not interrupted.exists()
     assert len(checks) == 4
     assert "built 0, reused 1" in capsys.readouterr().out
     assert first["coverage"] == resumed["coverage"]
     assert first["history"] == resumed["history"]
     assert all(torch.equal(value, resumed["weights"][key]) for key, value in first["weights"].items())
+
+
+@pytest.mark.parametrize("compress", [False, True])
+@pytest.mark.parametrize("failure", ["save", "replace"])
+def test_checkpoint_write_failure_preserves_completed_file_and_cleans_partial(
+        tmp_path, monkeypatch, compress, failure):
+    path = tmp_path / "completed.pt"
+    a.atomic_torch(path, {"weights": torch.tensor([7.])})
+    original_bytes = path.read_bytes()
+    # A leftover from the old writer must not prevent a new atomic attempt.
+    path.with_suffix(".pt.tmp").write_bytes(b"previous interrupted write")
+    if failure == "save":
+        def fail_save(value, handle):
+            handle.write(b"partial write")
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(a.torch, "save", fail_save)
+    else:
+        def fail_replace(*args):
+            raise OSError(122, "Disk quota exceeded")
+        monkeypatch.setattr(a.os, "replace", fail_replace)
+    with pytest.raises(RuntimeError, match="Checkpoint write failed") as caught:
+        a.atomic_torch(path, {"weights": torch.tensor([9.])}, compress=compress)
+    assert str(path) in str(caught.value)
+    assert "GiB free" in str(caught.value) and "storage quota" in str(caught.value)
+    assert isinstance(caught.value.__cause__, OSError)
+    assert path.read_bytes() == original_bytes
+    assert not path.with_suffix(".pt.tmp").exists()
+    assert a.load_checkpoint(path)["weights"].item() == 7.
+
+
+def test_compressed_decision_shard_preserves_all_audit_and_training_fields(tmp_path):
+    cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1,
+                   recognition_threshold=.1)
+    r = record(cfg)
+    scores = np.arange(cfg.n, 0, -1, dtype=np.float32)
+    safe, maximum = np.ones(cfg.n), np.array([1., 0., 0., 0.])
+    rows, cases = a.build_decision_rows(r, scores, safe, maximum, fake_predictor(cfg), cfg)
+    assert rows
+    shard = {"rows": rows, "cases": cases}
+    plain, zipped = tmp_path / "plain.pt", tmp_path / "zipped.pt"
+    a.atomic_torch(plain, shard)
+    a.atomic_torch(zipped, shard, compress=True)
+    assert zipped.stat().st_size < plain.stat().st_size
+    assert a.compressed_checkpoint(zipped) and not a.compressed_checkpoint(plain)
+    restored = a.load_checkpoint(zipped)
+    assert restored["cases"] == cases
+    for expected, actual in zip(rows, restored["rows"]):
+        assert actual.keys() == expected.keys()
+        for key, value in expected.items():
+            if isinstance(value, np.ndarray):
+                assert actual[key].dtype == value.dtype
+                np.testing.assert_array_equal(actual[key], value)
+            else:
+                assert actual[key] == value
+    for key, tensor in a.pack_decision_rows(rows, cfg).items():
+        assert torch.equal(tensor, a.pack_decision_rows(restored["rows"], cfg)[key])
 
 
 def test_notebook_is_self_contained_compiles_and_matches_module():

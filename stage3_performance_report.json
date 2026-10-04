@@ -1,0 +1,53 @@
+{
+  "evidence": "synthetic CPU microbenchmark; not a live Kaggle/GPU run",
+  "baseline_ref": "8afb15c",
+  "torch_version": "2.8.0+cu128",
+  "cpu_threads": 1,
+  "config": {
+    "k": 5,
+    "zero_shots": 3,
+    "decision_batch_size": 128
+  },
+  "questions": [
+    {
+      "question": 0,
+      "baseline_label_seconds": 4.8214041000000005,
+      "optimized_label_seconds": 1.9084733000000007,
+      "action_rows": 4008,
+      "state_order_cases": 11472,
+      "exact_label_match": true
+    },
+    {
+      "question": 1,
+      "optimized_label_seconds": 1.6505129999999983,
+      "baseline_label_seconds": 4.667311699999999,
+      "action_rows": 3621,
+      "state_order_cases": 11472,
+      "exact_label_match": true
+    },
+    {
+      "question": 2,
+      "baseline_label_seconds": 4.5182258,
+      "optimized_label_seconds": 1.6865848999999997,
+      "action_rows": 3606,
+      "state_order_cases": 11472,
+      "exact_label_match": true
+    }
+  ],
+  "files": {
+    "audit_file_bytes": 6813043,
+    "training_file_bytes": 2046725,
+    "audit_load_seconds_median": 0.09754960000000068,
+    "training_load_seconds_median": 0.0005491000000006352
+  },
+  "head": {
+    "baseline_train_seconds_median": 0.03257929999999831,
+    "optimized_train_seconds_median": 0.024771600000001115,
+    "exact_loss_and_weights_match": true
+  },
+  "label_seconds_median": {
+    "baseline": 4.667311699999999,
+    "optimized": 1.6865848999999997,
+    "speedup": 2.767315004421064
+  }
+}
