@@ -179,21 +179,32 @@ def grouped_split(
 
 
 def _chat_tokens(tokenizer: Any, prompt: str, label: str) -> Dict[str, List[int]]:
+    """Keep the inference prompt intact across the completion token boundary.
+
+    BPE can merge the assistant header's trailing newline with the first answer
+    character when the full conversation is encoded in one pass. Render and
+    validate the text prefix, then encode the prompt and completion separately
+    so training sees the same prompt tokens as local generation.
+    """
     user_messages = [{"role": "user", "content": prompt}]
     full_messages = user_messages + [{"role": "assistant", "content": label}]
-    prompt_ids = tokenizer.apply_chat_template(
-        user_messages, tokenize=True, add_generation_prompt=True
+    prompt_text = tokenizer.apply_chat_template(
+        user_messages, tokenize=False, add_generation_prompt=True
     )
-    full_ids = tokenizer.apply_chat_template(
-        full_messages, tokenize=True, add_generation_prompt=False
+    full_text = tokenizer.apply_chat_template(
+        full_messages, tokenize=False, add_generation_prompt=False
     )
+    if not full_text.startswith(prompt_text):
+        raise ValueError("Tokenizer chat template does not preserve the generation-prompt text prefix.")
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    completion_ids = tokenizer(
+        full_text[len(prompt_text):], add_special_tokens=False
+    )["input_ids"]
     if hasattr(prompt_ids, "tolist"):
         prompt_ids = prompt_ids.tolist()
-    if hasattr(full_ids, "tolist"):
-        full_ids = full_ids.tolist()
-    if full_ids[: len(prompt_ids)] != prompt_ids:
-        raise ValueError("Tokenizer chat template does not preserve the generation-prompt prefix.")
-    return {"prompt_ids": list(prompt_ids), "input_ids": list(full_ids)}
+    if hasattr(completion_ids, "tolist"):
+        completion_ids = completion_ids.tolist()
+    return {"prompt_ids": list(prompt_ids), "input_ids": list(prompt_ids) + list(completion_ids)}
 
 
 def tokenize_splits(
