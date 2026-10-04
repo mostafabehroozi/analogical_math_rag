@@ -14,6 +14,7 @@ import numpy as np
 from src.benchmark_data import HUGGINGFACE_BENCHMARK_SPECS, benchmark_name_for_target_index
 from src.finetuning_evaluation import external_evaluation_benchmarks, load_external_evaluation_benchmark
 from src.merging_finetuning import normalize_question, summarize_evaluated_runs
+from src.merging_evaluation_checkpoints import MergingEvaluationCheckpoint, canonical_fingerprint
 from src.simplification_finetuning import SIMPLIFICATION_INSTRUCTION, evaluate_question, summarize_evaluation
 from src.utils import save_json_atomic
 
@@ -123,7 +124,8 @@ class NotebookExternalEvaluationTests(TestCase):
             name = config["TARGET_BENCHMARK"]
             judged.append(name)
             correct = name in ("math500", "aime25")
-            return {"root_correct": correct, "node_correctness": {"leaf": correct}, "transitions": {}}
+            return {"root_correct": correct, "node_correctness": {"leaf": correct},
+                    "judge_status": {"leaf": "SUCCESS"}, "transitions": {}}
 
         with TemporaryDirectory() as directory, redirect_stdout(StringIO()):
             root = Path(directory)
@@ -134,6 +136,12 @@ class NotebookExternalEvaluationTests(TestCase):
                 "evaluator": object(), "generator": object(), "embedding_model": object(),
                 "exemplar_data": {"questions": [], "solutions": []}, "embedded_exemplars": [],
                 "GENERATION": {}, "np": np, "json": json, "save_json_atomic": save_json_atomic,
+                "MergingEvaluationCheckpoint": MergingEvaluationCheckpoint,
+                "canonical_fingerprint": canonical_fingerprint,
+                "evaluation_identity": {"test_protocol": 1}, "HF_TOKEN": None,
+                "HF_EVAL_DATASET_REPO_ID": None, "HF_EVAL_REMOTE_PREFIX": "merging_evaluations",
+                "HF_EVAL_UPLOAD_ENABLED": False, "HF_EVAL_RESTORE_ENABLED": False,
+                "HF_EVAL_DATASET_PRIVATE": True, "HF_EVAL_UPLOAD_EVERY": 10,
                 "load_external_evaluation_benchmark": self.benchmark_loader(events, root),
                 "retrieve_exemplars_cpu": lambda *args, **kwargs: [],
                 "generate_candidate_pool": lambda *args, **kwargs: {"candidates": [tree["trace"][0]] * kwargs["count"]},
@@ -156,6 +164,11 @@ class NotebookExternalEvaluationTests(TestCase):
                 self.assertEqual(metric["accuracy_on_evaluated"], float(name in ("math500", "aime25")))
                 rows = json.loads((root / name / "phase_1_results.json").read_text())
                 self.assertTrue(all(row["benchmark"] == name for row in rows))
+            events.clear()
+            judged.clear()
+            exec(notebook_cell("merging_finetuning.ipynb", "def evaluate_population"), namespace)
+            self.assertEqual(events, external_evaluation_benchmarks())
+            self.assertEqual(judged, [], "Completed merging questions must skip inference and judgment")
 
     def test_simplification_separate_reports_and_resume_use_external_unlabeled_rows(self):
         self.summary_file = "summary.json"

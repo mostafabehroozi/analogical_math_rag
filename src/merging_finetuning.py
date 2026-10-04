@@ -90,11 +90,16 @@ def load_merging_datasets(paths: Sequence[os.PathLike[str] | str]) -> Dict[str, 
         path = Path(raw_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(path)
-        sources.append({"path": str(path), "sha256": _sha256_file(path)})
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if not isinstance(payload, list):
             raise ValueError(f"{path} must contain a JSON list")
+        source = {
+            "path": str(path), "sha256": _sha256_file(path),
+            "raw_rows": len(payload), "extracted_rows": 0,
+            "invalid_rows": 0, "exact_duplicate_rows": 0,
+        }
+        sources.append(source)
         for source_index, item in enumerate(payload):
             try:
                 if not isinstance(item, Mapping):
@@ -112,10 +117,11 @@ def load_merging_datasets(paths: Sequence[os.PathLike[str] | str]) -> Dict[str, 
                 if duplicate_key in seen:
                     failures.append({
                         "source_path": str(path), "source_index": source_index,
+                        "source_row": source_index + 1,
                         "reason": "exact_duplicate",
                     })
+                    source["exact_duplicate_rows"] += 1
                     continue
-                seen.add(duplicate_key)
                 records.append({
                     "record_id": hashlib.sha256(
                         (str(path) + ":" + str(source_index)).encode("utf-8")
@@ -130,12 +136,17 @@ def load_merging_datasets(paths: Sequence[os.PathLike[str] | str]) -> Dict[str, 
                     "metadata": dict(item.get("metadata") or {}),
                     "source_path": str(path),
                     "source_index": source_index,
+                    "source_row": source_index + 1,
                 })
+                seen.add(duplicate_key)
+                source["extracted_rows"] += 1
             except (KeyError, TypeError, ValueError) as exc:
                 failures.append({
                     "source_path": str(path), "source_index": source_index,
+                    "source_row": source_index + 1,
                     "reason": str(exc),
                 })
+                source["invalid_rows"] += 1
     if not records:
         raise ValueError("No valid merging records were loaded.")
     return {"records": records, "failures": failures, "sources": sources}
@@ -262,11 +273,39 @@ def prepare_merging_data(
     """Prepare grouped data and persist a reproducibility manifest."""
     loaded = load_merging_datasets(paths)
     splits = grouped_split(loaded["records"], seed=seed)
+    dataset_statistics = {
+        "json_rows": sum(source["raw_rows"] for source in loaded["sources"]),
+        "extracted_rows": len(loaded["records"]),
+        "invalid_rows": sum(source["invalid_rows"] for source in loaded["sources"]),
+        "exact_duplicate_rows": sum(
+            source["exact_duplicate_rows"] for source in loaded["sources"]
+        ),
+        "split_rows": {name: len(values) for name, values in splits.items()},
+    }
+    print(
+        "Merging fine-tuning dataset: "
+        f"extracted {dataset_statistics['extracted_rows']} rows "
+        f"from {dataset_statistics['json_rows']} JSON rows "
+        f"(invalid: {dataset_statistics['invalid_rows']}; "
+        f"exact duplicates: {dataset_statistics['exact_duplicate_rows']})."
+    )
+    for source in loaded["sources"]:
+        print(
+            f"  {source['path']}: extracted {source['extracted_rows']} "
+            f"of {source['raw_rows']} rows "
+            f"(invalid: {source['invalid_rows']}; "
+            f"exact duplicates: {source['exact_duplicate_rows']})."
+        )
+    print(
+        "Merging dataset split rows: "
+        + ", ".join(f"{name}={count}" for name, count in dataset_statistics["split_rows"].items())
+    )
     manifest: Dict[str, Any] = {
         "format_version": 1,
         "seed": seed,
         "split_ratios": [0.8, 0.1, 0.1],
         "sources": loaded["sources"],
+        "dataset_statistics": dataset_statistics,
         "parsing_failures": loaded["failures"],
         "split_membership": {
             name: [record["record_id"] for record in values]
@@ -281,11 +320,24 @@ def prepare_merging_data(
     if tokenizer is not None:
         tokenized, token_report = tokenize_splits(splits, tokenizer, max_length)
         manifest["token_statistics"] = token_report
+        dataset_statistics["tokenized_split_rows"] = {
+            name: len(values) for name, values in tokenized.items()
+        }
+        print(
+            "Merging tokenized split rows after overlength filtering: "
+            + ", ".join(
+                f"{name}={count}"
+                for name, count in dataset_statistics["tokenized_split_rows"].items()
+            )
+        )
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     if not save_json_atomic(manifest, str(output_path / "data_manifest.json")):
         raise OSError("Failed to save data_manifest.json")
-    return {"splits": splits, "tokenized": tokenized, "manifest": manifest}
+    return {
+        "splits": splits, "tokenized": tokenized, "manifest": manifest,
+        "dataset_statistics": dataset_statistics,
+    }
 
 
 class CompletionOnlyCollator:
@@ -1291,8 +1343,13 @@ def evaluate_tree_trace(
     evaluator_manager: Any,
     evaluator_config: Mapping[str, Any],
     evaluation_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    checkpoint_callback: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
-    """Judge successful generated nodes and compute transparent transition counts."""
+    """Judge nodes, checkpoint successful judgments, and count transitions.
+
+    Failed judgments remain unknown and are retried when a partial evaluation
+    resumes; a successful judgment is persisted before the next API call.
+    """
     judged: Dict[str, Optional[bool]] = {}
     judge_status: Dict[str, str] = {}
     for node in tree_result.get("trace", []):
@@ -1302,12 +1359,14 @@ def evaluate_tree_trace(
             (str(ground_truth) + "\0" + str(node["text"])).encode("utf-8")
         ).hexdigest()
         result = (evaluation_cache or {}).get(cache_key)
-        if result is None:
+        if result is None or result.get("status") != "SUCCESS":
             result = evaluate_single_answer_with_llm(
                 node["text"], ground_truth, evaluator_manager, dict(evaluator_config)
             )
-            if evaluation_cache is not None:
+            if evaluation_cache is not None and result.get("status") == "SUCCESS":
                 evaluation_cache[cache_key] = dict(result)
+                if checkpoint_callback is not None:
+                    checkpoint_callback()
         judged[node["node_id"]] = result.get("is_correct") if result.get("status") == "SUCCESS" else None
         judge_status[node["node_id"]] = result.get("status", "UNKNOWN")
     transitions = {"corrections": 0, "regressions": 0, "unchanged": 0, "unknown": 0}

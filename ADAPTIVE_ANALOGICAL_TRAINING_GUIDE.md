@@ -4,6 +4,22 @@ The executable workflow is `adaptive_analogical_training.py`. The Kaggle
 notebook embeds the same definitions. Both use recorded Layer-1 run logs;
 training and offline evaluation make no provider calls.
 
+## Kaggle GPU execution
+
+Enable **Settings > Accelerator > GPU** before running the notebook. Leave
+`CFG.device="auto"`: all three stages select CUDA when PyTorch can see a GPU,
+and fall back to CPU when none is available. Each stage prints its selected
+device. Set `device="cuda"` if you want training to stop with a clear error
+when a GPU is unavailable; `device="cpu"` explicitly selects CPU.
+
+Stage 1 trains every fold teacher and the final teacher on the selected device.
+Stage 2 trains the snapshot predictor there. Stage 3 runs the frozen encoder
+and trains the acquisition head there. JSON loading, observation construction,
+continuation planning, and shard I/O remain CPU operations, so Stage 3 can
+remain CPU-bound between GPU forwards. One selected GPU is used; multiple
+Kaggle GPUs do not pool their memory. Completed checkpoints resume rather than
+retrain, and can move between CPU and GPU without changing the data contract.
+
 ## Evidence and models
 
 Each default question has three zero-shot candidates, five retrieved examples,
