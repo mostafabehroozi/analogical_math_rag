@@ -1,0 +1,70 @@
+{
+  "evidence": "Offline synthetic smoke regression on local NVIDIA laptop GPU; not a Kaggle or T4 run",
+  "baseline_ref": "1034634",
+  "torch_version": "2.8.0+cu128",
+  "cuda_version": "12.8",
+  "device": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+  "total_device_memory_bytes": 4294443008,
+  "cpu_threads": 1,
+  "config": {
+    "k": 5,
+    "zero_shots": 3,
+    "hidden_dim": 128,
+    "decision_batch_size": 128,
+    "decision_eval_batch_size": 4096
+  },
+  "labels": {
+    "baseline": {
+      "seconds": 2.7736368000000002,
+      "peak_allocated_bytes": 13514752,
+      "peak_reserved_bytes": 27262976
+    },
+    "optimized": {
+      "seconds": 1.5450624999999993,
+      "peak_allocated_bytes": 13514752,
+      "peak_reserved_bytes": 27262976
+    },
+    "action_rows": 4008,
+    "state_order_cases": 11472,
+    "exact_all_row_fields_and_case_match": true
+  },
+  "head_training": {
+    "baseline": {
+      "seconds": 0.49034560000000127,
+      "summed_loss": 5875.470146179199,
+      "rows": 4008,
+      "optimizer_steps": 32,
+      "peak_allocated_bytes": 21506560,
+      "peak_reserved_bytes": 27262976
+    },
+    "optimized": {
+      "seconds": 0.061154099999999545,
+      "summed_loss": 5875.470146179199,
+      "rows": 4008,
+      "optimizer_steps": 32,
+      "peak_allocated_bytes": 21506560,
+      "peak_reserved_bytes": 27262976
+    },
+    "exact_loss_and_weights_match": true
+  },
+  "dev_evaluation": {
+    "128": {
+      "seconds": 0.022570399999999324,
+      "mean_loss": 1.4421623783435173,
+      "rows": 4008,
+      "peak_allocated_bytes": 21506560,
+      "peak_reserved_bytes": 27262976
+    },
+    "4096": {
+      "seconds": 0.0034250000000000114,
+      "mean_loss": 1.442162275314331,
+      "rows": 4008,
+      "peak_allocated_bytes": 24865280,
+      "peak_reserved_bytes": 48234496
+    },
+    "absolute_mean_loss_difference": 1.0302918629356839e-07,
+    "mean_loss_matches_within_1e_6": true
+  },
+  "memory_scope": "Peak allocated includes both frozen predictor replicas and heads used for comparison; tensors remain bounded to one question plus model/optimizer workspaces.",
+  "timing_scope": "Single-pass smoke timings include first-use GPU kernel/optimizer overhead; do not treat these as representative speedups."
+}

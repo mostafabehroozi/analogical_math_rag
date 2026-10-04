@@ -67,6 +67,13 @@ It evaluates each under all six zero-shot permutations: **11,472 state/order
 cases per question**. Enumeration is independent of runtime acquisition order
 and budget. Cases above the budget stay in the dataset with an explicit status.
 
+Thus **2,000 training questions produce 22,944,000 state/order cases**, before
+development questions. These are exhaustive audit cases, not 22,944,000 head
+training rows: only `ACTION` cases contribute, and identical visible
+observations share one row. This expansion, together with continuation search
+and shard I/O, explains why Stage 3 can be slow even though the head is small.
+Question count alone is not its training-set size.
+
 The frozen Stage 2 predictor supplies recognition probabilities for each
 in-budget state, and complete-state reference probabilities once per
 permutation. Candidate identities, teacher ties, SAFE/MAX labels, and rank
@@ -154,8 +161,11 @@ manifest and shards bind to the config, split, teacher labels, and frozen
 predictor fingerprint. An interrupted build resumes completed matching
 questions; incompatible shards fail explicitly. A role with no actionable
 rows fails with its coverage report. During training, policy question and row
-order are shuffled deterministically each epoch, one shard is read at a time,
-and dev shards are read in stable order for masked-loss checkpoint selection.
+order are shuffled deterministically each epoch, and dev questions are read in
+stable order for masked-loss checkpoint selection. All exhaustive labels and
+frozen hidden vectors are constructed **once before the head's epoch loop**;
+epochs reuse those rows and never regenerate states, planner targets, or
+encoder features. A new invocation validates matching shards before reuse.
 The frozen Stage 2 state is checked after training.
 
 Stage 3 prints question progress, elapsed time, and estimated remaining time
@@ -167,8 +177,15 @@ labels are complete; development labels come next, before head training.
 With the default external-development setting, all four benchmark logs supply
 development questions, and their exhaustive label build can be substantial.
 Keep the same output directory and configuration to reuse completed shards
-after interruption. Head weights are saved only after Stage 3 finishes, so an
-interrupted head-training loop starts again from epoch 1.
+after interruption. After every completed training/development epoch,
+`decision_head_progress.pt` atomically saves current and best head weights,
+Adam state, question/row shuffle RNG, losses, and early-stopping bookkeeping.
+With `resume=True`, head optimization continues from the last completed epoch;
+an interrupted partial epoch repeats from its start. Failed checkpoint writes
+preserve the previous completed epoch. Older interrupted runs without this
+progress file begin head training at epoch 1. Keep the training and development
+settings and selected device consistent when comparing a resumed run to an
+uninterrupted run. The final selected head is saved when Stage 3 finishes.
 
 Audit shards are now gzip-compressed losslessly at level 1. This preserves
 every row, array dtype/value, state/order case, and fingerprint; it does not
@@ -196,28 +213,92 @@ the same `output_dir`, input files, and training configuration, including
 shards. Do not create a fresh output directory for this storage-only update.
 
 The Stage 3 implementation reuses budget-specific structure/action tables
-across questions, computes each scenario's observation once for both inference
-and visible-state grouping, and evaluates the scalar goal rules in arrays.
+across questions, constructs observations in NumPy batches, reuses each
+scenario's observations for both inference and visible-state grouping, and
+evaluates the scalar goal rules in arrays.
 It still enumerates every state/order case and keeps the same tie rules,
 shared continuation decisions, and masked training objective.
 
 After validating each full shard, it writes a compact `.training.pt` companion
 containing only `h`, `target`, and `valid` tensors. Epochs read these companions
-instead of unpickling the cases and audit metadata repeatedly. Companions are
-regenerated from validated source rows on each Stage 3 invocation, so existing
-schema-3 shards and manifests remain usable with the same configuration and
-output directory. Training transfers one question's tensors to the device
+instead of unpickling the cases and audit metadata repeatedly. Matching
+companions are validated and reused; missing or stale companions are rebuilt
+from validated source rows. Existing schema-3 shards and manifests remain
+usable with the same configuration and output directory. Training transfers
+one question's tensors to the device
 once, preserves the existing shuffled minibatch order and optimizer steps,
-and reads the accumulated loss back once per question. This uses additional
-disk space for the compact companions and device memory for one question,
-without loading the whole decision dataset into RAM or GPU memory.
+and reads the accumulated loss back once per question.
 
-For a reproducible **synthetic CPU** comparison against the pre-optimization
-commit, run `python -B benchmark_adaptive_stage3.py`. It writes
-`stage3_performance_report.json`, checks every row field and exhaustive case
-for exact equality, checks head losses/weights, and measures label generation,
-shard loading, and head training separately. This is not evidence of a live
-Kaggle/GPU speedup or a full-run runtime estimate.
+`decision_cache_mb=4096` sets a 4 GiB requested packed-tensor CPU cache cap,
+further limited to half the currently available host RAM. If available RAM
+cannot be detected, the cache is disabled. It retains memory-mapped tensors
+for a role only if every question in that role fits in the remaining budget,
+considering policy first. Other roles stream one memory-mapped packed question
+at a time. The OS pages these tensors on demand; the cache does not eagerly
+clone the entire dataset into RAM. Whole-role admission avoids repeatedly
+filling and evicting a partial cache when question order changes each epoch.
+`decision_cache_mb=0` disables the cache. This is a runtime setting: changing
+it does not invalidate matching experiment artifacts. The cap covers retained
+tensor payloads, not the entire process; records, one question's audit
+metadata, model state, and temporary arrays also need RAM. Every row remains
+available in either mode. Only one question's training tensors occupy GPU
+memory at a time; compact companions require additional disk space.
+
+`decision_eval_batch_size=4096` uses larger development-only forward batches
+for head evaluation. Every development row still contributes to masked loss,
+and training minibatches and optimizer steps stay unchanged. Floating-point
+roundoff can produce tiny development-loss differences and affect checkpoint
+selection or early stopping when losses are nearly tied. This is also a
+runtime setting; set it to `128` to use the earlier development batch size.
+Keep it unchanged across an interrupted run when preserving its checkpoint
+selection behavior matters.
+
+On Kaggle, enable an available GPU in **Settings > Accelerator** and keep
+`device="auto"`. The selected device runs the frozen encoder's batched
+inference during labeling and the head's forward/backward passes. Observation
+assembly, state enumeration, continuation search, grouping, and shard
+serialization still run on the CPU; enabling CUDA does not move Python search
+or file I/O to the GPU. The Stage 0 notebook cell reports the selected device,
+available GPUs, memory, and CPU threads so the active session can be checked.
+Kaggle offers GPU options such as T4 x2 and P100; this workflow uses one
+selected device and does not automatically combine two GPUs' memory.
+See [NVIDIA's Kaggle setup instructions](https://docs.nvidia.com/datascience/deployment/latest/platforms/kaggle/).
+
+The default `decision_batch_size=128` retains the same optimizer updates and
+shuffle order. For a new CUDA experiment, try `decision_batch_size=1024` to
+reduce the number of small head updates, then compare development loss and
+checkpoint quality. It keeps every training row but changes update count,
+gradient grouping, and the optimization trajectory; use a **new `output_dir`**
+when changing it. It does not accelerate label construction. The default
+head is too small to assume that adding distributed workers, mixed precision,
+or a second GPU improves total runtime. Reduced device transfers and loss
+readbacks follow the synchronization guidance in
+[PyTorch's performance tuning guide](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html).
+
+For a reproducible **synthetic CPU** comparison against commit `1034634`, run
+`python -B benchmark_adaptive_stage3.py`. It writes
+`stage3_full_dataset_performance_report.json`, checks every row field and
+exhaustive case for exact equality, checks training losses/weights, checks
+development loss within floating-point roundoff, and measures label
+generation, shard loading, and head training/development separately. This is
+not evidence of a live Kaggle/GPU speedup or a full-run runtime estimate.
+
+The recorded local CPU comparison uses one CPU thread and five synthetic
+questions with the default state geometry. Median label construction fell
+from **1.774 s to 0.701 s (2.53x)**; development forwards fell from **0.005934 s
+to 0.002930 s (2.03x)**. All exhaustive cases, row fields, and batch-128 training
+losses/weights matched exactly. Pure head optimization at the unchanged
+training batch size remained about **0.024-0.025 s**, so that measurement does
+not show a training-update speedup. These fixture measurements do not predict
+the runtime of the actual logs or Kaggle hardware.
+
+`stage3_local_cuda_smoke_report.json` records a separate synthetic regression
+on a local RTX 3050 Ti laptop GPU with 4 GiB memory. It verified exact case,
+label, and batch-128 head-update parity. Peak PyTorch allocated memory was
+about **24 MiB** for the comparison fixture, including both predictor replicas
+and heads; CUDA context, reserved allocator memory, and other processes are
+outside that number. Its single-pass timings include first-use overhead and
+are not representative speedup measurements. This was not a Kaggle/T4 run.
 
 Offline reports compare the complete-pool baseline, configurable fixed
 sequences, and learned acquisitions. Defaults for five evaluators and three

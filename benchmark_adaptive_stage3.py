@@ -40,21 +40,28 @@ def check_labels(expected, actual):
 
 def measure_files_and_head(rows, cases, cfg, directory, repeats):
     audit, packed = directory / "audit.pt", directory / "training.pt"
+    compressed = directory / "audit_compressed.pt"
     current.atomic_torch(audit, {"rows": rows, "cases": cases})
+    current.atomic_torch(compressed, {"rows": rows, "cases": cases}, compress=True)
     current.atomic_torch(packed, current.pack_decision_rows(rows, cfg))
     measurements = {"audit_file_bytes": audit.stat().st_size,
+                    "compressed_audit_file_bytes": compressed.stat().st_size,
                     "training_file_bytes": packed.stat().st_size}
-    for name, path in (("audit", audit), ("training", packed)):
-        times = [timed(lambda: current.load_checkpoint(path))[1] for _ in range(repeats)]
+    for name, path in (("audit", audit), ("compressed_audit", compressed),
+                       ("training", packed), ("mapped_training", packed)):
+        loader = current.load_training_checkpoint if name == "mapped_training" else current.load_checkpoint
+        times = [timed(lambda: loader(path))[1] for _ in range(repeats)]
         measurements[name + "_load_seconds_median"] = statistics.median(times)
+    measurements["projected_2000_question_storage_gib"] = (
+        (compressed.stat().st_size + packed.stat().st_size) * 2000 / 1024**3)
     return measurements
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline-ref", default="8afb15c")
+    parser.add_argument("--baseline-ref", default="1034634")
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--output", type=Path, default=Path("stage3_performance_report.json"))
+    parser.add_argument("--output", type=Path, default=Path("stage3_full_dataset_performance_report.json"))
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
@@ -69,7 +76,9 @@ def main():
     report = {"evidence": "synthetic CPU microbenchmark; not a live Kaggle/GPU run",
               "baseline_ref": args.baseline_ref, "torch_version": torch.__version__,
               "cpu_threads": 1, "config": {"k": cfg.k, "zero_shots": cfg.zero_shots,
-                                           "decision_batch_size": cfg.decision_batch_size},
+                                           "decision_batch_size": cfg.decision_batch_size,
+                                           "decision_eval_batch_size": cfg.decision_eval_batch_size,
+                                           "decision_cache_mb": cfg.decision_cache_mb},
               "questions": []}
     with tempfile.TemporaryDirectory(prefix="adaptive_stage3_benchmark_") as temp:
         directory = Path(temp)
@@ -117,7 +126,10 @@ def main():
         # Warm optimizer imports before timing either implementation.
         torch.optim.Adam(head.parameters(), lr=cfg.decision_lr)
         head_results, times = {}, {"baseline": [], "optimized": []}
-        for name, module, inputs in (("baseline", baseline, rows), ("optimized", current, packed)):
+        # Match the baseline's actual epoch path: recent revisions already load
+        # packed tensors, while older revisions pack individual audit rows.
+        baseline_inputs = packed if hasattr(baseline, "pack_decision_rows") else rows
+        for name, module, inputs in (("baseline", baseline, baseline_inputs), ("optimized", current, packed)):
             for _ in range(args.repeats):
                 trained = current.SupervisedActionHead(cfg)
                 trained.load_state_dict(head.state_dict())
@@ -131,6 +143,27 @@ def main():
         report["head"] = {name + "_train_seconds_median": statistics.median(values)
                           for name, values in times.items()}
         report["head"]["exact_loss_and_weights_match"] = True
+        evaluation, eval_results = {}, {}
+        head.eval()
+        with torch.no_grad():
+            for name in ("baseline", "optimized"):
+                eval_times = []
+                for _ in range(args.repeats):
+                    if name == "baseline":
+                        result, seconds = timed(lambda: baseline.masked_action_loss(
+                            head, packed, range(len(rows)), cfg, "cpu"))
+                    else:
+                        result, seconds = timed(lambda: current.masked_action_loss(
+                            head, packed, range(len(rows)), cfg, "cpu",
+                            batch_size=cfg.decision_eval_batch_size))
+                    eval_times.append(seconds)
+                eval_results[name] = result
+                evaluation[name + "_seconds_median"] = statistics.median(eval_times)
+        assert eval_results["baseline"][1] == eval_results["optimized"][1] == len(rows)
+        np.testing.assert_allclose(eval_results["baseline"][0], eval_results["optimized"][0], rtol=1e-6)
+        evaluation["same_row_count_and_loss_within_float_roundoff"] = True
+        evaluation["speedup"] = evaluation["baseline_seconds_median"] / evaluation["optimized_seconds_median"]
+        report["development_forward"] = evaluation
     old = statistics.median(q["baseline_label_seconds"] for q in report["questions"])
     new = statistics.median(q["optimized_label_seconds"] for q in report["questions"])
     report["label_seconds_median"] = {"baseline": old, "optimized": new, "speedup": old/new}

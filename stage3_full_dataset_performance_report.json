@@ -1,0 +1,81 @@
+{
+  "evidence": "synthetic CPU microbenchmark; not a live Kaggle/GPU run",
+  "baseline_ref": "1034634",
+  "torch_version": "2.8.0+cu128",
+  "cpu_threads": 1,
+  "config": {
+    "k": 5,
+    "zero_shots": 3,
+    "decision_batch_size": 128,
+    "decision_eval_batch_size": 4096,
+    "decision_cache_mb": 4096
+  },
+  "questions": [
+    {
+      "question": 0,
+      "baseline_label_seconds": 2.0074793000000004,
+      "optimized_label_seconds": 1.3388773,
+      "action_rows": 4008,
+      "state_order_cases": 11472,
+      "exact_label_match": true
+    },
+    {
+      "question": 1,
+      "optimized_label_seconds": 0.6887784999999997,
+      "baseline_label_seconds": 1.7743904000000006,
+      "action_rows": 3621,
+      "state_order_cases": 11472,
+      "exact_label_match": true
+    },
+    {
+      "question": 2,
+      "baseline_label_seconds": 1.883522300000001,
+      "optimized_label_seconds": 0.6609923000000002,
+      "action_rows": 3606,
+      "state_order_cases": 11472,
+      "exact_label_match": true
+    },
+    {
+      "question": 3,
+      "optimized_label_seconds": 0.7011097,
+      "baseline_label_seconds": 1.7549370999999994,
+      "action_rows": 3792,
+      "state_order_cases": 11472,
+      "exact_label_match": true
+    },
+    {
+      "question": 4,
+      "baseline_label_seconds": 1.6782130000000013,
+      "optimized_label_seconds": 0.7362840999999989,
+      "action_rows": 3849,
+      "state_order_cases": 11472,
+      "exact_label_match": true
+    }
+  ],
+  "files": {
+    "audit_file_bytes": 7187245,
+    "compressed_audit_file_bytes": 3543653,
+    "training_file_bytes": 2184417,
+    "audit_load_seconds_median": 0.11140350000000154,
+    "compressed_audit_load_seconds_median": 0.43698730000000197,
+    "training_load_seconds_median": 0.0007745000000021207,
+    "mapped_training_load_seconds_median": 0.0006054000000013104,
+    "projected_2000_question_storage_gib": 10.669361799955368
+  },
+  "head": {
+    "baseline_train_seconds_median": 0.023989199999999045,
+    "optimized_train_seconds_median": 0.024845199999997902,
+    "exact_loss_and_weights_match": true
+  },
+  "development_forward": {
+    "baseline_seconds_median": 0.005933999999999884,
+    "optimized_seconds_median": 0.002929699999999258,
+    "same_row_count_and_loss_within_float_roundoff": true,
+    "speedup": 2.025463358023479
+  },
+  "label_seconds_median": {
+    "baseline": 1.7743904000000006,
+    "optimized": 0.7011097,
+    "speedup": 2.5308313378063385
+  }
+}

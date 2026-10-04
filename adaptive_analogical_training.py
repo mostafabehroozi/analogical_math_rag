@@ -78,6 +78,8 @@ class Config:
     decision_epochs: int = 100
     decision_lr: float = 1e-4
     decision_batch_size: int = 128
+    decision_eval_batch_size: int = 4096  # Frozen dev forwards; no optimizer changes.
+    decision_cache_mb: int = 4096    # Shared CPU tensor cap; 0 streams memory-mapped shards.
     # Evaluation only: built-in order names or explicit [ZS1, R1, OS1, ...] sequences.
     fixed_acquisition_orders: dict = field(default_factory=lambda: {
         "fixed": "interleaved",
@@ -124,6 +126,7 @@ class Config:
         assert 1 <= self.budget <= self.full_cost
         assert self.teacher_epochs > 0 and self.snapshot_epochs > 0 and self.patience > 0
         assert self.decision_epochs > 0 and self.decision_batch_size >= 2 and self.decision_lr > 0
+        assert self.decision_eval_batch_size >= 2 and self.decision_cache_mb >= 0
         assert self.snapshots_per_query >= 2 and self.dev_snapshots_per_query >= 2
         assert 0 <= self.snapshot_reachable_fraction <= 1
         assert 0 <= self.snapshot_missing_fraction <= 1
@@ -841,6 +844,54 @@ def observation(record, state, cfg, allow_hidden_source=False):
     return x
 
 
+@lru_cache(maxsize=8)
+def structural_observation_template(states, zero_shots, k, repeats, cost_unit,
+                                    max_cost, allow_hidden_source):
+    """Cache state-only bytes/masks; records supply only observed measurements.
+
+    Build through the scalar contract once, retaining its validation, float32
+    rounding and budget features. A default catalog needs about 1.8 MiB, rather
+    than repeating this Python work for every question and historical order.
+    """
+    cfg = Config(zero_shots=zero_shots, k=k, repeats=repeats,
+                 cost_unit=cost_unit, max_cost=max_cost)
+    empty = Record("", "", "", [], [], np.zeros(k, np.float32),
+                   np.zeros(k, np.float32), np.zeros((cfg.n, k), np.float32),
+                   np.zeros(cfg.n, np.float32))
+    template = np.stack([observation(empty, state, cfg, allow_hidden_source)
+                         for state in states])
+    similarity_start = cfg.n * (k + 3) + 2*k
+    baseline_start = similarity_start + 2*k
+    ccs_start = baseline_start + 3*k
+    masks = (template[:, similarity_start+k:similarity_start+2*k].astype(bool),
+             template[:, baseline_start+k:baseline_start+2*k].astype(bool),
+             template[:, ccs_start+cfg.n*k:ccs_start+2*cfg.n*k].astype(bool))
+    template.setflags(write=False)
+    for mask in masks:
+        mask.setflags(write=False)
+    return template, masks, (similarity_start, baseline_start, ccs_start)
+
+
+def observation_many(record, states, cfg, allow_hidden_source=False):
+    """Batch complete structural states; augmented snapshots keep scalar logic."""
+    states = tuple(states)
+    if not states or not all(isinstance(state, State) for state in states):
+        return np.stack([observation(record, state, cfg, allow_hidden_source)
+                         for state in states])
+    template, masks, offsets = structural_observation_template(
+        states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit,
+        cfg.max_cost, allow_hidden_source)
+    xs = template.copy()
+    for source, mask, start in zip((record.similarity, record.baseline, record.ccs.ravel()),
+                                   masks, offsets):
+        block = xs[:, start:start+mask.shape[1]]
+        # Index before assignment: NaNs in unobserved cells must stay invisible.
+        block[mask] = np.broadcast_to(source, mask.shape)[mask]
+    if not np.isfinite(xs).all():
+        raise ValueError("Invalid snapshot observation.")
+    return xs
+
+
 def snapshot_target(record, safe, maximum, state, cfg):
     cm = present_mask(state, cfg).astype(np.float32)
     return np.r_[record.labels, safe, maximum,
@@ -1078,8 +1129,9 @@ class FrozenPredictor:
                      observations=None):
         """Batch frozen inference; only visible measurements enter the network."""
         cfg = cfg_override or self.cfg
-        xs = observations if observations is not None else np.stack([
-            observation(record, s, cfg, allow_hidden_source) for s in states])
+        states = tuple(states)
+        xs = observations if observations is not None else observation_many(
+            record, states, cfg, allow_hidden_source)
         hs, ps = [], []
         self.model.eval()
         with torch.no_grad():
@@ -1089,10 +1141,9 @@ class FrozenPredictor:
                 hs.append(h.cpu().numpy())
                 ps.append(1 / (1 + np.exp(-np.clip(logits / self.temperatures, -40, 40))))
         hidden, probabilities = np.concatenate(hs), np.concatenate(ps)
-        for row, state in enumerate(states):
-            absent = ~present_mask(state, self.cfg)
-            for block in range(3):
-                probabilities[row, block*self.cfg.n:(block+1)*self.cfg.n][absent] = 0
+        present = np.stack([present_mask(state, self.cfg) for state in states])
+        candidate_probabilities = probabilities[:, :3*self.cfg.n].reshape(-1, 3, self.cfg.n)
+        candidate_probabilities[~np.broadcast_to(present[:, None, :], candidate_probabilities.shape)] = 0
         return hidden, probabilities
 
 
@@ -1180,7 +1231,7 @@ def decision_scenario(record, scores, safe, maximum, predictor, cfg, states,
                       allow_hidden_source=False, reference_order=None):
     """Cache frozen evidence and goals without optimizing a clairvoyant path."""
     # Reuse exactly the same observation bytes for inference and visible grouping.
-    observations = np.stack([observation(record, state, cfg, allow_hidden_source) for state in states])
+    observations = observation_many(record, states, cfg, allow_hidden_source)
     if isinstance(predictor, FrozenPredictor):
         hidden, probabilities = predictor.predict_many(
             record, states, allow_hidden_source=allow_hidden_source, observations=observations)
@@ -1240,10 +1291,11 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
     costs = {state: cached_costs[state] if state in cached_costs else state_cost(state, cfg)
              for state in unique_states}
     prefixes = [np.logical_and.accumulate(scenario["goal"], axis=1) for scenario in scenarios]
+    goal_ranks = [prefix.sum(axis=1) for prefix in prefixes]
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
     for sid, scenario in enumerate(scenarios):
         for j, state in enumerate(scenario["states"]):
-            rank = next((r for r, met in enumerate(scenario["goal"][j]) if not met), cfg.n)
+            rank = int(goal_ranks[sid][j])
             valid = valid_by_state[state]
             status = ("COMPLETE" if rank == cfg.n else
                       "EXHAUSTED" if state == full else
@@ -1255,15 +1307,34 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
                           "training_row": None})
             groups.setdefault(scenario["keys"][j], []).append((sid, j, rank))
 
-    transitions = {}
-    for sid, scenario in enumerate(scenarios):
-        for j, state in enumerate(scenario["states"]):
-            possible = (transition_table[state] if transition_table is not None else
-                        {int(action): advance(state, int(action), cfg)
-                         for action in actions_by_state[state]})
-            transitions[sid, j] = {action: scenario["index"][nxt]
-                                   for action, nxt in possible.items()
-                                   if (costs[nxt] if nxt in costs else state_cost(nxt, cfg)) <= cfg.budget + 1e-6}
+    # Compare the same feature pairs with the same NumPy tolerances, in bounded
+    # batches, instead of invoking allclose thousands of times per question.
+    comparisons = []
+    for group in groups.values():
+        sid, j, _ = group[0]
+        hidden = scenarios[sid]["hidden"][j]
+        comparisons.extend((hidden, scenarios[s]["hidden"][index])
+                           for s, index, _ in group if (s, index) != (sid, j))
+    for start in range(0, len(comparisons), 1024):
+        batch = comparisons[start:start+1024]
+        if not np.allclose(np.stack([pair[0] for pair in batch]),
+                           np.stack([pair[1] for pair in batch]), atol=1e-6):
+            raise ValueError("One visible state has inconsistent frozen features.")
+
+    transitions, shared_transitions = [], {}
+    for scenario in scenarios:
+        structure = tuple(scenario["states"])
+        if structure not in shared_transitions:
+            indexed = []
+            for state in structure:
+                possible = (transition_table[state] if transition_table is not None else
+                            {int(action): advance(state, int(action), cfg)
+                             for action in actions_by_state[state]})
+                indexed.append({action: scenario["index"][nxt]
+                                for action, nxt in possible.items()
+                                if (costs[nxt] if nxt in costs else state_cost(nxt, cfg)) <= cfg.budget + 1e-6})
+            shared_transitions[structure] = indexed
+        transitions.append(shared_transitions[structure])
 
     rows = []
     case_index = {(case["scenario"], scenario["index"][State(case["candidate_mask"], case["evaluator_mask"])]): case
@@ -1278,9 +1349,6 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
         scenario = scenarios[sid]
         hidden, state = scenario["hidden"][j], scenario["states"][j]
         valid = valid_by_state[state]
-        if not all(np.allclose(hidden, scenarios[s]["hidden"][index], atol=1e-6)
-                   for s, index, _ in group if (s, index) != (sid, j)):
-            raise ValueError("One visible state has inconsistent frozen features.")
         active = [(s, index, rank) for s, index, rank in group
                   if case_index[s, index]["status"] is None]
         if not active:
@@ -1294,7 +1362,7 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
             outcomes = []
             for s, index, rank in active:
                 current = scenarios[s]
-                successor = transitions[s, index][int(action)]
+                successor = transitions[s][index][int(action)]
                 nxt = current["states"][successor]
                 delta = costs[nxt] - costs[state]
                 flags = current["goal"][successor]
@@ -1381,7 +1449,8 @@ def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
     digest.update(json.dumps({"schema": 3, "revision": PIPELINE_REVISION,
                               "config": {key: value for key, value in asdict(cfg).items()
                                          if key not in {"resume", "output_dir", "device", "cpu_threads", "print_every",
-                                                        "fixed_acquisition_orders"}},
+                                                        "fixed_acquisition_orders", "decision_eval_batch_size",
+                                                        "decision_cache_mb"}},
                               "predictor": predictor_fingerprint(predictor),
                               "data_sha256": data_digest(records),
                               "roles": {role: [records[i].uid for i in splits[role]]
@@ -1453,7 +1522,81 @@ def pack_decision_rows(rows, cfg):
                                       ("valid", cfg.action_count, torch.bool))}
 
 
-def masked_action_loss(model, rows, order, cfg, device, optimizer=None):
+def load_training_checkpoint(path):
+    """Map only the packed, ordinary tensor companion; the OS pages it on demand."""
+    return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+
+
+def ensure_training_companion(path, packed):
+    """Reuse only tensors identical to the validated audit rows; repair derived caches."""
+    if path.exists():
+        try:
+            previous = load_training_checkpoint(path)
+            matches = (set(previous) == set(packed) and all(
+                isinstance(previous[key], torch.Tensor) and
+                previous[key].dtype == value.dtype and torch.equal(previous[key], value)
+                for key, value in packed.items()))
+            del previous  # Close mappings before replacement, including on Windows.
+            if matches:
+                return True
+        except Exception:
+            # This derived cache is reconstructed from the validated source shard.
+            pass
+    atomic_torch(path, packed)
+    return False
+
+
+def available_host_memory():
+    """Available RAM, including reclaimable pages; no mandatory new dependency."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except ImportError:
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+    return None
+
+
+class PackedDecisionCache:
+    """Bounded whole-role tensor reuse, with mmap streaming when a role cannot fit.
+
+    Shuffle accesses each question once per epoch, so an undersized LRU would
+    thrash. Admit complete roles without using the training RNG, policy first.
+    Never retain audit cases or eagerly copy mapped tensors into RAM.
+    """
+    def __init__(self, paths, cfg):
+        available = available_host_memory()
+        requested = int(cfg.decision_cache_mb * 1024**2)
+        self.budget = min(requested, available // 2) if available is not None else 0
+        self.rows, self.bytes = {}, 0
+        retained = []
+        for role in ("policy", "dev"):
+            # File bytes conservatively include tensor payload plus archive headers.
+            required = sum(Path(path).stat().st_size for path in paths[role])
+            if required > self.budget - self.bytes or not self.budget:
+                continue
+            for path in paths[role]:
+                packed = load_training_checkpoint(path)
+                self.rows[Path(path)] = packed
+                self.bytes += sum(t.numel() * t.element_size() for t in packed.values())
+            retained.append(role)
+        print(f"Stage 3 tensor cache: {self.bytes / 1024**2:.1f} MiB retained, "
+              f"{self.budget / 1024**2:.1f} MiB cap (at most half available host RAM); "
+              f"roles {', '.join(retained) or 'none'}; other roles stream memory-mapped tensors.",
+              flush=True)
+
+    def get(self, path):
+        path = Path(path)
+        if path in self.rows:
+            return self.rows[path]
+        return load_training_checkpoint(path)
+
+
+def masked_action_loss(model, rows, order, cfg, device, optimizer=None, *, batch_size=None):
     if not len(order):
         return 0., 0
     packed = rows if isinstance(rows, dict) else pack_decision_rows(rows, cfg)
@@ -1463,8 +1606,11 @@ def masked_action_loss(model, rows, order, cfg, device, optimizer=None):
     valid_all = packed["valid"].to(device=device, dtype=torch.bool)
     indices = torch.as_tensor(np.asarray(order, dtype=np.int64), device=device)
     total, count = torch.zeros((), dtype=torch.float64, device=device), 0
-    for start in range(0, len(order), cfg.decision_batch_size):
-        batch = indices[start:start + cfg.decision_batch_size]
+    size = cfg.decision_batch_size if batch_size is None else batch_size
+    if optimizer is not None and size != cfg.decision_batch_size:
+        raise ValueError("Training must use decision_batch_size to preserve optimizer steps.")
+    for start in range(0, len(order), size):
+        batch = indices[start:start + size]
         h, target, valid = h_all[batch], target_all[batch], valid_all[batch]
         logits = model(h).masked_fill(~valid, -1e9)
         loss = -(target * nn.functional.log_softmax(logits, dim=1)).sum(1).mean()
@@ -1557,9 +1703,9 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
                 atomic_torch(path, shard, compress=True)
                 built += 1
             parts.append(part)
-            # Rebuild from validated source rows, including when resuming older shards.
-            # This cache adds no experiment settings and never replaces audit evidence.
-            atomic_torch(path.with_suffix(".training.pt"), pack_decision_rows(shard["rows"], cfg))
+            # Validate against the source, but do not rewrite an identical companion.
+            ensure_training_companion(path.with_suffix(".training.pt"),
+                                      pack_decision_rows(shard["rows"], cfg))
             del shard
             last_print = decision_progress(f"Stage 3 {role} labels", position, len(paths[role]),
                                            started, last_print, cfg,
@@ -1573,18 +1719,41 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
         if not coverage[role]["action_rows"]:
             raise ValueError(f"No actionable Stage 3 rows for {role}: {coverage[role]}")
     model = SupervisedActionHead(cfg).to(device)
+    cache = PackedDecisionCache(training_paths, cfg)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.decision_lr, weight_decay=cfg.weight_decay)
     best, weights, stale, history = math.inf, None, 0, []
     rng = np.random.RandomState(cfg.seed + 301)
+    progress_path = out / "decision_head_progress.pt"
+    start_epoch = 0
+    if cfg.resume and progress_path.exists():
+        progress = load_checkpoint(progress_path)
+        if progress.get("schema_version") != 1 or progress.get("fingerprint") != fingerprint:
+            raise ValueError("Decision head progress has an incompatible training contract.")
+        start_epoch = progress["epoch"]
+        if not (0 < start_epoch <= cfg.decision_epochs and
+                len(progress["history"]) == start_epoch and
+                1 <= progress["best_epoch"] <= start_epoch and progress["stale"] >= 0):
+            raise ValueError("Decision head progress has inconsistent epoch bookkeeping.")
+        model.load_state_dict(progress["current_weights"])
+        opt.load_state_dict(progress["optimizer"])
+        rng.set_state(progress["rng_state"])
+        best, weights, best_epoch = progress["dev_loss"], progress["best_weights"], progress["best_epoch"]
+        stale, history = progress["stale"], progress["history"]
+        del progress
+        print(f"Stage 3 head resume: {start_epoch} completed epochs; "
+              "restored optimizer, shuffle RNG, and best development checkpoint.", flush=True)
     print(f"Stage 3 head training: device={device}, up to {cfg.decision_epochs} epochs, "
-          f"batch size={cfg.decision_batch_size}.", flush=True)
-    for epoch in range(cfg.decision_epochs):
+          f"train batch={cfg.decision_batch_size}, dev batch={cfg.decision_eval_batch_size}. "
+          "Labels are complete; no per-epoch generation.", flush=True)
+    for epoch in range(start_epoch, cfg.decision_epochs):
+        if stale >= cfg.patience:
+            break
         epoch_started = time.monotonic()
         model.train()
         started = last_print = time.monotonic()
         train_total, train_count = 0., 0
         for position, path in enumerate(rng.permutation(training_paths["policy"]), 1):
-            rows = load_checkpoint(path)
+            rows = cache.get(path)
             value, n = masked_action_loss(model, rows, rng.permutation(len(rows["h"])), cfg, device, opt)
             train_total, train_count = train_total + value, train_count + n
             del rows
@@ -1595,8 +1764,9 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
             started = last_print = time.monotonic()
             total, count = 0., 0
             for position, path in enumerate(training_paths["dev"], 1):
-                rows = load_checkpoint(path)
-                value, n = masked_action_loss(model, rows, range(len(rows["h"])), cfg, device)
+                rows = cache.get(path)
+                value, n = masked_action_loss(model, rows, range(len(rows["h"])), cfg, device,
+                                              batch_size=cfg.decision_eval_batch_size)
                 total, count = total + value, count + n
                 del rows
                 last_print = decision_progress(f"Stage 3 epoch {epoch+1} dev", position, len(paths["dev"]),
@@ -1607,6 +1777,13 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
             best, weights, stale, best_epoch = dev_loss, cpu_state(model), 0, epoch+1
         else:
             stale += 1
+        # Only complete train+dev epochs commit. An interruption repeats at most
+        # the current partial epoch, with the exact question/row shuffle restored.
+        atomic_torch(progress_path, {
+            "schema_version": 1, "fingerprint": fingerprint, "epoch": epoch+1,
+            "current_weights": cpu_state(model), "optimizer": opt.state_dict(),
+            "rng_state": rng.get_state(), "best_weights": weights,
+            "best_epoch": best_epoch, "dev_loss": best, "stale": stale, "history": history})
         print(f"Stage 3 epoch {epoch+1}/{cfg.decision_epochs}: train loss {train_total/train_count:.4f}, "
               f"dev loss {dev_loss:.4f}, best {best:.4f} (epoch {best_epoch}), "
               f"patience {stale}/{cfg.patience} | elapsed {(time.monotonic()-epoch_started)/60:.1f} min",
@@ -2035,7 +2212,8 @@ class Workflow:
         self.out = Path(cfg.output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         contract_cfg = asdict(cfg)
-        for key in ("resume", "output_dir", "device", "cpu_threads", "print_every", "fixed_acquisition_orders"):
+        for key in ("resume", "output_dir", "device", "cpu_threads", "print_every", "fixed_acquisition_orders",
+                    "decision_eval_batch_size", "decision_cache_mb"):
             contract_cfg.pop(key)
         sources = [{"path": str(Path(p).resolve()), "bytes": Path(p).stat().st_size,
                     "mtime_ns": Path(p).stat().st_mtime_ns} for p in [cfg.train_file] + cfg.test_files]
