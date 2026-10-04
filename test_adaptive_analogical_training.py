@@ -902,6 +902,39 @@ def test_internal_fractions_and_stage3_shared_training_requirement(tmp_path):
     cfg.validate()  # Internal fractions are ignored in external-development mode.
 
 
+def test_decision_progress_and_single_coverage_check_preserve_shard_resume(tmp_path, monkeypatch, capsys):
+    cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1,
+                   decision_epochs=1, decision_batch_size=16, recognition_threshold=.1)
+    records = [record(cfg, index=i) for i in range(2)]
+    splits = {"supervised": [0], "policy": [0], "dev": [1]}
+    scores = np.tile(np.arange(cfg.n, 0, -1, dtype=np.float32), (2, 1))
+    safe = np.ones_like(scores)
+    maximum = np.zeros_like(scores)
+    maximum[:, 0] = 1
+    teacher = {"scores": scores, "safe": safe, "maximum": maximum}
+    predictor = fake_predictor(cfg)
+    checks = []
+    original = a.shard_coverage
+    def track_coverage(shard, config):
+        checks.append(shard["uid"])
+        return original(shard, config)
+    monkeypatch.setattr(a, "shard_coverage", track_coverage)
+    first = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
+    assert len(checks) == 2
+    log = capsys.readouterr().out
+    assert "Stage 3 dev labels: 1/1" in log
+    assert "Stage 3 epoch 1 train: 1/1" in log
+    assert "Stage 3 epoch 1 dev: 1/1" in log
+    assert "train loss" in log and "dev loss" in log and "ETA" in log
+    monkeypatch.setattr(a, "build_decision_rows", lambda *args: pytest.fail("Should reuse saved shards"))
+    resumed = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
+    assert len(checks) == 4
+    assert "built 0, reused 1" in capsys.readouterr().out
+    assert first["coverage"] == resumed["coverage"]
+    assert first["history"] == resumed["history"]
+    assert all(torch.equal(value, resumed["weights"][key]) for key, value in first["weights"].items())
+
+
 def test_notebook_is_self_contained_compiles_and_matches_module():
     root = Path(__file__).parent
     nb = json.loads((root/"adaptive_analogical_training_kaggle.ipynb").read_text(encoding="utf-8"))

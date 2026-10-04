@@ -158,6 +158,18 @@ order are shuffled deterministically each epoch, one shard is read at a time,
 and dev shards are read in stable order for masked-loss checkpoint selection.
 The frozen Stage 2 state is checked after training.
 
+Stage 3 prints question progress, elapsed time, and estimated remaining time
+for each role's label build and each epoch's training/development pass. Updates
+appear on the first/last question, every `print_every` questions, or after 30
+seconds at the next question boundary. Each epoch also prints both losses and
+early-stopping patience. The `Stage 3 policy: ...` coverage summary means policy
+labels are complete; development labels come next, before head training.
+With the default external-development setting, all four benchmark logs supply
+development questions, and their exhaustive label build can be substantial.
+Keep the same output directory and configuration to reuse completed shards
+after interruption. Head weights are saved only after Stage 3 finishes, so an
+interrupted head-training loop starts again from epoch 1.
+
 Offline reports compare the complete-pool baseline, configurable fixed
 sequences, and learned acquisitions. Defaults for five evaluators and three
 zero-shot candidates are:

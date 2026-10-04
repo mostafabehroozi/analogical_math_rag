@@ -12,6 +12,7 @@ import math
 import os
 import random
 import re
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -1381,6 +1382,17 @@ def masked_action_loss(model, rows, order, cfg, device, optimizer=None):
     return total, count
 
 
+def decision_progress(label, completed, total, started, last_print, cfg, detail=""):
+    now = time.monotonic()
+    if completed == 1 or completed == total or completed % cfg.print_every == 0 or now - last_print >= 30:
+        elapsed = now - started
+        eta = elapsed * (total - completed) / completed
+        print(f"{label}: {completed}/{total} questions | elapsed {elapsed/60:.1f} min | "
+              f"ETA {eta/60:.1f} min{detail}", flush=True)
+        return now
+    return last_print
+
+
 def train_decision_head(records, splits, teacher, predictor, cfg, device, out=None):
     if splits["policy"] != splits["supervised"]:
         raise ValueError("Stage 3 policy questions must match the Stage 1/2 supervised questions.")
@@ -1404,13 +1416,18 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
     coverage = {}
     for role in ("policy", "dev"):
         parts = []
-        for idx, path in zip(splits[role], paths[role]):
+        started = last_print = time.monotonic()
+        built = reused = 0
+        print(f"Stage 3 {role} labels: building/validating {len(paths[role])} question shards.", flush=True)
+        for position, (idx, path) in enumerate(zip(splits[role], paths[role]), 1):
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
                 shard = load_checkpoint(path)
                 if (shard.get("schema_version") != 3 or shard.get("fingerprint") != fingerprint
                         or shard.get("uid") != records[idx].uid):
                     raise ValueError(f"Incompatible decision shard: {path}")
+                part = shard_coverage(shard, cfg)
+                reused += 1
             else:
                 rows, cases = build_decision_rows(records[idx], teacher["scores"][idx],
                                                   teacher["safe"][idx], teacher["maximum"][idx],
@@ -1420,42 +1437,61 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
                          "structural_states": len(structural_states(cfg.zero_shots, cfg.k)),
                          "expected_cases": len(structural_states(cfg.zero_shots, cfg.k)) * math.factorial(cfg.zero_shots),
                          "rows": rows, "cases": cases}
-                shard_coverage(shard, cfg)
+                part = shard_coverage(shard, cfg)
                 atomic_torch(path, shard)
-            parts.append(shard_coverage(shard, cfg))
+                built += 1
+            parts.append(part)
             del shard
+            last_print = decision_progress(f"Stage 3 {role} labels", position, len(paths[role]),
+                                           started, last_print, cfg,
+                                           f" | built {built}, reused {reused}")
         coverage[role] = combine_coverage(parts)
         atomic_json(out / "decision_label_coverage.json", coverage)
         print(f"Stage 3 {role}: {coverage[role]['state_order_cases']} state/order cases, "
               f"{coverage[role]['action_rows']} shared action rows; "
               f"statuses {coverage[role]['status_counts']}; "
-              f"actionable ranks {coverage[role]['actionable_by_target_rank']}.")
+              f"actionable ranks {coverage[role]['actionable_by_target_rank']}.", flush=True)
         if not coverage[role]["action_rows"]:
             raise ValueError(f"No actionable Stage 3 rows for {role}: {coverage[role]}")
     model = SupervisedActionHead(cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.decision_lr, weight_decay=cfg.weight_decay)
     best, weights, stale, history = math.inf, None, 0, []
     rng = np.random.RandomState(cfg.seed + 301)
+    print(f"Stage 3 head training: device={device}, up to {cfg.decision_epochs} epochs, "
+          f"batch size={cfg.decision_batch_size}.", flush=True)
     for epoch in range(cfg.decision_epochs):
+        epoch_started = time.monotonic()
         model.train()
-        for path in rng.permutation(paths["policy"]):
+        started = last_print = time.monotonic()
+        train_total, train_count = 0., 0
+        for position, path in enumerate(rng.permutation(paths["policy"]), 1):
             rows = load_checkpoint(path)["rows"]
-            masked_action_loss(model, rows, rng.permutation(len(rows)), cfg, device, opt)
+            value, n = masked_action_loss(model, rows, rng.permutation(len(rows)), cfg, device, opt)
+            train_total, train_count = train_total + value, train_count + n
             del rows
+            last_print = decision_progress(f"Stage 3 epoch {epoch+1} train", position, len(paths["policy"]),
+                                           started, last_print, cfg, f" | rows {train_count}")
         model.eval()
         with torch.no_grad():
+            started = last_print = time.monotonic()
             total, count = 0., 0
-            for path in paths["dev"]:
+            for position, path in enumerate(paths["dev"], 1):
                 rows = load_checkpoint(path)["rows"]
                 value, n = masked_action_loss(model, rows, range(len(rows)), cfg, device)
                 total, count = total + value, count + n
                 del rows
+                last_print = decision_progress(f"Stage 3 epoch {epoch+1} dev", position, len(paths["dev"]),
+                                               started, last_print, cfg, f" | rows {count}")
             dev_loss = total / count
         history.append({"epoch": epoch+1, "dev_loss": dev_loss})
         if dev_loss < best - 1e-7:
             best, weights, stale, best_epoch = dev_loss, cpu_state(model), 0, epoch+1
         else:
             stale += 1
+        print(f"Stage 3 epoch {epoch+1}/{cfg.decision_epochs}: train loss {train_total/train_count:.4f}, "
+              f"dev loss {dev_loss:.4f}, best {best:.4f} (epoch {best_epoch}), "
+              f"patience {stale}/{cfg.patience} | elapsed {(time.monotonic()-epoch_started)/60:.1f} min",
+              flush=True)
         if stale >= cfg.patience:
             break
     if predictor_fingerprint(predictor) != frozen_before:
