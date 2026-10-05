@@ -323,12 +323,12 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
 
     Returns the canonical SHA-256 hash of the authoritative remote manifest.
     """
-    from src.distributed_execution import resolve_code_fingerprint
+    from src.distributed_execution import resolve_code_fingerprint, validate_manifest_integrity
 
     if not _distributed_execution_enabled(config):
         raise ValueError("ensure_distributed_manifest requires DISTRIBUTED_EXECUTION_ENABLED=True.")
 
-    run_id, _, _ = _validate_distributed_identity(config)
+    run_id, _, worker_count = _validate_distributed_identity(config)
     hf_token, repo_id = _distributed_repo_id(config)
     revision = _get_distributed_revision(config)
     max_retries, retry_base = _get_retry_settings(config)
@@ -352,6 +352,33 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
     if not isinstance(expected_manifest, dict):
         raise DistributedSyncError("The expected local distributed manifest must be a JSON object.")
 
+    # Authenticate the candidate before either creating or resuming a run.
+    # A missing remote manifest must not make a stale/manual code pin valid.
+    try:
+        validate_manifest_integrity(expected_manifest)
+        if expected_manifest.get("run_id") != run_id or expected_manifest.get("worker_count") != worker_count:
+            raise DistributedManifestMismatch(
+                "Expected manifest run_id or worker_count differs from this worker configuration."
+            )
+    except DistributedManifestMismatch as exc:
+        raise DistributedManifestMismatchError(
+            f"The expected local distributed manifest is invalid: {exc}"
+        ) from exc
+    project_root = Path(__file__).resolve().parents[1]
+    local_code_fingerprint = expected_manifest.get("code_fingerprint")
+    if local_code_fingerprint != resolve_code_fingerprint(project_root):
+        local_code_match, local_code_reason = diagnose_worker_code_compatibility(
+            project_root, local_code_fingerprint
+        )
+        if not local_code_match:
+            raise DistributedManifestMismatchError(
+                "The local manifest code_fingerprint does not match the "
+                "current worker source: " + local_code_reason + " "
+                "Restore the original checkout in an isolated directory and restart "
+                "the notebook kernel before importing project modules, or use a new "
+                "DISTRIBUTED_RUN_ID."
+            )
+
     api = HfApi(token=hf_token)
     last_error: Optional[BaseException] = None
     for attempt in range(max_retries + 1):
@@ -370,21 +397,6 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
             if remote_manifest_record is not None:
                 remote_manifest, remote_hash = remote_manifest_record
                 stored_code_fingerprint = remote_manifest.get("code_fingerprint")
-                # A local manifest can already contain a manually pinned legacy
-                # fingerprint.  Authenticate it against the actual source before
-                # accepting even an exact match with the remote manifest.
-                project_root = Path(__file__).resolve().parents[1]
-                local_code_fingerprint = expected_manifest.get("code_fingerprint")
-                if local_code_fingerprint != resolve_code_fingerprint(project_root):
-                    local_code_match, local_code_reason = diagnose_worker_code_compatibility(
-                        project_root, local_code_fingerprint
-                    )
-                    if not local_code_match:
-                        raise DistributedManifestMismatchError(
-                            "The local manifest code_fingerprint does not match the "
-                            "current worker source: " + local_code_reason + " "
-                            "Restore the original checkout or use a new DISTRIBUTED_RUN_ID."
-                        )
                 code_reason = ""
                 compatible_code = False
                 if stored_code_fingerprint != expected_manifest.get("code_fingerprint"):
@@ -427,8 +439,22 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
                         remote_path,
                         code_reason,
                     )
+                    saved_revision = re.fullmatch(
+                        r"git:([0-9a-f]{40}):source:[0-9a-f]{64}",
+                        str(stored_code_fingerprint),
+                    )
+                    recovery = (
+                        f"Original run Git revision: {saved_revision.group(1)}. "
+                        if saved_revision else ""
+                    )
+                    raise DistributedManifestMismatchError(
+                        f"Worker code compatibility could not be proven from {remote_path}: "
+                        f"{code_reason} {recovery}Restore the original checkout in an "
+                        "isolated directory and restart the notebook kernel before "
+                        "importing project modules, or use a new DISTRIBUTED_RUN_ID."
+                    )
                 # Role model names are runtime provenance. Code changes need
-                # the authenticated proof above or an explicit reviewed pin.
+                # the authenticated source proof above.
                 try:
                     model_changes = validate_manifest_compatibility(
                         remote_manifest,
@@ -483,9 +509,11 @@ def _atomic_copy(source: Path, destination: Path) -> None:
             temporary.unlink()
 
 
-def _initialize_distributed_workspace(config: dict):
+def _initialize_distributed_workspace(config: dict, *, expected_manifest: Optional[dict] = None):
+    from src.distributed_execution import resolve_code_fingerprint, validate_manifest_integrity
+
     logger = logging.getLogger(__name__)
-    _validate_distributed_identity(config)
+    run_id, _, worker_count = _validate_distributed_identity(config)
     hf_token, repo_id = _distributed_repo_id(config)
     revision = _get_distributed_revision(config)
     worker_root = _get_distributed_worker_root(config, create=True)
@@ -532,6 +560,67 @@ def _initialize_distributed_workspace(config: dict):
             except ValueError as exc:
                 raise DistributedSyncError(
                     "_DISTRIBUTED_MANIFEST_PATH must remain inside _DISTRIBUTED_RUN_ROOT."
+                ) from exc
+            # Validate the staged identity before replacing any durable local
+            # manifest or checkpoint. The Hub branch may have moved since the
+            # earlier ensure_distributed_manifest call.
+            staged_payload = json.loads(staged_manifest.read_text(encoding="utf-8"))
+            if not isinstance(staged_payload, dict):
+                raise DistributedManifestMismatchError(
+                    "Downloaded distributed manifest must be a JSON object."
+                )
+            try:
+                validate_manifest_integrity(staged_payload)
+                if staged_payload.get("run_id") != run_id or staged_payload.get("worker_count") != worker_count:
+                    raise DistributedManifestMismatch(
+                        "Downloaded manifest run_id or worker_count differs from this worker configuration."
+                    )
+                if expected_manifest is not None:
+                    validate_manifest_compatibility(staged_payload, expected_manifest)
+                project_root = Path(__file__).resolve().parents[1]
+                runtime_fingerprint = resolve_code_fingerprint(project_root)
+                staged_fingerprint = staged_payload.get("code_fingerprint")
+                if staged_fingerprint != runtime_fingerprint:
+                    source_match, source_reason = diagnose_worker_code_compatibility(
+                        project_root, staged_fingerprint
+                    )
+                    if not source_match:
+                        raise DistributedManifestMismatch(
+                            "Downloaded manifest worker source is incompatible: " + source_reason
+                        )
+                if local_manifest.exists():
+                    local_payload = json.loads(local_manifest.read_text(encoding="utf-8"))
+                    if not isinstance(local_payload, dict):
+                        raise DistributedManifestMismatch("Existing local manifest is malformed.")
+                    validate_manifest_integrity(local_payload)
+                    local_fingerprint = local_payload.get("code_fingerprint")
+                    if local_fingerprint != staged_fingerprint:
+                        source_match = local_fingerprint == runtime_fingerprint
+                        if not source_match:
+                            source_match, source_reason = diagnose_worker_code_compatibility(
+                                project_root, local_fingerprint
+                            )
+                            if not source_match:
+                                raise DistributedManifestMismatch(
+                                    "Existing local manifest worker source is incompatible: "
+                                    + source_reason
+                                )
+                        # Both fingerprints authenticate this worker source.
+                        # Normalize only that field before checking all inputs.
+                        local_payload = dict(local_payload)
+                        local_payload["code_fingerprint"] = staged_fingerprint
+                        local_payload.pop("manifest_sha256", None)
+                        local_payload["manifest_sha256"] = hashlib.sha256(
+                            json.dumps(
+                                local_payload, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    validate_manifest_compatibility(local_payload, staged_payload)
+            except DistributedManifestMismatch as exc:
+                raise DistributedManifestMismatchError(
+                    "Downloaded distributed manifest does not match the validated run; "
+                    f"local checkpoints were preserved: {exc}"
                 ) from exc
             _atomic_copy(staged_manifest, local_manifest)
 
@@ -818,7 +907,7 @@ def _get_workspace_download_settings(config: dict) -> Tuple[int, int, float]:
         raise ValueError("HF_DOWNLOAD_RETRY_BASE_SECONDS must be non-negative.")
     return max_workers, max_retries, float(retry_base)
 
-def initialize_workspace(config: dict):
+def initialize_workspace(config: dict, *, expected_manifest: Optional[dict] = None):
     """
     Downloads all files from the HF Hub repo to the local output directory.
 
@@ -833,7 +922,7 @@ def initialize_workspace(config: dict):
     # missing remote checkpoint can otherwise cause duplicate paid API calls.
     if _distributed_execution_enabled(config):
         _print_startup_progress(config, "Distributed restore selected; handing off to distributed initialization.")
-        return _initialize_distributed_workspace(config)
+        return _initialize_distributed_workspace(config, expected_manifest=expected_manifest)
     
     # 1. Check if persistence is enabled
     if not config.get("PERSIST_RESULTS_ONLINE"):

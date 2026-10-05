@@ -43,7 +43,7 @@ class Config:
     output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v4_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
-    device: str = "auto"           # CUDA when available (including Kaggle), otherwise CPU.
+    device: str = "auto"
     cpu_threads: int = 2
     k: int = 5
     zero_shots: int = 3
@@ -149,20 +149,6 @@ class Record:
     baseline: np.ndarray
     ccs: np.ndarray
     labels: np.ndarray
-
-
-def resolve_training_device(requested="auto"):
-    """Choose one shared device for all three neural training stages."""
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(requested)
-    if device.type == "cuda":
-        if not torch.cuda.is_available():
-            raise ValueError("CUDA was requested but is unavailable. Enable Kaggle Settings > "
-                             "Accelerator > GPU, or set device='auto' for CPU fallback.")
-        if device.index is not None and device.index >= torch.cuda.device_count():
-            raise ValueError(f"Requested {device}, but only {torch.cuda.device_count()} GPU(s) are visible.")
-    return device
 
 
 def seed_everything(seed):
@@ -2222,7 +2208,7 @@ class Workflow:
         self.cfg.validate()
         torch.set_num_threads(cfg.cpu_threads)
         seed_everything(cfg.seed)
-        self.device = resolve_training_device(cfg.device)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else torch.device(cfg.device)
         self.out = Path(cfg.output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         contract_cfg = asdict(cfg)
@@ -2285,7 +2271,7 @@ class Workflow:
     def train_teacher(self):
         if self.records is None:
             self.prepare()
-        section(f"STAGE 1 | Masked joint correctness model and out-of-fold ranking | device={self.device}")
+        section("STAGE 1 | Masked joint correctness model and out-of-fold ranking")
         path = self.out / "teacher_completed.pt"
         if self.cfg.resume and path.exists():
             self.teacher = load_checkpoint(path)
@@ -2305,7 +2291,7 @@ class Workflow:
     def train_snapshot(self):
         if not hasattr(self, "teacher"):
             self.train_teacher()
-        section(f"STAGE 2 | Snapshot ResNet ({self.cfg.input_dim} inputs, {3*self.cfg.n+2} prediction outputs) | device={self.device}")
+        section(f"STAGE 2 | Snapshot ResNet ({self.cfg.input_dim} inputs, {3*self.cfg.n+2} prediction outputs)")
         path = self.out / "snapshot_completed.pt"
         if self.cfg.resume and path.exists():
             checkpoint = load_checkpoint(path)
@@ -2322,7 +2308,7 @@ class Workflow:
     def train_decision_head(self):
         if not hasattr(self, "predictor"):
             self.train_snapshot()
-        section(f"STAGE 3 | Supervised acquisition labels and frozen-encoder head | device={self.device}")
+        section("STAGE 3 | Supervised acquisition labels and frozen-encoder head")
         path = self.out / "decision_head_completed.pt"
         if self.cfg.resume and path.exists():
             checkpoint = load_checkpoint(path)

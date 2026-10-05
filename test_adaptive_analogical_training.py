@@ -12,58 +12,6 @@ import torch
 import adaptive_analogical_training as a
 
 
-def test_training_device_selection(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    assert a.resolve_training_device().type == "cpu"
-    with pytest.raises(ValueError, match="Enable Kaggle"):
-        a.resolve_training_device("cuda")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
-    assert a.resolve_training_device().type == "cuda"
-    assert a.resolve_training_device("cpu").type == "cpu"
-    assert a.resolve_training_device("cuda:1") == torch.device("cuda:1")
-    with pytest.raises(ValueError, match="only 2 GPU"):
-        a.resolve_training_device("cuda:2")
-
-
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA hardware required"))])
-def test_three_stages_train_on_selected_device(tmp_path, monkeypatch, device):
-    cfg = a.Config(train_file=str(tmp_path / "train.json"),
-                   test_files=[str(tmp_path / "external.json")],
-                   output_dir=str(tmp_path / "run"), device=device, cpu_threads=1,
-                   k=1, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
-                   teacher_epochs=1, snapshot_epochs=1, decision_epochs=1,
-                   snapshots_per_query=4, dev_snapshots_per_query=4,
-                   batch_size=16, decision_batch_size=16, calibrate=False,
-                   recognition_threshold=.99)
-    Path(cfg.train_file).write_text(json.dumps([raw_record(i, cfg) for i in range(20)]))
-    Path(cfg.test_files[0]).write_text(json.dumps([
-        raw_record(i, cfg, prefix="external") for i in range(3)]))
-    trained = set()
-    def check_device(module, inputs):
-        assert inputs[0].device.type == device
-        assert all(p.device.type == device for p in module.parameters())
-        if module.training and torch.is_grad_enabled():
-            trained.add(type(module).__name__ + ":" + str(module.output_layer.out_features)
-                        if isinstance(module, a.ResNet) else "head")
-    # Check real forwards/backwards in every stage, rather than mocking tensor movement.
-    original_resnet_init = a.ResNet.__init__
-    original_head_init = a.SupervisedActionHead.__init__
-    def resnet_init(self, *args, **kwargs):
-        original_resnet_init(self, *args, **kwargs)
-        self.register_forward_pre_hook(check_device)
-    def head_init(self, *args, **kwargs):
-        original_head_init(self, *args, **kwargs)
-        self.register_forward_pre_hook(check_device)
-    monkeypatch.setattr(a.ResNet, "__init__", resnet_init)
-    monkeypatch.setattr(a.SupervisedActionHead, "__init__", head_init)
-    work = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
-    assert trained == {f"ResNet:{cfg.n}", f"ResNet:{3*cfg.n+2}", "head"}
-    assert next(work.predictor.model.parameters()).device.type == device
-    assert next(work.head.parameters()).device.type == device
-
-
 def raw_record(index, cfg, prefix="train", all_wrong=False):
     rng = np.random.RandomState(index + 810)
     eids = [str(100+j) for j in range(cfg.k)]

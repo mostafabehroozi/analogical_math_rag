@@ -158,7 +158,7 @@ def _auto_pin_local_legacy_code_fingerprint(
     manifest_path: str,
 ) -> bool:
     """Pin only a Git-authenticated change outside worker execution code."""
-    from src.distributed_execution import DistributedManifestMismatch
+    from src.distributed_execution import DistributedManifestMismatch, validate_manifest_integrity
 
     if not os.path.exists(manifest_path):
         return False
@@ -167,6 +167,7 @@ def _auto_pin_local_legacy_code_fingerprint(
         raise DistributedExecutionError(
             f"Malformed existing distributed manifest: {manifest_path}"
         )
+    validate_manifest_integrity(existing_manifest)
     stored_code_fingerprint = existing_manifest.get("code_fingerprint")
     if not isinstance(stored_code_fingerprint, str) or not stored_code_fingerprint:
         raise DistributedExecutionError(
@@ -182,9 +183,19 @@ def _auto_pin_local_legacy_code_fingerprint(
         project_root, stored_code_fingerprint
     )
     if not authenticated_code_match:
+        original_revision = str(stored_code_fingerprint).split(":")
+        recovery = (
+            f"Original run Git revision: {original_revision[1]}. "
+            if len(original_revision) == 4 and original_revision[0] == "git"
+            and len(original_revision[1]) == 40
+            and all(character in "0123456789abcdef" for character in original_revision[1])
+            else ""
+        )
         raise DistributedManifestMismatch(
             f"Worker code compatibility could not be proven from {manifest_path}: "
-            f"{code_reason} Restore the original checkout or use a new "
+            f"{code_reason} {recovery}Restore the original checkout in an isolated "
+            "directory and restart the notebook kernel before importing project "
+            "modules, or use a new "
             "DISTRIBUTED_RUN_ID."
         )
     global_config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
@@ -489,6 +500,8 @@ def _prepare_distributed_worker(
     exemplar_data: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Validate/create the immutable run and restore only this worker shard."""
+    import tempfile
+
     _validate_distributed_scope(global_config, experiment_configs, hard_solutions)
     paths = configure_worker_paths(global_config)
     # The three AvalAI role model names are runtime provenance and may change
@@ -505,31 +518,42 @@ def _prepare_distributed_worker(
     requested_manifest = _build_requested_distributed_manifest(
         global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
     )
-    if _auto_pin_local_legacy_code_fingerprint(
-        global_config, paths["manifest_path"]
-    ):
-        requested_manifest = _build_requested_distributed_manifest(
-            global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
-        )
-    manifest_path = write_or_validate_manifest(
-        paths["manifest_path"],
-        requested_manifest,
-        allow_model_rotation=allow_model_rotation,
-    )
+    try:
+        if _auto_pin_local_legacy_code_fingerprint(
+            global_config, paths["manifest_path"]
+        ):
+            requested_manifest = _build_requested_distributed_manifest(
+                global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
+            )
+        if os.path.exists(paths["manifest_path"]):
+            # Existing durable identity is validated without changing its bytes.
+            write_or_validate_manifest(
+                paths["manifest_path"], requested_manifest,
+                allow_model_rotation=allow_model_rotation,
+            )
 
-    # The results repo is created once by its owner.  Every notebook validates
-    # or creates exactly the same write-once manifest before any provider call.
-    ensure_distributed_manifest(global_config, manifest_path)
-    if global_config.get("_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"):
-        requested_manifest = _build_requested_distributed_manifest(
-            global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
+        # A rejected first startup must not leave a permanent manifest at this
+        # run ID. Only the staged candidate exists until the Hub accepts it.
+        with tempfile.TemporaryDirectory(prefix="distributed-manifest-candidate-") as staging_dir:
+            candidate_path = write_or_validate_manifest(
+                os.path.join(staging_dir, "manifest.json"), requested_manifest,
+                allow_model_rotation=allow_model_rotation,
+            )
+            ensure_distributed_manifest(global_config, candidate_path)
+        if global_config.get("_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"):
+            requested_manifest = _build_requested_distributed_manifest(
+                global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
+            )
+        initialize_workspace(global_config, expected_manifest=requested_manifest)
+        write_or_validate_manifest(
+            paths["manifest_path"],
+            requested_manifest,
+            allow_model_rotation=allow_model_rotation,
         )
-    initialize_workspace(global_config)
-    write_or_validate_manifest(
-        paths["manifest_path"],
-        requested_manifest,
-        allow_model_rotation=allow_model_rotation,
-    )
+    except Exception:
+        global_config.pop("DISTRIBUTED_CODE_FINGERPRINT", None)
+        global_config.pop("_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED", None)
+        raise
     manifest = load_json(paths["manifest_path"])
     if not isinstance(manifest, dict):
         raise DistributedExecutionError(

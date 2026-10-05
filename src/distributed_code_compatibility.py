@@ -19,17 +19,26 @@ import subprocess
 _LEGACY_FINGERPRINT = re.compile(r"^git:([0-9a-f]{40}):source:([0-9a-f]{64})$")
 _IGNORED_MODULES = {
     "src/distributed_code_compatibility.py",
+}
+_OPTIONAL_WORKER_MODULES = {
     # This module is used by the separate fine-tuning notebooks.  The
-    # distributed experiment worker does not import it.
+    # distributed experiment worker does not import it.  It is nevertheless
+    # checked if a worker module starts importing it.
     "src/merging_finetuning.py",
 }
+_DYNAMIC_IMPORT_MODULES = {"importlib", "runpy", "pkgutil", "imp"}
+_IMPORT_SEARCH_STATE = {"path", "modules", "meta_path", "path_hooks", "path_importer_cache"}
 _INFRASTRUCTURE_FUNCTIONS = {
     "src/orchestration.py": {
         "finalize_distributed_experiments",
         "_auto_pin_local_legacy_code_fingerprint",
         "_prepare_distributed_worker",
     },
-    "src/hf_sync.py": {"ensure_distributed_manifest"},
+    "src/hf_sync.py": {
+        "ensure_distributed_manifest",
+        "initialize_workspace",
+        "_initialize_distributed_workspace",
+    },
     "src/distributed_execution.py": {"validate_manifest_compatibility"},
 }
 
@@ -79,8 +88,8 @@ def _legacy_source_hash(sources: dict[str, bytes]) -> str:
     return digest.hexdigest()
 
 
-def _worker_source_ast(relative: str, source: bytes) -> str | None:
-    if relative in _IGNORED_MODULES or Path(relative).name.startswith("test_"):
+def _worker_source_tree(relative: str, source: bytes) -> ast.Module | None:
+    if relative in _IGNORED_MODULES:
         return None
     tree = ast.parse(source, filename=relative)
     excluded = _INFRASTRUCTURE_FUNCTIONS.get(relative, set())
@@ -92,7 +101,114 @@ def _worker_source_ast(relative: str, source: bytes) -> str | None:
             and node.module == "src.distributed_code_compatibility"
         )
     ]
-    return ast.dump(tree, include_attributes=False)
+    return tree
+
+
+def _worker_source_ast(relative: str, source: bytes) -> str | None:
+    tree = _worker_source_tree(relative, source)
+    return None if tree is None else ast.dump(tree, include_attributes=False)
+
+
+def _local_import_paths(module: str, sources: dict[str, bytes]) -> set[str]:
+    """Resolve local modules and package initializers conservatively."""
+    if not module:
+        return set()
+    components = module.split(".")
+    paths = set()
+    for length in range(1, len(components) + 1):
+        prefix = "/".join(components[:length])
+        module_path = prefix + ".py"
+        package_path = prefix + "/__init__.py"
+        if module_path in sources and package_path in sources:
+            raise ValueError(f"Ambiguous local module/package import: {'.'.join(components[:length])}.")
+        if package_path in sources:
+            paths.add(package_path)
+        if module_path in sources:
+            if length != len(components):
+                raise ValueError(f"Local import traverses a non-package module: {module}.")
+            paths.add(module_path)
+    return paths
+
+
+def _worker_source_paths(sources: dict[str, bytes]) -> set[str]:
+    """Include production modules, config, and every local import they can use.
+
+    Every module under src remains a root because orchestration has optional
+    workflows and imports inside functions.  Root training/report/benchmark
+    tools are excluded unless production code imports them.  Reading imports
+    from both source snapshots prevents a removed dependency from disappearing
+    from the compatibility proof.
+    """
+    pending = [
+        path for path in sources
+        if (path.startswith("src/") or path == "config.py")
+        and path not in _IGNORED_MODULES | _OPTIONAL_WORKER_MODULES
+    ]
+    if not pending:
+        raise ValueError("No production worker modules or config.py exist in this source snapshot.")
+    selected = set()
+    while pending:
+        relative = pending.pop()
+        if relative in selected:
+            continue
+        selected.add(relative)
+        tree = _worker_source_tree(relative, sources[relative])
+        if tree is None:
+            continue
+        sys_aliases = {
+            alias.asname or alias.name
+            for node in ast.walk(tree) if isinstance(node, ast.Import)
+            for alias in node.names if alias.name == "sys"
+        }
+        imports = set()
+        for node in ast.walk(tree):
+            # A static import graph cannot authenticate arbitrary runtime code
+            # loading.  Refuse the bridge rather than silently omit a helper.
+            if isinstance(node, ast.Name) and node.id in {"__import__", "exec", "eval", "__path__"}:
+                raise ValueError(f"Dynamic imports cannot be proven in {relative}.")
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in sys_aliases
+                and node.attr in _IMPORT_SEARCH_STATE
+            ):
+                raise ValueError(f"Dynamic import search state cannot be proven in {relative}.")
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+                if any(module.split(".")[0] in _DYNAMIC_IMPORT_MODULES for module in modules):
+                    raise ValueError(f"Dynamic import infrastructure cannot be proven in {relative}.")
+                imports.update(modules)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    package = relative.split("/")[:-1]
+                    if node.level > len(package):
+                        raise ValueError(f"Relative import escapes its package in {relative}.")
+                    base = package[:len(package) - node.level + 1]
+                    if node.module:
+                        base.extend(node.module.split("."))
+                    module = ".".join(base)
+                else:
+                    module = node.module or ""
+                if module.split(".")[0] in _DYNAMIC_IMPORT_MODULES:
+                    raise ValueError(f"Dynamic import infrastructure cannot be proven in {relative}.")
+                if module == "sys" and any(alias.name in _IMPORT_SEARCH_STATE for alias in node.names):
+                    raise ValueError(f"Dynamic import search state cannot be proven in {relative}.")
+                imports.add(module)
+                # ``from package import child`` may load a child module.
+                # Only resolve it if that child actually exists; a plain
+                # module's imported attributes are not submodules.
+                for alias in node.names:
+                    child = (module + "." + alias.name).strip(".")
+                    child_path = child.replace(".", "/")
+                    if child_path + ".py" in sources or any(
+                        path.startswith(child_path + "/") for path in sources
+                    ):
+                        imports.add(child)
+        for module in imports:
+            for path in _local_import_paths(module, sources):
+                if path not in selected:
+                    pending.append(path)
+    return selected
 
 
 def diagnose_worker_code_compatibility(
@@ -111,16 +227,21 @@ def diagnose_worker_code_compatibility(
         return False, "The saved source hash differs from the Git revision's Python files."
     try:
         current = _working_python(root)
+        worker_paths = _worker_source_paths(original) | _worker_source_paths(current)
         original_worker = {
             path: _worker_source_ast(path, source)
             for path, source in original.items()
+            if path in worker_paths
         }
         current_worker = {
             path: _worker_source_ast(path, source)
             for path, source in current.items()
+            if path in worker_paths
         }
     except (OSError, UnicodeError, SyntaxError):
         return False, "A Python source file could not be read or parsed."
+    except ValueError as exc:
+        return False, str(exc)
     changed = sorted(
         path for path in original_worker.keys() | current_worker.keys()
         if original_worker.get(path) != current_worker.get(path)
