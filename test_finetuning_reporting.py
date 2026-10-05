@@ -1,11 +1,16 @@
 """Reporting distinguishes unknowns, matched cohorts, failures, and recorded costs."""
 
+import json
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from src.finetuning_reporting import (
     format_benchmark_overview, format_merging_report, format_simplification_report,
 )
-from src.merging_evaluation_reporting import benchmark_metrics
+from src.merging_evaluation_reporting import benchmark_metrics, rebuild_legacy_two_phase_summary
 from src.simplification_finetuning import summarize_evaluation
 
 
@@ -26,6 +31,48 @@ def case(index, direct, base, adapted):
 
 
 class ReportTests(TestCase):
+    def test_legacy_summary_cell_recovers_saved_runs_without_notebook_globals(self):
+        runs = []
+        for population, base, adapted in (('heldout_accepted', False, True), ('remaining_benchmark', True, False)):
+            for arm, correct in (('base', base), ('adapted', adapted)):
+                runs.append({'benchmark': 'numina_hard', 'benchmark_index': 0,
+                             'population': population, 'phase': 'phase_1',
+                             'candidate_source': 'one_shot', 'candidate_count': 2,
+                             'mode': 'pair_fusion', 'arm': arm,
+                             'tree': {'status': 'SUCCESS', 'root_node_id': 'root', 'trace': []},
+                             'evaluation': {'root_correct': correct}})
+        with TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+            root = Path(directory)
+            for population in ('heldout_accepted', 'remaining_benchmark'):
+                (root / f'phase_1_{population}_results.json').write_text(json.dumps(
+                    [run for run in runs if run['population'] == population]))
+            # Aggregate copies must not double the sample size.
+            (root / 'phase_1_results.json').write_text(json.dumps(runs))
+            notebook = json.loads(Path('merging_finetuning.ipynb').read_text(encoding='utf-8'))
+            cell = next(''.join(c['source']) for c in notebook['cells']
+                        if c['cell_type'] == 'code' and 'report_index =' in ''.join(c['source']))
+            namespace = {'WORK_DIR': root, 'SEED': 42}
+            exec(cell, namespace)
+            self.assertNotIn('all_runs', namespace)
+            summary = json.loads((root / 'two_phase_evaluation_summary.json').read_text())
+            self.assertEqual(summary['phase_1_runs'], 4)
+            self.assertEqual(summary['phase_2_runs'], 0)
+            pairs = summary['paired_adapted_minus_base'].values()
+            self.assertEqual(sorted(pair['accuracy_delta'] for pair in pairs), [-1, 1])
+            self.assertTrue(all(pair['paired_questions'] == 1 for pair in pairs))
+            self.assertIn('Corrections', (root / 'evaluation_report.txt').read_text())
+
+    def test_conflicting_legacy_copies_are_rejected(self):
+        run = {'benchmark': 'numina_hard', 'population': 'heldout_accepted',
+               'phase': 'phase_1', 'benchmark_index': 0, 'candidate_source': 'one_shot',
+               'candidate_count': 2, 'mode': 'pair_fusion', 'arm': 'base'}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'phase_1_heldout_accepted_results.json').write_text(json.dumps([run]))
+            (root / 'phase_1_results.json').write_text(json.dumps([{**run, 'changed': True}]))
+            with self.assertRaisesRegex(ValueError, 'Conflicting saved legacy runs'):
+                rebuild_legacy_two_phase_summary(root)
+
     def test_simplifier_pairwise_cohorts_and_unknowns_are_not_counted_incorrect(self):
         rows = [case(0, True, False, True), case(1, None, True, False),
                 case(2, True, None, True), case(3, None, None, None)]

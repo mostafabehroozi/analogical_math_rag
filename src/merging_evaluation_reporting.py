@@ -1,5 +1,8 @@
 """Compute merging evaluation reports from explicit saved runs; no model calls."""
 
+import json
+from pathlib import Path
+
 import numpy as np
 
 from src.merging_finetuning import summarize_evaluated_runs
@@ -61,6 +64,64 @@ def diagnostic_summary(runs, eval_mode):
         for layer, values in sorted(layer_values.items())
     }
     return result
+
+
+def rebuild_legacy_two_phase_summary(work_dir, *, seed=42):
+    """Recover the old standalone summary from its saved phase/population files.
+
+    Legacy runs judged all trace nodes. Keep benchmark/population cohorts
+    separate; indices can overlap across them. Never require notebook globals.
+    """
+    work_dir = Path(work_dir)
+    paths = sorted(work_dir.glob('phase_[12]_*_results.json'))
+    paths += [work_dir / f'phase_{phase}_results.json' for phase in (1, 2)
+              if (work_dir / f'phase_{phase}_results.json').is_file()]
+    if not paths:
+        return None
+    groups, seen = {}, {}
+    for path in paths:
+        rows = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(rows, list):
+            raise ValueError(f'Expected a list of saved runs in {path}')
+        for run in rows:
+            identity = tuple(run[field] for field in (
+                'phase', 'population', 'benchmark_index', 'candidate_source',
+                'candidate_count', 'mode', 'arm',
+            ))
+            benchmark = run.get('benchmark', 'legacy')
+            identity = (benchmark, *identity)
+            if identity in seen:
+                if seen[identity] != run:
+                    raise ValueError(f'Conflicting saved legacy runs in {path}; use one matching result set')
+                continue  # identical aggregate and population-file copies
+            seen[identity] = run
+            if run['phase'] not in ('phase_1', 'phase_2'):
+                raise ValueError(f'Unknown saved phase in {path}: {run["phase"]}')
+            key = (benchmark, run['population'])
+            groups.setdefault(key, {'phase_1': [], 'phase_2': []})[run['phase']].append(run)
+    reports, summaries, paired_effects = [], {}, {}
+    for (benchmark, population), phases in sorted(groups.items()):
+        count = len({run['benchmark_index'] for runs in phases.values() for run in runs})
+        report = benchmark_metrics(
+            f'{benchmark}/{population}', phases['phase_1'], phases['phase_2'],
+            {'eligible_external_questions': count,
+             'legacy_population': population,
+             'note': 'Count reflects saved questions only; original limits and population audit were not saved.'},
+            eval_mode='full', question_limit=None, seed=seed,
+        )
+        report['legacy_sources'] = [str(path) for path in paths]
+        report['bootstrap_seed'] = seed
+        reports.append(report)
+        for name, metric in report['summaries'].items():
+            summaries[f'{benchmark}/{population}/{name}'] = metric
+        for name, metric in report['paired_adapted_minus_base'].items():
+            paired_effects[f'{benchmark}/{population}/{name}'] = metric
+    return {
+        'phase_1_runs': sum(len(group['phase_1']) for group in groups.values()),
+        'phase_2_runs': sum(len(group['phase_2']) for group in groups.values()),
+        'summaries': summaries, 'paired_adapted_minus_base': paired_effects,
+        'legacy_reports': reports,
+    }
 
 def paired_arm_effect(runs, seed=42, bootstrap_samples=10000):
     by_question = {}
