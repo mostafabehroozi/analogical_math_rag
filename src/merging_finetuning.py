@@ -1344,22 +1344,31 @@ def evaluate_tree_trace(
     evaluator_config: Mapping[str, Any],
     evaluation_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     checkpoint_callback: Optional[Callable[[], None]] = None,
+    *,
+    root_only: bool = False,
+    progress_callback: Optional[Callable[[Mapping[str, Any], Mapping[str, Any], bool], None]] = None,
 ) -> Dict[str, Any]:
     """Judge nodes, checkpoint successful judgments, and count transitions.
 
     Failed judgments remain unknown and are retried when a partial evaluation
     resumes; a successful judgment is persisted before the next API call.
+    Set ``root_only`` to score only the final answer without judging candidates
+    or diagnosing parent-to-child transitions. The original trace is retained.
     """
     judged: Dict[str, Optional[bool]] = {}
     judge_status: Dict[str, str] = {}
+    root_id = tree_result.get("root_node_id")
     for node in tree_result.get("trace", []):
+        if root_only and (root_id is None or node.get("node_id") != root_id):
+            continue
         if node.get("status") != "SUCCESS" or not node.get("text"):
             continue
         cache_key = hashlib.sha256(
             (str(ground_truth) + "\0" + str(node["text"])).encode("utf-8")
         ).hexdigest()
         result = (evaluation_cache or {}).get(cache_key)
-        if result is None or result.get("status") != "SUCCESS":
+        cached = result is not None and result.get("status") == "SUCCESS"
+        if not cached:
             result = evaluate_single_answer_with_llm(
                 node["text"], ground_truth, evaluator_manager, dict(evaluator_config)
             )
@@ -1369,9 +1378,12 @@ def evaluate_tree_trace(
                     checkpoint_callback()
         judged[node["node_id"]] = result.get("is_correct") if result.get("status") == "SUCCESS" else None
         judge_status[node["node_id"]] = result.get("status", "UNKNOWN")
-    transitions = {"corrections": 0, "regressions": 0, "unchanged": 0, "unknown": 0}
-    by_id = {node["node_id"]: node for node in tree_result.get("trace", [])}
-    for node in tree_result.get("trace", []):
+        if progress_callback is not None:
+            progress_callback(node, result, cached)
+    transitions = {} if root_only else {"corrections": 0, "regressions": 0, "unchanged": 0, "unknown": 0}
+    diagnostic_trace = [] if root_only else tree_result.get("trace", [])
+    by_id = {node["node_id"]: node for node in diagnostic_trace}
+    for node in diagnostic_trace:
         if node.get("kind") != "fusion":
             continue
         child = judged.get(node["node_id"])
@@ -1384,13 +1396,13 @@ def evaluate_tree_trace(
             transitions["regressions"] += 1
         else:
             transitions["unchanged"] += 1
-    root_id = tree_result.get("root_node_id")
     return {
         "root_correct": judged.get(root_id),
         "evaluation_coverage": sum(value is not None for value in judged.values()) / max(1, len(judged)),
         "node_correctness": judged,
         "judge_status": judge_status,
         "transitions": transitions,
+        "evaluation_scope": "root_only" if root_only else "all_nodes",
     }
 
 

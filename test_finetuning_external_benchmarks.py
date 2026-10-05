@@ -95,12 +95,18 @@ class ExternalBenchmarkTests(TestCase):
         self.assertEqual(audit["duplicate_benchmark_rows_removed"], 2)
         self.assertEqual(audit["duplicate_rows_with_different_reference_text"], 1)
 
-    def test_both_notebooks_default_to_full_external_evaluation(self):
+    def test_both_notebooks_default_to_all_external_benchmarks(self):
         for filename, limit in (("merging_finetuning.ipynb", "EVAL_QUESTION_LIMIT"),
                                 ("simplification_finetuning.ipynb", "MAX_EVAL_QUESTIONS")):
             config = notebook_cell(filename, limit + " =")
             self.assertIn(limit + " = None", config)
             self.assertIn("EVAL_BENCHMARKS = external_evaluation_benchmarks()", config)
+
+    def test_merging_defaults_to_minimal_evaluation_with_progress_and_details(self):
+        config = notebook_cell("merging_finetuning.ipynb", "EVAL_QUESTION_LIMIT =")
+        self.assertRegex(config, r"EVAL_MODE\s*=\s*['\"]minimal['\"]")
+        self.assertIn("EVAL_PROGRESS = True", config)
+        self.assertIn("EVAL_VERBOSE = True", config)
 
 
 class NotebookExternalEvaluationTests(TestCase):
@@ -115,6 +121,12 @@ class NotebookExternalEvaluationTests(TestCase):
         return load
 
     def test_merging_saves_each_benchmark_before_next_and_routes_judges(self):
+        self.assert_merging_reports("full")
+
+    def test_minimal_merging_saves_separate_base_adapter_comparisons_and_resumes(self):
+        self.assert_merging_reports("minimal")
+
+    def assert_merging_reports(self, mode):
         self.summary_file = "two_phase_evaluation_summary.json"
         events, judged = [], []
         tree = {"status": "SUCCESS", "root_node_id": "leaf", "root_solution": "42",
@@ -130,6 +142,7 @@ class NotebookExternalEvaluationTests(TestCase):
         with TemporaryDirectory() as directory, redirect_stdout(StringIO()):
             root = Path(directory)
             namespace = {
+                "EVAL_MODE": mode, "EVAL_PROGRESS": False, "EVAL_VERBOSE": False,
                 "RUN_PHASE_1": True, "RUN_PHASE_2": True, "PHASE_2_TREE_SIZES": (4, 8),
                 "EVAL_BENCHMARKS": external_evaluation_benchmarks(), "EVAL_QUESTION_LIMIT": None,
                 "EVALUATION_DIR": root, "prepared": prepared(), "CONFIG": {}, "SEED": 42,
@@ -143,8 +156,12 @@ class NotebookExternalEvaluationTests(TestCase):
                 "HF_EVAL_UPLOAD_ENABLED": False, "HF_EVAL_RESTORE_ENABLED": False,
                 "HF_EVAL_DATASET_PRIVATE": True, "HF_EVAL_UPLOAD_EVERY": 10,
                 "load_external_evaluation_benchmark": self.benchmark_loader(events, root),
-                "retrieve_exemplars_cpu": lambda *args, **kwargs: [],
-                "generate_candidate_pool": lambda *args, **kwargs: {"candidates": [tree["trace"][0]] * kwargs["count"]},
+                "retrieve_exemplars_cpu": lambda *args, **kwargs: [
+                    {"question": f"Example {i}?", "solution": "42"} for i in range(kwargs["top_k"])
+                ],
+                "generate_candidate_pool": lambda *args, **kwargs: {
+                    "status": "SUCCESS", "candidates": [tree["trace"][0]] * kwargs["count"],
+                },
                 "run_direct_solution": lambda *args, **kwargs: tree,
                 "run_single_candidate_revision": lambda *args, **kwargs: tree,
                 "compare_base_and_adapted_candidate_trees": lambda *args, **kwargs: {"base": tree, "adapted": tree},
@@ -158,10 +175,18 @@ class NotebookExternalEvaluationTests(TestCase):
                 report = json.loads((root / name / self.summary_file).read_text())
                 self.assertEqual(report["benchmark"], name)
                 self.assertEqual(report["evaluated_questions"], 2)
-                self.assertEqual(report["phase_1_runs"], 28)
-                self.assertEqual(report["phase_2_runs"], 16)
-                metric = report["summaries"]["phase_1/none/0/direct_solution/base"]
+                self.assertEqual(report["phase_1_runs"], 4 if mode == "minimal" else 28)
+                self.assertEqual(report["phase_2_runs"], 0 if mode == "minimal" else 16)
+                group = "phase_1/one_shot/2/pair_fusion" if mode == "minimal" else "phase_1/none/0/direct_solution"
+                metric = report["summaries"][group + "/base"]
                 self.assertEqual(metric["accuracy_on_evaluated"], float(name in ("math500", "aime25")))
+                if mode == "minimal":
+                    comparison = report["minimal_comparison"]
+                    for arm in ("base", "adapted"):
+                        self.assertEqual(comparison[arm]["accuracy_on_evaluated"],
+                                         float(name in ("math500", "aime25")))
+                    self.assertEqual(comparison["paired"]["paired_questions"], 2)
+                    self.assertEqual(comparison["paired"]["accuracy_delta"], 0.0)
                 rows = json.loads((root / name / "phase_1_results.json").read_text())
                 self.assertTrue(all(row["benchmark"] == name for row in rows))
             events.clear()
