@@ -14,6 +14,7 @@ import os
 import random
 import re
 import time
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -1421,6 +1422,11 @@ def summarize_evaluated_runs(runs: Sequence[Mapping[str, Any]]) -> Dict[str, Any
                 transitions[name] += int(count)
     return {
         "runs": len(runs), "evaluated_roots": len(known),
+        "correct_roots": sum(known), "unknown_roots": len(runs) - len(known),
+        "root_judge_status_counts": dict(Counter(
+            run.get("evaluation", {}).get("judge_status", {}).get(
+                run.get("tree", {}).get("root_node_id"), "NOT_JUDGED") for run in runs
+        )),
         "accuracy_on_evaluated": sum(known) / len(known) if known else None,
         "evaluation_coverage": len(known) / len(runs) if runs else 0.0,
         "incomplete_trees": failed, "generated_nodes": total_nodes,

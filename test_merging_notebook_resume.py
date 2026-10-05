@@ -29,7 +29,7 @@ class NotebookPartialResumeTests(TestCase):
         notebook = json.loads(Path("merging_finetuning.ipynb").read_text(encoding="utf-8"))
         cell = next("".join(c["source"]) for c in notebook["cells"]
                     if "def evaluate_population" in "".join(c["source"]))
-        self.loop = cell.split("def diagnostic_summary", 1)[0]
+        self.loop = cell.split("benchmark_reports = {}", 1)[0]
 
     def generate(self, prompt, **kwargs):
         if self.interrupt_generation == len(self.generated):

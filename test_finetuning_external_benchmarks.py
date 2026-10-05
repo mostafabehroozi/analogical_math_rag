@@ -140,12 +140,12 @@ class NotebookExternalEvaluationTests(TestCase):
                     "judge_status": {"leaf": "SUCCESS"}, "transitions": {}}
 
         with TemporaryDirectory() as directory, redirect_stdout(StringIO()):
-            root = Path(directory)
+            root = Path(directory) / "evaluations"
             namespace = {
                 "EVAL_MODE": mode, "EVAL_PROGRESS": False, "EVAL_VERBOSE": False,
                 "RUN_PHASE_1": True, "RUN_PHASE_2": True, "PHASE_2_TREE_SIZES": (4, 8),
                 "EVAL_BENCHMARKS": external_evaluation_benchmarks(), "EVAL_QUESTION_LIMIT": None,
-                "EVALUATION_DIR": root, "prepared": prepared(), "CONFIG": {}, "SEED": 42,
+                "EVALUATION_DIR": root, "WORK_DIR": root.parent, "prepared": prepared(), "CONFIG": {}, "SEED": 42,
                 "evaluator": object(), "generator": object(), "embedding_model": object(),
                 "exemplar_data": {"questions": [], "solutions": []}, "embedded_exemplars": [],
                 "GENERATION": {}, "np": np, "json": json, "save_json_atomic": save_json_atomic,
@@ -168,11 +168,22 @@ class NotebookExternalEvaluationTests(TestCase):
                 "evaluate_tree_trace": judge, "summarize_evaluated_runs": summarize_evaluated_runs,
             }
             exec(notebook_cell("merging_finetuning.ipynb", "def evaluate_population"), namespace)
-            exec(notebook_cell("merging_finetuning.ipynb", "report_index ="), namespace)
+            # Recover reporting with no inference objects, run lists, helpers, or
+            # report index in memory. Saved settings take precedence on restart.
+            for name in events:
+                (root / name / self.summary_file).unlink()
+            recovery = {
+                "WORK_DIR": root.parent, "EVAL_BENCHMARKS": external_evaluation_benchmarks(),
+                "EVAL_MODE": "changed-after-evaluation", "SEED": -1,
+            }
+            exec(notebook_cell("merging_finetuning.ipynb", "report_index ="), recovery)
             self.assertEqual(events, external_evaluation_benchmarks())
             self.assertEqual(set(judged), set(events))
             for name in events:
                 report = json.loads((root / name / self.summary_file).read_text())
+                text = (root / name / "evaluation_report.txt").read_text()
+                self.assertIn("Final-answer comparison", text)
+                self.assertIn("Bootstrap 95% CI", text)
                 self.assertEqual(report["benchmark"], name)
                 self.assertEqual(report["evaluated_questions"], 2)
                 self.assertEqual(report["phase_1_runs"], 4 if mode == "minimal" else 28)
@@ -194,6 +205,13 @@ class NotebookExternalEvaluationTests(TestCase):
             exec(notebook_cell("merging_finetuning.ipynb", "def evaluate_population"), namespace)
             self.assertEqual(events, external_evaluation_benchmarks())
             self.assertEqual(judged, [], "Completed merging questions must skip inference and judgment")
+
+    def test_merging_report_recovery_without_saved_results_has_actionable_error(self):
+        with TemporaryDirectory() as directory:
+            namespace = {"WORK_DIR": Path(directory), "EVAL_BENCHMARKS": ["math500"]}
+            with self.assertRaisesRegex(FileNotFoundError, "No complete saved benchmark results"):
+                exec(notebook_cell("merging_finetuning.ipynb", "report_index ="), namespace)
+            self.assertFalse((Path(directory) / "evaluations" / "benchmark_reports.json").exists())
 
     def test_simplification_separate_reports_and_resume_use_external_unlabeled_rows(self):
         self.summary_file = "summary.json"
@@ -227,8 +245,18 @@ class NotebookExternalEvaluationTests(TestCase):
             exec(cell, namespace)
             self.assertEqual(events, external_evaluation_benchmarks())
             self.assertEqual(set(judged), set(events))
+            # The final cell works after restart without evaluation objects or
+            # in-memory summaries, and upgrades saved metrics from raw outputs.
+            recovery = {"WORK_DIR": Path(directory), "EVAL_BENCHMARKS": external_evaluation_benchmarks()}
+            captured = StringIO()
+            with redirect_stdout(captured):
+                exec(notebook_cell("simplification_finetuning.ipynb", "report_index ="), recovery)
+            self.assertIn("Benchmark comparison", captured.getvalue())
             for name in events:
                 report = json.loads((root / name / "summary.json").read_text())
+                text = (root / name / "evaluation_report.txt").read_text()
+                self.assertIn("Solver final-answer comparison", text)
+                self.assertIn("Failures and reuse", text)
                 self.assertEqual(report["benchmark"], name)
                 self.assertEqual(report["questions"], 2)
                 self.assertEqual(report["behavior"]["unlabeled"]["base"]["exact_copy_rate"], 1)

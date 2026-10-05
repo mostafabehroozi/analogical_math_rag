@@ -315,7 +315,8 @@ def summarize_evaluation(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     for row in rows:
         results = [row.get("direct", {}).get("evaluation")]
         results += [row["arms"][arm].get("evaluation") for arm in ("base", "adapted")]
-        if all(isinstance(value, Mapping) and value.get("status") == "SUCCESS" for value in results):
+        if all(isinstance(value, Mapping) and value.get("status") == "SUCCESS"
+               and value.get("is_correct") is not None for value in results):
             paired.append(tuple(bool(value["is_correct"]) for value in results))
     summary["solver"] = {
         "eligible_with_ground_truth": sum(bool(r.get("ground_truth")) for r in rows),
@@ -331,4 +332,51 @@ def summarize_evaluation(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             sum(row[2] - row[0] for row in paired) / len(paired) if paired else None
         ),
     }
+    # Keep the original three-arm cohort metrics and also expose each arm's
+    # coverage plus pairwise cohorts, so missing judgments cannot look wrong.
+    from src.merging_evaluation_reporting import paired_arm_effect
+
+    def evaluation(row, arm):
+        return (row.get("direct", {}) if arm == "direct" else row["arms"][arm]).get("evaluation")
+
+    summary["solver"]["arms"] = {}
+    for arm in ("direct", "base", "adapted"):
+        judgments = [evaluation(row, arm) for row in rows]
+        known = [value["is_correct"] for value in judgments
+                 if isinstance(value, Mapping) and value.get("status") == "SUCCESS"
+                 and value.get("is_correct") is not None]
+        summary["solver"]["arms"][arm] = {
+            "questions": len(rows), "judged": len(known), "correct": sum(known),
+            "unknown": len(rows) - len(known),
+            "coverage": len(known) / len(rows) if rows else 0.0,
+            "accuracy": sum(known) / len(known) if known else None,
+            "judge_status_counts": dict(Counter(
+                value.get("status", "UNKNOWN") if isinstance(value, Mapping) else "NOT_JUDGED"
+                for value in judgments)),
+        }
+    summary["solver"]["pairwise"] = {}
+    for baseline in ("base", "direct"):
+        runs = []
+        for index, row in enumerate(rows):
+            for source, arm in ((baseline, "base"), ("adapted", "adapted")):
+                value = evaluation(row, source)
+                correct = value.get("is_correct") if isinstance(value, Mapping) and value.get("status") == "SUCCESS" else None
+                runs.append({"benchmark_index": index, "arm": arm, "evaluation": {"root_correct": correct}})
+        summary["solver"]["pairwise"][f"adapted_minus_{baseline}"] = paired_arm_effect(runs)
+    summary["generation"] = {}
+    for arm in ("direct", "base", "adapted"):
+        outputs = []
+        for row in rows:
+            branch = row.get("direct", {}) if arm == "direct" else row["arms"][arm]
+            keys = ("solution",) if arm == "direct" else ("simplification", "proxy_solution", "original_solution")
+            outputs.extend(branch[key] for key in keys if isinstance(branch.get(key), Mapping))
+        summary["generation"][arm] = {
+            "recorded_calls": len(outputs),
+            "status_counts": dict(Counter(value.get("status", "UNKNOWN") for value in outputs)),
+            "input_tokens": sum(value.get("input_tokens", 0) or 0 for value in outputs),
+            "output_tokens": sum(value.get("output_tokens", 0) or 0 for value in outputs),
+            "elapsed_seconds": sum(value.get("elapsed_seconds", 0) or 0 for value in outputs),
+            "resource_metadata_calls": sum(any(key in value for key in ("input_tokens", "output_tokens", "elapsed_seconds")) for value in outputs),
+            "solver_status_counts": dict(Counter(row["arms"][arm].get("solver_status", "UNKNOWN") for row in rows)) if arm != "direct" else {},
+        }
     return summary

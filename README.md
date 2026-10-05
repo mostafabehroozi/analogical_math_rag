@@ -126,6 +126,15 @@ references and construction overlaps, `phase_1_results.json` and
 `phase_2_results.json` save raw runs, and `two_phase_evaluation_summary.json`
 reports accuracy, candidate/transition/resource metrics, and paired effects.
 `WORK_DIR/evaluations/benchmark_reports.json` indexes the separate reports.
+The final reporting cell rebuilds metrics from saved runs and `report_config.json`
+without model calls. It prints side-by-side accuracy, judged/unknown counts,
+coverage, paired gains with bootstrap intervals, corrections/regressions, failures,
+and trace resources; full mode also prints candidate and fusion diagnostics.
+Both fine-tuning notebooks save the readable output as `evaluation_report.txt`
+and print a final comparison table across the separate benchmarks. Full JSON
+metrics and raw results remain available. The simplification report compares
+direct solving, base simplification, and adapted simplification using a fixed
+base solver, with separate copy/change behavior and matched-question contrasts.
 
 ## Simplification-model fine-tuning
 
