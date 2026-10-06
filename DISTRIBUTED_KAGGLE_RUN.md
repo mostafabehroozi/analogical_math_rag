@@ -163,6 +163,67 @@ If worker behavior changed, resume with the original source or start a separate
 run. Setting a fingerprint by hand or overwriting the remote manifest would mix
 incompatible results and is not a recovery method.
 
+### Resume `layer1-grouping-k5-size2-v2` after a Kaggle restart
+
+This run's remote manifest identifies original Git revision
+`7f6b91217973b08e0f38ac86d5e59b5b12111953`. Current source at `8befd58`
+reproduces the five-file compatibility error. A fresh kernel alone cannot fix
+it if startup clones the newer source again. Keep the existing run ID and use
+the authenticated original source for every subsequent worker session.
+
+After cloning the current repository, put this cell **before the pasted setup
+cell and before any `config` or `src` import**. Give the notebook read access to
+`mostafabehroozi/grouping_dist` through the `HF_SYNC_TOKEN` Kaggle Secret,
+`HF_SYNC_TOKEN`/`HF_TOKEN` environment variable, or an existing Hugging Face
+login. The token is never printed or stored in the checkout.
+
+```python
+%run /kaggle/working/analogical_math_rag/kaggle_resume_v2_bootstrap.py
+```
+
+The Kaggle checkout must include this new bootstrap file. Until that checkout
+has the updated repository, paste the file's contents into the first notebook
+cell instead of using `%run`.
+
+The bootstrap downloads
+`distributed_runs/layer1-grouping-k5-size2-v2/manifest.json`, invokes
+`prepare_distributed_resume.py` in a separate process, and switches the
+notebook to `/kaggle/working/analogical_math_rag-resume-v2` only after the
+saved source is verified. It stops if `config` or `src` was already imported.
+If the saved Git commit is absent, fetch its history into the active checkout
+and rerun the bootstrap in a fresh kernel. A mismatched saved source hash must
+be investigated rather than overridden.
+
+In the pasted setup, replace **both** occurrences of
+`os.chdir("/kaggle/working/analogical_math_rag")` with:
+
+```python
+os.chdir(RESUME_SOURCE)
+```
+
+The first occurrence matters because it precedes a `src` import. The second
+would otherwise switch the notebook back to the changed source. Keep the
+original setup's project imports, experiment configuration, question order,
+answers, exemplar data, and model settings. Immediately after
+`setup_kaggle_mode()` and before `configure_worker_paths(CONFIG)`, use a clean
+local checkpoint base for the recovered worker:
+
+```python
+CONFIG["BASE_OUTPUT_DIR"] = "/kaggle/working/resume-v2-state"
+CONFIG["DISTRIBUTED_RUN_ID"] = "layer1-grouping-k5-size2-v2"
+CONFIG["DISTRIBUTED_WORKER_COUNT"] = 5
+CONFIG["DISTRIBUTED_WORKER_ID"] = 0  # Retain this notebook's original ID, 0..4.
+CONFIG["DISTRIBUTED_FINALIZER_MODE"] = False
+```
+
+Keep shared data and embedding paths at their original locations. The worker
+will validate the saved manifest and restore its own remote shard into this
+local state directory. Do not run the same worker ID in two notebooks at once.
+On every later Kaggle restart, repeat the bootstrap with the same run ID and
+worker ID; the verified detached checkout is reused if it still matches. The
+normal `run_experiments(...)` cell needs no change. Do not set
+`DISTRIBUTED_CODE_FINGERPRINT` manually or edit the remote manifest.
+
 For `layer1-grouping-k5-size2-v1`, the downloaded manifest identifies revision
 `22f35725faf98b6426854260109579026694c6f4`. Its full source hash matches that
 commit. Later provider pacing and retry changes affect this AvalAI grouping
