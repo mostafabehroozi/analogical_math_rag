@@ -30,8 +30,12 @@ class QuestionResult:
 
 
 def _terminal_status(result: Dict[str, Any]) -> str:
-    status = str(result.get("pipeline_status", result.get("status", "SUCCESS")))
-    return "FAILED" if "FAIL" in status.upper() or "ERROR" in status.upper() else "SUCCESS"
+    status = str(result.get("pipeline_status", result.get("status", "SUCCESS"))).upper()
+    # An unchanged proxy is an intentional, completed simplification skip.
+    # Its name contains FAIL, but it must not trigger the batch failure policy.
+    if status == "SKIPPED_FAILSAFE":
+        return "SUCCESS"
+    return "FAILED" if "FAIL" in status or "ERROR" in status else "SUCCESS"
 
 
 class BatchCoordinator:
