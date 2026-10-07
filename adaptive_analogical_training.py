@@ -80,7 +80,6 @@ class Config:
     decision_lr: float = 1e-4
     decision_batch_size: int = 128
     decision_eval_batch_size: int = 4096  # Frozen dev forwards; no optimizer changes.
-    decision_cache_mb: int = 4096    # Shared CPU tensor cap; 0 streams memory-mapped shards.
     # Evaluation only: built-in order names or explicit [ZS1, R1, OS1, ...] sequences.
     fixed_acquisition_orders: dict = field(default_factory=lambda: {
         "fixed": "interleaved",
@@ -128,7 +127,7 @@ class Config:
         assert 1 <= self.budget <= self.full_cost
         assert self.teacher_epochs > 0 and self.snapshot_epochs > 0 and self.patience > 0
         assert self.decision_epochs > 0 and self.decision_batch_size >= 2 and self.decision_lr > 0
-        assert self.decision_eval_batch_size >= 2 and self.decision_cache_mb >= 0
+        assert self.decision_eval_batch_size >= 2
         assert self.snapshots_per_query >= 2 and self.dev_snapshots_per_query >= 2
         assert 0 <= self.snapshot_reachable_fraction <= 1
         assert 0 <= self.snapshot_missing_fraction <= 1
@@ -177,23 +176,15 @@ def atomic_json(path, value):
     os.replace(tmp, path)
 
 
-def atomic_torch(path, value, *, compress=False):
-    """Preserve completed artifacts and remove partial writes, including on ENOSPC.
-
-    Compressed audit shards use pickle protocol 4: torch.save's default protocol 2
-    stores every NumPy buffer as a latin-1 string, roughly tripling their size.
-    """
+def atomic_torch(path, value):
+    """Preserve completed artifacts and remove partial writes, including on ENOSPC."""
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         # A Python file handle exposes filesystem errors that the C++ path writer
         # can otherwise obscure behind an iostream/unexpected-position error.
         with tmp.open("wb") as handle:
-            if compress:
-                with gzip.GzipFile(fileobj=handle, mode="wb", compresslevel=1, mtime=0) as zipped:
-                    torch.save(value, zipped, pickle_protocol=4)
-            else:
-                torch.save(value, handle)
+            torch.save(value, handle)
         os.replace(tmp, path)
     except (OSError, RuntimeError) as exc:
         try:
@@ -217,6 +208,7 @@ def compressed_checkpoint(path):
 
 def load_checkpoint(path):
     # Only load checkpoints created by this workflow, never untrusted .pt files.
+    # Gzip covers schema-3 Stage 3 audit shards read once for migration.
     if compressed_checkpoint(path):
         with gzip.open(path, "rb") as handle:
             return torch.load(handle, map_location="cpu", weights_only=False)
@@ -1512,8 +1504,7 @@ def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
     digest.update(json.dumps({"schema": 3, "revision": PIPELINE_REVISION,
                               "config": {key: value for key, value in asdict(cfg).items()
                                          if key not in {"resume", "output_dir", "device", "cpu_threads", "print_every",
-                                                        "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size",
-                                                        "decision_cache_mb"}},
+                                                        "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size"}},
                               "predictor": predictor_fingerprint(predictor),
                               "data_sha256": data_digest(records),
                               "roles": {role: [records[i].uid for i in splits[role]]
@@ -1525,50 +1516,61 @@ def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
     return digest.hexdigest()
 
 
+DECISION_LABEL_SCHEMA = 4  # Compact numeric labels; the label fingerprint is unchanged.
+
+
+def question_paths(records, ids, directory):
+    return [directory / f"{position:06d}_{hashlib.sha256(records[idx].uid.encode()).hexdigest()[:12]}.pt"
+            for position, idx in enumerate(ids)]
+
+
 def decision_shard_paths(records, splits, out):
-    return {role: [out / "decision_shards" / role /
-                   f"{position:06d}_{hashlib.sha256(records[idx].uid.encode()).hexdigest()[:12]}.pt"
-                   for position, idx in enumerate(splits[role])]
+    """Schema-3 audit shards from earlier revision-5 runs, read once to migrate."""
+    return {role: question_paths(records, splits[role], Path(out) / "decision_shards" / role)
             for role in ("policy", "dev")}
 
 
-def shard_coverage(shard, cfg):
-    statuses = Counter(case["status"] for case in shard["cases"])
+def decision_role_path(out, role):
+    return Path(out) / "decision_labels" / f"{role}.pt"
+
+
+def label_coverage(rows, cases, cfg):
+    """One question's state/order dispositions; the rows and cases are not stored."""
+    statuses = Counter(case["status"] for case in cases)
     structures = structural_states(cfg.zero_shots, cfg.k)
     expected = {(sid, state.candidate_mask, state.evaluator_mask)
                 for sid in range(math.factorial(cfg.zero_shots)) for state in structures}
     actual = {(case["scenario"], case["candidate_mask"], case["evaluator_mask"])
-              for case in shard["cases"]}
-    if (sum(statuses.values()) != shard["expected_cases"] or
-            len(actual) != len(shard["cases"]) or actual != expected):
-        raise ValueError("Decision shard has incomplete state/order coverage.")
+              for case in cases}
+    if len(actual) != len(cases) or actual != expected:
+        raise ValueError("Decision labels have incomplete state/order coverage.")
     allowed = {"OUT_OF_BUDGET", "COMPLETE", "EXHAUSTED", "BUDGET", "ACTION", "UNREACHABLE"}
     if set(statuses) - allowed:
-        raise ValueError("Decision shard contains an unknown status.")
+        raise ValueError("Decision labels contain an unknown status.")
     _, _, cached_valid, _ = decision_structure(
         cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     trained_statuses = Counter()
-    for case in shard["cases"]:
+    for case in cases:
         index = case["training_row"]
         state = State(case["candidate_mask"], case["evaluator_mask"])
         valid = cached_valid[state] if state in cached_valid else valid_actions(state, cfg)
         if bool(valid.any()) != (index is not None):
-            raise ValueError("Decision shard action mapping is incomplete.")
-        if index is not None and not 0 <= index < len(shard["rows"]):
-            raise ValueError("Decision shard has an invalid training-row reference.")
+            raise ValueError("Decision label action mapping is incomplete.")
+        if index is not None and not 0 <= index < len(rows):
+            raise ValueError("Decision labels have an invalid training-row reference.")
         if index is not None:
             trained_statuses[case["status"]] += 1
-    for row in shard["rows"]:
+    for row in rows:
         if (len(row["target"]) != cfg.action_count or
                 len(row["valid"]) != cfg.action_count or
                 not np.isclose(row["target"].sum(), 1) or
                 np.any(row["target"][~row["valid"]])):
-            raise ValueError("Decision shard has an invalid masked action target.")
-    return {"questions": 1, "structural_states": shard["structural_states"],
-            "state_order_cases": shard["expected_cases"], "action_rows": len(shard["rows"]),
+            raise ValueError("Decision labels have an invalid masked action target.")
+    return {"questions": 1, "structural_states": len(structures),
+            "state_order_cases": len(cases), "action_rows": len(rows),
             "status_counts": dict(statuses), "trained_status_counts": dict(trained_statuses),
             "actionable_by_target_rank": dict(Counter(str(case["goal_rank"] + 1)
-                for case in shard["cases"] if case["status"] == "ACTION"))}
+                for case in cases if case["status"] == "ACTION"))}
 
 
 def combine_coverage(parts):
@@ -1586,7 +1588,7 @@ def combine_coverage(parts):
 
 
 def pack_decision_rows(rows, cfg, keys=("h", "target", "valid")):
-    """Stack the head's row arrays; audit fields stay in the source shard."""
+    """Stack the head's row arrays from full audit rows."""
     shapes = {"h": (cfg.hidden_dim, torch.float32), "target": (cfg.action_count, torch.float32),
               "valid": (cfg.action_count, torch.bool)}
     return {key: torch.from_numpy(np.stack([row[key] for row in rows])) if rows else
@@ -1594,18 +1596,35 @@ def pack_decision_rows(rows, cfg, keys=("h", "target", "valid")):
             for key in keys}
 
 
-def without_hidden(rows):
-    """Audit rows minus frozen features, which are re-encoded rather than stored."""
-    return [{key: value for key, value in row.items() if key != "h"} for row in rows]
+@lru_cache(maxsize=8)
+def decision_valid_table(zero_shots, k, repeats, cost_unit, max_cost):
+    """Valid-action masks for the in-budget states, in label-source order."""
+    states, _ = budget_state_index(zero_shots, k, repeats, cost_unit, max_cost)
+    _, _, valid, _ = decision_structure(zero_shots, k, repeats, cost_unit, max_cost)
+    table = np.stack([valid[state] for state in states])
+    table.setflags(write=False)
+    return table
 
 
-def decision_row_observations(record, packed, cfg):
-    """Rebuild each row's label-time observation from its scenario and in-budget state."""
+def decision_valid(source, cfg):
+    table = decision_valid_table(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    return table[np.asarray(source, dtype=np.int64) % len(table)]
+
+
+def decision_targets(preferred, cfg):
+    """Each row's soft target: an even split over its tied optimal actions."""
+    support = np.unpackbits(np.asarray(preferred, np.uint8), axis=1,
+                            count=cfg.action_count).astype(bool)
+    # Same float64 -> float32 rounding as the planner's 1 / len(preferred).
+    return np.where(support, 1 / np.maximum(support.sum(1, keepdims=True), 1), 0).astype(np.float32)
+
+
+def decision_row_observations(record, source, cfg):
+    """Rebuild each row's label-time observation from its scenario * states + state source."""
     states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     template, masks, offsets = structural_observation_template(
         states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, False)
-    scenario = np.asarray(packed["scenario"], dtype=np.int64)
-    position = np.asarray(packed["state"], dtype=np.int64)
+    scenario, position = np.divmod(np.asarray(source, dtype=np.int64), len(states))
     blank = np.zeros(cfg.n, np.float32)
     orders = [permute_zero_shots(record, blank, blank, blank, order, cfg)[0]
               for order in permutations(range(cfg.zero_shots))]
@@ -1621,122 +1640,188 @@ def decision_row_observations(record, packed, cfg):
     return xs
 
 
-def training_companion(record, rows, cases, cfg):
-    """Head targets plus each row's first visible case, checked against its state key.
+def compact_decision_labels(record, rows, cases, cfg):
+    """Keep only what the head trains on, as about five bytes per row.
 
-    A row's frozen features are a function of that exact observation, so they are
-    re-encoded on demand. Storing them twice made a question about 8 MiB on disk.
+    A row's source (zero-shot scenario and in-budget state of its first case)
+    fixes its observation, frozen features, and valid mask; a bitmask of tied
+    optimal actions fixes its soft target. Planner values and case dispositions
+    are deterministic audit data, recomputed by decision_question_audit.
     """
     states, index = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
-    sources = [None] * len(rows)
+    source = np.full(len(rows), -1, np.int64)
     for case in cases:
         row = case["training_row"]
-        if row is not None and sources[row] is None:
-            sources[row] = (case["scenario"],
-                            index.get(State(case["candidate_mask"], case["evaluator_mask"]), -1))
-    if any(source is None or source[1] < 0 for source in sources):
-        raise ValueError("Decision shard has a training row without an in-budget visible case.")
-    sources = np.asarray(sources, dtype=np.int32).reshape(len(rows), 2)
-    packed = {**pack_decision_rows(rows, cfg, ("target", "valid")),
-              "scenario": torch.from_numpy(sources[:, 0].copy()),
-              "state": torch.from_numpy(sources[:, 1].copy())}
-    observed = decision_row_observations(record, packed, cfg)
-    for row, x, position in zip(rows, observed, sources[:, 1]):
+        if row is not None and source[row] < 0:
+            position = index.get(State(case["candidate_mask"], case["evaluator_mask"]), -1)
+            if position < 0:
+                source[row] = -2  # First visible case is over budget; rejected below.
+            else:
+                source[row] = case["scenario"] * len(states) + position
+    if (source < 0).any():
+        raise ValueError("Decision labels have a training row without an in-budget visible case.")
+    target = (np.stack([row["target"] for row in rows]) if rows else
+              np.zeros((0, cfg.action_count), np.float32))
+    valid = (np.stack([row["valid"] for row in rows]) if rows else
+             np.zeros((0, cfg.action_count), bool))
+    preferred = np.packbits(target > 0, axis=1)
+    if target.dtype != np.float32 or not np.array_equal(decision_targets(preferred, cfg), target):
+        raise ValueError("Decision targets must split evenly over tied optimal actions.")
+    if not np.array_equal(decision_valid(source, cfg), valid):
+        raise ValueError("Decision valid masks do not match their in-budget states.")
+    observed = decision_row_observations(record, source, cfg)
+    for row, x, position in zip(rows, observed, source % len(states)):
         state = states[position]
         if (tuple(row["state_key"]) != (state.candidate_mask, state.evaluator_mask,
                                         hashlib.sha256(x.tobytes()).hexdigest())):
-            raise ValueError("Decision shard rows do not reproduce their visible observations.")
-    return packed
+            raise ValueError("Decision rows do not reproduce their visible observations.")
+    return {"source": torch.from_numpy(source.astype(np.int32)),
+            "preferred": torch.from_numpy(preferred),
+            "observation_sha256": hashlib.sha256(observed.tobytes()).hexdigest()}
 
 
-def decision_training_rows(record, packed, predictor, cfg):
-    """One question's head inputs: stored targets plus re-encoded frozen features."""
-    return {"h": predictor.encode(decision_row_observations(record, packed, cfg)),
-            "target": packed["target"], "valid": packed["valid"]}
+def check_saved_labels(record, labels, cfg):
+    """Saved labels must rebuild their label-time observations under the current code."""
+    source, preferred = labels["source"].numpy(), labels["preferred"].numpy()
+    if (source.ndim != 1 or preferred.shape != (len(source), (cfg.action_count + 7) // 8) or
+            len(source) != labels["coverage"]["action_rows"]):
+        raise ValueError(f"Saved Stage 3 labels for {record.uid} have inconsistent shapes.")
+    support = np.unpackbits(preferred, axis=1, count=cfg.action_count).astype(bool)
+    if not support.any(1).all() or (support & ~decision_valid(source, cfg)).any():
+        raise ValueError(f"Saved Stage 3 labels for {record.uid} target invalid actions.")
+    observed = decision_row_observations(record, source, cfg)
+    if hashlib.sha256(observed.tobytes()).hexdigest() != labels["observation_sha256"]:
+        raise ValueError(f"Saved Stage 3 labels for {record.uid} no longer reproduce their "
+                         "label-time observations; observation code or data changed.")
 
 
-def load_training_checkpoint(path):
-    """Map only the packed, ordinary tensor companion; the OS pages it on demand."""
-    return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+def decision_training_rows(record, source, preferred, predictor, cfg):
+    """One question's head inputs: decoded targets plus re-encoded frozen features."""
+    source = np.asarray(source)
+    return {"h": predictor.encode(decision_row_observations(record, source, cfg)),
+            "target": torch.from_numpy(decision_targets(preferred, cfg)),
+            "valid": torch.from_numpy(decision_valid(source, cfg))}
 
 
-def stored_feature_companion(path):
-    """Companions written before features were re-encoded hold large "h" tensors."""
-    try:
-        return "h" in load_training_checkpoint(path)
-    except Exception:
-        # Unreadable caches are repaired from their validated source shard.
-        return False
+def load_label_file(path):
+    """Compact label files hold only tensors, strings, and counts."""
+    return torch.load(path, map_location="cpu", weights_only=True)
 
 
-def ensure_training_companion(path, packed):
-    """Reuse only tensors identical to the validated audit rows; repair derived caches."""
-    if path.exists():
-        try:
-            previous = load_training_checkpoint(path)
-            matches = (set(previous) == set(packed) and all(
-                isinstance(previous[key], torch.Tensor) and
-                previous[key].dtype == value.dtype and torch.equal(previous[key], value)
-                for key, value in packed.items()))
-            del previous  # Close mappings before replacement, including on Windows.
-            if matches:
-                return True
-        except Exception:
-            # This derived cache is reconstructed from the validated source shard.
-            pass
-    atomic_torch(path, packed)
-    return False
+def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, fingerprint):
+    """Build, migrate, or reuse one role's labels; returns them in RAM.
 
-
-def available_host_memory():
-    """Available RAM, including reclaimable pages; no mandatory new dependency."""
-    try:
-        import psutil
-        return int(psutil.virtual_memory().available)
-    except ImportError:
-        try:
-            for line in Path("/proc/meminfo").read_text().splitlines():
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-        except OSError:
-            pass
-    return None
-
-
-class PackedDecisionCache:
-    """Bounded whole-role companion reuse, with mmap streaming when a role cannot fit.
-
-    Companions hold targets, valid masks, and row sources; features are re-encoded.
-    Shuffle accesses each question once per epoch, so an undersized LRU would
-    thrash. Admit complete roles without using the training RNG, policy first.
-    Never retain audit cases or eagerly copy mapped tensors into RAM.
+    Each question completes as one small atomic file, and the finished role is
+    merged into a single file. Schema-3 audit shards are converted without
+    relabeling and deleted once converted, so a full disk regains space.
     """
-    def __init__(self, paths, cfg):
-        available = available_host_memory()
-        requested = int(cfg.decision_cache_mb * 1024**2)
-        self.budget = min(requested, available // 2) if available is not None else 0
-        self.rows, self.bytes = {}, 0
-        retained = []
-        for role in ("policy", "dev"):
-            # File bytes conservatively include tensor payload plus archive headers.
-            required = sum(Path(path).stat().st_size for path in paths[role])
-            if required > self.budget - self.bytes or not self.budget:
-                continue
-            for path in paths[role]:
-                packed = load_training_checkpoint(path)
-                self.rows[Path(path)] = packed
-                self.bytes += sum(t.numel() * t.element_size() for t in packed.values())
-            retained.append(role)
-        print(f"Stage 3 tensor cache: {self.bytes / 1024**2:.1f} MiB retained, "
-              f"{self.budget / 1024**2:.1f} MiB cap (at most half available host RAM); "
-              f"roles {', '.join(retained) or 'none'}; other roles stream memory-mapped tensors.",
-              flush=True)
+    out = Path(out)
+    uids = [records[idx].uid for idx in ids]
+    role_path = decision_role_path(out, role)
+    paths = question_paths(records, ids, out / "decision_labels" / role)
+    legacy_paths = question_paths(records, ids, out / "decision_shards" / role)
+    expected_cases = len(structural_states(cfg.zero_shots, cfg.k)) * math.factorial(cfg.zero_shots)
+    store = load_label_file(role_path) if role_path.exists() else None
+    if store is not None:
+        offsets = store["offsets"].tolist() if isinstance(store.get("offsets"), torch.Tensor) else []
+        if (store.get("schema_version") != DECISION_LABEL_SCHEMA or store.get("fingerprint") != fingerprint
+                or store.get("role") != role or store.get("uids") != uids
+                or len(offsets) != len(ids) + 1 or offsets[0] != 0 or offsets[-1] != len(store["source"])):
+            raise ValueError(f"Incompatible decision labels: {role_path}")
+    sources, preferred, digests, parts = [], [], [], []
+    started = last_print = time.monotonic()
+    built = reused = migrated = 0
+    print(f"Stage 3 {role} labels: building/validating {len(ids)} questions.", flush=True)
+    for position, (idx, path, legacy) in enumerate(zip(ids, paths, legacy_paths), 1):
+        record = records[idx]
+        if store is not None:
+            start, stop = offsets[position-1:position+1]
+            labels = {"source": store["source"][start:stop], "preferred": store["preferred"][start:stop],
+                      "observation_sha256": store["observation_sha256"][position-1],
+                      "coverage": store["coverage"][position-1]}
+        elif path.exists():
+            labels = load_label_file(path)
+            if (labels.get("schema_version") != DECISION_LABEL_SCHEMA or
+                    labels.get("fingerprint") != fingerprint or labels.get("uid") != record.uid):
+                raise ValueError(f"Incompatible decision labels: {path}")
+        else:
+            labels = None
+        if labels is not None:
+            check_saved_labels(record, labels, cfg)
+            reused += 1
+        else:
+            if legacy.exists():
+                shard = load_checkpoint(legacy)
+                if (shard.get("schema_version") != 3 or shard.get("fingerprint") != fingerprint
+                        or shard.get("uid") != record.uid or shard.get("expected_cases") != expected_cases):
+                    raise ValueError(f"Incompatible decision shard: {legacy}")
+                rows, cases = shard["rows"], shard["cases"]
+                del shard
+                migrated += 1
+            else:
+                rows, cases = build_decision_rows(record, teacher["scores"][idx], teacher["safe"][idx],
+                                                  teacher["maximum"][idx], predictor, cfg)
+                built += 1
+            labels = {"schema_version": DECISION_LABEL_SCHEMA, "fingerprint": fingerprint,
+                      "uid": record.uid, "coverage": label_coverage(rows, cases, cfg),
+                      **compact_decision_labels(record, rows, cases, cfg)}
+            del rows, cases
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_torch(path, labels)
+        # The compact file is saved, so the large audit shard is no longer needed.
+        legacy.unlink(missing_ok=True)
+        sources.append(labels["source"])
+        preferred.append(labels["preferred"])
+        digests.append(labels["observation_sha256"])
+        parts.append(labels["coverage"])
+        last_print = decision_progress(f"Stage 3 {role} labels", position, len(ids), started, last_print, cfg,
+                                       f" | built {built}, reused {reused}" +
+                                       (f", migrated {migrated}" if migrated else ""))
+    if store is None:
+        counts = [len(source) for source in sources]
+        store = {"schema_version": DECISION_LABEL_SCHEMA, "fingerprint": fingerprint, "role": role,
+                 "uids": uids, "offsets": torch.from_numpy(np.cumsum([0] + counts, dtype=np.int64)),
+                 "source": torch.cat(sources) if sources else torch.empty(0, dtype=torch.int32),
+                 "preferred": (torch.cat(preferred) if preferred else
+                               torch.empty((0, (cfg.action_count + 7) // 8), dtype=torch.uint8)),
+                 "observation_sha256": digests, "coverage": parts}
+        atomic_torch(role_path, store)
+    del sources, preferred
+    # The merged role file is complete; remove per-question files and leftovers.
+    for path in paths + legacy_paths:
+        path.unlink(missing_ok=True)
+    for directory in (out / "decision_labels" / role, out / "decision_shards" / role, out / "decision_shards"):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass  # Missing, or holds files this workflow does not own.
+    return store
 
-    def get(self, path):
-        path = Path(path)
-        if path in self.rows:
-            return self.rows[path]
-        return load_training_checkpoint(path)
+
+def decision_question_audit(records, splits, teacher, predictor, cfg, out, role, position):
+    """Rebuild one saved question's full rows and cases, checked against its labels.
+
+    Stage 3 stores only head inputs. Goal ranks, per-action reach/cost/steps, and
+    case dispositions are deterministic, so they are recomputed here on demand
+    (use the labeling device; another device may round probabilities differently).
+    """
+    fingerprint = decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
+    path = decision_role_path(out, role)
+    store = load_label_file(path)
+    if (store.get("schema_version") != DECISION_LABEL_SCHEMA or store.get("fingerprint") != fingerprint
+            or store.get("role") != role):
+        raise ValueError(f"Incompatible decision labels: {path}")
+    idx = splits[role][position]
+    rows, cases = build_decision_rows(records[idx], teacher["scores"][idx], teacher["safe"][idx],
+                                      teacher["maximum"][idx], predictor, cfg)
+    compact = compact_decision_labels(records[idx], rows, cases, cfg)
+    start, stop = store["offsets"][position:position+2].tolist()
+    if not (torch.equal(compact["source"], store["source"][start:stop]) and
+            torch.equal(compact["preferred"], store["preferred"][start:stop]) and
+            compact["observation_sha256"] == store["observation_sha256"][position]):
+        raise ValueError("Rebuilt Stage 3 labels differ from the saved labels.")
+    return {"uid": records[idx].uid, "rows": rows, "cases": cases,
+            "coverage": label_coverage(rows, cases, cfg)}
 
 
 def masked_action_loss(model, rows, order, cfg, device, optimizer=None, *, batch_size=None):
@@ -1783,97 +1868,58 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
         raise ValueError("Stage 3 policy questions must match the Stage 1/2 supervised questions.")
     seed_everything(cfg.seed + 300)
     if out is None:
-        raise ValueError("Stage 3 requires an output directory for question-sized shards.")
+        raise ValueError("Stage 3 requires an output directory for its label files.")
     out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    roles = ("policy", "dev")
     fingerprint = decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
     frozen_before = predictor_fingerprint(predictor)
-    paths = decision_shard_paths(records, splits, out)
-    training_paths = {role: [path.with_suffix(".training.pt") for path in paths[role]]
-                      for role in ("policy", "dev")}
     manifest_path = out / "decision_dataset_manifest.json"
-    manifest = {"schema_version": 3, "implementation_revision": PIPELINE_REVISION,
+    manifest = {"schema_version": DECISION_LABEL_SCHEMA, "implementation_revision": PIPELINE_REVISION,
                 "fingerprint": fingerprint,
-                "roles": {role: [str(path.relative_to(out)) for path in paths[role]]
-                          for role in ("policy", "dev")}}
-    if manifest_path.exists():
-        if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
+                "roles": {role: decision_role_path(out, role).relative_to(out).as_posix() for role in roles}}
+    previous = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+    if previous is not None:
+        # Schema-3 runs with the same label contract are migrated, not relabeled.
+        if previous != manifest and not (
+                previous.get("schema_version") == 3 and
+                previous.get("implementation_revision") == PIPELINE_REVISION and
+                previous.get("fingerprint") == fingerprint):
             raise ValueError("Decision dataset manifest has an incompatible teacher, predictor, split, or action contract.")
-    # These exact temporary names are never resumed; the final .pt is the
-    # atomic completion marker. Reclaim old failed writes, and companions that
-    # stored frozen features, before migrating shards on a nearly full disk.
-    reclaimed = legacy = 0
-    for role in paths:
-        for path in paths[role] + training_paths[role]:
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            if tmp.exists():
-                size = tmp.stat().st_size
-                tmp.unlink()
-                reclaimed += size
-        for path in training_paths[role]:
-            if path.exists() and stored_feature_companion(path):
-                size = path.stat().st_size
-                path.unlink()
-                legacy += size
-    print(f"Stage 3 storage: {out.resolve()} | "
-          f"{shutil.disk_usage(out).free / 1024**3:.2f} GiB free; "
-          f"removed {reclaimed / 1024**2:.2f} MiB of incomplete shard writes and "
-          f"{legacy / 1024**2:.2f} MiB of stored-feature companions; compressed audit shards and "
-          "compact companions, with frozen features re-encoded rather than saved.", flush=True)
-    if not manifest_path.exists():
+    # Free space before any write: interrupted writes, and schema-3 training
+    # companions (derived caches, some holding 4 MiB of frozen features each).
+    reclaimed = 0
+    legacy = decision_shard_paths(records, splits, out)
+    for role in roles:
+        current = question_paths(records, splits[role], out / "decision_labels" / role)
+        for path in legacy[role] + current + [decision_role_path(out, role)]:
+            for leftover in (path.with_suffix(path.suffix + ".tmp"), path.with_suffix(".training.pt"),
+                             path.with_suffix(".training.pt.tmp")):
+                if leftover.exists():
+                    reclaimed += leftover.stat().st_size
+                    leftover.unlink()
+    convertible = sum(path.stat().st_size for role in roles for path in legacy[role] if path.exists())
+    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    # Per-question files plus the merged role file, at the most rows a question can have.
+    upper = 2 * sum(len(splits[role]) for role in roles) * len(states) * math.factorial(cfg.zero_shots) * (
+        4 + (cfg.action_count + 7) // 8)
+    free = shutil.disk_usage(out).free
+    print(f"Stage 3 storage: {out.resolve()} | {free / 1024**3:.2f} GiB free; "
+          f"removed {reclaimed / 1024**2:.2f} MiB of derived companions and incomplete writes; "
+          f"{convertible / 1024**2:.2f} MiB of schema-3 audit shards will be converted and deleted. "
+          f"Compact labels need at most {upper / 1024**3:.2f} GiB; frozen features and audit "
+          "fields are recomputed rather than saved.", flush=True)
+    if upper > free + convertible:
+        print(f"WARNING: Stage 3 labels may need up to {upper / 1024**3:.2f} GiB, but only "
+              f"{(free + convertible) / 1024**3:.2f} GiB is free or reclaimable. Free space now; "
+              "completed questions are reused on resume.", flush=True)
+    if previous != manifest:
         atomic_json(manifest_path, manifest)
-    coverage = {}
-    for role in ("policy", "dev"):
-        parts = []
-        started = last_print = time.monotonic()
-        built = reused = compacted = stored = 0
-        print(f"Stage 3 {role} labels: building/validating {len(paths[role])} question shards.", flush=True)
-        for position, (idx, path) in enumerate(zip(splits[role], paths[role]), 1):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists():
-                shard = load_checkpoint(path)
-                if (shard.get("schema_version") != 3 or shard.get("fingerprint") != fingerprint
-                        or shard.get("uid") != records[idx].uid):
-                    raise ValueError(f"Incompatible decision shard: {path}")
-                part = shard_coverage(shard, cfg)
-                packed = training_companion(records[idx], shard["rows"], shard["cases"], cfg)
-                # Storage-only migration: keep every label field, case, and the
-                # validated contract; drop re-encodable features and pickle overhead.
-                if not compressed_checkpoint(path) or any("h" in row for row in shard["rows"]):
-                    atomic_torch(path, {**shard, "rows": without_hidden(shard["rows"])}, compress=True)
-                    compacted += 1
-                reused += 1
-            else:
-                rows, cases = build_decision_rows(records[idx], teacher["scores"][idx],
-                                                  teacher["safe"][idx], teacher["maximum"][idx],
-                                                  predictor, cfg)
-                shard = {"schema_version": 3, "implementation_revision": PIPELINE_REVISION,
-                         "fingerprint": fingerprint, "uid": records[idx].uid,
-                         "structural_states": len(structural_states(cfg.zero_shots, cfg.k)),
-                         "expected_cases": len(structural_states(cfg.zero_shots, cfg.k)) * math.factorial(cfg.zero_shots),
-                         "rows": without_hidden(rows), "cases": cases}
-                part = shard_coverage(shard, cfg)
-                packed = training_companion(records[idx], shard["rows"], cases, cfg)
-                atomic_torch(path, shard, compress=True)
-                built += 1
-            parts.append(part)
-            companion = path.with_suffix(".training.pt")
-            # Validate against the source, but do not rewrite an identical companion.
-            ensure_training_companion(companion, packed)
-            del shard, packed
-            stored += path.stat().st_size + companion.stat().st_size
-            if position == min(10, len(paths[role])):
-                # Warn early instead of failing hours into a long label build.
-                pending = sum(not p.exists() for r in ("policy", "dev") for p in paths[r])
-                needed, free = stored / position * pending, shutil.disk_usage(out).free
-                if needed > free:
-                    print(f"WARNING: Stage 3 needs about {needed / 1024**3:.2f} GiB for {pending} "
-                          f"remaining question shards, but {free / 1024**3:.2f} GiB is free. "
-                          "Free space now; completed shards are reused on resume.", flush=True)
-            last_print = decision_progress(f"Stage 3 {role} labels", position, len(paths[role]),
-                                           started, last_print, cfg,
-                                           f" | built {built}, reused {reused}" +
-                                           (f", compacted {compacted}" if compacted else ""))
-        coverage[role] = combine_coverage(parts)
+    labels, coverage = {}, {}
+    for role in roles:
+        labels[role] = decision_role_labels(role, records, splits[role], teacher, predictor,
+                                            cfg, out, fingerprint)
+        coverage[role] = combine_coverage(labels[role]["coverage"])
         atomic_json(out / "decision_label_coverage.json", coverage)
         print(f"Stage 3 {role}: {coverage[role]['state_order_cases']} state/order cases, "
               f"{coverage[role]['action_rows']} shared action rows; "
@@ -1881,10 +1927,19 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
               f"actionable ranks {coverage[role]['actionable_by_target_rank']}.", flush=True)
         if not coverage[role]["action_rows"]:
             raise ValueError(f"No actionable Stage 3 rows for {role}: {coverage[role]}")
+    held = sum(labels[role][key].numel() * labels[role][key].element_size()
+               for role in roles for key in ("source", "preferred"))
+    print(f"Stage 3 labels in RAM: {held / 1024**2:.1f} MiB for "
+          f"{sum(coverage[role]['action_rows'] for role in roles)} rows.", flush=True)
+    offsets = {role: labels[role]["offsets"].tolist() for role in roles}
+
+    def question_rows(role, position):
+        start, stop = offsets[role][position:position+2]
+        return decision_training_rows(records[splits[role][position]],
+                                      labels[role]["source"][start:stop].numpy(),
+                                      labels[role]["preferred"][start:stop].numpy(), predictor, cfg)
+
     model = SupervisedActionHead(cfg).to(device)
-    cache = PackedDecisionCache(training_paths, cfg)
-    question = {path: records[idx] for role in ("policy", "dev")
-                for idx, path in zip(splits[role], training_paths[role])}
     opt = torch.optim.Adam(model.parameters(), lr=cfg.decision_lr, weight_decay=cfg.weight_decay)
     best, weights, stale, history = math.inf, None, 0, []
     rng = np.random.RandomState(cfg.seed + 301)
@@ -1918,24 +1973,24 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
         model.train()
         started = last_print = time.monotonic()
         train_total, train_count = 0., 0
-        for position, path in enumerate(rng.permutation(training_paths["policy"]), 1):
-            rows = decision_training_rows(question[path], cache.get(path), predictor, cfg)
+        for position, question in enumerate(rng.permutation(len(splits["policy"])), 1):
+            rows = question_rows("policy", question)
             value, n = masked_action_loss(model, rows, rng.permutation(len(rows["target"])), cfg, device, opt)
             train_total, train_count = train_total + value, train_count + n
             del rows
-            last_print = decision_progress(f"Stage 3 epoch {epoch+1} train", position, len(paths["policy"]),
+            last_print = decision_progress(f"Stage 3 epoch {epoch+1} train", position, len(splits["policy"]),
                                            started, last_print, cfg, f" | rows {train_count}")
         model.eval()
         with torch.no_grad():
             started = last_print = time.monotonic()
             total, count = 0., 0
-            for position, path in enumerate(training_paths["dev"], 1):
-                rows = decision_training_rows(question[path], cache.get(path), predictor, cfg)
+            for position in range(len(splits["dev"])):
+                rows = question_rows("dev", position)
                 value, n = masked_action_loss(model, rows, range(len(rows["target"])), cfg, device,
                                               batch_size=cfg.decision_eval_batch_size)
                 total, count = total + value, count + n
                 del rows
-                last_print = decision_progress(f"Stage 3 epoch {epoch+1} dev", position, len(paths["dev"]),
+                last_print = decision_progress(f"Stage 3 epoch {epoch+1} dev", position + 1, len(splits["dev"]),
                                                started, last_print, cfg, f" | rows {count}")
             dev_loss = total / count
         history.append({"epoch": epoch+1, "dev_loss": dev_loss})
@@ -2435,7 +2490,7 @@ class Workflow:
         contract_cfg = asdict(cfg)
         for key in ("resume", "output_dir", "device", "cpu_threads", "print_every", "fixed_acquisition_orders",
                     "continue_after_max",
-                    "decision_eval_batch_size", "decision_cache_mb"):
+                    "decision_eval_batch_size"):
             contract_cfg.pop(key)
         sources = [{"path": str(Path(p).resolve()), "bytes": Path(p).stat().st_size,
                     "mtime_ns": Path(p).stat().st_mtime_ns} for p in [cfg.train_file] + cfg.test_files]
@@ -2561,6 +2616,13 @@ class Workflow:
               f"development loss {checkpoint['dev_loss']:.4f}.")
         return self
 
+    def decision_label_audit(self, role, position):
+        """Full planner rows and cases for one saved Stage 3 question, recomputed."""
+        if not hasattr(self, "predictor"):
+            self.train_snapshot()
+        return decision_question_audit(self.records, self.splits, self.teacher, self.predictor,
+                                       self.cfg, self.out, role, position)
+
     def report(self):
         if not hasattr(self, "head"):
             self.train_decision_head()
@@ -2622,7 +2684,8 @@ def load_inference_bundle(path, device="cpu"):
     bundle = load_checkpoint(path)
     if bundle.get("schema_version") != 4 or bundle.get("implementation_revision") != PIPELINE_REVISION:
         raise ValueError(f"Expected a version 4 inference bundle with revision {PIPELINE_REVISION} training contract; old bundles are incompatible.")
-    cfg = Config(**bundle["config"])
+    # decision_cache_mb was a runtime-only Stage 3 setting in earlier revision-5 bundles.
+    cfg = Config(**{key: value for key, value in bundle["config"].items() if key != "decision_cache_mb"})
     cfg.validate()
     if (bundle.get("action_names") != action_names(cfg) or
             bundle["decision_head"].get("action_count") != cfg.action_count or

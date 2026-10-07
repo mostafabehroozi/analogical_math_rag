@@ -84,8 +84,8 @@ and budget. Cases above the budget stay in the dataset with an explicit status.
 Thus **2,000 training questions produce 22,944,000 state/order cases**, before
 development questions. These are exhaustive audit cases, not 22,944,000 head
 training rows: every in-budget case with a valid acquisition contributes,
-and identical visible observations share one row. This expansion, together with continuation search
-and shard I/O, explains why Stage 3 can be slow even though the head is small.
+and identical visible observations share one row. This expansion, together with continuation search,
+explains why Stage 3 label construction can be slow even though the head is small.
 Question count alone is not its training-set size.
 
 The frozen Stage 2 predictor supplies recognition probabilities for each
@@ -150,9 +150,10 @@ Every case has exactly one disposition, with this precedence:
 
 Cases without a valid acquisition have a null training-row reference.
 Identical visible observations within a question share one training row.
-Each row stores its visible state key, valid mask, normalized soft target,
-goal-rank distribution, and per-action reach/cost/steps for diagnosis. Its
-frozen hidden vector is re-encoded from that exact observation when needed. All
+Each row has a visible state key, valid mask, normalized soft target,
+goal-rank distribution, and per-action reach/cost/steps for diagnosis. Only
+the head's inputs are saved (see below); the diagnostic fields are recomputed
+on demand. All
 ordinary Stage 3 rows have equal loss weight, regardless of how many original
 state/order cases they represent. Thus exhaustive case coverage does not mean
 one equally weighted training example per case. Terminal and over-budget
@@ -199,21 +200,22 @@ not an independent held-out test. `evaluation_protocol` in both
 and the external files used for model selection. Final reports include the
 pooled audit set and each benchmark separately.
 
-Stage 3 writes atomic question-sized shards in
-`decision_shards/policy` and `decision_shards/dev`, with
+Stage 3 writes `decision_labels/policy.pt` and `decision_labels/dev.pt`, with
 `decision_dataset_manifest.json` and `decision_label_coverage.json`. The
-manifest and shards bind to the config, split, teacher labels, and frozen
-predictor fingerprint. An interrupted build resumes completed matching
-questions; incompatible shards fail explicitly. A role with no actionable
-rows fails with its coverage report. During training, policy question and row
-order are shuffled deterministically each epoch, and dev questions are read in
-stable order for masked-loss checkpoint selection. All exhaustive labels are
+manifest and label files bind to the config, split, teacher labels, and frozen
+predictor fingerprint. While a role builds, each completed question is one
+small atomic file in `decision_labels/<role>/`; an interrupted build resumes
+completed matching questions, and the finished role is merged into one file.
+Incompatible files fail explicitly. A role with no actionable rows fails with
+its coverage report. During training, policy question and row order are
+shuffled deterministically each epoch, and dev questions are read in stable
+order for masked-loss checkpoint selection. All exhaustive labels are
 constructed **once before the head's epoch loop**; epochs reuse those rows and
 never regenerate states or planner targets. Frozen hidden vectors are not
-stored: each training and development pass rebuilds every row's stored
-observation and re-encodes it with the frozen predictor on the selected
-device. A new invocation validates matching shards before reuse. The frozen
-Stage 2 state is checked after training.
+stored: each training and development pass rebuilds every row's observation
+and re-encodes it with the frozen predictor on the selected device. A new
+invocation verifies saved labels before reuse. The frozen Stage 2 state is
+checked after training.
 
 Stage 3 prints question progress, elapsed time, and estimated remaining time
 for each role's label build and each epoch's training/development pass. Updates
@@ -223,7 +225,7 @@ early-stopping patience. The `Stage 3 policy: ...` coverage summary means policy
 labels are complete; development labels come next, before head training.
 With the default external-development setting, all four benchmark logs supply
 development questions, and their exhaustive label build can be substantial.
-Keep the same output directory and configuration to reuse completed shards
+Keep the same output directory and configuration to reuse completed questions
 after interruption. After every completed training/development epoch,
 `decision_head_progress.pt` atomically saves current and best head weights,
 Adam state, question/row shuffle RNG, losses, and early-stopping bookkeeping.
@@ -234,45 +236,77 @@ progress file begin head training at epoch 1. Keep the training and development
 settings and selected device consistent when comparing a resumed run to an
 uninterrupted run. The final selected head is saved when Stage 3 finishes.
 
-Audit shards are gzip-compressed at level 1 with pickle protocol 4. They keep
-every row field, array dtype/value, state/order case, and fingerprint except
-the row's frozen hidden vector `h`. That vector is a deterministic function of
-the fingerprinted Stage 2 predictor and the row's observation, so it is
-re-encoded instead of stored. Earlier revision-5 shards stored `h` twice (audit
-shard and training companion), and `torch.save`'s default protocol 2 wrote
-NumPy buffers as latin-1 strings. That took about 8 MiB per question, roughly
-30 GiB for the default policy role plus pooled test-file development, and
-filled Kaggle's output disk during the policy labels. A synthetic
-default-geometry question with about 8,100 rows now needs about 1 MiB
-(audit shard plus companion) instead of about 11 MiB. It does not reduce
-coverage or change labels.
+### Stage 3 label storage
 
-`load_checkpoint` detects compressed and legacy uncompressed shards. On
-resume, matching shards that still contain `h`, or are uncompressed, are
-validated and atomically rewritten without it. Labels are not rebuilt; the
-progress line counts these questions as `compacted`. Companions that stored
-`h` are deleted before any shard is rewritten, so a run that stopped on a full
-disk can resume in place. Training companions and public model checkpoints
-remain ordinary PyTorch files. Use this workflow's `load_checkpoint` rather
-than bare `torch.load` for compressed audit shards.
+Stage 3 saves only what the head trains on. Each row keeps two values:
+
+- `source`: the zero-shot scenario and in-budget state of the first case
+  mapped to the row, as one `int32` (`scenario * in-budget states + state`).
+- `preferred`: a bitmask of the row's tied optimal actions (one byte for the
+  default seven actions).
+
+That is about **5 bytes per row**: roughly 43 KB for a synthetic
+default-geometry question with about 8,100 rows, and about 0.2 GB for 2,000
+policy questions plus the pooled test-file development questions. Everything
+else is a deterministic function of these values and the fingerprinted
+contract:
+
+| Head input | Rebuilt from |
+| --- | --- |
+| Observation | The question's measurements, permuted by `scenario`, at `state` |
+| Frozen hidden vector `h` | The observation, re-encoded by the frozen predictor |
+| Valid-action mask | The budget-filtered action table at `state` |
+| Soft target | An even split over `preferred`, rounded exactly as the planner did |
+
+When a question is labeled, every row's rebuilt observation is checked
+against the row's visible state key, and targets and valid masks must match
+exactly. Each question also stores the SHA-256 of its rebuilt observations.
+Reused questions are re-verified against that hash, so an observation-code or
+data change cannot silently alter training inputs. On CPU the re-encoded
+features match label-time features bit for bit; on a GPU they can differ by
+about 2e-7 from floating-point roundoff.
+
+Planner diagnostics (goal-rank distributions, per-action reach/cost/steps,
+objective) and the 11,472 case dispositions per question are not stored.
+`decision_label_coverage.json` keeps their counts. To inspect one question,
+`WORK.decision_label_audit("policy", position)` (or
+`decision_question_audit(...)`) rebuilds its full rows and cases and checks
+them against the saved labels. Run it on the labeling device; another device
+can round probabilities differently and fail the check.
+
+Both roles' labels stay in RAM during training, about 160 MiB for the default
+run, so there is no cache setting; the earlier `decision_cache_mb` option is
+gone. Only one question's re-encoded features and training tensors occupy GPU
+memory at a time. Before writing, Stage 3 prints free disk space and an upper
+bound for its label files, and warns if the bound does not fit.
+
+**Why the earlier layout filled Kaggle's disk.** Earlier revision-5 code
+pickled every audit row and case per question, first with the 128-value
+feature vector stored twice (about 8 MiB per question; the v5 run hit
+`No space left on device` after 1,467 policy questions), later about 1 MiB per
+question in two files. Most of that was derivable data, such as a 64-character
+hash string per row.
+
+**Recovering such a run.** Keep the same `output_dir`, input files, and
+training configuration with `resume=True`. Run the updated definition cells,
+configuration, and Stages 0-2 (they load their completed checkpoints), then
+`WORK.train_decision_head()`. Before any write, Stage 3 deletes the derived
+`.training.pt` companions (up to 4 MiB each) and interrupted `.tmp` files. It
+then converts each completed schema-3 shard to compact labels **without
+relabeling** and deletes the shard, so free space only grows; the progress
+line counts these as `migrated`. Only missing questions are built, and a
+matching schema-3 manifest is upgraded in place. If the disk is completely
+full, Stage 0's small JSON reports can fail before Stage 3 frees space; delete
+`decision_shards/*/*.training.pt` first. Revision-4 runs cannot resume under
+the revision-5 action and label contract; start revision 5 in a new output
+directory.
 
 A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
 write failure, commonly caused by exhausted disk space or a storage quota.
-It is not evidence of a GPU-memory failure. Stage 3 prints the output path
-and free filesystem space, removes known incomplete shard `.pt.tmp` files
-left by old interrupted runs, and preserves completed files on failed writes.
-Write errors report the affected path, free space, and original exception;
-free filesystem space alone does not rule out a quota or I/O problem.
-
-On Kaggle, check `shutil.disk_usage(CFG.output_dir)` and free unneeded files
-if the output filesystem is full. Each write still needs temporary space for
-one shard. After the first ten questions of each role, Stage 3 projects the
-space needed for every remaining shard from the sizes so far and prints a
-warning if it exceeds the free space, instead of failing hours later.
-To recover an interrupted **revision-5** run, use the same `output_dir`, input
-files, and training configuration with `resume=True`. Revision-4 runs cannot
-resume under the new action and label contract; start revision 5 in its new
-default output directory.
+It is not evidence of a GPU-memory failure. Failed writes report the affected
+path, free space, and original exception, remove the partial temporary file,
+and preserve completed files. Free filesystem space alone does not rule out a
+quota or I/O problem.
 
 The Stage 3 implementation reuses budget-specific structure/action tables
 across questions, constructs observations in NumPy batches, reuses each
@@ -280,41 +314,9 @@ scenario's observations for both inference and visible-state grouping, and
 evaluates the scalar goal rules in arrays.
 It still enumerates every state/order case and uses shared continuation
 decisions and masked training. The evaluator action and tie rule changed in
-revision 5, so older label shards cannot be reused.
-
-After validating each full shard, it writes a compact `.training.pt` companion
-containing `target` and `valid` tensors plus each row's source: the zero-shot
-`scenario` and in-budget `state` of the first case mapped to that row.
-Building or validating a companion rebuilds every row's observation from
-these sources and checks it against the row's stored `state_key` hash, so the
-re-encoded features use exactly the label-time inputs. Epochs read these
-companions instead of unpickling the cases and audit metadata repeatedly, then
-re-encode one question's observations on the predictor's device. A synthetic
-default-geometry question took about 20 ms on two CPU threads and about 9 ms
-on a local RTX 3050 Ti laptop GPU, mostly CPU observation assembly; this is not
-a Kaggle measurement. On CPU the re-encoded vectors matched the formerly stored
-ones bit for bit; on that GPU they differed by at most about 2e-7 from
-floating-point roundoff. Matching companions are
-validated and reused; missing or stale companions are rebuilt from validated
-source rows. Matching revision-5 schema-3 shards and manifests remain usable
-with the same configuration and output directory. Training preserves the
-existing shuffled minibatch order and optimizer steps, and reads the
-accumulated loss back once per question.
-
-`decision_cache_mb=4096` sets a 4 GiB requested packed-tensor CPU cache cap,
-further limited to half the currently available host RAM. If available RAM
-cannot be detected, the cache is disabled. It retains memory-mapped companion
-tensors, not re-encoded features, for a role only if every question in that
-role fits in the remaining budget, considering policy first. Other roles stream one memory-mapped packed question
-at a time. The OS pages these tensors on demand; the cache does not eagerly
-clone the entire dataset into RAM. Whole-role admission avoids repeatedly
-filling and evicting a partial cache when question order changes each epoch.
-`decision_cache_mb=0` disables the cache. This is a runtime setting: changing
-it does not invalidate matching experiment artifacts. The cap covers retained
-tensor payloads, not the entire process; records, one question's audit
-metadata, model state, and temporary arrays also need RAM. Every row remains
-available in either mode. Only one question's re-encoded features and
-training tensors occupy GPU memory at a time.
+revision 5, so revision-4 labels cannot be reused. Training preserves the
+shuffled minibatch order and optimizer steps, and reads the accumulated loss
+back once per question.
 
 `decision_eval_batch_size=4096` uses larger development-only forward batches
 for head evaluation. Every development row still contributes to masked loss,
@@ -328,7 +330,7 @@ selection behavior matters.
 On Kaggle, enable an available GPU in **Settings > Accelerator** and keep
 `device="auto"`. The selected device runs the frozen encoder's batched
 inference during labeling and the head's forward/backward passes. Observation
-assembly, state enumeration, continuation search, grouping, and shard
+assembly, state enumeration, continuation search, grouping, and label
 serialization still run on the CPU; enabling CUDA does not move Python search
 or file I/O to the GPU. The Stage 0 notebook cell reports the selected device,
 available GPUs, memory, and CPU threads so the active session can be checked.

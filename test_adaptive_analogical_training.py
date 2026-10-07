@@ -921,28 +921,33 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     assert work.audit["second"]["duplicate_or_cross_file_overlap"] == 2
     assert (tmp_path/"run"/"decision_head_completed.pt").exists()
     manifest = json.loads((tmp_path/"run"/"decision_dataset_manifest.json").read_text())
-    assert manifest["schema_version"] == 3
-    policy_shards = [a.load_checkpoint(tmp_path/"run"/path) for path in manifest["roles"]["policy"]]
-    saved_rows = [row for shard in policy_shards for row in shard["rows"]]
-    assert saved_rows and {"uid", "state_key", "target", "valid", "goal_rank"} <= set(saved_rows[0])
-    # Frozen features are re-encoded from each row's stored visible source, not saved.
-    assert not {"h", "truth", "teacher_scores", "future_measurements"} & set(saved_rows[0])
-    assert all(set(a.load_training_checkpoint((tmp_path/"run"/path).with_suffix(".training.pt"))) ==
-               {"target", "valid", "scenario", "state"} for path in manifest["roles"]["policy"])
-    assert all("weight" not in row for row in saved_rows)
-    assert all(np.isclose(row["target"].sum(), 1) and not row["target"][~row["valid"]].any()
-               for row in saved_rows)
-    assert all(len(shard["cases"]) == len(a.structural_states(cfg.zero_shots, cfg.k)) * 2
-               for shard in policy_shards)
-    assert all(sum(a.Counter(case["status"] for case in shard["cases"]).values()) == shard["expected_cases"]
-               for shard in policy_shards)
+    assert manifest["schema_version"] == 4
+    assert manifest["roles"] == {"policy": "decision_labels/policy.pt", "dev": "decision_labels/dev.pt"}
+    stores = {role: a.load_label_file(tmp_path/"run"/path) for role, path in manifest["roles"].items()}
+    # Only head inputs are stored: about five bytes per row, no features or audit rows.
+    assert set(stores["policy"]) == {"schema_version", "fingerprint", "role", "uids", "offsets",
+                                     "source", "preferred", "observation_sha256", "coverage"}
+    assert sorted(path.name for path in (tmp_path/"run"/"decision_labels").iterdir()) == ["dev.pt", "policy.pt"]
+    assert not (tmp_path/"run"/"decision_shards").exists()
+    for store in stores.values():
+        target = a.decision_targets(store["preferred"].numpy(), cfg)
+        valid = a.decision_valid(store["source"].numpy(), cfg)
+        assert len(target) and np.allclose(target.sum(1), 1) and not target[~valid].any()
     role_uids = {role: {work.records[i].uid for i in ids} for role, ids in work.splits.items()}
-    assert {shard["uid"] for shard in policy_shards} == role_uids["supervised"] == role_uids["policy"]
+    assert stores["policy"]["uids"] == [work.records[i].uid for i in work.splits["policy"]]
+    assert set(stores["policy"]["uids"]) == role_uids["supervised"] == role_uids["policy"]
     assert work.splits["policy"] == work.splits["supervised"]
-    assert {row["uid"] for row in saved_rows} <= role_uids["supervised"]
-    dev_rows = [row for path in manifest["roles"]["dev"]
-                for row in a.load_checkpoint(tmp_path/"run"/path)["rows"]]
-    assert {row["uid"] for row in dev_rows} <= role_uids["dev"]
+    assert set(stores["dev"]["uids"]) == role_uids["dev"]
+    coverage = work.decision_checkpoint["coverage"]["policy"]
+    assert coverage["action_rows"] == len(stores["policy"]["source"])
+    assert coverage["state_order_cases"] == (
+        len(a.structural_states(cfg.zero_shots, cfg.k)) * 2 * len(work.splits["policy"]))
+    audit = work.decision_label_audit("policy", 0)
+    assert len(audit["rows"]) == stores["policy"]["offsets"][1].item()
+    assert {"uid", "state_key", "target", "valid", "goal_rank"} <= set(audit["rows"][0])
+    assert not {"truth", "teacher_scores", "future_measurements", "weight"} & set(audit["rows"][0])
+    assert {row["uid"] for row in audit["rows"]} == {stores["policy"]["uids"][0]}
+    assert len(audit["cases"]) == len(a.structural_states(cfg.zero_shots, cfg.k)) * 2
     external_uids = role_uids["external"] | role_uids["second"]
     assert not role_uids["supervised"] & (role_uids["dev"] | role_uids["audit"] | external_uids)
     protocol = work.results["evaluation_protocol"]
@@ -989,24 +994,28 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     assert comparison.decision_checkpoint["dataset_fingerprint"] == work.decision_checkpoint["dataset_fingerprint"]
     comparison_report = comparison.report()["external"]["adaptive"]
     assert set(comparison_report["policies"]) == {"full", "fixed_short", "supervised"}
-    # Interrupted shard construction rebuilds only the missing question.
-    keep = tmp_path/"run"/manifest["roles"]["policy"][0]
-    missing = tmp_path/"run"/manifest["roles"]["policy"][1]
-    kept_mtime = keep.stat().st_mtime_ns
-    missing.unlink()
+    # A missing role file is rebuilt; the other role's saved labels are reused untouched.
+    policy_file, dev_file = (tmp_path/"run"/manifest["roles"][role] for role in ("policy", "dev"))
+    dev_mtime = dev_file.stat().st_mtime_ns
+    policy_file.unlink()
     (tmp_path/"run"/"decision_head_completed.pt").unlink()
+    build = a.build_decision_rows
+    built = []
+    monkeypatch.setattr(a, "build_decision_rows",
+                        lambda record, *args: built.append(record.uid) or build(record, *args))
     repaired = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
-    assert missing.exists() and keep.stat().st_mtime_ns == kept_mtime
-    assert repaired.decision_checkpoint["coverage"]["policy"]["state_order_cases"] == (
-        len(a.structural_states(cfg.zero_shots, cfg.k)) * 2 * len(work.splits["policy"]))
-    shard = a.load_checkpoint(keep)
-    shard["schema_version"] = 2
-    a.atomic_torch(keep, shard)
+    monkeypatch.setattr(a, "build_decision_rows", build)
+    assert built == [work.records[i].uid for i in work.splits["policy"]]
+    assert policy_file.exists() and dev_file.stat().st_mtime_ns == dev_mtime
+    assert repaired.decision_checkpoint["coverage"] == work.decision_checkpoint["coverage"]
+    store = a.load_label_file(dev_file)
+    store["schema_version"] = 3
+    a.atomic_torch(dev_file, store)
     (tmp_path/"run"/"decision_head_completed.pt").unlink()
-    with pytest.raises(ValueError, match="Incompatible decision shard"):
+    with pytest.raises(ValueError, match="Incompatible decision labels"):
         a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
-    shard["schema_version"] = 3
-    a.atomic_torch(keep, shard)
+    store["schema_version"] = a.DECISION_LABEL_SCHEMA
+    a.atomic_torch(dev_file, store)
     contract_path = tmp_path/"run"/"contract.json"
     contract = json.loads(contract_path.read_text())
     assert contract.pop("implementation_revision") == a.PIPELINE_REVISION
@@ -1129,7 +1138,7 @@ def test_packed_head_batches_preserve_losses_updates_and_row_order(train):
     assert a.masked_action_loss(optimized, [], [], cfg, "cpu") == (0., 0)
 
 
-def test_decision_progress_and_single_coverage_check_preserve_shard_resume(tmp_path, monkeypatch, capsys):
+def test_decision_progress_and_single_coverage_check_preserve_label_resume(tmp_path, monkeypatch, capsys):
     cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1,
                    decision_epochs=1, decision_batch_size=16, recognition_threshold=.1)
     records = [record(cfg, index=i) for i in range(2)]
@@ -1141,11 +1150,11 @@ def test_decision_progress_and_single_coverage_check_preserve_shard_resume(tmp_p
     teacher = {"scores": scores, "safe": safe, "maximum": maximum}
     predictor = fake_predictor(cfg)
     checks = []
-    original = a.shard_coverage
-    def track_coverage(shard, config):
-        checks.append(shard["uid"])
-        return original(shard, config)
-    monkeypatch.setattr(a, "shard_coverage", track_coverage)
+    original = a.label_coverage
+    def track_coverage(rows, cases, config):
+        checks.append(len(cases))
+        return original(rows, cases, config)
+    monkeypatch.setattr(a, "label_coverage", track_coverage)
     first = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
     assert len(checks) == 2
     log = capsys.readouterr().out
@@ -1153,29 +1162,22 @@ def test_decision_progress_and_single_coverage_check_preserve_shard_resume(tmp_p
     assert "Stage 3 epoch 1 train: 1/1" in log
     assert "Stage 3 epoch 1 dev: 1/1" in log
     assert "train loss" in log and "dev loss" in log and "ETA" in log
-    # Resume a legacy uncompressed audit shard without regenerating its labels.
-    paths = a.decision_shard_paths(records, splits, tmp_path)
-    legacy = paths["policy"][0]
-    shard = a.load_checkpoint(legacy)
-    a.atomic_torch(legacy, shard)
-    assert not a.compressed_checkpoint(legacy)
-    interrupted = paths["dev"][0].with_suffix(".pt.tmp")
-    interrupted.write_bytes(b"leftover from failed dev shard")
-    monkeypatch.setattr(a, "build_decision_rows", lambda *args: pytest.fail("Should reuse saved shards"))
+    # Resume saved role labels: no relabeling and no second coverage pass.
+    interrupted = a.decision_role_path(tmp_path, "dev").with_suffix(".pt.tmp")
+    interrupted.write_bytes(b"leftover from failed dev label write")
+    monkeypatch.setattr(a, "build_decision_rows", lambda *args: pytest.fail("Should reuse saved labels"))
     resumed = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    assert a.compressed_checkpoint(legacy)
     assert not interrupted.exists()
-    assert len(checks) == 4
+    assert len(checks) == 2
     assert "built 0, reused 1" in capsys.readouterr().out
     assert first["coverage"] == resumed["coverage"]
     assert first["history"] == resumed["history"]
     assert all(torch.equal(value, resumed["weights"][key]) for key, value in first["weights"].items())
 
 
-@pytest.mark.parametrize("compress", [False, True])
 @pytest.mark.parametrize("failure", ["save", "replace"])
 def test_checkpoint_write_failure_preserves_completed_file_and_cleans_partial(
-        tmp_path, monkeypatch, compress, failure):
+        tmp_path, monkeypatch, failure):
     path = tmp_path / "completed.pt"
     a.atomic_torch(path, {"weights": torch.tensor([7.])})
     original_bytes = path.read_bytes()
@@ -1191,41 +1193,13 @@ def test_checkpoint_write_failure_preserves_completed_file_and_cleans_partial(
             raise OSError(122, "Disk quota exceeded")
         monkeypatch.setattr(a.os, "replace", fail_replace)
     with pytest.raises(RuntimeError, match="Checkpoint write failed") as caught:
-        a.atomic_torch(path, {"weights": torch.tensor([9.])}, compress=compress)
+        a.atomic_torch(path, {"weights": torch.tensor([9.])})
     assert str(path) in str(caught.value)
     assert "GiB free" in str(caught.value) and "storage quota" in str(caught.value)
     assert isinstance(caught.value.__cause__, OSError)
     assert path.read_bytes() == original_bytes
     assert not path.with_suffix(".pt.tmp").exists()
     assert a.load_checkpoint(path)["weights"].item() == 7.
-
-
-def test_compressed_decision_shard_preserves_all_audit_and_training_fields(tmp_path):
-    cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1,
-                   recognition_threshold=.1)
-    r = record(cfg)
-    scores = np.arange(cfg.n, 0, -1, dtype=np.float32)
-    safe, maximum = np.ones(cfg.n), np.array([1., 0., 0., 0.])
-    rows, cases = a.build_decision_rows(r, scores, safe, maximum, fake_predictor(cfg), cfg)
-    assert rows
-    shard = {"rows": rows, "cases": cases}
-    plain, zipped = tmp_path / "plain.pt", tmp_path / "zipped.pt"
-    a.atomic_torch(plain, shard)
-    a.atomic_torch(zipped, shard, compress=True)
-    assert zipped.stat().st_size < plain.stat().st_size
-    assert a.compressed_checkpoint(zipped) and not a.compressed_checkpoint(plain)
-    restored = a.load_checkpoint(zipped)
-    assert restored["cases"] == cases
-    for expected, actual in zip(rows, restored["rows"]):
-        assert actual.keys() == expected.keys()
-        for key, value in expected.items():
-            if isinstance(value, np.ndarray):
-                assert actual[key].dtype == value.dtype
-                np.testing.assert_array_equal(actual[key], value)
-            else:
-                assert actual[key] == value
-    for key, tensor in a.pack_decision_rows(rows, cfg).items():
-        assert torch.equal(tensor, a.pack_decision_rows(restored["rows"], cfg)[key])
 
 
 def test_notebook_is_self_contained_compiles_and_matches_module():

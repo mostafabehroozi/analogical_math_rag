@@ -38,22 +38,17 @@ def check_labels(expected, actual):
                 assert before[key] == after[key], key
 
 
-def measure_files_and_head(rows, cases, cfg, directory, repeats):
-    audit, packed = directory / "audit.pt", directory / "training.pt"
-    compressed = directory / "audit_compressed.pt"
+def measure_files_and_head(record, rows, cases, cfg, directory, repeats):
+    audit, labels = directory / "audit.pt", directory / "labels.pt"
     current.atomic_torch(audit, {"rows": rows, "cases": cases})
-    current.atomic_torch(compressed, {"rows": rows, "cases": cases}, compress=True)
-    current.atomic_torch(packed, current.pack_decision_rows(rows, cfg))
+    current.atomic_torch(labels, current.compact_decision_labels(record, rows, cases, cfg))
     measurements = {"audit_file_bytes": audit.stat().st_size,
-                    "compressed_audit_file_bytes": compressed.stat().st_size,
-                    "training_file_bytes": packed.stat().st_size}
-    for name, path in (("audit", audit), ("compressed_audit", compressed),
-                       ("training", packed), ("mapped_training", packed)):
-        loader = current.load_training_checkpoint if name == "mapped_training" else current.load_checkpoint
+                    "label_file_bytes": labels.stat().st_size}
+    for name, path, loader in (("audit", audit, current.load_checkpoint),
+                               ("labels", labels, current.load_label_file)):
         times = [timed(lambda: loader(path))[1] for _ in range(repeats)]
         measurements[name + "_load_seconds_median"] = statistics.median(times)
-    measurements["projected_2000_question_storage_gib"] = (
-        (compressed.stat().st_size + packed.stat().st_size) * 2000 / 1024**3)
+    measurements["projected_2000_question_storage_gib"] = labels.stat().st_size * 2000 / 1024**3
     return measurements
 
 
@@ -77,8 +72,7 @@ def main():
               "baseline_ref": args.baseline_ref, "torch_version": torch.__version__,
               "cpu_threads": 1, "config": {"k": cfg.k, "zero_shots": cfg.zero_shots,
                                            "decision_batch_size": cfg.decision_batch_size,
-                                           "decision_eval_batch_size": cfg.decision_eval_batch_size,
-                                           "decision_cache_mb": cfg.decision_cache_mb},
+                                           "decision_eval_batch_size": cfg.decision_eval_batch_size},
               "questions": []}
     with tempfile.TemporaryDirectory(prefix="adaptive_stage3_benchmark_") as temp:
         directory = Path(temp)
@@ -118,7 +112,8 @@ def main():
             print(json.dumps(entry), flush=True)
             report["questions"].append(entry)
         assert rows, "Need actionable rows for head benchmark"
-        report["files"] = measure_files_and_head(rows, cases, cfg, directory, max(5, args.repeats))
+        report["files"] = measure_files_and_head(current.Record(**data), rows, cases, cfg, directory,
+                                                 max(5, args.repeats))
         order = np.random.RandomState(91).permutation(len(rows))
         packed = current.pack_decision_rows(rows, cfg)
         torch.manual_seed(19)
