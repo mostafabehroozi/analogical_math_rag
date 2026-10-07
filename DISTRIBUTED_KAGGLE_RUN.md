@@ -86,12 +86,16 @@ CONFIG["AVALAI_MODEL_NAME_EVALUATOR"] = "openai/gpt-oss-20b"
 ```
 
 No opt-in flag is required for a model-name-only change when the execution code
-is unchanged. A legacy code fingerprint is adopted only after authenticating
+is unchanged. A saved code fingerprint is adopted only after authenticating
 its complete source hash against the saved Git revision and comparing worker
-source. Tests and unrelated training/report scripts do not affect that proof;
-worker modules, configuration, and their local import dependencies do. The
-actual runtime fingerprint is recorded separately in worker status.
-`DISTRIBUTED_ALLOW_MODEL_ROTATION=True` does not authorize changed worker code.
+source. The proof covers `config.py`, `src/orchestration.py` (the
+`run_experiments` entry module), and every local module they import, directly
+or transitively, including imports inside functions. Tests, notebooks, the
+fine-tuning and reporting modules under `src`, and other scripts the worker
+never imports do not affect it. The actual runtime fingerprint is recorded
+separately in worker status and in each run log's `worker_code_history`.
+`DISTRIBUTED_ALLOW_MODEL_ROTATION=True` does not authorize changed worker code;
+`DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE=True` does (see below).
 Do not set `DISTRIBUTED_CODE_FINGERPRINT` manually: workers discard manual pins,
 and the Hub helper authenticates source even when creating a new manifest.
 
@@ -159,17 +163,53 @@ Model-name rotation retains the existing manifest under the rules above.
 
 A mismatch occurs before provider calls. The original revision is inside the
 authoritative manifest's `code_fingerprint`, rather than the latest branch HEAD.
-If worker behavior changed, resume with the original source or start a separate
-run. Setting a fingerprint by hand or overwriting the remote manifest would mix
+The manifest hashes every Python file, so a restarted notebook that clones a
+newer commit almost always has a different fingerprint. That alone does not
+block a resume: the worker reconstructs the saved revision from Git history and
+compares only the worker import closure described above. Two outcomes exist:
+
+- **Only unrelated files changed** (tests, notebooks, fine-tuning or reporting
+  modules, root-level tools). The resume proceeds automatically; the manifest's
+  code identity is pinned and nothing needs to be configured.
+- **Worker code changed** (the error lists the modules). The run stops unless
+  you choose one of the options below.
+
+### Resume with changed worker code (normal case)
+
+Set this in every restarted worker notebook, before `run_experiments(...)`:
+
+```python
+CONFIG["DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE"] = True
+```
+
+The worker keeps the existing run ID, manifest, and checkpoints, pins the
+manifest's code identity, and resumes with the current source. The accepted
+change is written to the worker's `status.json` (`worker_code`) and to the
+`worker_code_history` of every run log the session touches, so the finalized
+run records exactly which code produced which results. Scientific inputs,
+settings, question order, answers, and corpus are still validated strictly;
+the flag never hides those. The manifest is never rewritten.
+
+Leave the flag off when a run must stay on one exact code revision; then use
+the isolated original checkout described next, or start a new run ID. Setting
+a fingerprint by hand or overwriting the remote manifest would mix
 incompatible results and is not a recovery method.
 
 ### Resume `layer1-grouping-k5-size2-v2` after a Kaggle restart
 
 This run's remote manifest identifies original Git revision
-`7f6b91217973b08e0f38ac86d5e59b5b12111953`. Current source at `8befd58`
-reproduces the five-file compatibility error. A fresh kernel alone cannot fix
-it if startup clones the newer source again. Keep the existing run ID and use
-the authenticated original source for every subsequent worker session.
+`7f6b91217973b08e0f38ac86d5e59b5b12111953`. Since then `src/batching.py`
+gained a real worker fix (unchanged simplification proxies no longer halt a
+batch), and this guide's provenance recording touched `config.py` and
+`src/orchestration.py`; the fine-tuning modules that the old proof also listed
+are no longer part of it. Resume by setting
+`CONFIG["DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE"] = True` in each worker
+notebook as described above. The rest of this section is the alternative for
+running the exact original source instead.
+
+A fresh kernel alone cannot provide the original source if startup clones the
+newer commit again. Keep the existing run ID and use the authenticated original
+checkout for every subsequent worker session.
 
 After cloning the current repository, put this cell **before the pasted setup
 cell and before any `config` or `src` import**. Give the notebook read access to

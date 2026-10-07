@@ -41,7 +41,11 @@ from src.distributed_execution import (
     DistributedManifestMismatch,
     validate_manifest_compatibility,
 )
-from src.distributed_code_compatibility import diagnose_worker_code_compatibility
+from src.distributed_code_compatibility import (
+    accept_worker_code_change,
+    diagnose_worker_code_compatibility,
+    worker_code_change_hint,
+)
 
 
 class DistributedSyncError(RuntimeError):
@@ -314,6 +318,35 @@ def _remote_manifest_at_revision(
     return payload, remote_hash
 
 
+def _worker_code_resumable(
+    config: dict, project_root, saved_fingerprint, *, source: str
+) -> Tuple[bool, str, bool]:
+    """Authenticate saved worker code, or accept an explicitly authorized change.
+
+    Returns ``(resumable, reason, accepted_change)``.  ``accepted_change`` is
+    True only when the worker source differs and the operator opted in with
+    ``DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE``; that decision is then recorded in
+    ``config`` for status and run-log provenance.
+    """
+    from src.distributed_execution import resolve_code_fingerprint
+
+    compatible, reason = diagnose_worker_code_compatibility(project_root, saved_fingerprint)
+    if compatible:
+        return True, reason, False
+    runtime_fingerprint = config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT") or (
+        resolve_code_fingerprint(project_root)
+    )
+    if accept_worker_code_change(
+        config,
+        saved_fingerprint=saved_fingerprint,
+        runtime_fingerprint=runtime_fingerprint,
+        reason=reason,
+        source=source,
+    ):
+        return True, reason, True
+    return False, reason, False
+
+
 def ensure_distributed_manifest(config: dict, manifest_path) -> str:
     """Create or verify the immutable distributed-run manifest.
 
@@ -367,16 +400,15 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
     project_root = Path(__file__).resolve().parents[1]
     local_code_fingerprint = expected_manifest.get("code_fingerprint")
     if local_code_fingerprint != resolve_code_fingerprint(project_root):
-        local_code_match, local_code_reason = diagnose_worker_code_compatibility(
-            project_root, local_code_fingerprint
+        local_code_match, local_code_reason, _ = _worker_code_resumable(
+            config, project_root, local_code_fingerprint,
+            source=str(local_manifest_path),
         )
         if not local_code_match:
             raise DistributedManifestMismatchError(
                 "The local manifest code_fingerprint does not match the "
                 "current worker source: " + local_code_reason + " "
-                "Restore the original checkout in an isolated directory and restart "
-                "the notebook kernel before importing project modules, or use a new "
-                "DISTRIBUTED_RUN_ID."
+                + worker_code_change_hint()
             )
 
     api = HfApi(token=hf_token)
@@ -399,9 +431,13 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
                 stored_code_fingerprint = remote_manifest.get("code_fingerprint")
                 code_reason = ""
                 compatible_code = False
+                accepted_code_change = False
                 if stored_code_fingerprint != expected_manifest.get("code_fingerprint"):
-                    compatible_code, code_reason = diagnose_worker_code_compatibility(
-                        project_root, stored_code_fingerprint
+                    compatible_code, code_reason, accepted_code_change = (
+                        _worker_code_resumable(
+                            config, project_root, stored_code_fingerprint,
+                            source=remote_path,
+                        )
                     )
                 if compatible_code:
                     pinned_expected = dict(expected_manifest)
@@ -425,12 +461,21 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
                         ) from exc
                     config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
                     config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
-                    logger.warning(
-                        "Pinned authenticated compatible worker code from immutable "
-                        "manifest %s; execution source outside finalizer and checkpoint "
-                        "plumbing is unchanged.",
-                        remote_path,
-                    )
+                    if accepted_code_change:
+                        logger.warning(
+                            "Pinned the immutable manifest code identity from %s while "
+                            "running CHANGED worker code under "
+                            "DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE: %s",
+                            remote_path,
+                            code_reason,
+                        )
+                    else:
+                        logger.warning(
+                            "Pinned authenticated compatible worker code from immutable "
+                            "manifest %s; execution source outside finalizer and checkpoint "
+                            "plumbing is unchanged.",
+                            remote_path,
+                        )
                     return remote_hash
                 if stored_code_fingerprint != expected_manifest.get("code_fingerprint"):
                     logger.warning(
@@ -449,9 +494,7 @@ def ensure_distributed_manifest(config: dict, manifest_path) -> str:
                     )
                     raise DistributedManifestMismatchError(
                         f"Worker code compatibility could not be proven from {remote_path}: "
-                        f"{code_reason} {recovery}Restore the original checkout in an "
-                        "isolated directory and restart the notebook kernel before "
-                        "importing project modules, or use a new DISTRIBUTED_RUN_ID."
+                        f"{code_reason} {recovery}" + worker_code_change_hint()
                     )
                 # Role model names are runtime provenance. Code changes need
                 # the authenticated source proof above.
@@ -581,12 +624,14 @@ def _initialize_distributed_workspace(config: dict, *, expected_manifest: Option
                 runtime_fingerprint = resolve_code_fingerprint(project_root)
                 staged_fingerprint = staged_payload.get("code_fingerprint")
                 if staged_fingerprint != runtime_fingerprint:
-                    source_match, source_reason = diagnose_worker_code_compatibility(
-                        project_root, staged_fingerprint
+                    source_match, source_reason, _ = _worker_code_resumable(
+                        config, project_root, staged_fingerprint,
+                        source=manifest_remote_path,
                     )
                     if not source_match:
                         raise DistributedManifestMismatch(
-                            "Downloaded manifest worker source is incompatible: " + source_reason
+                            "Downloaded manifest worker source is incompatible: "
+                            + source_reason + " " + worker_code_change_hint()
                         )
                 if local_manifest.exists():
                     local_payload = json.loads(local_manifest.read_text(encoding="utf-8"))
@@ -597,13 +642,14 @@ def _initialize_distributed_workspace(config: dict, *, expected_manifest: Option
                     if local_fingerprint != staged_fingerprint:
                         source_match = local_fingerprint == runtime_fingerprint
                         if not source_match:
-                            source_match, source_reason = diagnose_worker_code_compatibility(
-                                project_root, local_fingerprint
+                            source_match, source_reason, _ = _worker_code_resumable(
+                                config, project_root, local_fingerprint,
+                                source=str(local_manifest),
                             )
                             if not source_match:
                                 raise DistributedManifestMismatch(
                                     "Existing local manifest worker source is incompatible: "
-                                    + source_reason
+                                    + source_reason + " " + worker_code_change_hint()
                                 )
                         # Both fingerprints authenticate this worker source.
                         # Normalize only that field before checking all inputs.

@@ -356,6 +356,32 @@ def record_avalai_model_provenance(
             openrouter_history.append(openrouter_record)
 
 
+def record_worker_code_provenance(
+    run_log: Dict[str, Any],
+    config: Mapping[str, Any],
+    run_mode: str,
+) -> None:
+    """Record which worker code produced new work, including accepted changes.
+
+    The immutable manifest keeps the run's code identity.  When a session runs
+    under ``DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE`` with different worker code,
+    each run log it touches records both fingerprints and the authorization.
+    """
+    runtime_fingerprint = config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT")
+    if not runtime_fingerprint:
+        return
+    record: Dict[str, Any] = {
+        "run_mode": str(run_mode),
+        "runtime_code_fingerprint": str(runtime_fingerprint),
+    }
+    accepted_change = config.get("_DISTRIBUTED_WORKER_CODE_CHANGE")
+    if isinstance(accepted_change, Mapping) and accepted_change:
+        record["accepted_worker_code_change"] = dict(accepted_change)
+    history = run_log.setdefault("worker_code_history", [])
+    if isinstance(history, list) and (not history or history[-1] != record):
+        history.append(record)
+
+
 def _manifest_without_rotatable_models(
     manifest: Mapping[str, Any],
     *,
@@ -890,6 +916,16 @@ def write_worker_status(
         ) else {},
         "runtime_code_fingerprint": config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"),
     }
+    accepted_code_change = config.get("_DISTRIBUTED_WORKER_CODE_CHANGE")
+    payload["worker_code"] = {
+        "manifest_code_fingerprint": manifest.get("code_fingerprint"),
+        "runtime_code_fingerprint": config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"),
+        "accepted_change": (
+            dict(accepted_code_change)
+            if isinstance(accepted_code_change, Mapping) and accepted_code_change
+            else None
+        ),
+    }
     if message:
         payload["message"] = str(message)
     status_path = config.get("_DISTRIBUTED_WORKER_STATUS_PATH")
@@ -1222,7 +1258,7 @@ def merge_distributed_run(
 __all__ = [
     "ASSIGNMENT_STRATEGY", "MODEL_ROTATION_CONFIG_KEYS", "DistributedExecutionError", "DistributedManifestMismatch",
     "active_avalai_models", "active_openrouter_models", "apply_distributed_run_log_contract",
-    "indexed_output_artifacts", "record_avalai_model_provenance",
+    "indexed_output_artifacts", "record_avalai_model_provenance", "record_worker_code_provenance",
     "DistributedMergeError", "api_deadline_due", "assigned_indices", "build_run_manifest",
     "configure_worker_paths", "distributed_enabled", "fingerprint_exemplar_data", "layer1_cache_filename",
     "layer1_state_complete", "merge_distributed_run", "pending_indices_for_worker",

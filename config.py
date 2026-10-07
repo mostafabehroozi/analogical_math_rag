@@ -51,6 +51,12 @@ CONFIG = {
     # may change during resume. Enable this legacy bridge only when applying the
     # compatibility patch to a pre-patch run whose code fingerprint also changed.
     "DISTRIBUTED_ALLOW_MODEL_ROTATION": False,
+    # Resume an existing run ID even though the worker execution code changed
+    # since the manifest was created (for example a bug fix between Kaggle
+    # sessions). Edits outside the worker's import closure (fine-tuning tools,
+    # tests, reports) never need this. The accepted change is recorded as
+    # provenance in worker status and run logs; the manifest is never rewritten.
+    "DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE": False,
     "DISTRIBUTED_RUN_ID": None,
     "DISTRIBUTED_WORKER_COUNT": 5,
     "DISTRIBUTED_WORKER_ID": 0,

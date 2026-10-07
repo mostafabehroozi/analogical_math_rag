@@ -46,12 +46,17 @@ ARCHITECTURAL REFACTOR: "Acquire-Optimize-Fork".
 import logging
 from tqdm import tqdm
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from sentence_transformers import SentenceTransformer
 from src.context_logger import tprint
 from src.benchmark_data import benchmark_name_for_target_index
 from src.api_manager import bind_api_managers
-from src.distributed_code_compatibility import diagnose_worker_code_compatibility
+from src.distributed_code_compatibility import (
+    WORKER_CODE_CHANGE_STATE_KEY,
+    accept_worker_code_change,
+    diagnose_worker_code_compatibility,
+    worker_code_change_hint,
+)
 
 
 from src.pipeline_steps import (
@@ -97,6 +102,7 @@ from src.distributed_execution import (
     layer1_state_complete,
     merge_distributed_run,
     record_avalai_model_provenance,
+    record_worker_code_provenance,
     resolve_code_fingerprint,
     run_log_successful,
     start_worker_session,
@@ -153,11 +159,43 @@ def _build_requested_distributed_manifest(
     )
 
 
+def _worker_code_resumable(
+    global_config: Dict[str, Any],
+    project_root: str,
+    saved_fingerprint: Any,
+    runtime_fingerprint: Any,
+    *,
+    source: str,
+) -> Tuple[bool, str, bool]:
+    """Authenticate saved worker code, or accept an explicitly authorized change.
+
+    Returns ``(resumable, reason, accepted_change)``; see the same helper in
+    ``src.hf_sync`` for the remote manifest.
+    """
+    compatible, reason = diagnose_worker_code_compatibility(project_root, saved_fingerprint)
+    if compatible:
+        return True, reason, False
+    if accept_worker_code_change(
+        global_config,
+        saved_fingerprint=saved_fingerprint,
+        runtime_fingerprint=runtime_fingerprint,
+        reason=reason,
+        source=source,
+    ):
+        return True, reason, True
+    return False, reason, False
+
+
 def _auto_pin_local_legacy_code_fingerprint(
     global_config: Dict[str, Any],
     manifest_path: str,
 ) -> bool:
-    """Pin only a Git-authenticated change outside worker execution code."""
+    """Pin the saved code identity when the current source may resume it.
+
+    The pin is applied when the worker execution code is Git-authenticated as
+    unchanged, or when the operator explicitly accepted a worker code change
+    with ``DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE``.
+    """
     from src.distributed_execution import DistributedManifestMismatch, validate_manifest_integrity
 
     if not os.path.exists(manifest_path):
@@ -179,8 +217,9 @@ def _auto_pin_local_legacy_code_fingerprint(
     ) or resolve_code_fingerprint(project_root)
     if stored_code_fingerprint == runtime_code_fingerprint:
         return False
-    authenticated_code_match, code_reason = diagnose_worker_code_compatibility(
-        project_root, stored_code_fingerprint
+    authenticated_code_match, code_reason, accepted_code_change = _worker_code_resumable(
+        global_config, project_root, stored_code_fingerprint, runtime_code_fingerprint,
+        source=str(manifest_path),
     )
     if not authenticated_code_match:
         original_revision = str(stored_code_fingerprint).split(":")
@@ -193,18 +232,23 @@ def _auto_pin_local_legacy_code_fingerprint(
         )
         raise DistributedManifestMismatch(
             f"Worker code compatibility could not be proven from {manifest_path}: "
-            f"{code_reason} {recovery}Restore the original checkout in an isolated "
-            "directory and restart the notebook kernel before importing project "
-            "modules, or use a new "
-            "DISTRIBUTED_RUN_ID."
+            f"{code_reason} {recovery}" + worker_code_change_hint()
         )
     global_config["DISTRIBUTED_CODE_FINGERPRINT"] = stored_code_fingerprint
     global_config["_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED"] = True
-    logging.getLogger(__name__).warning(
-        "Automatically pinned the authenticated compatible code fingerprint "
-        "from %s; worker execution code is unchanged.",
-        manifest_path,
-    )
+    if accepted_code_change:
+        logging.getLogger(__name__).warning(
+            "Automatically pinned the saved code identity from %s while running "
+            "CHANGED worker code under DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE: %s",
+            manifest_path,
+            code_reason,
+        )
+    else:
+        logging.getLogger(__name__).warning(
+            "Automatically pinned the authenticated compatible code fingerprint "
+            "from %s; worker execution code is unchanged.",
+            manifest_path,
+        )
     return True
 
 
@@ -515,6 +559,7 @@ def _prepare_distributed_worker(
     # is not proof that the current source can resume that manifest.
     global_config.pop("DISTRIBUTED_CODE_FINGERPRINT", None)
     global_config.pop("_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED", None)
+    global_config.pop(WORKER_CODE_CHANGE_STATE_KEY, None)
     requested_manifest = _build_requested_distributed_manifest(
         global_config, experiment_configs, hard_questions, hard_solutions, exemplar_data
     )
@@ -553,6 +598,7 @@ def _prepare_distributed_worker(
     except Exception:
         global_config.pop("DISTRIBUTED_CODE_FINGERPRINT", None)
         global_config.pop("_DISTRIBUTED_MODEL_ROTATION_CODE_FINGERPRINT_AUTO_PINNED", None)
+        global_config.pop(WORKER_CODE_CHANGE_STATE_KEY, None)
         raise
     manifest = load_json(paths["manifest_path"])
     if not isinstance(manifest, dict):
@@ -565,6 +611,14 @@ def _prepare_distributed_worker(
         allow_model_rotation=allow_model_rotation,
     )
     _announce_authorized_model_rotation(model_changes, context="worker resume")
+    accepted_code_change = global_config.get(WORKER_CODE_CHANGE_STATE_KEY)
+    if accepted_code_change:
+        print(
+            "Distributed worker resume: worker code differs from the immutable "
+            "manifest and was accepted by DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE. "
+            f"{accepted_code_change.get('reason')} The runtime code fingerprint is "
+            "recorded in worker status and in every run log of this session."
+        )
 
     start_worker_session(global_config)
     global_config["_DISTRIBUTED_MANIFEST"] = manifest
@@ -734,6 +788,7 @@ def run_pipeline_for_single_query(
 
     if distributed_enabled(config):
         record_avalai_model_provenance(run_log, config, run_mode)
+        record_worker_code_provenance(run_log, config, run_mode)
 
     # API Manager Selection 
     def _get_api_manager(provider_name):

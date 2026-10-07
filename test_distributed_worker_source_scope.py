@@ -57,9 +57,46 @@ class WorkerSourceScopeTests(unittest.TestCase):
         self.assertTrue(self.verdict()[0], self.verdict()[1])
 
     def test_unreferenced_production_module_remains_checked(self):
+        # Without the worker entry module, the snapshot cannot be narrowed.
         self.save()
         self.write("src/pipeline.py", "def solve():\n    return 2\n")
         self.assert_rejected_path("src/pipeline.py")
+
+    def test_only_the_worker_import_closure_is_checked_with_the_entry_module(self):
+        self.write("src/orchestration.py", "from src.pipeline import solve\n")
+        self.write("src/finetuning_tool.py", "RESULT = 1\n")
+        self.write("src/utils.py", "RESULT = 1\n")
+        self.save()
+        # Modules under src that the worker never imports are outside the proof.
+        self.write("src/finetuning_tool.py", "RESULT = 2\n")
+        self.write("src/new_report.py", "RESULT = 1\n")
+        (self.root / "src/utils.py").unlink()
+        self.assertTrue(self.verdict()[0], self.verdict()[1])
+        # The entry module, config, and everything they import remain checked.
+        self.write("src/pipeline.py", "def solve():\n    return 2\n")
+        self.assert_rejected_path("src/pipeline.py")
+        self.write("src/pipeline.py", "def solve():\n    return 1\n")
+        self.write("src/orchestration.py", "from src.pipeline import solve\nEXTRA = 1\n")
+        self.assert_rejected_path("src/orchestration.py")
+        self.write("src/orchestration.py", "from src.pipeline import solve\n")
+        self.write("config.py", "SETTING = 2\n")
+        self.assert_rejected_path("config.py")
+
+    def test_export_lists_never_count_as_worker_changes(self):
+        self.write("src/pipeline.py", "def solve():\n    return 1\n\n__all__ = ['solve']\n")
+        self.save()
+        self.write("src/pipeline.py", "def solve():\n    return 1\n\n__all__ = ['solve', 'extra']\n")
+        self.assertTrue(self.verdict()[0], self.verdict()[1])
+
+    def test_function_imports_inside_the_entry_module_are_followed(self):
+        self.write(
+            "src/orchestration.py",
+            "def run():\n    from src.optional_flow import go\n    return go()\n",
+        )
+        self.write("src/optional_flow.py", "def go():\n    return 1\n")
+        self.save()
+        self.write("src/optional_flow.py", "def go():\n    return 2\n")
+        self.assert_rejected_path("src/optional_flow.py")
 
     def test_config_changes_remain_checked(self):
         self.save()

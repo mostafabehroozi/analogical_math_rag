@@ -511,7 +511,11 @@ class WorkerCodeCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "src").mkdir()
+            # The entry module imports worker code and infrastructure exactly
+            # like the real one; the proof follows these imports.
             (root / "src" / "orchestration.py").write_text(
+                "from src.distributed_execution import build_run_manifest\n"
+                "from src.pipeline_steps import solve\n\n"
                 "def run_experiments():\n    return 1\n\n"
                 "def _prepare_distributed_worker():\n    return 1\n\n"
                 "def finalize_distributed_experiments():\n    return 1\n",
@@ -541,6 +545,8 @@ class WorkerCodeCompatibilityTests(unittest.TestCase):
             saved = f"git:{revision}:source:{_legacy_source_hash(_committed_python(root, revision))}"
 
             (root / "src" / "orchestration.py").write_text(
+                "from src.distributed_execution import build_run_manifest\n"
+                "from src.pipeline_steps import solve\n\n"
                 "def run_experiments():\n    return 1\n\n"
                 "def _prepare_distributed_worker():\n    return 2\n\n"
                 "def finalize_distributed_experiments():\n    return 2\n",
