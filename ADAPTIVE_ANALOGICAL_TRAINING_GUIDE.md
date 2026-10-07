@@ -16,7 +16,10 @@ teacher ranks, correctness labels, or future measurements.
 1. **Stage 1: reference ranking.** A ResNet reads 223 observation features and
    predicts correctness for eight candidates. Complete-state predictions define
    the teacher's deterministic ranking. Supervised questions use out-of-fold
-   predictions. Its loss masks absent candidates. Training includes complete
+   predictions from the fold model that did not train on that question;
+   development questions use the final teacher. The final saved teacher need
+   not reproduce the reference ranking used for each training question.
+   Its loss masks absent candidates. Training includes complete
    observations, candidate/evaluator masking, individual missing measurements,
    slot permutations, and training-only hidden-source examples.
 2. **Stage 2: recognition predictor.** A second ResNet uses the same observation
@@ -25,38 +28,49 @@ teacher ranks, correctness labels, or future measurements.
    candidate-specific losses mask absent candidates. Development-only
    temperature calibration is fitted, then the 128-dimensional encoder,
    prediction heads, normalization state, and calibration are frozen.
-3. **Stage 3: acquisition head.** A `128 → 64 → 11` network learns the next
+3. **Stage 3: acquisition head.** A `128 → 64 → 7` network learns the next
    acquisition from the frozen hidden vector. It is supervised with masked
    cross-entropy. There is no STOP output, reward, replay buffer, or Bellman
-   target. Stage 3 does not use the Stage 1/2 hidden-source augmentation.
+   target. Stage 3 uses complete measurements for coherent structural states;
+   hidden-source and individual missing-measurement augmentations belong to
+   Stages 1 and 2 only.
 
 SAFE is the leading uninterrupted run of actually correct candidates in the
 teacher order; MAX is its first member. If rank one is wrong, both are empty.
 These historical labels define offline goals and audit strata, not runtime
-truth. More evidence can lower a recognition probability, so the planner
-checks previously achieved goals at every intermediate state.
+truth. For example, ordered correctness [correct, wrong, correct] makes only
+the first candidate SAFE and MAX; [wrong, correct, correct] makes both empty.
+More evidence can lower a recognition probability. Temporary loss is allowed,
+but the first unfinished rank is recomputed at every state: restoring an
+earlier lost goal takes priority over continuing a later goal.
 
 ## Acquisition state, actions, and cost
 
 `State(candidate_mask, evaluator_mask)` records explicit presence. A one-shot
 candidate requires its own evaluator. A Stage 3 state uses complete recorded
-measurements for every present candidate/evaluator pair. The runtime begins
-with ZS1 and no evaluators. The zero-shot action fills the first missing slot;
-the head cannot select a specific unseen answer. Evaluator identities remain
-aligned with recorded similarity order.
+measurements for every present candidate/evaluator pair. Every state contains
+at least one candidate; candidate-empty states are outside this contract.
+The runtime begins with ZS1 and no evaluators, so its first generation precedes
+the head's decisions. The zero-shot action fills the first missing slot;
+the head cannot select a specific unseen answer. The evaluator action fills
+the first missing evaluator in similarity order; the head cannot choose its
+identity. Training still audits non-prefix presence masks from masking.
 
 | Action index | Operation |
 | --- | --- |
-| `0 … k-1` | Add the specified missing evaluator, its baseline, and cross evaluations against present candidates. |
-| `k` | Generate another zero-shot candidate and cross-evaluate it against active evaluators. |
-| `k+1 … 2k` | Generate the one-shot candidate from the specified active evaluator and cross-evaluate it against active evaluators. |
+| `0` | Add the next missing evaluator in similarity order, its baseline, and cross evaluations against present candidates. |
+| `1` | Generate another zero-shot candidate and cross-evaluate it against active evaluators. |
+| `2 … k+1` | Generate the one-shot candidate from the specified active evaluator and cross-evaluate it against active evaluators. |
 
-The default `k=5` gives eleven actions. Invalid or unaffordable actions are
+The default `k=5` gives seven actions. Invalid or unaffordable actions are
 masked. The incremental cost is the difference between the existing state-cost
 formula before and after acquisition. With five repeated solves per estimate,
-the default full pool costs **233 solver calls**: eight generations, 25
-baseline solves, and 200 cross-CCS solves. `cost_unit="total_calls"` also
-counts evaluator grading according to that formula.
+the default objective counts **458 total calls**: eight generations, 25
+baseline solves, 200 cross-CCS solves, and 225 corresponding graders.
+`cost_unit="solver_calls"` optionally excludes those graders and gives a
+233-call complete pool. Retrieval/embedding work and target-answer grading
+remain outside this recorded-data accounting. There is no separate penalty
+for the number of acquired candidates or evaluators.
 
 ## Exhaustive Stage 3 dataset
 
@@ -69,54 +83,80 @@ and budget. Cases above the budget stay in the dataset with an explicit status.
 
 Thus **2,000 training questions produce 22,944,000 state/order cases**, before
 development questions. These are exhaustive audit cases, not 22,944,000 head
-training rows: only `ACTION` cases contribute, and identical visible
-observations share one row. This expansion, together with continuation search
+training rows: every in-budget case with a valid acquisition contributes,
+and identical visible observations share one row. This expansion, together with continuation search
 and shard I/O, explains why Stage 3 can be slow even though the head is small.
 Question count alone is not its training-set size.
 
 The frozen Stage 2 predictor supplies recognition probabilities for each
 in-budget state, and complete-state reference probabilities once per
-permutation. Candidate identities, teacher ties, SAFE/MAX labels, and rank
+permutation. The full state is the comparison reference; more evidence does
+not guarantee that its predictions are more accurate or all goals hold.
+Candidate identities, teacher ties, SAFE/MAX labels, and rank
 order move consistently through permutations. The first unfinished reference
 rank is the objective:
 
-- With MAX present, rank one requires the candidate to be present and global
-  MAX, MAX-i, global SAFE, and SAFE-i probabilities all at least the configured
-  recognition threshold (0.5 by default).
-- Without MAX, rank one requires the candidate's partial-state correctness
-  probability to exceed every lower-ranked candidate's frozen full-state
-  probability.
-- Later ranks require candidate presence and, by default, the same comparison
-  to lower-ranked full-state probabilities. A later SAFE member additionally
+- With MAX present, rank one requires the candidate to be present and selected
+  by the same correctness argmax used at runtime. Global MAX, MAX-i, global
+  SAFE, and SAFE-i probabilities must all pass the configured threshold
+  (0.5 by default).
+- Without MAX, rank one requires candidate presence and, when
+  `later_rank_filter=True`, its partial-state correctness probability must
+  exceed every lower-ranked candidate's frozen full-state probability.
+- Later ranks require candidate presence and, when the same filter is enabled,
+  the comparison to lower-ranked full-state probabilities. A later SAFE member additionally
   requires SAFE-i at the threshold.
 
-Search adds valid items while preserving every earlier goal at **each step**.
-A path that temporarily loses one is rejected even if later evidence restores
-it. Shared visible observations across zero-shot scenarios must choose the
-same action at every search depth. Only newly observed evidence may separate
-their continuations. The objective is lexicographic: maximize goal-reaching
-probability, then minimize expected additional cost, then minimize expected
-acquisition steps. Genuine ties split the soft target evenly; a concrete
-tied continuation uses the lowest action index. Once a rank is reached, the
-successor state's target addresses the next unfinished rank.
+Search adds valid items toward a destination satisfying the current goal and
+all earlier goals. Teacher order prioritizes recognition goals, not physical
+generation: a lower-ranked supporting candidate may be acquired first.
+Temporary loss of an earlier light is allowed. At each successor, however,
+the continuation policy prioritizes its first unfinished rank, including an
+earlier lost goal. Cost minimization follows those continuation decisions;
+it is not an unrestricted shortest-path search holding the original goal
+fixed. A legal route to that goal can therefore be cheaper than the chosen
+recovery route, or succeed where the chosen route fails.
+
+Shared visible observations within a question across zero-shot scenarios must
+choose the same action at every search depth. Only newly observed evidence
+may separate their continuations. Their hidden orders are treated as
+equiprobable. The objective is lexicographic: maximize average goal reach,
+then minimize average additional calls, then average acquisition steps. Costs
+include unsuccessful continuations up to action exhaustion. On a remaining
+tie, adding an evaluator takes priority over generating a candidate. Other
+genuine ties split the soft target evenly; the planner uses the lowest action
+index as its concrete tied continuation. A shared choice need not be cheapest
+or successful for every hidden case.
+
+When the available actions have zero average reach under the constructed
+continuation policy, the head still gets an acquisition target so it can
+operate through the full pool. This fallback chooses the next
+similarity-ranked evaluator whenever affordable, even if a candidate is
+cheaper; otherwise it chooses the cheapest valid candidate, with action index
+breaking ties. This evaluator-first fallback is stronger than the ordinary
+objective's tie preference. It does not claim the unresolved goal was achieved
+or prove that no other legal route could reach it.
 
 Every case has exactly one disposition, with this precedence:
 
 | Status | Meaning | Head loss |
 | --- | --- | --- |
 | `OUT_OF_BUDGET` | The state itself exceeds the configured budget. | Excluded |
-| `COMPLETE` | All reference recognition goals hold. | Excluded |
+| `COMPLETE` | All reference recognition goals hold; this requires the complete candidate and evaluator pool. | Excluded. |
 | `EXHAUSTED` | The full pool is acquired and a goal remains unfinished. | Excluded |
 | `BUDGET` | The pool is incomplete and no affordable action remains. | Excluded |
-| `ACTION` | An admissible continuation can reach the current goal. | Masked cross-entropy |
-| `UNREACHABLE` | Actions remain, but no admissible path reaches the goal. | Excluded |
+| `ACTION` | A shared continuation has positive average reach for the current goal. | Masked cross-entropy |
+| `UNREACHABLE` | Actions remain, but the current goal has zero average reach under the constructed continuation policy; other legal paths may exist. | Fill-pool fallback target. |
 
-Non-action cases have a null training-row reference and no fabricated target.
-Identical visible observations within a question share one actionable row.
+Cases without a valid acquisition have a null training-row reference.
+Identical visible observations within a question share one training row.
 Each row stores the frozen hidden vector, valid mask, normalized soft target,
 goal-rank distribution, and per-action reach/cost/steps for diagnosis. All
-ordinary Stage 3 rows have equal weight. Offline rank and historical truth
-never enter the head input.
+ordinary Stage 3 rows have equal loss weight, regardless of how many original
+state/order cases they represent. Thus exhaustive case coverage does not mean
+one equally weighted training example per case. Terminal and over-budget
+cases remain audit records, with no STOP or abstention target. Offline rank
+and historical truth never enter the head input.
 
 ## Training, artifacts, and evaluation
 
@@ -140,6 +180,10 @@ The teacher's fold models still use internal training/validation folds and
 produce out-of-fold labels for all shared training questions. The final
 teacher trains on all shared training questions. The snapshot predictor
 stays frozen while the acquisition head trains.
+
+Stage 2 selects its checkpoint by development correctness Top-1, then Brier
+score; Stage 3 selects by development action cross-entropy. These criteria do
+not directly optimize recognition-goal coverage or realized API savings.
 
 Set `use_test_files_for_dev_and_audit=False` for separate internal development
 and audit groups. `split_fractions=(0.80, 0.10, 0.10)` then means **shared
@@ -206,25 +250,25 @@ free filesystem space alone does not rule out a quota or I/O problem.
 On Kaggle, check `shutil.disk_usage(CFG.output_dir)` and free unneeded files
 if the output filesystem is full. Compression still needs enough temporary
 space to write one shard, and packed companions consume additional space.
-To recover an existing run, use the updated notebook definitions with exactly
-the same `output_dir`, input files, and training configuration, including
-`resume=True`. Rerun configuration and Stage 0, then
-`WORK.train_decision_head()`: it loads completed Stages 1/2 and resumes matching
-shards. Do not create a fresh output directory for this storage-only update.
+To recover an interrupted **revision-5** run, use the same `output_dir`, input
+files, and training configuration with `resume=True`. Revision-4 runs cannot
+resume under the new action and label contract; start revision 5 in its new
+default output directory.
 
 The Stage 3 implementation reuses budget-specific structure/action tables
 across questions, constructs observations in NumPy batches, reuses each
 scenario's observations for both inference and visible-state grouping, and
 evaluates the scalar goal rules in arrays.
-It still enumerates every state/order case and keeps the same tie rules,
-shared continuation decisions, and masked training objective.
+It still enumerates every state/order case and uses shared continuation
+decisions and masked training. The evaluator action and tie rule changed in
+revision 5, so older label shards cannot be reused.
 
 After validating each full shard, it writes a compact `.training.pt` companion
 containing only `h`, `target`, and `valid` tensors. Epochs read these companions
 instead of unpickling the cases and audit metadata repeatedly. Matching
 companions are validated and reused; missing or stale companions are rebuilt
-from validated source rows. Existing schema-3 shards and manifests remain
-usable with the same configuration and output directory. Training transfers
+from validated source rows. Matching revision-5 schema-3 shards and manifests
+remain usable with the same configuration and output directory. Training transfers
 one question's tensors to the device
 once, preserves the existing shuffled minibatch order and optimizer steps,
 and reads the accumulated loss back once per question.
@@ -275,13 +319,14 @@ or a second GPU improves total runtime. Reduced device transfers and loss
 readbacks follow the synchronization guidance in
 [PyTorch's performance tuning guide](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html).
 
-For a reproducible **synthetic CPU** comparison against commit `1034634`, run
-`python -B benchmark_adaptive_stage3.py`. It writes
+The following benchmark results are **historical revision-4 measurements**.
+They do not validate the new revision-5 labels or runtime policy. The old
+`benchmark_adaptive_stage3.py` compared against commit `1034634` and wrote
 `stage3_full_dataset_performance_report.json`, checks every row field and
 exhaustive case for exact equality, checks training losses/weights, checks
-development loss within floating-point roundoff, and measures label
-generation, shard loading, and head training/development separately. This is
-not evidence of a live Kaggle/GPU speedup or a full-run runtime estimate.
+development loss within floating-point roundoff, and measured label
+generation, shard loading, and head training/development separately. Do not
+use its old exact-parity assertion as a revision-5 validation gate.
 
 The recorded local CPU comparison uses one CPU thread and five synthetic
 questions with the default state geometry. Median label construction fell
@@ -312,29 +357,61 @@ zero-shot candidates are:
 
 Edit `fixed_acquisition_orders` in the Kaggle configuration cell to select
 these built-ins or add a method such as
-`"fixed_custom": ["ZS1", "R2", "OS2", "ZS2", "R1", "OS1", "ZS3"]`.
-`Rj` adds the evaluator at retrieval rank j; `OSj` generates its one-shot
+`"fixed_custom": ["ZS1", "R1", "OS1", "ZS2", "R2", "OS2", "ZS3"]`.
+`Rj` adds the next evaluator at retrieval rank j; `OSj` generates its one-shot
 candidate. Every sequence starts with the already generated `ZS1`, and
 unseen zero-shots arrive in slot order. Duplicates, out-of-range items, and
-one-shots before their evaluators are rejected. A custom sequence may be a
+one-shots before their evaluators and out-of-order retrieval are rejected. A custom sequence may be a
 partial pool; ending it produces `fixed_sequence_exhaustion` rather than
 claiming successful recognition. Fixed order stops at its next unaffordable
 scheduled action and never skips ahead.
 
-Learned and fixed rollouts use the same application rule after the initial
-ZS1 and after **every single evaluator or candidate acquisition**:
-stop when global MAX/SAFE and the selected candidate's MAX-i/SAFE-i signals
-reach the threshold, or no affordable action remains. This runtime rule is
-separate from offline Stage 3 labels. A historical MAX label is never read
-to decide whether to stop. The full-pool reference acquires the complete
-pool without early stopping, even when it exceeds the adaptive budget.
+Stage-3 training labels cover acquisition decisions through the complete
+pool, including states after MAX recognition. Evaluation checks the four
+MAX/SAFE recognition signals after the initial ZS1 and after every
+acquisition. Both fixed and learned evaluation rollouts stop at the first
+predicted MAX, then compare top-1 correctness and API calls with the
+complete-pool reference. The historical MAX label scores the stop but never
+causes it. If no MAX is recognized, acquisition continues until the budget
+or available actions end. The full-pool reference acquires the complete
+pool even when it exceeds the adaptive budget.
+
+An application wrapper can choose its own stopping point. A direct learned
+`rollout(...)` uses `continue_after_max=True` by default: it records the
+first MAX recognition and continues until the pool is acquired or the budget
+prevents another action. Its `ranked_list_complete` reason means **acquisition
+complete**, even if MAX/SAFE lights or later recognition goals fail. It differs
+from the dataset's `COMPLETE` status, which requires all recognition goals.
+The result also exposes `acquisition_complete` and `final_max_recognized`
+separately, so callers can distinguish pool completion from current MAX
+recognition without interpreting the legacy reason string. Full-pool reference
+runs record recognition at their observed full state as well.
+Pass `continue_after_max=False` to stop that call at predicted MAX, or change
+the configuration default. This runtime-only choice does not change the
+Stage-3 labels or training fingerprints. With the default full-pool budget,
+a continuing call has no API savings against the full reference.
+
+The returned `ranked_candidates` list sorts present candidates by their current
+Stage 2 correctness probabilities, and `selected` is their correctness argmax.
+Stage 1 defines offline reference goals; it does not define this runtime list.
+The inference bundle contains the frozen Stage 2 predictor and action head,
+not the Stage 1 teacher. These two rankings may disagree.
+
+Continuation diagnostics keep the best-ever prefix in
+`mean_rank_prefix_reached` and `per_rank_reach`. They separately report the
+ending prefix in `mean_final_rank_prefix` and `per_rank_final_recognition`,
+all-goal recognition in `all_goals_recognized_rate`, and acquired-pool
+completion in `acquisition_complete_rate`. These are averaged over zero-shot
+orders within each question, then equally across questions. An earlier
+recognition peak does not establish that those goals still hold at the end.
 
 The additional API-savings table has two rows per method: **all questions**
 and **MAX-present questions** (nonempty historical teacher MAX labels).
 It shows question counts, mean API calls used, mean calls saved per question
 versus the full pool, savings percentage, and exact MAX recovery. Savings
 include failed/incorrect stops; they are not conditional on successful MAX
-recovery. JSON `policies[method].call_savings` stores these cohorts, both
+recovery. `first_max_recognition` and `max_recognition_rate` also record when
+recognition occurs. JSON `policies[method].call_savings` stores both
 `solver_calls` and `total_calls`, expected total savings across questions,
 predicted-MAX stopping rates, and wrong predicted-MAX stopping rates.
 
@@ -368,24 +445,24 @@ the recorded-pool simulator, not observed live traffic. Costs and savings
 are averaged across zero-shot orders within each question before aggregating,
 so a question is counted once. Empty MAX-present cohorts have null metrics.
 Trajectories name each acquired evaluator/candidate and its incremental cost.
-Every stopping check, including the initial ZS1 and the final state, records
+Every prediction check, including the initial ZS1 and the final state, records
 available candidate IDs, the selected candidate, the four MAX/SAFE signals,
 and the threshold. These make the reason for stopping inspectable.
 
 Fixed comparison orders affect evaluation only. They are excluded from
-training/checkpoint fingerprints, so matching revision-4 checkpoints can
+training/checkpoint fingerprints, so matching revision-5 checkpoints can
 be reused when changing orders and rerunning reports.
 
 Reports keep answer correctness, exact reference-MAX recovery, no-MAX results,
-costs and savings, and preservation of earlier recognition goals separate.
+costs and savings, and temporary loss of earlier recognition goals separately.
 They also expose exhaustive status counts, actionable coverage by target
 rank, evaluator masks, and action names. The run saves teacher/snapshot/head
 checkpoints, an inference bundle, trajectories, and `results.json`.
 
-This implementation uses **revision 4**, **contract/inference schema 4**, and
+This implementation uses **revision 5**, **contract/inference schema 4**, and
 **decision-dataset schema 3**. Older action/state bundles and checkpoints are
 rejected. Use the new default output directory
-`/kaggle/working/adaptive_analogical_shared_training_v4_run` for a fresh run; old runs are
+`/kaggle/working/adaptive_analogical_shared_training_v5_run` for a fresh run; old runs are
 not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
 quality. Recorded outcomes cannot establish live provider behavior or the
 results of newly generated candidates.

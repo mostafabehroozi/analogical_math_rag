@@ -251,6 +251,7 @@ def test_runtime_storage_controls_preserve_dataset_fingerprint():
     changed = copy.deepcopy(cfg)
     changed.decision_cache_mb = 0
     changed.decision_eval_batch_size = 128
+    changed.continue_after_max = False
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, changed) == first
 
 
@@ -262,9 +263,10 @@ def test_runtime_storage_controls_preserve_existing_workflow_contract(tmp_path):
                    decision_cache_mb=0, decision_eval_batch_size=128)
     a.Workflow(cfg)
     contract = json.loads((tmp_path / "run" / "contract.json").read_text(encoding="utf-8"))
-    assert not {"decision_cache_mb", "decision_eval_batch_size"} & set(contract["config"])
+    assert not {"decision_cache_mb", "decision_eval_batch_size", "continue_after_max"} & set(contract["config"])
     cfg.decision_cache_mb = 4096
     cfg.decision_eval_batch_size = 4096
+    cfg.continue_after_max = False
     a.Workflow(cfg)
 
 

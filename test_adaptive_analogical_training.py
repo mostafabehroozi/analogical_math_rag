@@ -84,16 +84,18 @@ def test_retrieval_ties_keep_log_order_and_missing_similarity_is_auditable():
 
 def test_initial_state_retrieval_order_one_shot_dependency_and_cost():
     cfg = a.Config()
-    assert cfg.full_cost == 233
+    assert cfg.full_cost == 458
     assert a.state_cost(a.State(), cfg) == 1
-    assert len(a.reachable_states(cfg)) == 729
-    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0, 1, 2, 3, 4, 5]
+    assert len(a.reachable_states(cfg)) == 189
+    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0, 1]
     first = a.advance(a.State(), 0, cfg)
     assert first.evaluator_mask == 1
-    assert 6 in np.flatnonzero(a.valid_actions(first, cfg))
+    assert 2 in np.flatnonzero(a.valid_actions(first, cfg))
     with pytest.raises(ValueError, match="Unavailable"):
-        a.advance(a.State(), 6, cfg)
-    assert a.fixed_order_actions(cfg) == [0, 6, 5, 1, 7, 5, 2, 8, 3, 9, 4, 10]
+        a.advance(a.State(), 2, cfg)
+    assert a.advance(a.State(), 0, cfg).evaluator_mask == 1
+    assert a.advance(first, 0, cfg).evaluator_mask == 3
+    assert a.fixed_order_actions(cfg) == [0, 2, 1, 0, 3, 1, 0, 4, 0, 5, 0, 6]
 
 
 def test_exhaustive_catalog_matches_independent_enumerator_and_transition_graph():
@@ -116,25 +118,25 @@ def test_exhaustive_catalog_matches_independent_enumerator_and_transition_graph(
 
 
 def test_arbitrary_evaluator_subsets_zero_shot_and_exact_budget_cost():
-    cfg = a.Config(k=3, zero_shots=3, max_cost=17)
+    cfg = a.Config(k=3, zero_shots=3, max_cost=32)
     state = a.State(1, 4)  # ZS1 with only R3 active.
-    assert a.state_cost(state, cfg) == 11
-    assert np.flatnonzero(a.valid_actions(state, cfg)).tolist() == [3, 6]
-    zs = a.advance(state, 3, cfg)
-    os = a.advance(state, 6, cfg)
+    assert a.state_cost(state, cfg) == 21
+    assert np.flatnonzero(a.valid_actions(state, cfg)).tolist() == [1, 4]
+    zs = a.advance(state, 1, cfg)
+    os = a.advance(state, 4, cfg)
     assert zs == a.State(3, 4) and os == a.State(1 | (1 << 5), 4)
     snapshot = a.as_snapshot_state(os, cfg)
     assert snapshot.baseline_attempted == snapshot.baseline_observed == 4
     assert snapshot.ccs_attempted == snapshot.ccs_observed == (4 | (4 << (5*cfg.k)))
     with pytest.raises(ValueError, match="without retrieved source"):
         a.as_snapshot_state(a.State(1 << 5, 0), cfg)
-    assert a.state_cost(zs, cfg) - a.state_cost(state, cfg) == 6
-    assert a.state_cost(os, cfg) - a.state_cost(state, cfg) == 6
+    assert a.state_cost(zs, cfg) - a.state_cost(state, cfg) == 11
+    assert a.state_cost(os, cfg) - a.state_cost(state, cfg) == 11
     with pytest.raises(ValueError, match="Unavailable"):
-        a.advance(state, 4, cfg)  # R1 is not active.
-    cfg.max_cost = 16
+        a.advance(state, 2, cfg)  # R1's one-shot source is not active.
+    cfg.max_cost = 20
     assert not a.valid_actions(state, cfg).any()
-    assert a.state_cost(a.State((1 << a.Config().n)-1, (1 << a.Config().k)-1), a.Config()) == 233
+    assert a.state_cost(a.State((1 << a.Config().n)-1, (1 << a.Config().k)-1), a.Config()) == 458
 
 
 def test_independent_masks_include_training_only_hidden_source():
@@ -249,7 +251,7 @@ def test_no_max_fallback_and_strict_optional_later_filter():
     disabled.later_rank_filter = False
     assert a.goal_condition(1, order, empty, empty, p, full, present, disabled)
     p[0] = .2
-    assert not a.goal_condition(0, order, empty, empty, p, full, state, disabled)
+    assert a.goal_condition(0, order, empty, empty, p, full, state, disabled)
 
 
 def test_recognition_can_require_evaluator_or_prerequisite_path():
@@ -283,6 +285,7 @@ def test_recognition_can_require_evaluator_or_prerequisite_path():
             p = np.zeros(3*cfg.n+2, np.float32)
             if state.candidate_mask & 4 and state.evaluator_mask:
                 p[[cfg.n+2, 2*cfg.n+2, 3*cfg.n, 3*cfg.n+1]] = .9
+                p[2] = .9
             return np.zeros(cfg.hidden_dim, np.float32), p
     scenario = a.decision_scenario(r, np.array([.8, .7, .9]), one_shot_safe,
                                    one_shot_max, OneShotRecognition(), cfg, states)
@@ -320,13 +323,17 @@ def test_explicit_status_precedence_and_case_reconciliation():
     assert rank_by_mask[3]["goal_rank"] == 2 and rank_by_mask[3]["status"] == "ACTION"
     assert next(c for c in cases if c["scenario"] == 0 and c["candidate_mask"] == 7
                 and c["evaluator_mask"] == 1)["status"] == "COMPLETE"
-    assert all((c["training_row"] is not None) == (c["status"] == "ACTION") for c in cases)
+    assert all((c["training_row"] is not None) == bool(a.valid_actions(
+        a.State(c["candidate_mask"], c["evaluator_mask"]), cfg).any()) for c in cases)
+    assert all(c["training_row"] is None for c in cases if c["status"] == "COMPLETE")
     assert all(np.isclose(row["target"].sum(), 1) and not row["target"][~row["valid"]].any()
                for row in rows)
     rows, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([0, 0, 0]), cfg)
     assert a.Counter(c["status"] for c in cases)["EXHAUSTED"] == 2
     assert a.Counter(c["status"] for c in cases)["UNREACHABLE"] > 0
-    assert not rows
+    assert rows and all(c["training_row"] is not None for c in cases
+                        if c["status"] == "UNREACHABLE")
+    assert any(row["objective"] == "fill_pool_unreachable_goal" for row in rows)
     cfg.max_cost = 1
     _, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([0, 0, 0]), cfg)
     counts = a.Counter(c["status"] for c in cases)
@@ -335,7 +342,7 @@ def test_explicit_status_precedence_and_case_reconciliation():
     assert sum(counts.values()) == 20
 
 
-def test_max_requires_all_four_correct_lights_and_previous_goal_is_preserved():
+def test_max_requires_all_four_correct_lights_and_recovers_after_temporary_loss():
     cfg = a.Config(k=1, zero_shots=2)
     order = [0, 1, 2]
     safe = np.array([1, 0, 0], np.float32)
@@ -353,6 +360,7 @@ def test_max_requires_all_four_correct_lights_and_previous_goal_is_preserved():
             q = np.zeros(3*cfg.n+2, np.float32)
             if state.evaluator_mask:
                 q[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+                q[0] = .9
             if state.candidate_mask & 2:
                 q[1] = .8
             if state.candidate_mask not in (1, 7):
@@ -369,7 +377,7 @@ def test_max_requires_all_four_correct_lights_and_previous_goal_is_preserved():
     assert scenario["goal"][after_first].tolist() == [True, False, False]
     assert scenario["goal"][states.index(a.State(7, 1)), 0]
     rows, cases = a.aggregate_decision_rows([scenario], cfg)
-    assert next(case for case in cases if case["candidate_mask"] == 1 and case["evaluator_mask"] == 1)["status"] == "UNREACHABLE"
+    assert next(case for case in cases if case["candidate_mask"] == 1 and case["evaluator_mask"] == 1)["status"] == "ACTION"
 
 
 def test_planner_shares_future_actions_until_zero_shot_evidence_is_observed():
@@ -387,6 +395,7 @@ def test_planner_shares_future_actions_until_zero_shot_evidence_is_observed():
                 for i in range(cfg.n):
                     if state.candidate_mask & (1 << i) and rec.ccs[i, 0] == 1:
                         p[[cfg.n+i, 2*cfg.n+i, 3*cfg.n, 3*cfg.n+1]] = .9
+                        p[i] = .9
             return np.zeros(cfg.hidden_dim, np.float32), p
         def predict_many(self, rec, states, allow_hidden_source=False):
             values = [self.predict(rec, state) for state in states]
@@ -421,8 +430,10 @@ def test_future_group_stays_shared_when_only_one_scenario_has_reached_its_goal()
             p = np.zeros(3*cfg.n+2, np.float32)
             if state.candidate_mask & 3 == 3:
                 p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+                p[0] = .9
                 if state.evaluator_mask:
                     p[[cfg.n+1, 2*cfg.n+1]] = .9
+                    p[1] = .8
             return np.zeros(cfg.hidden_dim, np.float32), p
         def predict_many(self, rec, states, allow_hidden_source=False):
             values = [self.predict(rec, state) for state in states]
@@ -442,13 +453,13 @@ def test_future_group_stays_shared_when_only_one_scenario_has_reached_its_goal()
 
 
 def test_fixed_policy_does_not_skip_an_unaffordable_step():
-    cfg = a.Config(max_cost=29)
+    cfg = a.Config(max_cost=55)
     class NoStop:
         def predict(self, rec, state, cfg_override=None):
             return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
     row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed", trace=True)
-    assert [step["action"] for step in row["trajectory"] if step["action"] is not None] == [0, 6, 5]
-    assert row["cost"] == 23 and row["reason"] == "budget"
+    assert [step["action"] for step in row["trajectory"] if step["action"] is not None] == [0, 2, 1]
+    assert row["cost"] == 43 and row["reason"] == "budget"
 
 
 def test_no_max_evaluation_keeps_false_predicted_max_and_separate_stratum():
@@ -483,6 +494,7 @@ def test_fixed_sequences_acquire_each_item_once_and_obey_prerequisites(k, zero_s
 
 
 @pytest.mark.parametrize("items", [[], ["R1"], ["ZS1", "OS1"], ["ZS1", "R1", "R1"],
+                                   ["ZS1", "R2"],
                                    ["ZS1", "ZS3"], ["ZS1", "ZS1"], ["ZS1", "R6"],
                                    ["ZS1", "OS6"], ["ZS1", "ZS4"], ["ZS1", "X1"]])
 def test_custom_fixed_sequence_rejects_invalid_steps(items):
@@ -492,31 +504,34 @@ def test_custom_fixed_sequence_rejects_invalid_steps(items):
 
 
 def test_fixed_and_learned_policies_stop_after_recognizing_generated_max():
-    cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={
-        "fixed_custom": ["ZS1", "R2", "OS2", "ZS2", "R1", "OS1"]})
+    cfg = a.Config(k=2, zero_shots=2, continue_after_max=False, fixed_acquisition_orders={
+        "fixed_custom": ["ZS1", "R1", "OS1", "ZS2", "R2", "OS2"]})
     r = record(cfg)
     r.labels[:] = 0
-    r.labels[3] = 1
-    maximum = np.array([0, 0, 0, 1], np.float32)
+    r.labels[2] = 1
+    maximum = np.array([0, 0, 1, 0], np.float32)
     class Predictor:
         device = "cpu"
         def predict(self, rec, state, cfg_override=None):
             p = np.zeros(3*cfg.n+2)
             p[0] = .8
-            if state.candidate_mask & (1 << 3):
-                p[3] = .9
-                p[[cfg.n+3, 2*cfg.n+3, 3*cfg.n, 3*cfg.n+1]] = .9
-            return np.zeros(cfg.hidden_dim), p
+            if state.candidate_mask & (1 << 2):
+                p[2] = .9
+                p[[cfg.n+2, 2*cfg.n+2, 3*cfg.n, 3*cfg.n+1]] = .9
+            hidden = np.zeros(cfg.hidden_dim)
+            hidden[0] = state.evaluator_mask
+            return hidden, p
     class Head(torch.nn.Module):
         def forward(self, hidden):
-            return torch.tensor([[0., 3., -1., -2., 2.]]).repeat(len(hidden), 1)
+            return torch.tensor([[3., 0., 2., -1.] if row[0] == 0 else
+                                 [1., 0., 3., -1.] for row in hidden])
     for method in ("fixed_custom", "supervised"):
         row = a.rollout(r, maximum, Predictor(), cfg, policy=method, head=Head(), trace=True)
         assert row["reason"] == "predicted_max" and row["exact_max"] and row["correct"] == 1
-        assert [step["acquired_item"] for step in row["trajectory"] if step["action"] is not None] == ["R2", "OS2"]
-        assert row["trajectory"][1]["acquired_candidate"] == r.candidate_ids[3]
-        assert row["trajectory"][0]["acquired_evaluator"] == r.evaluator_ids[1]
-        assert row["trajectory"][1]["cost_after"] == row["cost"] == 17
+        assert [step["acquired_item"] for step in row["trajectory"] if step["action"] is not None] == ["R1", "OS1"]
+        assert row["trajectory"][1]["acquired_candidate"] == r.candidate_ids[2]
+        assert row["trajectory"][0]["acquired_evaluator"] == r.evaluator_ids[0]
+        assert row["trajectory"][1]["cost_after"] == row["cost"] == 32
         assert row["call_counts"]["total_calls"] == 32
         summary = a.policy_summary([row])["call_savings"]
         assert summary["max_present"]["total_calls"]["mean_saved"] == 104-32
@@ -524,17 +539,17 @@ def test_fixed_and_learned_policies_stop_after_recognizing_generated_max():
 
 
 def test_custom_fixed_sequence_exhaustion_is_separate_from_budget():
-    cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={"fixed_short": ["ZS1", "R2"]})
+    cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={"fixed_short": ["ZS1", "R1"]})
     class NoStop:
         def predict(self, rec, state, cfg_override=None):
             return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
     row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed_short", trace=True)
     assert row["reason"] == "fixed_sequence_exhaustion"
-    assert row["cost"] == 11
+    assert row["cost"] == 21
     cfg.max_cost = 5
     row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed_short", trace=True)
     assert row["reason"] == "budget" and row["cost"] == 1
-    assert row["trajectory"][-1]["blocked_fixed_action"] == 1
+    assert row["trajectory"][-1]["blocked_fixed_action"] == 0
 
 
 def test_call_savings_average_orders_per_question_and_keep_max_cohort_separate():
@@ -580,16 +595,17 @@ def test_call_counts_include_grading_and_are_independent_of_selected_cost_unit()
     assert a.acquisition_call_counts(cfg.n, cfg.k, cfg) == dict(
         generation_calls=8, measurement_solver_calls=225, grading_calls=225,
         solver_calls=233, total_calls=458)
-    cfg.cost_unit = "total_calls"
     assert cfg.full_cost == 458
+    cfg.cost_unit = "solver_calls"
+    assert cfg.full_cost == 233
 
 
 @pytest.mark.parametrize("method", ["fixed_custom", "supervised"])
-@pytest.mark.parametrize("trigger,target,steps,cost", [("initial", 0, 0, 1), ("R2", 0, 1, 11),
-                                                       ("ZS2", 1, 2, 17), ("OS2", 3, 3, 23)])
+@pytest.mark.parametrize("trigger,target,steps,cost", [("initial", 0, 0, 1), ("R1", 0, 1, 21),
+                                                       ("ZS2", 1, 2, 32), ("OS1", 2, 3, 43)])
 def test_max_is_checked_at_initial_state_and_after_every_kind_of_acquisition(method, trigger, target, steps, cost):
-    cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={
-        "fixed_custom": ["ZS1", "R2", "ZS2", "OS2", "R1", "OS1"]})
+    cfg = a.Config(k=2, zero_shots=2, continue_after_max=False, fixed_acquisition_orders={
+        "fixed_custom": ["ZS1", "R1", "ZS2", "OS1", "R2", "OS2"]})
     rec = record(cfg)
     rec.labels[:] = 0
     rec.labels[target] = 1
@@ -598,21 +614,26 @@ def test_max_is_checked_at_initial_state_and_after_every_kind_of_acquisition(met
     class Predictor:
         device = "cpu"
         def predict(self, rec, state, cfg_override=None):
-            ready = {"initial": True, "R2": bool(state.evaluator_mask & 2),
-                     "ZS2": bool(state.candidate_mask & 2), "OS2": bool(state.candidate_mask & 8)}[trigger]
+            ready = {"initial": True, "R1": bool(state.evaluator_mask & 1),
+                     "ZS2": bool(state.candidate_mask & 2), "OS1": bool(state.candidate_mask & 4)}[trigger]
             p = np.zeros(3*cfg.n+2)
             p[0] = .8
             if ready:
                 p[target] = .95
                 p[[cfg.n+target, 2*cfg.n+target, 3*cfg.n, 3*cfg.n+1]] = cfg.recognition_threshold
-            return np.zeros(cfg.hidden_dim), p
+            hidden = np.zeros(cfg.hidden_dim)
+            hidden[0] = state.evaluator_mask
+            hidden[1] = state.candidate_mask
+            return hidden, p
     class Head(torch.nn.Module):
         def forward(self, hidden):
-            return torch.tensor([[0., 4., 3., 1., 2.]]).repeat(len(hidden), 1)
+            return torch.tensor([[4., 1., 0., -1.] if row[0] == 0 else
+                                 [1., 4., 0., -1.] if row[1] == 1 else
+                                 [1., 0., 4., -1.] for row in hidden])
     row = a.rollout(rec, maximum, Predictor(), cfg, policy=method, head=Head(), trace=True)
     assert row["reason"] == "predicted_max" and row["cost"] == cost and row["exact_max"]
     assert len(row["trajectory"]) == steps+1
-    assert [step["acquired_item"] for step in row["trajectory"][:-1]] == ["R2", "ZS2", "OS2"][:steps]
+    assert [step["acquired_item"] for step in row["trajectory"][:-1]] == ["R1", "ZS2", "OS1"][:steps]
     assert row["trajectory"][0]["candidates"] == [rec.candidate_ids[0]]
     assert row["trajectory"][-1]["selected"] == rec.candidate_ids[target]
     for step in row["trajectory"]:
@@ -637,6 +658,84 @@ def test_max_stop_requires_every_signal_for_the_selected_available_candidate(mis
     assert a.stopping_reason(p, a.State(), cfg) is None
     p[indices[missing]] = cfg.recognition_threshold
     assert a.stopping_reason(p, a.State(), cfg) == "predicted_max"
+
+
+def test_planner_max_goal_requires_runtime_to_select_the_reference_candidate():
+    cfg = a.Config(k=1, zero_shots=2)
+    state = a.State(3, 0)
+    order = [0, 1, 2]
+    safe = maximum = np.array([1, 0, 0], np.float32)
+    p = np.zeros(3*cfg.n+2, np.float32)
+    p[:2] = [.4, .9]
+    p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+    assert not a.goal_condition(0, order, safe, maximum, p, p, state, cfg)
+    p[0] = .95
+    assert a.goal_condition(0, order, safe, maximum, p, p, state, cfg)
+
+
+def test_tied_goal_paths_prioritize_retrieved_evidence():
+    cfg = a.Config(k=1, zero_shots=2, repeats=1, hidden_dim=4)
+    r = record(cfg)
+    safe = maximum = np.array([1, 0, 0], np.float32)
+    class Predictor:
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            p[0] = .9
+            if state.evaluator_mask and state.candidate_mask & 2:
+                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+            return np.zeros(cfg.hidden_dim, np.float32), p
+        def predict_many(self, rec, states, allow_hidden_source=False):
+            pairs = [self.predict(rec, state) for state in states]
+            return np.stack([x[0] for x in pairs]), np.stack([x[1] for x in pairs])
+    scenario = a.decision_scenario(r, np.array([.9, .8, .1]), safe, maximum,
+                                   Predictor(), cfg, a.structural_states(cfg.zero_shots, cfg.k))
+    rows, cases = a.aggregate_decision_rows([scenario], cfg)
+    case = next(c for c in cases if (c["candidate_mask"], c["evaluator_mask"]) == (1, 0))
+    row = rows[case["training_row"]]
+    assert row["reach"] == 1
+    assert row["action_expected_cost"][0] == row["action_expected_cost"][1]
+    np.testing.assert_array_equal(row["target"], [1., 0., 0.])
+
+
+def test_learned_rollout_continues_after_max_and_returns_ranked_pool():
+    cfg = a.Config(k=1, zero_shots=2)
+    r = record(cfg)
+    maximum = np.array([1, 0, 0], np.float32)
+    class Predictor:
+        device = "cpu"
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            p[0] = .9
+            p[1] = .6
+            p[2] = .4
+            p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+            hidden = np.zeros(cfg.hidden_dim, np.float32)
+            hidden[0] = state.evaluator_mask
+            return hidden, p
+    class Head(torch.nn.Module):
+        def forward(self, hidden):
+            return torch.tensor([[0., 3., -1.] if row[0] == 0 else
+                                 [0., -1., 3.] for row in hidden])
+    row = a.rollout(r, maximum, Predictor(), cfg, head=Head(), trace=True)
+    assert row["reason"] == "ranked_list_complete"
+    assert row["first_max_recognition"] == {"candidate": r.candidate_ids[0], "cost": 1.}
+    assert row["ranked_candidates"] == r.candidate_ids
+    assert row["cost"] == cfg.full_cost
+    assert [step["acquired_item"] for step in row["trajectory"][:-1]] == ["ZS2", "R1", "OS1"]
+    assert a.policy_summary([row])["max_recognition_rate"] == 1
+
+    # The reporting wrapper measures savings at the first predicted MAX even
+    # when direct application rollouts use the continuing default.
+    scores = np.array([.9, .6, .4], np.float32)
+    teacher = {"scores": [scores], "safe": [maximum], "maximum": [maximum]}
+    evaluation = a.evaluate_policy([r], [0], teacher, Predictor(), cfg, head=Head())
+    assert len(evaluation) == 2
+    assert all(result["reason"] == "predicted_max" and result["cost"] == 1
+               for result in evaluation)
+    assert all(not result["acquisition_complete"] and result["final_max_recognized"]
+               for result in evaluation)
+    assert a.policy_summary(evaluation)["call_savings"]["all"]["total_calls"]["mean_saved"] == (
+        a.acquisition_call_counts(cfg.n, cfg.k, cfg)["total_calls"] - 1)
 
 
 def test_budget_and_short_sequence_savings_are_not_counted_as_max_stopping():
@@ -668,6 +767,37 @@ def test_budget_and_short_sequence_savings_are_not_counted_as_max_stopping():
                                                             for stop in ("correct_max", "wrong_max", "other")))
 
 
+@pytest.mark.parametrize("policy", ["full", "supervised"])
+@pytest.mark.parametrize("recognized", [False, True])
+def test_rollout_separates_pool_completion_from_final_max_recognition(policy, recognized):
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
+    rec = record(cfg)
+    maximum = np.array([1, 0, 0], np.float32)
+    class Predictor:
+        device = "cpu"
+        def predict(self, rec, state, cfg_override=None):
+            probabilities = np.zeros(3*cfg.n+2, np.float32)
+            probabilities[:cfg.n] = [.9, .6, .4]
+            if recognized:
+                probabilities[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+            return np.zeros(cfg.hidden_dim, np.float32), probabilities
+    class Head(torch.nn.Module):
+        def forward(self, hidden):
+            return torch.zeros((len(hidden), cfg.action_count))
+    row = a.rollout(rec, maximum, Predictor(), cfg, policy=policy, head=Head())
+    assert row["acquisition_complete"] is True
+    assert row["final_max_recognized"] is recognized
+    assert row["cost"] == cfg.full_cost
+    assert row["reason"] == ("full_budget_reference" if policy == "full" else "ranked_list_complete")
+    if recognized:
+        assert row["first_max_recognition"] == {
+            "candidate": rec.candidate_ids[0],
+            "cost": cfg.full_cost if policy == "full" else 1.}
+    else:
+        assert row["first_max_recognition"] is None
+    assert a.policy_summary([row])["max_recognition_rate"] == float(recognized)
+
+
 def test_predicted_max_stop_savings_condition_on_stops_with_equal_question_weights():
     cfg = a.Config(k=1, zero_shots=2)
     full = a.acquisition_call_counts(cfg.n, cfg.k, cfg)
@@ -680,6 +810,7 @@ def test_predicted_max_stop_savings_condition_on_stops_with_equal_question_weigh
     first = [row("a", 1, 0, "predicted_max"), row("a", 3, 1, "budget")]
     second = [row("b", 2, 1, "predicted_max")] * 2
     summary = a.policy_summary(first + second)["call_savings"]["all"]
+    assert a.policy_summary(first + second)["max_recognition_rate"] == .75
     assert summary["predicted_max_stop_rate"] == .75
     assert summary["predicted_max_stop_precision"] == 1
     assert summary["total_calls"]["mean_saved_on_predicted_max_stop"] == pytest.approx(64/3)
@@ -692,7 +823,7 @@ def test_predicted_max_stop_savings_condition_on_stops_with_equal_question_weigh
     assert no_stops["total_calls"]["mean_saved_on_predicted_max_stop"] is None
 
 
-def test_continuation_counts_all_orders_and_rejects_recovery_after_a_broken_goal(monkeypatch):
+def test_continuation_counts_all_orders_and_allows_recovery_after_a_dipped_goal(monkeypatch):
     cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
     class Predictor:
         device = "cpu"
@@ -709,10 +840,39 @@ def test_continuation_counts_all_orders_and_rejects_recovery_after_a_broken_goal
                "safe": np.array([[1, 0, 0]]), "maximum": np.array([[1, 0, 0]])}
     result = a.continuation_diagnostic([record(cfg)], [0], teacher, Predictor(), cfg, Head())
     assert result["orders_per_question"] == 2
-    assert result["mean_rank_prefix_reached"] == 1
-    assert result["per_rank_reach"] == [1., 0., 0.]
+    assert result["mean_rank_prefix_reached"] == 3
+    assert result["per_rank_reach"] == [1., 1., 1.]
+    assert result["mean_final_rank_prefix"] == 3
+    assert result["per_rank_final_recognition"] == [1., 1., 1.]
+    assert result["all_goals_recognized_rate"] == 1
+    assert result["acquisition_complete_rate"] == 1
     assert result["prior_goal_loss_rate"] == 1
     assert result["questions_with_prior_goal_lost"] == 1
+
+
+def test_continuation_reports_final_recognition_after_an_unrecovered_goal_loss(monkeypatch):
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
+    class Predictor:
+        device = "cpu"
+        def predict(self, rec, state, cfg_override=None):
+            return np.zeros(cfg.hidden_dim, np.float32), np.zeros(3*cfg.n+2)
+    class Head(torch.nn.Module):
+        def forward(self, hidden):
+            return torch.tensor([[0., 1., 2.]]).repeat(len(hidden), 1)
+    # Two ranks are recognized after ZS2, then retrieval loses both permanently.
+    def flags(rank, order, safe, maximum, probabilities, full_probabilities, state, config):
+        return state.evaluator_mask == 0 and rank < bin(state.candidate_mask).count("1")
+    monkeypatch.setattr(a, "goal_condition", flags)
+    teacher = {"scores": np.array([[.9, .8, .7]]),
+               "safe": np.array([[1, 0, 0]]), "maximum": np.array([[1, 0, 0]])}
+    result = a.continuation_diagnostic([record(cfg)], [0], teacher, Predictor(), cfg, Head())
+    assert result["mean_rank_prefix_reached"] == 2
+    assert result["per_rank_reach"] == [1., 1., 0.]
+    assert result["mean_final_rank_prefix"] == 0
+    assert result["per_rank_final_recognition"] == [0., 0., 0.]
+    assert result["all_goals_recognized_rate"] == 0
+    assert result["acquisition_complete_rate"] == 1
+    assert result["prior_goal_loss_rate"] == 1
 
 
 @pytest.mark.parametrize("external_dev_audit", [False, True])
@@ -821,7 +981,7 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     resumed = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
     assert resumed.decision_checkpoint["best_epoch"] == work.decision_checkpoint["best_epoch"]
     comparison_cfg = copy.deepcopy(cfg)
-    comparison_cfg.fixed_acquisition_orders = {"fixed_short": ["ZS1", "R2", "OS2"]}
+    comparison_cfg.fixed_acquisition_orders = {"fixed_short": ["ZS1", "R1", "OS1"]}
     comparison = a.Workflow(comparison_cfg).prepare().train_teacher().train_snapshot().train_decision_head()
     assert comparison.decision_checkpoint["dataset_fingerprint"] == work.decision_checkpoint["dataset_fingerprint"]
     comparison_report = comparison.report()["external"]["adaptive"]
