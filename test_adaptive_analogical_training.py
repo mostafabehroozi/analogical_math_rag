@@ -924,8 +924,11 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     assert manifest["schema_version"] == 3
     policy_shards = [a.load_checkpoint(tmp_path/"run"/path) for path in manifest["roles"]["policy"]]
     saved_rows = [row for shard in policy_shards for row in shard["rows"]]
-    assert saved_rows and {"uid", "state_key", "h", "target", "valid", "goal_rank"} <= set(saved_rows[0])
-    assert not {"truth", "teacher_scores", "future_measurements"} & set(saved_rows[0])
+    assert saved_rows and {"uid", "state_key", "target", "valid", "goal_rank"} <= set(saved_rows[0])
+    # Frozen features are re-encoded from each row's stored visible source, not saved.
+    assert not {"h", "truth", "teacher_scores", "future_measurements"} & set(saved_rows[0])
+    assert all(set(a.load_training_checkpoint((tmp_path/"run"/path).with_suffix(".training.pt"))) ==
+               {"target", "valid", "scenario", "state"} for path in manifest["roles"]["policy"])
     assert all("weight" not in row for row in saved_rows)
     assert all(np.isclose(row["target"].sum(), 1) and not row["target"][~row["valid"]].any()
                for row in saved_rows)
@@ -1179,7 +1182,7 @@ def test_checkpoint_write_failure_preserves_completed_file_and_cleans_partial(
     # A leftover from the old writer must not prevent a new atomic attempt.
     path.with_suffix(".pt.tmp").write_bytes(b"previous interrupted write")
     if failure == "save":
-        def fail_save(value, handle):
+        def fail_save(value, handle, **kwargs):
             handle.write(b"partial write")
             raise OSError(28, "No space left on device")
         monkeypatch.setattr(a.torch, "save", fail_save)

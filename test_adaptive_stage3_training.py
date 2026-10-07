@@ -1,6 +1,10 @@
 """Offline checks for bounded Stage 3 storage and unchanged training updates."""
 import copy
+import gzip
+import io
+import itertools
 import json
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -375,4 +379,126 @@ def test_resuming_patience_exhausted_head_skips_every_training_epoch(tmp_path, m
     monkeypatch.setattr(a, "masked_action_loss", lambda *args, **kwargs: pytest.fail("Stopped head must not restart epochs"))
     monkeypatch.setattr(a, "build_decision_rows", lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
     actual = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
+    assert_matching_training_checkpoints(expected, actual)
+
+
+def shard_pickle_protocol(path):
+    with gzip.open(path, "rb") as handle, zipfile.ZipFile(io.BytesIO(handle.read())) as archive:
+        name = next(name for name in archive.namelist() if name.endswith("data.pkl"))
+        return archive.read(name)[1]
+
+
+def test_reencoded_rows_reproduce_label_time_observations_and_features():
+    cfg, records, _, teacher, predictor = small_stage3_problem()
+    record = records[0]
+    rows, cases = a.build_decision_rows(record, teacher["scores"][0], teacher["safe"][0],
+                                        teacher["maximum"][0], predictor, cfg)
+    packed = a.training_companion(record, a.without_hidden(rows), cases, cfg)
+    assert set(packed) == {"target", "valid", "scenario", "state"}
+    states, _ = a.budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    orders = list(itertools.permutations(range(cfg.zero_shots)))
+    blank = np.zeros(cfg.n, np.float32)
+    observed = a.decision_row_observations(record, packed, cfg)
+    for x, scenario, position in zip(observed, packed["scenario"].tolist(), packed["state"].tolist()):
+        permuted = a.permute_zero_shots(record, blank, blank, blank, orders[scenario], cfg)[0]
+        # The scalar observation is an independent oracle for the batched rebuild.
+        np.testing.assert_array_equal(x, a.observation(permuted, states[position], cfg))
+    reencoded = a.decision_training_rows(record, packed, predictor, cfg)
+    stored = a.pack_decision_rows(rows, cfg)
+    torch.testing.assert_close(reencoded["h"], stored["h"], rtol=1e-6, atol=1e-6)
+    assert all(torch.equal(reencoded[key], stored[key]) for key in ("target", "valid"))
+
+
+def test_training_companion_rejects_rows_that_do_not_reproduce_their_state():
+    cfg, records, _, teacher, predictor = small_stage3_problem()
+    rows, cases = a.build_decision_rows(records[0], teacher["scores"][0], teacher["safe"][0],
+                                        teacher["maximum"][0], predictor, cfg)
+    rows = a.without_hidden(rows)
+    tampered = copy.deepcopy(rows)
+    tampered[0]["state_key"] = (*tampered[0]["state_key"][:2], "0" * 64)
+    with pytest.raises(ValueError, match="do not reproduce"):
+        a.training_companion(records[0], tampered, cases, cfg)
+    # Another question's measurements cannot stand in for this question's rows.
+    with pytest.raises(ValueError, match="do not reproduce"):
+        a.training_companion(records[1], rows, cases, cfg)
+    orphaned = [dict(case, training_row=None) if case["training_row"] == 0 else case for case in cases]
+    with pytest.raises(ValueError, match="without an in-budget visible case"):
+        a.training_companion(records[0], rows, orphaned, cfg)
+
+
+def test_default_geometry_question_storage_stays_compact(tmp_path):
+    torch.set_num_threads(1)
+    cfg = a.Config()
+    rng = np.random.RandomState(3)
+    record = a.Record("synthetic::0", "0", "synthetic",
+                      [f"zs_{i}" for i in range(cfg.zero_shots)] + [f"os_{i}" for i in range(cfg.k)],
+                      [str(i) for i in range(cfg.k)],
+                      np.sort(rng.rand(cfg.k).astype(np.float32))[::-1].copy(),
+                      (rng.randint(6, size=cfg.k) / 5).astype(np.float32),
+                      (rng.randint(6, size=(cfg.n, cfg.k)) / 5).astype(np.float32),
+                      (rng.rand(cfg.n) > .5).astype(np.float32))
+    scores = rng.rand(cfg.n).astype(np.float32)
+    safe, maximum = a.teacher_labels(scores, record.labels, cfg)
+    torch.manual_seed(7)
+    model = a.ResNet(cfg.input_dim, 3 * cfg.n + 2, cfg)
+    predictor = a.FrozenPredictor({"weights": a.cpu_state(model), "temperatures": np.ones(5)},
+                                  cfg, torch.device("cpu"))
+    rows, cases = a.build_decision_rows(record, scores, safe, maximum, predictor, cfg)
+    shard, companion = tmp_path / "question.pt", tmp_path / "question.training.pt"
+    a.atomic_torch(shard, {"rows": a.without_hidden(rows), "cases": cases}, compress=True)
+    a.atomic_torch(companion, a.training_companion(record, a.without_hidden(rows), cases, cfg))
+    # Storing 128 float32 features per row twice (with protocol-2 pickles) took
+    # about 11 MB for this question and filled Kaggle's disk part-way through Stage 3.
+    assert len(rows) > 5000 and shard_pickle_protocol(shard) == 4
+    assert shard.stat().st_size + companion.stat().st_size < 2 * 1024**2
+
+
+def write_stored_feature_layout(out, records, splits, teacher, predictor, cfg):
+    """Rewrite shards as before re-encoding: rows keep "h", protocol 2, full companions."""
+    paths = a.decision_shard_paths(records, splits, out)
+    for role in ("policy", "dev"):
+        for idx, path in zip(splits[role], paths[role]):
+            shard = a.load_checkpoint(path)
+            shard["rows"], _ = a.build_decision_rows(records[idx], teacher["scores"][idx], teacher["safe"][idx],
+                                                     teacher["maximum"][idx], predictor, cfg)
+            with path.open("wb") as handle:
+                with gzip.GzipFile(fileobj=handle, mode="wb", compresslevel=1, mtime=0) as zipped:
+                    torch.save(shard, zipped)
+            a.atomic_torch(path.with_suffix(".training.pt"), a.pack_decision_rows(shard["rows"], cfg))
+    return [path for role in ("policy", "dev") for path in paths[role]]
+
+
+def test_stored_feature_shards_migrate_in_place_without_relabeling(tmp_path, monkeypatch, capsys):
+    cfg, records, splits, teacher, predictor = small_stage3_problem()
+    fresh, legacy = tmp_path / "fresh", tmp_path / "legacy"
+    fresh.mkdir()
+    legacy.mkdir()
+    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", fresh)
+    a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", legacy)
+    (legacy / "decision_head_progress.pt").unlink()
+    paths = write_stored_feature_layout(legacy, records, splits, teacher, predictor, cfg)
+    before = {path: a.load_checkpoint(path) for path in paths}
+    assert all(shard_pickle_protocol(path) == 2 for path in paths)
+    capsys.readouterr()
+    monkeypatch.setattr(a, "build_decision_rows", lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
+    actual = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", legacy)
+    log = capsys.readouterr().out
+    assert "built 0, reused 1, compacted 1" in log
+    assert "0.00 MiB of stored-feature companions" not in log
+    for path, old in before.items():
+        new = a.load_checkpoint(path)
+        assert shard_pickle_protocol(path) == 4
+        assert {key: value for key, value in new.items() if key != "rows"} == {
+            key: value for key, value in old.items() if key != "rows"}
+        assert len(new["rows"]) == len(old["rows"])
+        for kept, original in zip(new["rows"], old["rows"]):
+            assert kept.keys() == original.keys() - {"h"}
+            for key, value in kept.items():
+                if isinstance(value, np.ndarray):
+                    assert value.dtype == original[key].dtype
+                    np.testing.assert_array_equal(value, original[key])
+                else:
+                    assert value == original[key]
+        assert set(a.load_training_checkpoint(path.with_suffix(".training.pt"))) == {
+            "target", "valid", "scenario", "state"}
     assert_matching_training_checkpoints(expected, actual)

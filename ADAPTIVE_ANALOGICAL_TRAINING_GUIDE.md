@@ -150,8 +150,9 @@ Every case has exactly one disposition, with this precedence:
 
 Cases without a valid acquisition have a null training-row reference.
 Identical visible observations within a question share one training row.
-Each row stores the frozen hidden vector, valid mask, normalized soft target,
-goal-rank distribution, and per-action reach/cost/steps for diagnosis. All
+Each row stores its visible state key, valid mask, normalized soft target,
+goal-rank distribution, and per-action reach/cost/steps for diagnosis. Its
+frozen hidden vector is re-encoded from that exact observation when needed. All
 ordinary Stage 3 rows have equal loss weight, regardless of how many original
 state/order cases they represent. Thus exhaustive case coverage does not mean
 one equally weighted training example per case. Terminal and over-budget
@@ -206,11 +207,13 @@ predictor fingerprint. An interrupted build resumes completed matching
 questions; incompatible shards fail explicitly. A role with no actionable
 rows fails with its coverage report. During training, policy question and row
 order are shuffled deterministically each epoch, and dev questions are read in
-stable order for masked-loss checkpoint selection. All exhaustive labels and
-frozen hidden vectors are constructed **once before the head's epoch loop**;
-epochs reuse those rows and never regenerate states, planner targets, or
-encoder features. A new invocation validates matching shards before reuse.
-The frozen Stage 2 state is checked after training.
+stable order for masked-loss checkpoint selection. All exhaustive labels are
+constructed **once before the head's epoch loop**; epochs reuse those rows and
+never regenerate states or planner targets. Frozen hidden vectors are not
+stored: each training and development pass rebuilds every row's stored
+observation and re-encodes it with the frozen predictor on the selected
+device. A new invocation validates matching shards before reuse. The frozen
+Stage 2 state is checked after training.
 
 Stage 3 prints question progress, elapsed time, and estimated remaining time
 for each role's label build and each epoch's training/development pass. Updates
@@ -231,13 +234,27 @@ progress file begin head training at epoch 1. Keep the training and development
 settings and selected device consistent when comparing a resumed run to an
 uninterrupted run. The final selected head is saved when Stage 3 finishes.
 
-Audit shards are now gzip-compressed losslessly at level 1. This preserves
-every row, array dtype/value, state/order case, and fingerprint; it does not
-reduce coverage or change labels. `load_checkpoint` detects compressed and
-legacy uncompressed shards. Matching legacy shards are validated and then
-atomically compressed in place during resume. Packed training companions and
-public model checkpoints remain ordinary PyTorch files. Use this workflow's
-`load_checkpoint` rather than bare `torch.load` for compressed audit shards.
+Audit shards are gzip-compressed at level 1 with pickle protocol 4. They keep
+every row field, array dtype/value, state/order case, and fingerprint except
+the row's frozen hidden vector `h`. That vector is a deterministic function of
+the fingerprinted Stage 2 predictor and the row's observation, so it is
+re-encoded instead of stored. Earlier revision-5 shards stored `h` twice (audit
+shard and training companion), and `torch.save`'s default protocol 2 wrote
+NumPy buffers as latin-1 strings. That took about 8 MiB per question, roughly
+30 GiB for the default policy role plus pooled test-file development, and
+filled Kaggle's output disk during the policy labels. A synthetic
+default-geometry question with about 8,100 rows now needs about 1 MiB
+(audit shard plus companion) instead of about 11 MiB. It does not reduce
+coverage or change labels.
+
+`load_checkpoint` detects compressed and legacy uncompressed shards. On
+resume, matching shards that still contain `h`, or are uncompressed, are
+validated and atomically rewritten without it. Labels are not rebuilt; the
+progress line counts these questions as `compacted`. Companions that stored
+`h` are deleted before any shard is rewritten, so a run that stopped on a full
+disk can resume in place. Training companions and public model checkpoints
+remain ordinary PyTorch files. Use this workflow's `load_checkpoint` rather
+than bare `torch.load` for compressed audit shards.
 
 A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
 write failure, commonly caused by exhausted disk space or a storage quota.
@@ -248,8 +265,10 @@ Write errors report the affected path, free space, and original exception;
 free filesystem space alone does not rule out a quota or I/O problem.
 
 On Kaggle, check `shutil.disk_usage(CFG.output_dir)` and free unneeded files
-if the output filesystem is full. Compression still needs enough temporary
-space to write one shard, and packed companions consume additional space.
+if the output filesystem is full. Each write still needs temporary space for
+one shard. After the first ten questions of each role, Stage 3 projects the
+space needed for every remaining shard from the sizes so far and prints a
+warning if it exceeds the free space, instead of failing hours later.
 To recover an interrupted **revision-5** run, use the same `output_dir`, input
 files, and training configuration with `resume=True`. Revision-4 runs cannot
 resume under the new action and label contract; start revision 5 in its new
@@ -264,20 +283,29 @@ decisions and masked training. The evaluator action and tie rule changed in
 revision 5, so older label shards cannot be reused.
 
 After validating each full shard, it writes a compact `.training.pt` companion
-containing only `h`, `target`, and `valid` tensors. Epochs read these companions
-instead of unpickling the cases and audit metadata repeatedly. Matching
-companions are validated and reused; missing or stale companions are rebuilt
-from validated source rows. Matching revision-5 schema-3 shards and manifests
-remain usable with the same configuration and output directory. Training transfers
-one question's tensors to the device
-once, preserves the existing shuffled minibatch order and optimizer steps,
-and reads the accumulated loss back once per question.
+containing `target` and `valid` tensors plus each row's source: the zero-shot
+`scenario` and in-budget `state` of the first case mapped to that row.
+Building or validating a companion rebuilds every row's observation from
+these sources and checks it against the row's stored `state_key` hash, so the
+re-encoded features use exactly the label-time inputs. Epochs read these
+companions instead of unpickling the cases and audit metadata repeatedly, then
+re-encode one question's observations on the predictor's device. A synthetic
+default-geometry question took about 20 ms on two CPU threads and about 9 ms
+on a local RTX 3050 Ti laptop GPU, mostly CPU observation assembly; this is not
+a Kaggle measurement. On CPU the re-encoded vectors matched the formerly stored
+ones bit for bit; on that GPU they differed by at most about 2e-7 from
+floating-point roundoff. Matching companions are
+validated and reused; missing or stale companions are rebuilt from validated
+source rows. Matching revision-5 schema-3 shards and manifests remain usable
+with the same configuration and output directory. Training preserves the
+existing shuffled minibatch order and optimizer steps, and reads the
+accumulated loss back once per question.
 
 `decision_cache_mb=4096` sets a 4 GiB requested packed-tensor CPU cache cap,
 further limited to half the currently available host RAM. If available RAM
-cannot be detected, the cache is disabled. It retains memory-mapped tensors
-for a role only if every question in that role fits in the remaining budget,
-considering policy first. Other roles stream one memory-mapped packed question
+cannot be detected, the cache is disabled. It retains memory-mapped companion
+tensors, not re-encoded features, for a role only if every question in that
+role fits in the remaining budget, considering policy first. Other roles stream one memory-mapped packed question
 at a time. The OS pages these tensors on demand; the cache does not eagerly
 clone the entire dataset into RAM. Whole-role admission avoids repeatedly
 filling and evicting a partial cache when question order changes each epoch.
@@ -285,8 +313,8 @@ filling and evicting a partial cache when question order changes each epoch.
 it does not invalidate matching experiment artifacts. The cap covers retained
 tensor payloads, not the entire process; records, one question's audit
 metadata, model state, and temporary arrays also need RAM. Every row remains
-available in either mode. Only one question's training tensors occupy GPU
-memory at a time; compact companions require additional disk space.
+available in either mode. Only one question's re-encoded features and
+training tensors occupy GPU memory at a time.
 
 `decision_eval_batch_size=4096` uses larger development-only forward batches
 for head evaluation. Every development row still contributes to masked loss,
