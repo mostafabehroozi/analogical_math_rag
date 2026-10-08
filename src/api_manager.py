@@ -504,7 +504,7 @@ class GeminiAPIManager(_KeyedAPIManager):
         if genai is None:
             raise ImportError("GeminiAPIManager requires the 'google-genai' package. Run: pip install google-genai")
         
-        self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0))
+        self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0))
         self.clients = {
             key: genai.Client(
                 api_key=key, 
@@ -604,7 +604,7 @@ class AvalAIAPIManager(_KeyedAPIManager):
         if "GLOBAL_API_CALL_DELAY_SECONDS" not in self.config:
             self.config["GLOBAL_API_CALL_DELAY_SECONDS"] = global_delay_seconds
         
-        timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0))
+        timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0))
         self.clients = {
             key: openai.OpenAI(
                 api_key=key, 
@@ -699,7 +699,7 @@ class OpenRouterAPIManager(_KeyedAPIManager):
             key: openai.OpenAI(
                 api_key=key,
                 base_url=base_url,
-                timeout=float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 180.0)),
+                timeout=float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0)),
                 default_headers=headers,
                 max_retries=0,
             ) for key in self.api_keys_list
