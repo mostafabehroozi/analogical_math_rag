@@ -88,6 +88,10 @@ class Config:
     })
     bootstrap_samples: int = 1000
     print_every: int = 10
+    # Runtime-only mirror of output_dir on the Hugging Face Hub: Kaggle keeps its
+    # working disk only while a session lives, so uploads make a run resumable.
+    hf_repo: Optional[str] = None      # Private dataset repo id such as "user/run"; None disables.
+    hf_sync_minutes: float = 15.       # Upload cadence inside long loops; stage ends always upload.
 
     @property
     def n(self):
@@ -136,6 +140,9 @@ class Config:
                                          self.evaluator_mask_fraction,
                                          self.hidden_source_fraction))
         assert self.print_every > 0
+        assert self.hf_sync_minutes > 0
+        if self.hf_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", str(self.hf_repo)):
+            raise ValueError("hf_repo must be a Hugging Face dataset repository id such as 'user/name'.")
         fixed_acquisition_sequences(self)
 
 
@@ -217,6 +224,15 @@ def load_checkpoint(path):
 
 def cpu_state(model):
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def file_digest(path, chunk=8 * 1024**2):
+    """SHA-256 of a file's bytes; identifies an input log independently of its path or mtime."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(chunk), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def normalized_group(text):
@@ -582,7 +598,18 @@ def teacher_labels(scores, truth, cfg):
     return safe, maximum
 
 
-def fit_teachers(records, splits, cfg, device, out):
+def completed_teacher(path, expected, cfg, name):
+    """A saved fold/final teacher is reused only when its question roles match exactly."""
+    if not (cfg.resume and path.exists()):
+        return None
+    ckpt = load_checkpoint(path)
+    if any(ckpt.get(key) != value for key, value in expected.items()):
+        return None
+    print(f"{name:<24} | loaded completed checkpoint (best epoch {ckpt.get('best_epoch')})")
+    return ckpt
+
+
+def fit_teachers(records, splits, cfg, device, out, sync=None):
     sup = np.array(splits["supervised"])
     rng = np.random.RandomState(cfg.seed + 1)
     rng.shuffle(sup)
@@ -595,15 +622,29 @@ def fit_teachers(records, splits, cfg, device, out):
         train_ids, val_ids = others[nv:].tolist(), others[:nv].tolist()
         if not train_ids:
             raise ValueError("Too few training records for nested teacher fold.")
-        ckpt = train_teacher(records, train_ids, val_ids, cfg, device, cfg.seed + f,
-                             f"Teacher fold {f+1}/{cfg.teacher_folds}")
+        name, fold_path = f"Teacher fold {f+1}/{cfg.teacher_folds}", out / f"teacher_fold_{f+1}.pt"
+        expected = {"train_ids": [records[i].uid for i in train_ids],
+                    "validation_ids": [records[i].uid for i in val_ids],
+                    "heldout_ids": [records[i].uid for i in heldout]}
+        # Each fold completes as an atomic file, so an interrupted Stage 1 resumes per fold.
+        ckpt = completed_teacher(fold_path, expected, cfg, name)
+        if ckpt is None:
+            ckpt = train_teacher(records, train_ids, val_ids, cfg, device, cfg.seed + f, name)
+            ckpt["heldout_ids"] = expected["heldout_ids"]
+            atomic_torch(fold_path, ckpt)
         predictions = teacher_predict(ckpt, records, heldout.tolist(), cfg, device)
         oof.update({int(i): p for i, p in zip(heldout, predictions)})
-        ckpt["heldout_ids"] = [records[i].uid for i in heldout]
-        atomic_torch(out / f"teacher_fold_{f+1}.pt", ckpt)
         provenance.append({k: ckpt[k] for k in ("train_ids", "validation_ids", "heldout_ids")})
-    final = train_teacher(records, splits["supervised"], splits["dev"], cfg, device,
-                          cfg.seed + 100, "Final teacher")
+        if sync is not None:
+            sync.push(f"Stage 1: teacher fold {f+1}/{cfg.teacher_folds}")
+    final_path = out / "teacher_final.pt"
+    expected = {"train_ids": [records[i].uid for i in splits["supervised"]],
+                "validation_ids": [records[i].uid for i in splits["dev"]]}
+    final = completed_teacher(final_path, expected, cfg, "Final teacher")
+    if final is None:
+        final = train_teacher(records, splits["supervised"], splits["dev"], cfg, device,
+                              cfg.seed + 100, "Final teacher")
+        atomic_torch(final_path, final)
     scores = teacher_predict(final, records, list(range(len(records))), cfg, device)
     for idx, pred in oof.items():
         scores[idx] = pred
@@ -1504,7 +1545,8 @@ def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
     digest.update(json.dumps({"schema": 3, "revision": PIPELINE_REVISION,
                               "config": {key: value for key, value in asdict(cfg).items()
                                          if key not in {"resume", "output_dir", "device", "cpu_threads", "print_every",
-                                                        "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size"}},
+                                                        "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size",
+                                                        "hf_repo", "hf_sync_minutes"}},
                               "predictor": predictor_fingerprint(predictor),
                               "data_sha256": data_digest(records),
                               "roles": {role: [records[i].uid for i in splits[role]]
@@ -1727,7 +1769,7 @@ def load_label_file(path):
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
-def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, fingerprint):
+def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, fingerprint, sync=None):
     """Build, migrate, or reuse one role's labels; returns them in RAM.
 
     Each question completes as one small atomic file, and the finished role is
@@ -1796,6 +1838,8 @@ def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, finge
         last_print = decision_progress(f"Stage 3 {role} labels", position, len(ids), started, last_print, cfg,
                                        f" | built {built}, reused {reused}" +
                                        (f", migrated {migrated}" if migrated else ""))
+        if sync is not None:
+            sync.push(f"Stage 3: {role} labels {position}/{len(ids)} questions")
     if store is None:
         counts = [len(source) for source in sources]
         store = {"schema_version": DECISION_LABEL_SCHEMA, "fingerprint": fingerprint, "role": role,
@@ -1814,6 +1858,8 @@ def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, finge
             directory.rmdir()
         except OSError:
             pass  # Missing, or holds files this workflow does not own.
+    if sync is not None:
+        sync.push(f"Stage 3: {role} labels complete", force=True)
     return store
 
 
@@ -1882,7 +1928,7 @@ def decision_progress(label, completed, total, started, last_print, cfg, detail=
     return last_print
 
 
-def train_decision_head(records, splits, teacher, predictor, cfg, device, out=None):
+def train_decision_head(records, splits, teacher, predictor, cfg, device, out=None, sync=None):
     if splits["policy"] != splits["supervised"]:
         raise ValueError("Stage 3 policy questions must match the Stage 1/2 supervised questions.")
     seed_everything(cfg.seed + 300)
@@ -1930,7 +1976,7 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
     labels, coverage = {}, {}
     for role in roles:
         labels[role] = decision_role_labels(role, records, splits[role], teacher, predictor,
-                                            cfg, out, fingerprint)
+                                            cfg, out, fingerprint, sync)
         coverage[role] = combine_coverage(labels[role]["coverage"])
         atomic_json(out / "decision_label_coverage.json", coverage)
         print(f"Stage 3 {role}: {coverage[role]['state_order_cases']} state/order cases, "
@@ -2021,6 +2067,8 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
               f"dev loss {dev_loss:.4f}, best {best:.4f} (epoch {best_epoch}), "
               f"patience {stale}/{cfg.patience} | elapsed {(time.monotonic()-epoch_started)/60:.1f} min",
               flush=True)
+        if sync is not None:
+            sync.push(f"Stage 3: epoch {epoch+1} progress")
         if stale >= cfg.patience:
             break
     if predictor_fingerprint(predictor) != frozen_before:
@@ -2489,6 +2537,116 @@ def policy_report(records, ids, teacher, predictor, cfg, head, title):
             "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg),
             "continuation": continuation_diagnostic(records, ids, teacher, predictor, cfg, head)}, rows
 
+def hub_access_token():
+    """A Hub token from the environment, Kaggle Secrets, or an existing login; never printed."""
+    for name in ("HF_SYNC_TOKEN", "HF_TOKEN"):
+        if os.environ.get(name):
+            return os.environ[name]
+    try:
+        from kaggle_secrets import UserSecretsClient
+        client = UserSecretsClient()
+    except Exception:
+        client = None
+    for name in ("HF_SYNC_TOKEN", "HF_TOKEN") if client is not None else ():
+        try:
+            token = client.get_secret(name)
+        except Exception:
+            continue
+        if token:
+            return token
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except Exception:
+        return None
+
+
+def hub_api():
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise ImportError("hf_repo needs the huggingface_hub package: %pip install -q huggingface_hub") from exc
+    return HfApi(token=hub_access_token())
+
+
+def folder_size(path):
+    return sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file())
+
+
+class OutputSync:
+    """Mirror output_dir to a private Hugging Face dataset repository.
+
+    Kaggle keeps /kaggle/working only while a session lives. Every stage
+    already completes through atomic files in output_dir, so uploading that
+    folder makes a run resumable across sessions: a new session pulls the
+    folder, Stages 0-2 load their completed checkpoints, and Stage 3 continues
+    from its completed questions and epochs. Uploads skip unchanged files by
+    content hash, never include `.tmp` files, and remove per-question label
+    files from the mirror once a role is merged. Run one session per repo.
+    """
+    def __init__(self, out, repo, interval_minutes, api=None):
+        self.out, self.repo, self.interval = Path(out), repo, interval_minutes * 60
+        self.api = hub_api() if api is None else api
+        self.last = time.monotonic()
+        self.uploads, self.last_message, self.last_error = 0, None, None
+
+    def pull(self):
+        """Download the mirrored run into an empty output folder; a filled folder is current."""
+        if self.out.exists() and any(self.out.iterdir()):
+            return "local"
+        if not self.api.repo_exists(self.repo, repo_type="dataset"):
+            return "new"
+        self.api.snapshot_download(repo_id=self.repo, repo_type="dataset", local_dir=str(self.out),
+                                   ignore_patterns=[".gitattributes"])
+        shutil.rmtree(self.out / ".cache", ignore_errors=True)  # Download bookkeeping only.
+        return "pulled"
+
+    def push(self, message, *, force=False, required=False):
+        """Upload changed files; inside loops only once per interval, at stage ends always.
+
+        A failed upload never discards local work: periodic failures warn and
+        retry at the next sync point; a required upload raises so a bad token
+        or repository is visible at Stage 0 rather than after hours of training.
+        """
+        if not force and time.monotonic() - self.last < self.interval:
+            return False
+        error = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(5 * 2 ** (attempt - 1))
+            try:
+                self.api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
+                self.api.upload_folder(folder_path=str(self.out), repo_id=self.repo, repo_type="dataset",
+                                       commit_message=message, ignore_patterns=["*.tmp"],
+                                       delete_patterns=["decision_labels/*/*.pt", "decision_shards/*/*"])
+            except Exception as exc:  # Network, rate limit, or credentials; local files stay complete.
+                error = exc
+                continue
+            self.last, self.last_message, self.last_error = time.monotonic(), message, None
+            self.uploads += 1
+            return True
+        self.last, self.last_error = time.monotonic(), error
+        if required:
+            raise RuntimeError(f"Upload to {self.repo} failed: {error}. Check the token (HF_SYNC_TOKEN or "
+                               "HF_TOKEN), the repository id, and Kaggle Internet; completed files remain "
+                               f"in {self.out}.") from error
+        print(f"WARNING: upload to {self.repo} failed ({error}); retrying at the next sync point. "
+              f"Completed files remain in {self.out}.", flush=True)
+        return False
+
+    def describe(self):
+        return (f"Mirror {self.repo}: {self.uploads} uploads; last upload: {self.last_message or 'none'}; "
+                f"last error: {self.last_error or 'none'}.")
+
+
+def contract_identity(contract):
+    """Input logs are identified by filename, size, and content; directory and mtime vary."""
+    identity = json.loads(json.dumps(contract))
+    identity["sources"] = [{key: source.get(key) for key in ("name", "bytes", "sha256")}
+                           for source in identity.get("sources", [])]
+    return identity
+
+
 class Workflow:
     """Notebook stages; completed checkpoints resume, interrupted stages restart safely."""
     def __init__(self, cfg):
@@ -2499,20 +2657,41 @@ class Workflow:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else torch.device(cfg.device)
         self.out = Path(cfg.output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
+        self.sync = OutputSync(self.out, cfg.hf_repo, cfg.hf_sync_minutes) if cfg.hf_repo else None
+        if self.sync is not None:
+            state = self.sync.pull()
+            print({"local": f"Mirror {cfg.hf_repo}: {self.out} already holds files; they are used as is.",
+                   "new": f"Mirror {cfg.hf_repo}: no uploaded run yet; this run is uploaded as it progresses.",
+                   "pulled": f"Mirror {cfg.hf_repo}: downloaded {folder_size(self.out) / 1024**2:.1f} MiB "
+                             f"into {self.out}; completed stages resume."}[state], flush=True)
         contract_cfg = asdict(cfg)
         for key in ("resume", "output_dir", "device", "cpu_threads", "print_every", "fixed_acquisition_orders",
                     "continue_after_max",
-                    "decision_eval_batch_size"):
+                    "decision_eval_batch_size", "hf_repo", "hf_sync_minutes",
+                    "train_file", "test_files"):  # Logs are identified by the sources below.
             contract_cfg.pop(key)
-        sources = [{"path": str(Path(p).resolve()), "bytes": Path(p).stat().st_size,
-                    "mtime_ns": Path(p).stat().st_mtime_ns} for p in [cfg.train_file] + cfg.test_files]
+        # A log's filename is its benchmark identity; its directory and mtime are not.
+        sources = [{"path": str(Path(p).resolve()), "name": Path(p).name, "bytes": Path(p).stat().st_size,
+                    "sha256": file_digest(p)} for p in [cfg.train_file] + cfg.test_files]
         contract = {"schema_version": 4, "implementation_revision": PIPELINE_REVISION,
                     "config": contract_cfg, "sources": sources}
         path = self.out / "contract.json"
         if path.exists():
             old = json.loads(path.read_text(encoding="utf-8"))
             # Round-trip converts tuples to JSON lists consistently.
-            if old != json.loads(json.dumps(contract)):
+            if any("sha256" not in source for source in old.get("sources", [])):
+                # Before content hashing, a contract bound each log to its path, size, and
+                # mtime, which hold only within one session; upgrade a matching one in place.
+                legacy = {**contract,
+                          "config": {**contract_cfg, "train_file": cfg.train_file,
+                                     "test_files": list(cfg.test_files)},
+                          "sources": [{"path": source["path"], "bytes": source["bytes"],
+                                       "mtime_ns": Path(source["path"]).stat().st_mtime_ns}
+                                      for source in sources]}
+                if old != json.loads(json.dumps(legacy)):
+                    raise ValueError("Output folder belongs to a different config/data contract. Choose a new output_dir.")
+                atomic_json(path, contract)
+            elif contract_identity(old) != contract_identity(contract):
                 raise ValueError("Output folder belongs to a different config/data contract. Choose a new output_dir.")
             if not cfg.resume:
                 raise ValueError("Output folder already contains this run. Set resume=True or choose a new folder.")
@@ -2539,7 +2718,7 @@ class Workflow:
             cache = load_checkpoint(cache_path)
             self.records = [Record(**r) for r in cache["records"]]
             self.audit = cache["audit"]
-            print("Using compact cached records (source path/size/mtime contract verified).")
+            print("Using compact cached records (source size/sha256 contract verified).")
         else:
             self.records, self.audit = load_records(self.cfg)
             atomic_torch(cache_path, {"records": [asdict(r) for r in self.records], "audit": self.audit})
@@ -2565,7 +2744,13 @@ class Workflow:
                     "evaluation_protocol": split_protocol(self.cfg, self.splits),
                     "roles": {k: [self.records[i].uid for i in ids] for k,ids in self.splits.items()},
                     "groups": {r.uid: r.group for r in self.records}})
+        # The first upload is required, so a bad token or repository fails here, not hours later.
+        self.push("Stage 0: data audit, compact records, and split", required=True)
         return self
+
+    def push(self, message="manual upload", *, force=True, required=False):
+        """Upload the output folder to hf_repo now; a no-op without a mirror."""
+        return False if self.sync is None else self.sync.push(message, force=force, required=required)
 
     def train_teacher(self):
         if self.records is None:
@@ -2576,7 +2761,7 @@ class Workflow:
             self.teacher = load_checkpoint(path)
             print("Loaded completed teacher stage.")
         else:
-            self.teacher = fit_teachers(self.records, self.splits, self.cfg, self.device, self.out)
+            self.teacher = fit_teachers(self.records, self.splits, self.cfg, self.device, self.out, self.sync)
             atomic_torch(path, self.teacher)
         self.heuristics = select_heuristics(self.records, self.splits["dev"], self.cfg)
         atomic_json(self.out / "heuristics_selected_on_dev.json", self.heuristics)
@@ -2585,6 +2770,7 @@ class Workflow:
         print(f"OOF labels: {len(ids)} supervised questions; empty SAFE/MAX: {empty}/{len(ids)}.")
         teacher_report(self.records, self.splits["dev"], self.cfg, self.teacher["scores"],
                        self.heuristics, "TEACHER DEVELOPMENT REPORT (used for model selection)")
+        self.push("Stage 1 complete: teacher folds and out-of-fold labels")
         return self
 
     def train_snapshot(self):
@@ -2602,6 +2788,7 @@ class Workflow:
         print("Encoder and prediction heads frozen. Development temperature calibration: "
               + ("enabled." if self.cfg.calibrate else "disabled."))
         print(f"Recognition threshold for supervised goals: {self.cfg.recognition_threshold:.2f}.")
+        self.push("Stage 2 complete: frozen snapshot predictor")
         return self
 
     def train_decision_head(self):
@@ -2618,7 +2805,7 @@ class Workflow:
             print("Loaded completed supervised decision head.")
         else:
             checkpoint = train_decision_head(self.records, self.splits, self.teacher,
-                                             self.predictor, self.cfg, self.device, self.out)
+                                             self.predictor, self.cfg, self.device, self.out, self.sync)
             atomic_torch(path, checkpoint)
         self.head = SupervisedActionHead(self.cfg).to(self.device)
         self.head.load_state_dict(checkpoint["weights"])
@@ -2636,6 +2823,7 @@ class Workflow:
             "cost_note": "Fixed-m cached bundles; no target-grading cost at deployment."})
         print(f"Decision head: epoch {checkpoint['best_epoch']}, "
               f"development loss {checkpoint['dev_loss']:.4f}.")
+        self.push("Stage 3 complete: decision head and inference bundle")
         return self
 
     def decision_label_audit(self, role, position):
@@ -2699,6 +2887,7 @@ class Workflow:
         print(f"Saved reports, trajectories, checkpoints, and inference bundle to {self.out}")
         print("These are cached historical outcomes, not live API or Kaggle evidence.")
         self.results = results
+        self.push("Stage 4 complete: reports and trajectories")
         return results
 
 

@@ -226,7 +226,9 @@ labels are complete; development labels come next, before head training.
 With the default external-development setting, all four benchmark logs supply
 development questions, and their exhaustive label build can be substantial.
 Keep the same output directory and configuration to reuse completed questions
-after interruption. After every completed training/development epoch,
+after interruption, including in a new Kaggle session when `hf_repo` mirrors
+the folder (see "Surviving Kaggle session limits"). After every completed
+training/development epoch,
 `decision_head_progress.pt` atomically saves current and best head weights,
 Adam state, question/row shuffle RNG, losses, and early-stopping bookkeeping.
 With `resume=True`, head optimization continues from the last completed epoch;
@@ -235,6 +237,45 @@ preserve the previous completed epoch. Older interrupted runs without this
 progress file begin head training at epoch 1. Keep the training and development
 settings and selected device consistent when comparing a resumed run to an
 uninterrupted run. The final selected head is saved when Stage 3 finishes.
+
+### Surviving Kaggle session limits
+
+Kaggle keeps `/kaggle/working` only while a session lives, and a session ends
+after at most 12 hours. Every stage already completes through atomic files in
+`output_dir`, so the run becomes resumable across sessions once that folder is
+mirrored. Set `hf_repo` to a private Hugging Face **dataset** repository id
+such as `user/adaptive-run` (runtime-only, outside the contract and the label
+fingerprint). The token comes from the `HF_SYNC_TOKEN` or `HF_TOKEN`
+environment variable, the Kaggle Secret of the same name (attach it to the
+notebook under Add-ons > Secrets, with Internet enabled), or an existing
+`huggingface_hub` login; it is never printed or stored.
+
+- **Pull.** Constructing `Workflow(CFG)` downloads the mirrored run into an
+  empty output folder (a non-empty folder is used as is). The repository is
+  created on the first upload if it does not exist.
+- **Push.** Stage 0 ends with a required upload, so a bad token, repository
+  id, or disabled Internet fails in the first minute. Each later stage uploads
+  when it completes. Inside long loops the run uploads every `hf_sync_minutes`
+  (default 15): after Stage 1 folds, during the Stage 3 label build, and after
+  Stage 3 epochs; each merged role uploads immediately. Uploads skip unchanged
+  files by content hash, never include `.tmp` files, and remove per-question
+  label files and migrated shards from the mirror once they are gone locally.
+  A failed periodic upload prints a warning and retries at the next sync
+  point; local files are never discarded. `WORK.push()` uploads on demand,
+  and `WORK.sync.describe()` reports the upload state.
+- **Resume.** In a new session, download the same input logs, keep the same
+  configuration, and run the cells. Inputs are identified by size and
+  SHA-256, so a new path or mtime keeps the same run (contracts written by
+  earlier code, which recorded an mtime, are upgraded in place when they still
+  match). Stages 0-2 load their completed checkpoints; Stage 1 also reuses
+  completed `teacher_fold_<n>.pt` and `teacher_final.pt` files whose question
+  roles match exactly, so an interrupted Stage 1 repeats at most one fold.
+  Stage 3 reuses completed questions and continues from the last completed
+  epoch. Stage 2 and Stage 4 restart if interrupted; neither takes long
+  compared with Stage 3.
+- **One session per repository.** Two sessions writing the same mirror would
+  overwrite each other; use a different `hf_repo` for a different run
+  (`QUICK_PILOT` appends `_pilot` to both the output folder and the mirror).
 
 ### Stage 3 label storage
 
