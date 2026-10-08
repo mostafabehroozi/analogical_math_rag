@@ -287,19 +287,28 @@ feature vector stored twice (about 8 MiB per question; the v5 run hit
 question in two files. Most of that was derivable data, such as a 64-character
 hash string per row.
 
+**Recognizing the earlier code.** The notebook embeds its implementation,
+so a Kaggle copy uploaded before this change keeps writing audit shards. Its
+traceback fails inside `atomic_torch(path, shard, compress=True)` while
+writing `decision_shards/<role>/<position>_<hash>.pt`; the current code has
+neither that call nor that directory as a write target. Stage 0 of the
+current workflow prints the implementation revision and the compact label
+schema (`Implementation revision 5; Stage 3 stores compact labels (schema
+4, ...)`) before any stage trains, so the running code can be checked in the
+first minute rather than hours later.
+
 **Recovering such a run.** Keep the same `output_dir`, input files, and
-training configuration with `resume=True`. Run the updated definition cells,
-configuration, and Stages 0-2 (they load their completed checkpoints), then
-`WORK.train_decision_head()`. Before any write, Stage 3 deletes the derived
-`.training.pt` companions (up to 4 MiB each) and interrupted `.tmp` files. It
+training configuration with `resume=True`. Constructing `Workflow(CFG)` on an
+existing run deletes the derived `.training.pt` companions (up to 4 MiB each)
+and interrupted `.tmp` files before Stage 0 writes its reports, and prints
+the reclaimed size, so a completely full disk needs no manual cleanup.
+Stages 0-2 load their completed checkpoints; `WORK.train_decision_head()`
 then converts each completed schema-3 shard to compact labels **without
 relabeling** and deletes the shard, so free space only grows; the progress
 line counts these as `migrated`. Only missing questions are built, and a
-matching schema-3 manifest is upgraded in place. If the disk is completely
-full, Stage 0's small JSON reports can fail before Stage 3 frees space; delete
-`decision_shards/*/*.training.pt` first. Revision-4 runs cannot resume under
-the revision-5 action and label contract; start revision 5 in a new output
-directory.
+matching schema-3 manifest is upgraded in place. Revision-4 runs cannot
+resume under the revision-5 action and label contract; start revision 5 in a
+new output directory.
 
 A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
 write failure, commonly caused by exhausted disk space or a storage quota.

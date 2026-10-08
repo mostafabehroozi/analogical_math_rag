@@ -876,7 +876,7 @@ def test_continuation_reports_final_recognition_after_an_unrecovered_goal_loss(m
 
 
 @pytest.mark.parametrize("external_dev_audit", [False, True])
-def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, external_dev_audit, monkeypatch):
+def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, external_dev_audit, monkeypatch, capsys):
     train, external, second = tmp_path/"train.json", tmp_path/"external.json", tmp_path/"second.json"
     cfg = a.Config(train_file=str(train), test_files=[str(external), str(second)],
                    use_test_files_for_dev_and_audit=external_dev_audit,
@@ -901,6 +901,9 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
         return build_snapshots(*args, **kwargs)
     monkeypatch.setattr(a, "build_snapshots", track_snapshot_training)
     work = a.run_pipeline(cfg)
+    # Stage 0 names the embedded code before any stage trains, so a stale notebook is visible.
+    assert (f"Implementation revision {a.PIPELINE_REVISION}; Stage 3 stores compact labels "
+            f"(schema {a.DECISION_LABEL_SCHEMA}, about 5 bytes per row)") in capsys.readouterr().out
     assert snapshot_training_ids and all(ids == work.splits["supervised"] for ids in snapshot_training_ids)
     assert set(work.results["external"]["adaptive"]["policies"]) == {
         "full", "fixed", "fixed_evaluators_first", "fixed_zero_shots_first", "supervised"}

@@ -1534,6 +1534,25 @@ def decision_role_path(out, role):
     return Path(out) / "decision_labels" / f"{role}.pt"
 
 
+def reclaim_derived_stage3_files(out):
+    """Delete derived caches and incomplete writes; completed work is never touched.
+
+    Earlier revision-5 runs kept a `.training.pt` companion beside each
+    schema-3 audit shard (derived from the shard, up to 4 MiB each), and an
+    interrupted atomic write leaves a `.tmp` file. Neither holds completed
+    work. Removing them before a resumed run writes anything lets a run that
+    filled its disk continue without manual cleanup.
+    """
+    out, reclaimed = Path(out), 0
+    for pattern in ("*.tmp", "decision_labels/*.tmp", "decision_labels/*/*.tmp",
+                    "decision_shards/*/*.tmp", "decision_shards/*/*.training.pt"):
+        for path in out.glob(pattern):
+            if path.is_file():
+                reclaimed += path.stat().st_size
+                path.unlink()
+    return reclaimed
+
+
 def label_coverage(rows, cases, cfg):
     """One question's state/order dispositions; the rows and cases are not stored."""
     statuses = Counter(case["status"] for case in cases)
@@ -1888,16 +1907,9 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
             raise ValueError("Decision dataset manifest has an incompatible teacher, predictor, split, or action contract.")
     # Free space before any write: interrupted writes, and schema-3 training
     # companions (derived caches, some holding 4 MiB of frozen features each).
-    reclaimed = 0
+    # Workflow construction already did this; a direct call gets the same guarantee.
+    reclaimed = reclaim_derived_stage3_files(out)
     legacy = decision_shard_paths(records, splits, out)
-    for role in roles:
-        current = question_paths(records, splits[role], out / "decision_labels" / role)
-        for path in legacy[role] + current + [decision_role_path(out, role)]:
-            for leftover in (path.with_suffix(path.suffix + ".tmp"), path.with_suffix(".training.pt"),
-                             path.with_suffix(".training.pt.tmp")):
-                if leftover.exists():
-                    reclaimed += leftover.stat().st_size
-                    leftover.unlink()
     convertible = sum(path.stat().st_size for role in roles for path in legacy[role] if path.exists())
     states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     # Per-question files plus the merged role file, at the most rows a question can have.
@@ -2504,6 +2516,12 @@ class Workflow:
                 raise ValueError("Output folder belongs to a different config/data contract. Choose a new output_dir.")
             if not cfg.resume:
                 raise ValueError("Output folder already contains this run. Set resume=True or choose a new folder.")
+            # Before Stage 0 writes its reports: a resumed run that filled its
+            # disk regains the space held by derived caches and partial writes.
+            reclaimed = reclaim_derived_stage3_files(self.out)
+            if reclaimed:
+                print(f"Reclaimed {reclaimed / 1024**2:.2f} MiB of derived Stage 3 companions and "
+                      f"incomplete writes in {self.out} before resuming.", flush=True)
         else:
             if any(self.out.iterdir()):
                 raise ValueError("Use an empty output folder; existing unrecognized files will not be overwritten.")
@@ -2512,6 +2530,10 @@ class Workflow:
 
     def prepare(self):
         section(f"DATA AUDIT | device={self.device} | {self.cfg.n} candidates, {self.cfg.k} evaluators")
+        # Names the embedded code: a notebook from before compact labels wrote audit shards.
+        print(f"Implementation revision {PIPELINE_REVISION}; Stage 3 stores compact labels "
+              f"(schema {DECISION_LABEL_SCHEMA}, about 5 bytes per row) and never writes audit shards.",
+              flush=True)
         cache_path = self.out / "compact_records.pt"
         if self.cfg.resume and cache_path.exists():
             cache = load_checkpoint(cache_path)

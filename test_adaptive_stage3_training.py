@@ -466,3 +466,37 @@ def test_question_audit_recomputes_the_saved_rows_and_cases(tmp_path):
     a.atomic_torch(path, store)
     with pytest.raises(ValueError, match="differ from the saved labels"):
         a.decision_question_audit(records, splits, teacher, predictor, cfg, tmp_path, "dev", 0)
+
+
+def test_workflow_reclaims_derived_stage3_leftovers_before_stage0_writes(tmp_path, capsys):
+    train = tmp_path / "train.json"
+    train.write_text("[]", encoding="utf-8")
+    cfg = a.Config(train_file=str(train), test_files=[], use_test_files_for_dev_and_audit=False,
+                   output_dir=str(tmp_path / "run"), device="cpu", cpu_threads=1)
+    a.Workflow(cfg)
+    out = tmp_path / "run"
+    # The full-disk v5 layout: derived companions and interrupted atomic writes.
+    derived = [out / "decision_shards" / "policy" / "000000_abc.training.pt",
+               out / "decision_shards" / "dev" / "000000_def.training.pt.tmp",
+               out / "decision_shards" / "policy" / "000001_abc.pt.tmp",
+               out / "decision_labels" / "policy" / "000002_abc.pt.tmp",
+               out / "decision_labels" / "policy.pt.tmp",
+               out / "compact_records.pt.tmp"]
+    # Completed shards, labels, and checkpoints hold finished work and stay.
+    kept = [out / "decision_shards" / "policy" / "000000_abc.pt",
+            out / "decision_labels" / "policy" / "000003_abc.pt",
+            out / "decision_labels" / "dev.pt",
+            out / "decision_head_progress.pt"]
+    for path in derived + kept:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * 1024)
+    capsys.readouterr()
+    a.Workflow(cfg)
+    log = capsys.readouterr().out
+    assert f"Reclaimed {len(derived) * 1024 / 1024**2:.2f} MiB" in log and "before resuming" in log
+    assert not any(path.exists() for path in derived)
+    assert all(path.exists() for path in kept)
+    assert a.reclaim_derived_stage3_files(out) == 0
+    capsys.readouterr()
+    a.Workflow(cfg)
+    assert "Reclaimed" not in capsys.readouterr().out
