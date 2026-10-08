@@ -138,19 +138,44 @@ base solver, with separate copy/change behavior and matched-question contrasts.
 
 ## Simplification-model fine-tuning
 
-`simplification_finetuning.ipynb` trains a Kaggle QLoRA adapter from an existing
-Phase 1 `<experiment_name>_run_log.json`. Configure its path in a Hugging Face
-dataset repository before running the notebook. Accepted proxies become
-simplification targets; rejected and failsafe cases become exact-copy targets.
-Repeated questions receive one label: a successful proxy takes priority, and
-the loader chooses the largest recorded score gain among successful proxies. The
-notebook saves an input audit and compares base and adapted simplification with
-a fixed local Qwen solver on the same four external benchmarks, sequentially.
-`MAX_EVAL_QUESTIONS=None` evaluates all eligible questions per benchmark;
-`EVAL_BENCHMARKS` controls the ordered selection. Exact normalized matches to
-every construction split are excluded. External questions have no copy/simplify
-target label, so copy/change rates are reported as unlabeled behavior alongside
-direct/base/adapted solver accuracy and paired effects. Each benchmark has
-`population_audit.json`, resumable `evaluation.json`, and `summary.json` under
-`WORK_DIR/evaluations/<benchmark>/`; the report index is
+`simplification_finetuning.ipynb` trains a Kaggle QLoRA adapter from an
+existing Phase 1 `<experiment_name>_run_log.json`. Configure its path in a
+Hugging Face dataset repository before running the notebook. Accepted proxies
+become simplification targets; rejected and failsafe cases become exact-copy
+targets. Repeated questions receive one label: a successful proxy takes
+priority, and the loader chooses the largest recorded score gain among
+successful proxies. It uses the merging notebook's dependency guard, so run the
+setup cell first and restart when it reports stale imports. `HF_TOKEN` and
+`AVALAI_API_KEY` come from Kaggle Secrets.
+
+The best adapter is uploaded to its own model repository,
+`<user>/simplification-qwen3-4b-qlora` by default, together with
+`training_source.json`. That file records the run-log hash, instruction, split,
+and QLoRA settings. With `HF_REUSE_ADAPTER_IF_AVAILABLE=True` a later session
+restores the adapter and skips training, and a mismatched
+`training_source.json` stops the notebook. Use a new `HF_MODEL_REPO_ID` and
+`WORK_DIR` for each training configuration.
+
+Evaluation compares direct solving with base and adapted simplification using a
+fixed local base solver. With `EVAL_HELDOUT=True` it first evaluates the
+labeled construction test split as `heldout`, where copy and change rates can
+be read against the targets; judging routes to Numina, and failsafe rows
+without a ground truth contribute behavior only. It then evaluates the four
+external benchmarks sequentially. `MAX_EVAL_QUESTIONS=None` evaluates all
+eligible questions per population; `EVAL_BENCHMARKS` controls the ordered
+external selection. Exact normalized matches to every construction split are
+excluded, and external copy/change rates are reported as unlabeled behavior.
+
+Evaluation is resumable across Kaggle sessions. Successful generations and
+judgments are checkpointed per question and synced to a private dataset
+repository, `<user>/simplification-qwen3-4b-evaluation` by default, under
+`simplification_evaluations/`. A new session restores them, skips completed
+questions, and retries only crashed generations and failed judgments. Truncated
+or empty outputs recur under greedy decoding, so they stay final and count as
+unknown. The checkpoint identity covers the adapter weights, base-model
+revision, run log, rendered prompts, generation budgets, and judge settings.
+Increase `protocol_version` in the evaluator cell after changing evaluation
+logic that the identity cannot see. Each population has
+`population_audit.json`, `evaluation.json`, and `summary.json` under
+`WORK_DIR/evaluations/<population>/`; the report index is
 `WORK_DIR/evaluations/benchmark_reports.json`.

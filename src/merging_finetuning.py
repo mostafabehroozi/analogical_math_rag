@@ -523,6 +523,7 @@ def upload_adapter_to_hub(
     private: bool = True,
     commit_message: str = "Upload trained merging QLoRA adapter",
     api: Optional[Any] = None,
+    default_repo_name: str = "merging-qwen3-4b-qlora",
 ) -> Dict[str, str]:
     """Create/update a Hub model repo and upload a saved PEFT adapter folder.
 
@@ -552,7 +553,7 @@ def upload_adapter_to_hub(
         username = identity.get("name") if isinstance(identity, Mapping) else None
         if not username:
             raise RuntimeError("Could not determine the authenticated Hugging Face username.")
-        resolved_repo_id = f"{username}/merging-qwen3-4b-qlora"
+        resolved_repo_id = f"{username}/{default_repo_name}"
     if "/" not in resolved_repo_id:
         raise ValueError("repo_id must use the 'owner/repository' format.")
 
@@ -582,6 +583,7 @@ def download_adapter_from_hub(
     *,
     api: Optional[Any] = None,
     download_fn: Optional[Callable[..., str]] = None,
+    default_repo_name: str = "merging-qwen3-4b-qlora",
 ) -> Optional[Dict[str, str]]:
     """Restore a completed PEFT adapter, or return None when its repo is absent.
 
@@ -601,7 +603,7 @@ def download_adapter_from_hub(
         username = identity.get("name") if isinstance(identity, Mapping) else None
         if not username:
             raise RuntimeError("Could not determine the authenticated Hugging Face username.")
-        resolved_repo_id = f"{username}/merging-qwen3-4b-qlora"
+        resolved_repo_id = f"{username}/{default_repo_name}"
     if "/" not in resolved_repo_id:
         raise ValueError("repo_id must use the 'owner/repository' format.")
 

@@ -15,7 +15,10 @@ from src.benchmark_data import HUGGINGFACE_BENCHMARK_SPECS, benchmark_name_for_t
 from src.finetuning_evaluation import external_evaluation_benchmarks, load_external_evaluation_benchmark
 from src.merging_finetuning import normalize_question, summarize_evaluated_runs
 from src.merging_evaluation_checkpoints import MergingEvaluationCheckpoint, canonical_fingerprint
-from src.simplification_finetuning import SIMPLIFICATION_INSTRUCTION, evaluate_question, summarize_evaluation
+from src.simplification_finetuning import (
+    HELDOUT_POPULATION, SIMPLIFICATION_INSTRUCTION, SimplificationEvaluationCheckpoint,
+    evaluate_question, load_heldout_population, retryable_failures, summarize_evaluation,
+)
 from src.utils import save_json_atomic
 
 
@@ -227,21 +230,28 @@ class NotebookExternalEvaluationTests(TestCase):
             return {"status": "SUCCESS", "is_correct": name == "math500"}
 
         with TemporaryDirectory() as directory, redirect_stdout(StringIO()), patch(
-            "src.api_manager.AvalAIAPIManager", return_value=SimpleNamespace()
-        ), patch("src.evaluation.evaluate_single_answer_with_llm", side_effect=judge):
+            "src.evaluation.evaluate_single_answer_with_llm", side_effect=judge
+        ):
             root = Path(directory) / "evaluations"
             namespace = {
-                "RUN_EVALUATION": True, "EVAL_BENCHMARKS": external_evaluation_benchmarks(),
+                "RUN_EVALUATION": True, "EVAL_POPULATIONS": external_evaluation_benchmarks(),
                 "MAX_EVAL_QUESTIONS": None, "WORK_DIR": Path(directory), "prepared": prepared(),
-                "CONFIG": {"AVALAI_BASE_URL": "fake", "AVALAI_MODEL_QUOTAS": {}},
-                "setup_kaggle_mode": lambda *args: None, "optional_secret": lambda name: "fake-test-key",
-                "generator": generator, "SEED": 42, "SIMPLIFIER_MAX_NEW_TOKENS": 20, "SOLVER_MAX_NEW_TOKENS": 20,
-                "external_evaluation_benchmarks": external_evaluation_benchmarks,
+                "CONFIG": {}, "evaluator": SimpleNamespace(), "generator": generator, "SEED": 42,
+                "SIMPLIFIER_MAX_NEW_TOKENS": 20, "SOLVER_MAX_NEW_TOKENS": 20,
+                "EVAL_PROGRESS": False, "EVAL_VERBOSE": False,
+                "HELDOUT_POPULATION": HELDOUT_POPULATION, "load_heldout_population": load_heldout_population,
                 "load_external_evaluation_benchmark": self.benchmark_loader(events, root),
+                "SIMPLIFICATION_INSTRUCTION": SIMPLIFICATION_INSTRUCTION,
                 "evaluate_question": evaluate_question, "summarize_evaluation": summarize_evaluation,
-                "save_json_atomic": save_json_atomic, "json": json,
+                "retryable_failures": retryable_failures, "save_json_atomic": save_json_atomic,
+                "SimplificationEvaluationCheckpoint": SimplificationEvaluationCheckpoint,
+                "canonical_fingerprint": canonical_fingerprint, "evaluation_identity": {"test_protocol": 1},
+                "HF_TOKEN": None, "HF_EVAL_DATASET_REPO_ID": None,
+                "HF_EVAL_REMOTE_PREFIX": "simplification_evaluations",
+                "HF_EVAL_UPLOAD_ENABLED": False, "HF_EVAL_RESTORE_ENABLED": False,
+                "HF_EVAL_DATASET_PRIVATE": True, "HF_EVAL_UPLOAD_EVERY": 10,
             }
-            cell = notebook_cell("simplification_finetuning.ipynb", "if RUN_EVALUATION:")
+            cell = notebook_cell("simplification_finetuning.ipynb", "retryable_failures(case)")
             exec(cell, namespace)
             self.assertEqual(events, external_evaluation_benchmarks())
             self.assertEqual(set(judged), set(events))

@@ -6,9 +6,11 @@ import hashlib
 import json
 import math
 from collections import Counter, defaultdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from src.merging_evaluation_checkpoints import MergingEvaluationCheckpoint
 from src.merging_finetuning import grouped_split, normalize_question, tokenize_splits
 from src.prompts import (
     create_core_simp_augmented_solver_prompt,
@@ -27,10 +29,31 @@ _ACCEPTED = "SUCCESS"
 _COPY_STATUSES = frozenset({"REJECTED_BY_FILTER", "SKIPPED_FAILSAFE"})
 _PROMPT_MARKER = "\nOriginal Question:\n"
 _PROMPT_END = "\n\nOUTPUT FORMAT (Strictly follow this format):"
+SOLVER_PROMPT_TEMPLATE = "final_solver_simple_v3"
+HELDOUT_POPULATION = "heldout"
+TRAINING_SOURCE_FILE = "training_source.json"
+# Greedy decoding repeats LENGTH_LIMIT, EMPTY and CONTEXT_OVERFLOW outputs exactly,
+# so only crashed generations are worth repeating on a rerun.
+RETRYABLE_GENERATION_STATUSES = frozenset({"GENERATION_FAILED"})
 
 
 def simplification_prompt(question: str) -> str:
     return f"{SIMPLIFICATION_INSTRUCTION}\n\nOriginal question:\n{question}"
+
+
+def solver_prompt(question: str) -> str:
+    return create_final_reasoning_prompt_simple(
+        question, {"PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": SOLVER_PROMPT_TEMPLATE}
+    )
+
+
+def evaluation_prompts() -> Dict[str, str]:
+    """Render every evaluation prompt around placeholders for the evaluation identity."""
+    return {
+        "simplifier": simplification_prompt("<QUESTION>"),
+        "solver": solver_prompt("<QUESTION>"),
+        "augmented_solver": create_core_simp_augmented_solver_prompt("<QUESTION>", "<SOLVED PROXY>"),
+    }
 
 
 def recover_original_question(row: Mapping[str, Any]) -> Optional[str]:
@@ -189,6 +212,82 @@ def prepare_simplification_data(
     return {"splits": splits, "tokenized": tokenized, "manifest": manifest}
 
 
+def training_identity(manifest: Mapping[str, Any], qlora_config: Any) -> Dict[str, Any]:
+    """Describe an adapter's training data and settings without local paths.
+
+    The result travels with the adapter, so a copy restored from the Hub in a
+    later Kaggle session can be checked against the current notebook settings.
+    """
+    settings = asdict(qlora_config) if is_dataclass(qlora_config) else dict(qlora_config)
+    identity = {
+        "format_version": 1,
+        "run_log_sha256": sorted(source["sha256"] for source in manifest["sources"]),
+        "instruction": manifest["instruction"],
+        "split_seed": manifest["seed"],
+        "split_ratios": manifest["split_ratios"],
+        "qlora": {key: value for key, value in settings.items() if key not in {"output_dir", "gpu_index"}},
+    }
+    return json.loads(json.dumps(identity))
+
+
+def verify_adapter_training_source(adapter_dir: str | Path, expected: Mapping[str, Any]) -> None:
+    """Refuse to evaluate an adapter trained on other data or settings."""
+    path = Path(adapter_dir) / TRAINING_SOURCE_FILE
+    remedy = ("Use a new HF_MODEL_REPO_ID (and WORK_DIR) for each training configuration, "
+              "or set HF_REUSE_ADAPTER_IF_AVAILABLE=False and TRAIN=True to retrain.")
+    if not path.is_file():
+        raise ValueError(f"Adapter {adapter_dir} has no {TRAINING_SOURCE_FILE}, so its training "
+                         f"data and settings cannot be verified. {remedy}")
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    expected = json.loads(json.dumps(dict(expected)))
+    if saved != expected:
+        changed = sorted(key for key in set(saved) | set(expected) if saved.get(key) != expected.get(key))
+        raise ValueError(f"Adapter {adapter_dir} was trained with different {', '.join(changed)}. {remedy}")
+
+
+def load_heldout_population(prepared: Mapping[str, Any], config: Mapping[str, Any]) -> tuple:
+    """Return the labeled construction test split as its own evaluation population.
+
+    These questions were never trained on, and their copy/simplify labels show
+    whether the adapter changes a question exactly when it should. Judging
+    routes to Numina, the construction source. SKIPPED_FAILSAFE rows carry no
+    ground truth in Phase 1 logs, so they contribute behavior only.
+    """
+    records = []
+    for record in prepared["splits"]["test"]:
+        row = dict(record)
+        row["benchmark_index"] = int(str(row["record_id"]).split(":", 1)[1])
+        row["source_benchmark"] = HELDOUT_POPULATION
+        records.append(row)
+    evaluator_config = dict(config)
+    evaluator_config.update({
+        "TARGET_BENCHMARK": "numina_hard", "TARGET_BENCHMARKS": [],
+        "BENCHMARK_MAX_QUESTIONS": None, "_TARGET_BENCHMARK_FOR_QUERY": "numina_hard",
+        "TARGET_BENCHMARK_BY_INDEX": [],
+    })
+    audit = {
+        "benchmark": HELDOUT_POPULATION, "source": "construction test split",
+        "eligible_questions": len(records),
+        "label_counts": dict(Counter(row["label_kind"] for row in records)),
+        "with_ground_truth": sum(
+            isinstance(row.get("ground_truth"), str) and bool(row["ground_truth"].strip())
+            for row in records
+        ),
+    }
+    return records, audit, evaluator_config
+
+
+class SimplificationEvaluationCheckpoint(MergingEvaluationCheckpoint):
+    """The merging notebook's durable per-question checkpoint, in its own Hub repo.
+
+    A finished ``evaluate_question`` result is stored as the question's single
+    ``phase_1_runs`` entry and must carry ``benchmark`` and ``benchmark_index``.
+    """
+
+    default_repo_name = "simplification-qwen3-4b-evaluation"
+    label = "simplification"
+
+
 def copy_metrics(record: Mapping[str, Any], generation: Mapping[str, Any]) -> Dict[str, Any]:
     text = generation.get("text") if generation.get("status") == "SUCCESS" else None
     question = record["question"]
@@ -204,9 +303,18 @@ def evaluate_question(
     record: Mapping[str, Any], generator: Any, evaluator: Any, evaluator_config: Mapping[str, Any],
     *, seed: int = 42, simplifier_max_new_tokens: int = 512,
     solver_max_new_tokens: int = 1024,
+    judge: Optional[Callable[[str, str], Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Compare fixed-base solving with base/adapted simplification on one question."""
+    """Compare fixed-base solving with base/adapted simplification on one question.
+
+    ``judge(answer, ground_truth)`` replaces the direct evaluator call, which lets
+    the notebook reuse saved judgments after an interrupted session.
+    """
     from src.evaluation import evaluate_single_answer_with_llm
+
+    if judge is None:
+        def judge(answer: str, ground_truth: str) -> Mapping[str, Any]:
+            return evaluate_single_answer_with_llm(answer, ground_truth, evaluator, dict(evaluator_config))
 
     question = record["question"]
     result: Dict[str, Any] = {
@@ -233,15 +341,8 @@ def evaluate_question(
         result["solver_status"] = "NO_GROUND_TRUTH"
         return result
 
-    direct = generate(
-        create_final_reasoning_prompt_simple(
-            question, {"PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v3"}
-        ), False, solver_max_new_tokens,
-    )
-    direct_eval = (
-        evaluate_single_answer_with_llm(direct["text"], ground_truth, evaluator, dict(evaluator_config))
-        if direct.get("status") == "SUCCESS" else None
-    )
+    direct = generate(solver_prompt(question), False, solver_max_new_tokens)
+    direct_eval = judge(direct["text"], ground_truth) if direct.get("status") == "SUCCESS" else None
     result["direct"] = {"solution": direct, "evaluation": direct_eval}
     for arm in ("base", "adapted"):
         branch = result["arms"][arm]
@@ -254,11 +355,7 @@ def evaluate_question(
             branch["evaluation"] = direct_eval
             continue
         proxy_text = proxy["text"]
-        proxy_solution = generate(
-            create_final_reasoning_prompt_simple(
-                proxy_text, {"PROMPT_TEMPLATE_FINAL_SOLVER_SIMPLE": "final_solver_simple_v3"}
-            ), False, solver_max_new_tokens,
-        )
+        proxy_solution = generate(solver_prompt(proxy_text), False, solver_max_new_tokens)
         branch["proxy_solution"] = proxy_solution
         if proxy_solution.get("status") != "SUCCESS":
             branch["solver_status"] = "PROXY_SOLVER_FAILED"
@@ -272,9 +369,7 @@ def evaluate_question(
         if augmented.get("status") != "SUCCESS":
             branch["solver_status"] = "AUGMENTED_SOLVER_FAILED"
             continue
-        branch["evaluation"] = evaluate_single_answer_with_llm(
-            augmented["text"], ground_truth, evaluator, dict(evaluator_config)
-        )
+        branch["evaluation"] = judge(augmented["text"], ground_truth)
         branch["solver_status"] = "EVALUATED"
     evaluations = [direct_eval] + [
         result["arms"][arm].get("evaluation") for arm in ("base", "adapted")
@@ -284,6 +379,30 @@ def evaluate_question(
         for value in evaluations
     ) else "PARTIAL"
     return result
+
+
+def retryable_failures(case: Mapping[str, Any]) -> List[str]:
+    """Name the failures a rerun should repeat: crashed generations and failed judgments.
+
+    Deterministic generation outcomes stay final and are reported as unknown.
+    An empty list means the question is complete.
+    """
+    branches = [("direct", case.get("direct") or {}, ("solution",))]
+    branches += [
+        (arm, (case.get("arms") or {}).get(arm) or {},
+         ("simplification", "proxy_solution", "original_solution"))
+        for arm in ("base", "adapted")
+    ]
+    failures = []
+    for name, branch, keys in branches:
+        for key in keys:
+            output = branch.get(key)
+            if isinstance(output, Mapping) and output.get("status") in RETRYABLE_GENERATION_STATUSES:
+                failures.append(f"{name}.{key}: {output['status']}")
+        judgment = branch.get("evaluation")
+        if isinstance(judgment, Mapping) and judgment.get("status") != "SUCCESS":
+            failures.append(f"{name}.evaluation: {judgment.get('status', 'UNKNOWN')}")
+    return failures
 
 
 def summarize_evaluation(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:

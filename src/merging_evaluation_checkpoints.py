@@ -64,6 +64,10 @@ class MergingEvaluationCheckpoint:
     arguments. One notebook owns each checkpoint prefix at a time.
     """
 
+    # Subclasses for other fine-tuning workflows override these two names only.
+    default_repo_name = "merging-qwen3-4b-evaluation"
+    label = "merging"
+
     def __init__(
         self, report_dir, identity: Mapping[str, Any], *, token: Optional[str] = None,
         repo_id: Optional[str] = None, remote_prefix: str = "merging_evaluations",
@@ -137,7 +141,7 @@ class MergingEvaluationCheckpoint:
             username = identity.get("name") if isinstance(identity, Mapping) else None
             if not username:
                 raise RuntimeError("Could not determine the Hugging Face checkpoint owner.")
-            self.repo_id = f"{username}/merging-qwen3-4b-evaluation"
+            self.repo_id = f"{username}/{self.default_repo_name}"
         if not isinstance(self.repo_id, str) or not re.fullmatch(r"[^/\s]+/[^/\s]+", self.repo_id):
             raise ValueError("Evaluation dataset repo_id must use the 'owner/repository' format.")
 
@@ -361,7 +365,7 @@ class MergingEvaluationCheckpoint:
             repo_id=self.repo_id, repo_type="dataset", folder_path=str(self.checkpoint_dir),
             path_in_repo=self.remote_prefix,
             allow_patterns=sorted(self._dirty_files | {"manifest.json"}),
-            commit_message=f"Checkpoint merging evaluation {self.identity['benchmark']}",
+            commit_message=f"Checkpoint {self.label} evaluation {self.identity['benchmark']}",
         )
         self._pending_operations = 0
         self._dirty_files.clear()

@@ -10,10 +10,12 @@ from unittest.mock import patch
 
 
 class MergingNotebookSetupTests(TestCase):
+    notebook_name = "merging_finetuning.ipynb"
+
     @classmethod
     def setUpClass(cls):
         root = Path(__file__).resolve().parent
-        notebook = json.loads((root / "merging_finetuning.ipynb").read_text(encoding="utf-8"))
+        notebook = json.loads((root / cls.notebook_name).read_text(encoding="utf-8"))
         setup = "".join(notebook["cells"][1]["source"])
         # Execute the actual post-pip guard without installing anything or using a GPU.
         cls.guard = setup.split("%pip install -q -r requirements-merging-finetuning.txt\n", 1)[1]
@@ -55,3 +57,9 @@ class MergingNotebookSetupTests(TestCase):
     def test_failed_install_reports_pip_failure(self):
         with self.assertRaisesRegex(RuntimeError, "Dependency installation failed"):
             self.run_guard({}, {"transformers": "4.57.1"})
+
+
+class SimplificationNotebookSetupTests(MergingNotebookSetupTests):
+    """The simplification notebook runs the same guard before importing Transformers."""
+
+    notebook_name = "simplification_finetuning.ipynb"
