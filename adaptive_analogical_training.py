@@ -147,6 +147,14 @@ class Config:
         fixed_acquisition_sequences(self)
 
 
+# Outside the run contract and the Stage 3 fingerprint: runtime controls, the Hub
+# mirror, and the input log paths. A log is identified by its content, and its
+# filename stem is the benchmark named in each record uid.
+NON_CONTRACT_SETTINGS = ("resume", "output_dir", "device", "cpu_threads", "print_every",
+                         "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size",
+                         "hf_repo", "hf_sync_minutes", "train_file", "test_files")
+
+
 @dataclass
 class Record:
     uid: str
@@ -1629,13 +1637,21 @@ def predictor_fingerprint(predictor):
     return digest.hexdigest()
 
 
-def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
+def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg, legacy_log_paths=None):
+    """Stage 3 identity: config, records, roles, teacher labels, and frozen predictor.
+
+    Schema 4 leaves out the input log paths, so logs downloaded to a new directory
+    keep their labels; the records' content and uids already identify them. Earlier
+    code hashed the configured paths too (schema 3): `legacy_log_paths`, the train
+    file followed by the test files, reproduces that fingerprint for upgrades.
+    """
+    config = {key: value for key, value in asdict(cfg).items() if key not in NON_CONTRACT_SETTINGS}
+    schema = 4
+    if legacy_log_paths is not None:
+        schema = 3
+        config.update(train_file=legacy_log_paths[0], test_files=list(legacy_log_paths[1:]))
     digest = hashlib.sha256()
-    digest.update(json.dumps({"schema": 3, "revision": PIPELINE_REVISION,
-                              "config": {key: value for key, value in asdict(cfg).items()
-                                         if key not in {"resume", "output_dir", "device", "cpu_threads", "print_every",
-                                                        "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size",
-                                                        "hf_repo", "hf_sync_minutes"}},
+    digest.update(json.dumps({"schema": schema, "revision": PIPELINE_REVISION, "config": config,
                               "predictor": predictor_fingerprint(predictor),
                               "data_sha256": data_digest(records),
                               "roles": {role: [records[i].uid for i in splits[role]]
@@ -1648,7 +1664,7 @@ def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
 
 
 # Schema 5 stores one action byte per row plus one first-case bitmap per question;
-# schema 4 (an int32 source per row) converts in place. The label fingerprint is unchanged.
+# schema 4 (an int32 source per row) converts in place without relabeling.
 DECISION_LABEL_SCHEMA = 5
 
 
@@ -1684,6 +1700,93 @@ def reclaim_derived_stage3_files(out):
                 reclaimed += path.stat().st_size
                 path.unlink()
     return reclaimed
+
+
+def legacy_log_paths(cfg, out):
+    """Log paths a schema-3 fingerprint may have hashed, train file first.
+
+    As configured now, resolved, as contract.json records them (resolved, by the
+    session that created the run), and as the inference bundle's config names
+    them (the configured strings when Stage 3 last completed).
+    """
+    paths = [cfg.train_file] + list(cfg.test_files)
+    candidates = [paths, [str(Path(path).resolve()) for path in paths]]
+    contract = Path(out) / "contract.json"
+    if contract.exists():
+        candidates.append([source.get("path") for source in
+                           json.loads(contract.read_text(encoding="utf-8")).get("sources", [])])
+    bundle = Path(out) / "inference_bundle.pt"
+    if bundle.exists():
+        config = load_checkpoint(bundle).get("config", {})
+        candidates.append([config.get("train_file")] + list(config.get("test_files") or []))
+    unique = []
+    for candidate in candidates:
+        if (len(candidate) == len(paths) and all(isinstance(path, str) for path in candidate)
+                and candidate not in unique):
+            unique.append(candidate)
+    return unique
+
+
+def rewrite_checkpoint(path, value):
+    """Atomic in-place rewrite that keeps a schema-3 shard's gzip framing."""
+    path = Path(path)
+    if not compressed_checkpoint(path):
+        atomic_torch(path, value)
+        return
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp.open("wb") as handle:
+            with gzip.GzipFile(fileobj=handle, mode="wb", compresslevel=1, mtime=0) as zipped:
+                torch.save(value, zipped)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def upgrade_decision_fingerprints(records, splits, teacher, predictor, cfg, out):
+    """Rebind Stage 3 files from the path-bound schema-3 fingerprint; returns the current one.
+
+    Earlier code hashed the input log paths into the fingerprint, so the same logs
+    at a new path rejected completed labels, progress, and the head. Files whose
+    fingerprint is that schema-3 value for a known path set (`legacy_log_paths`)
+    get the current fingerprint in place, without relabeling or retraining. The
+    manifest is rewritten last, so an interrupted upgrade repeats; once it is done,
+    only the manifest is read.
+    """
+    out = Path(out)
+    fingerprint = decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
+    manifest_path = out / "decision_dataset_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+    if manifest is None or manifest.get("fingerprint") == fingerprint:
+        return fingerprint
+    legacy = {decision_dataset_fingerprint(records, splits, teacher, predictor, cfg, paths)
+              for paths in legacy_log_paths(cfg, out)}
+    if manifest.get("fingerprint") not in legacy:
+        # Another config, split, teacher, or predictor: the callers reject these files.
+        print("NOTE: Stage 3 files match neither this run nor its path-bound fingerprint at the "
+              "configured, resolved, contract.json, or inference-bundle log paths. If only the log "
+              "paths changed, place the logs at the paths that built them for one session; the "
+              "files are then upgraded in place.", flush=True)
+        return fingerprint
+    reclaim_derived_stage3_files(out)  # Free space, and drop shard companions, before rewriting.
+    paths = [out / "decision_head_completed.pt", out / "decision_head_progress.pt",
+             *sorted(out.glob("decision_labels/*.pt")), *sorted(out.glob("decision_labels/*/*.pt")),
+             *sorted(out.glob("decision_shards/*/*.pt"))]
+    upgraded = 0
+    for path in paths:
+        if not path.is_file():
+            continue
+        value = load_checkpoint(path)
+        key = "dataset_fingerprint" if path.name == "decision_head_completed.pt" else "fingerprint"
+        if isinstance(value, dict) and value.get(key) in legacy:
+            value[key] = fingerprint
+            rewrite_checkpoint(path, value)
+            upgraded += 1
+        del value
+    atomic_json(manifest_path, dict(manifest, fingerprint=fingerprint))
+    print(f"Stage 3 fingerprint: the manifest and {upgraded} label, progress, or head files hashed "
+          "the input log paths; rebound them to the logs' content without relabeling.", flush=True)
+    return fingerprint
 
 
 def label_coverage(rows, cases, cfg):
@@ -2109,7 +2212,7 @@ def decision_question_audit(records, splits, teacher, predictor, cfg, out, role,
     case dispositions are deterministic, so they are recomputed here on demand
     (use the labeling device; another device may round probabilities differently).
     """
-    fingerprint = decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
+    fingerprint = upgrade_decision_fingerprints(records, splits, teacher, predictor, cfg, out)
     path = decision_role_path(out, role)
     store = load_label_file(path)
     if (store.get("schema_version") not in (4, DECISION_LABEL_SCHEMA) or store.get("fingerprint") != fingerprint
@@ -2179,7 +2282,7 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     roles = ("policy", "dev")
-    fingerprint = decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
+    fingerprint = upgrade_decision_fingerprints(records, splits, teacher, predictor, cfg, out)
     frozen_before = predictor_fingerprint(predictor)
     manifest_path = out / "decision_dataset_manifest.json"
     manifest = {"schema_version": DECISION_LABEL_SCHEMA, "implementation_revision": PIPELINE_REVISION,
@@ -3045,12 +3148,8 @@ class Workflow:
                    "new": f"Mirror {cfg.hf_repo}: no uploaded run yet; this run is uploaded as it progresses.",
                    "pulled": f"Mirror {cfg.hf_repo}: downloaded {folder_size(self.out) / 1024**2:.1f} MiB "
                              f"into {self.out}; completed stages resume."}[state], flush=True)
-        contract_cfg = asdict(cfg)
-        for key in ("resume", "output_dir", "device", "cpu_threads", "print_every", "fixed_acquisition_orders",
-                    "continue_after_max",
-                    "decision_eval_batch_size", "hf_repo", "hf_sync_minutes",
-                    "train_file", "test_files"):  # Logs are identified by the sources below.
-            contract_cfg.pop(key)
+        # Logs are identified by the sources below, not by the configured paths.
+        contract_cfg = {key: value for key, value in asdict(cfg).items() if key not in NON_CONTRACT_SETTINGS}
         # A log's filename is its benchmark identity; its directory and mtime are not.
         sources = [{"path": str(Path(p).resolve()), "name": Path(p).name, "bytes": Path(p).stat().st_size,
                     "sha256": file_digest(p)} for p in [cfg.train_file] + cfg.test_files]
@@ -3092,8 +3191,9 @@ class Workflow:
         section(f"DATA AUDIT | device={self.device} | {self.cfg.n} candidates, {self.cfg.k} evaluators")
         # Names the embedded code: a notebook from before compact labels wrote audit shards.
         print(f"Implementation revision {PIPELINE_REVISION}; Stage 3 stores compact labels "
-              f"(schema {DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question) "
-              "and never writes audit shards; Stage 4 rolls out each question once and saves "
+              f"(schema {DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question), "
+              "binds them to the input logs' content rather than their paths, and never writes "
+              "audit shards; Stage 4 rolls out each question once and saves "
               f"compact outcomes to {ROLLOUT_FILE}, not trajectories.", flush=True)
         cache_path = self.out / "compact_records.pt"
         if self.cfg.resume and cache_path.exists():
@@ -3178,11 +3278,13 @@ class Workflow:
             self.train_snapshot()
         section("STAGE 3 | Supervised acquisition labels and frozen-encoder head")
         path = self.out / "decision_head_completed.pt"
+        # Files from earlier code, whose fingerprint hashed the log paths, are rebound first.
+        fingerprint = upgrade_decision_fingerprints(self.records, self.splits, self.teacher,
+                                                    self.predictor, self.cfg, self.out)
         if self.cfg.resume and path.exists():
             checkpoint = load_checkpoint(path)
             if (checkpoint.get("action_count") != self.cfg.action_count or
-                    checkpoint.get("dataset_fingerprint") != decision_dataset_fingerprint(
-                        self.records, self.splits, self.teacher, self.predictor, self.cfg)):
+                    checkpoint.get("dataset_fingerprint") != fingerprint):
                 raise ValueError("Completed decision head has an incompatible dataset or action contract.")
             print("Loaded completed supervised decision head.")
         else:

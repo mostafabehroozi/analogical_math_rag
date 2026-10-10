@@ -410,9 +410,10 @@ def test_interrupted_label_build_reuses_completed_questions_then_merges_each_rol
     assert_matching_training_checkpoints(expected, actual)
 
 
-def write_legacy_layout(out, records, splits, teacher, predictor, cfg, layout):
+def write_legacy_layout(out, records, splits, teacher, predictor, cfg, layout, fingerprint=None):
     """Schema-3 shards as earlier revision-5 code wrote them, with their companions."""
-    fingerprint = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
+    if fingerprint is None:
+        fingerprint = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
     paths = a.decision_shard_paths(records, splits, out)
     structures = len(a.structural_states(cfg.zero_shots, cfg.k))
     for role in ("policy", "dev"):
@@ -498,6 +499,26 @@ def test_full_disk_run_migrates_completed_shards_and_builds_only_the_rest(tmp_pa
     assert built == [records[splits["policy"][2]].uid, records[splits["dev"][0]].uid]
     assert "Stage 3 policy labels: 3/3 questions" in log and "built 1, reused 0, migrated 2" in log
     assert not (run / "decision_shards").exists()
+    assert_matching_training_checkpoints(expected, actual)
+
+
+def test_path_bound_schema3_shards_are_rebound_compressed_then_migrated(tmp_path, monkeypatch, capsys):
+    # Earlier code also hashed the configured log paths into the shards' fingerprint.
+    cfg, records, splits, teacher, predictor = small_stage3_problem(questions=3)
+    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path / "fresh")
+    run = tmp_path / "legacy"
+    legacy = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
+                                            [cfg.train_file] + cfg.test_files)
+    shards = write_legacy_layout(run, records, splits, teacher, predictor, cfg, "stored_features", legacy)
+    capsys.readouterr()
+    current = a.upgrade_decision_fingerprints(records, splits, teacher, predictor, cfg, run)
+    assert "the manifest and 3 label, progress, or head files hashed" in capsys.readouterr().out
+    assert current == expected["dataset_fingerprint"] != legacy
+    for path in shards:
+        assert a.compressed_checkpoint(path) and a.load_checkpoint(path)["fingerprint"] == current
+        assert not path.with_suffix(".training.pt").exists()
+    actual, built = run_with_build_counter(monkeypatch, records, splits, teacher, predictor, cfg, "cpu", run)
+    assert built == [] and not (run / "decision_shards").exists()
     assert_matching_training_checkpoints(expected, actual)
 
 

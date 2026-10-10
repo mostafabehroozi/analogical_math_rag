@@ -202,8 +202,9 @@ pooled audit set and each benchmark separately.
 
 Stage 3 writes `decision_labels/policy.pt` and `decision_labels/dev.pt`, with
 `decision_dataset_manifest.json` and `decision_label_coverage.json`. The
-manifest and label files bind to the config, split, teacher labels, and frozen
-predictor fingerprint. While a role builds, each completed question is one
+manifest and label files bind to the config (not the input log paths), the
+records, split, teacher labels, and frozen predictor fingerprint. While a role
+builds, each completed question is one
 small atomic file in `decision_labels/<role>/`; an interrupted build resumes
 completed matching questions, and the finished role is merged into one file.
 Incompatible files fail explicitly. A role with no actionable rows fails with
@@ -268,15 +269,40 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
   point; local files are never discarded. `WORK.push()` uploads on demand,
   and `WORK.sync.describe()` reports the upload state.
 - **Resume.** In a new session, download the same input logs, keep the same
-  configuration, and run the cells. Inputs are identified by size and
-  SHA-256, so a new path or mtime keeps the same run (contracts written by
-  earlier code, which recorded an mtime, are upgraded in place when they still
-  match). Stages 0-2 load their completed checkpoints; Stage 1 also reuses
-  completed `teacher_fold_<n>.pt` and `teacher_final.pt` files whose question
-  roles match exactly, so an interrupted Stage 1 repeats at most one fold.
-  Stage 3 reuses completed questions and continues from the last completed
-  epoch. Stage 2 and Stage 4 restart if interrupted; neither takes long
-  compared with Stage 3.
+  configuration, and run the cells. Inputs are identified by filename, size,
+  and SHA-256, so a new directory or mtime keeps the same run (contracts
+  written by earlier code, which recorded an mtime, are upgraded in place when
+  they still match). The logs may be downloaded to a different directory than
+  last session: point `train_file` and `test_files` there. The Stage 3
+  fingerprint leaves those paths out too; the records' content and their uids,
+  which name each log's filename stem, identify the logs. Stages 0-2 load
+  their completed checkpoints; Stage 1 also reuses completed
+  `teacher_fold_<n>.pt` and `teacher_final.pt` files whose question roles
+  match exactly, so an interrupted Stage 1 repeats at most one fold. Stage 3
+  reuses completed questions and continues from the last completed epoch.
+  Stage 2 and Stage 4 restart if interrupted; neither takes long compared with
+  Stage 3.
+- **Stage 3 files from earlier code.** Earlier code also hashed the
+  configured log paths into the Stage 3 fingerprint, so the same logs in a
+  new directory rejected the manifest, labels, `decision_head_progress.pt`,
+  and `decision_head_completed.pt` ("incompatible teacher, predictor, split,
+  or action contract" or "Completed decision head has an incompatible
+  dataset"). Stage 3 and `WORK.decision_label_audit` now recompute that
+  path-bound fingerprint for every path set they can find: the configured
+  paths, the same paths resolved, the resolved paths `contract.json`
+  recorded when the run was created, and the configured paths
+  `inference_bundle.pt` recorded when Stage 3 last completed. Files that
+  match are rewritten in place with the new fingerprint, the manifest last
+  (an interrupted upgrade repeats), and the run continues without relabeling
+  or retraining. Stage 3 then prints `Stage 3 fingerprint: the manifest and
+  <n> label, progress, or head files hashed the input log paths`. If none of
+  those paths reproduces the old fingerprint (for example, an unfinished
+  Stage 3 whose labels were built with relative paths, or in another
+  directory than the one that created the run), Stage 3 prints a NOTE and
+  rejects the files as before; place the logs at the paths that
+  built the labels for one session, and the upgrade runs. Stage 0's version
+  line includes `binds them to the input logs' content rather than their
+  paths`; a notebook copy without it still rejects moved logs.
 - **One session per repository.** Two sessions writing the same mirror would
   overwrite each other; use a different `hf_repo` for a different run
   (`QUICK_PILOT` appends `_pilot` to both the output folder and the mirror).
@@ -631,7 +657,8 @@ trajectories`; a notebook copy without it still writes the traced file.
 ### Versions
 
 This implementation uses **revision 5**, **contract/inference schema 4**,
-**decision-dataset schema 3** (the label fingerprint), and **label-file
+**decision-dataset schema 4** (the label fingerprint, without input log
+paths; schema-3 files are upgraded in place), and **label-file
 schema 5**. Older action/state bundles and checkpoints are
 rejected. Use the new default output directory
 `/kaggle/working/adaptive_analogical_shared_training_v5_run` for a fresh run; old runs are
