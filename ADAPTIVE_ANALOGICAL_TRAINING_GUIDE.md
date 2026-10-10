@@ -279,33 +279,38 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
 
 ### Stage 3 label storage
 
-Stage 3 saves only what the head trains on. Each row keeps two values:
+Stage 3 saves only what the head trains on (label-file schema 5):
 
-- `source`: the zero-shot scenario and in-budget state of the first case
-  mapped to the row, as one `int32` (`scenario * in-budget states + state`).
-- `preferred`: a bitmask of the row's tied optimal actions (one byte for the
-  default seven actions).
+- `preferred`, one value per row: a bitmask of the row's tied optimal actions
+  (one byte for the default seven actions).
+- `first_cases`, one value per question: a bitmap over its in-budget
+  state/order cases (1,434 bytes for the default 6 x 1,912 cases) marking the
+  first case mapped to each row.
 
-That is about **5 bytes per row**: roughly 43 KB for a synthetic
-default-geometry question with about 8,100 rows, and about 0.2 GB for 2,000
-policy questions plus the pooled test-file development questions. Everything
-else is a deterministic function of these values and the fingerprinted
-contract:
+Rows are stored in the planner's order: larger structures (acquired candidates
+plus evaluators) first, ties in case order. That order is a function of the
+bitmap, so each row's source (`scenario * in-budget states + state`) is rebuilt
+from it rather than stored. A synthetic default-geometry question with about
+8,000 rows takes about **12 KB** (about 1.5 bytes per row with the bitmap and
+file overhead), and 2,000 policy questions plus the pooled test-file development
+questions take roughly 40 MB. Everything else is a deterministic function of
+these values and the fingerprinted contract:
 
 | Head input | Rebuilt from |
 | --- | --- |
+| Row source | The question's `first_cases` bitmap, in planning order |
 | Observation | The question's measurements, permuted by `scenario`, at `state` |
 | Frozen hidden vector `h` | The observation, re-encoded by the frozen predictor |
 | Valid-action mask | The budget-filtered action table at `state` |
 | Soft target | An even split over `preferred`, rounded exactly as the planner did |
 
-When a question is labeled, every row's rebuilt observation is checked
-against the row's visible state key, and targets and valid masks must match
-exactly. Each question also stores the SHA-256 of its rebuilt observations.
-Reused questions are re-verified against that hash, so an observation-code or
-data change cannot silently alter training inputs. On CPU the re-encoded
-features match label-time features bit for bit; on a GPU they can differ by
-about 2e-7 from floating-point roundoff.
+When a question is labeled, the bitmap must reproduce the planner's row order,
+every row's rebuilt observation is checked against the row's visible state key,
+and targets must use valid actions. Each question also stores the SHA-256 of its
+rebuilt observations. Reused questions are re-verified against that hash, so an
+observation-code or data change cannot silently alter training inputs. On CPU
+the re-encoded features match label-time features bit for bit; on a GPU they
+can differ by about 2e-7 from floating-point roundoff.
 
 Planner diagnostics (goal-rank distributions, per-action reach/cost/steps,
 objective) and the 11,472 case dispositions per question are not stored.
@@ -315,28 +320,37 @@ objective) and the 11,472 case dispositions per question are not stored.
 them against the saved labels. Run it on the labeling device; another device
 can round probabilities differently and fail the check.
 
-Both roles' labels stay in RAM during training, about 160 MiB for the default
-run, so there is no cache setting; the earlier `decision_cache_mb` option is
-gone. Only one question's re-encoded features and training tensors occupy GPU
-memory at a time. Before writing, Stage 3 prints free disk space and an upper
-bound for its label files, and warns if the bound does not fit.
+**Memory.** The planner keeps its working state in arrays: one status, goal
+rank, and training row per case, and solved continuations at 24 bytes per case
+and target rank. The per-row and per-case audit dictionaries are built only for
+`decision_label_audit`. Labeling one default-geometry question therefore peaks
+near 20 MiB of Python/NumPy allocations, down from about 60 MiB. During head
+training only the action bytes, bitmaps, and row offsets stay in RAM, about
+30 MiB for the default run (schema 4 held about 125 MiB); each question's row
+sources are rebuilt from its bitmap when its rows are encoded. There is no cache
+setting; the earlier `decision_cache_mb` option is gone. Only one question's
+re-encoded features and training tensors occupy GPU memory at a time. Before
+writing, Stage 3 prints free disk space and an upper bound for its label files,
+and warns if the bound does not fit.
 
-**Why the earlier layout filled Kaggle's disk.** Earlier revision-5 code
-pickled every audit row and case per question, first with the 128-value
-feature vector stored twice (about 8 MiB per question; the v5 run hit
-`No space left on device` after 1,467 policy questions), later about 1 MiB per
-question in two files. Most of that was derivable data, such as a 64-character
-hash string per row.
+**Why the earlier layouts used more.** Earlier revision-5 code pickled every
+audit row and case per question, first with the 128-value feature vector stored
+twice (about 8 MiB per question; the v5 run hit `No space left on device` after
+1,467 policy questions), later about 1 MiB per question in two files, with a
+4 GiB in-RAM tensor cache. Most of that was derivable data, such as a
+64-character hash string per row. Schema 4 then kept an `int32` source per row
+(about 5 bytes per row), which the bitmap now replaces.
 
 **Recognizing the earlier code.** The notebook embeds its implementation,
-so a Kaggle copy uploaded before this change keeps writing audit shards. Its
-traceback fails inside `atomic_torch(path, shard, compress=True)` while
-writing `decision_shards/<role>/<position>_<hash>.pt`; the current code has
-neither that call nor that directory as a write target. Stage 0 of the
-current workflow prints the implementation revision and the compact label
-schema (`Implementation revision 5; Stage 3 stores compact labels (schema
-4, ...)`) before any stage trains, so the running code can be checked in the
-first minute rather than hours later.
+so a Kaggle copy uploaded before these changes keeps its old storage. A copy
+that still writes audit shards fails inside `atomic_torch(path, shard, compress=True)`
+while writing `decision_shards/<role>/<position>_<hash>.pt`, and its Stage 3
+progress reads `building/validating N question shards`; the current code has
+neither that call nor that directory as a write target. Stage 0 of the current
+workflow prints the implementation revision and the label schema
+(`Implementation revision 5; Stage 3 stores compact labels (schema 5, one byte
+per row plus one bitmap per question)`) before any stage trains, so the running
+code can be checked in the first minute rather than hours later.
 
 **Recovering such a run.** Keep the same `output_dir`, input files, and
 training configuration with `resume=True`. Constructing `Workflow(CFG)` on an
@@ -344,12 +358,15 @@ existing run deletes the derived `.training.pt` companions (up to 4 MiB each)
 and interrupted `.tmp` files before Stage 0 writes its reports, and prints
 the reclaimed size, so a completely full disk needs no manual cleanup.
 Stages 0-2 load their completed checkpoints; `WORK.train_decision_head()`
-then converts each completed schema-3 shard to compact labels **without
+then converts each completed schema-3 shard to schema-5 labels **without
 relabeling** and deletes the shard, so free space only grows; the progress
-line counts these as `migrated`. Only missing questions are built, and a
-matching schema-3 manifest is upgraded in place. Revision-4 runs cannot
-resume under the revision-5 action and label contract; start revision 5 in a
-new output directory.
+line counts these as `migrated`. Schema-4 labels convert the same way:
+per-question files are rewritten in place and counted as `migrated`, and a
+merged schema-4 role file is rewritten once. Only missing questions are built,
+and a matching schema-3 or schema-4 manifest is upgraded in place. Head
+training resumes from `decision_head_progress.pt` with the same row order.
+Revision-4 runs cannot resume under the revision-5 action and label contract;
+start revision 5 in a new output directory.
 
 A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
 write failure, commonly caused by exhausted disk space or a storage quota.
@@ -539,8 +556,9 @@ They also expose exhaustive status counts, actionable coverage by target
 rank, evaluator masks, and action names. The run saves teacher/snapshot/head
 checkpoints, an inference bundle, trajectories, and `results.json`.
 
-This implementation uses **revision 5**, **contract/inference schema 4**, and
-**decision-dataset schema 3**. Older action/state bundles and checkpoints are
+This implementation uses **revision 5**, **contract/inference schema 4**,
+**decision-dataset schema 3** (the label fingerprint), and **label-file
+schema 5**. Older action/state bundles and checkpoints are
 rejected. Use the new default output directory
 `/kaggle/working/adaptive_analogical_shared_training_v5_run` for a fresh run; old runs are
 not migrated. The notebook's `QUICK_PILOT` checks execution, not final model

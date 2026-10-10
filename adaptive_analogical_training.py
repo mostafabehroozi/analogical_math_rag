@@ -15,6 +15,7 @@ import random
 import re
 import shutil
 import time
+from array import array
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -1337,7 +1338,11 @@ def visible_state_key(record, state, cfg, allow_hidden_source=False):
     return (state.candidate_mask, state.evaluator_mask, hashlib.sha256(observed.tobytes()).hexdigest())
 
 
-def aggregate_decision_rows(scenarios, cfg, transition_table=None):
+# Case dispositions in precedence order; a plan stores each as an int8 code.
+DECISION_STATUSES = ("OUT_OF_BUDGET", "COMPLETE", "EXHAUSTED", "BUDGET", "ACTION", "UNREACHABLE")
+
+
+def plan_decision_rows(scenarios, cfg, transition_table=None):
     """Choose common actions until acquired evidence distinguishes the futures.
 
     Each visible group contains equiprobable historical orders with the same
@@ -1346,8 +1351,15 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
     prioritizes its first unfinished rank, including an earlier lost goal.
     Values follow that recovery policy rather than an unrestricted fixed-goal
     shortest path.
+
+    The plan is held in arrays rather than per-case dictionaries: for every
+    case (scenario-major), a status code, goal rank, and training row; for
+    every row, in planning order, its first case, tied optimal actions,
+    concrete continuation, and per-action values. Solved continuations take
+    24 bytes per case and target rank. Labels are compacted from these arrays;
+    aggregate_decision_rows expands them into audit dictionaries.
     """
-    groups, cases = {}, []
+    groups = {}
     # Actions and costs depend on the structure/config, never on historical order.
     unique_states = {state for scenario in scenarios for state in scenario["states"]}
     _, _, cached_valid, cached_costs = decision_structure(
@@ -1365,18 +1377,17 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
     prefixes = [np.logical_and.accumulate(scenario["goal"], axis=1) for scenario in scenarios]
     goal_ranks = [prefix.sum(axis=1) for prefix in prefixes]
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
+    pending, complete, exhausted, budget, action_status, unreachable = (
+        -1, *(DECISION_STATUSES.index(name) for name in
+              ("COMPLETE", "EXHAUSTED", "BUDGET", "ACTION", "UNREACHABLE")))
+    starts, status = [0], []
     for sid, scenario in enumerate(scenarios):
+        starts.append(starts[-1] + len(scenario["states"]))
         for j, state in enumerate(scenario["states"]):
             rank = int(goal_ranks[sid][j])
-            valid = valid_by_state[state]
-            status = ("COMPLETE" if rank == cfg.n else
-                      "EXHAUSTED" if state == full else
-                      "BUDGET" if not valid.any() else None)
-            cases.append({"scenario": sid, "candidate_mask": state.candidate_mask,
-                          "evaluator_mask": state.evaluator_mask, "status": status,
-                          "evaluators": evaluator_names(state.evaluator_mask, cfg),
-                          "goal_rank": None if rank == cfg.n else rank,
-                          "training_row": None})
+            status.append(complete if rank == cfg.n else
+                          exhausted if state == full else
+                          budget if not valid_by_state[state].any() else pending)
             groups.setdefault(scenario["keys"][j], []).append((sid, j, rank))
 
     # Compare the same feature pairs with the same NumPy tolerances, in bounded
@@ -1392,6 +1403,7 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
         if not np.allclose(np.stack([pair[0] for pair in batch]),
                            np.stack([pair[1] for pair in batch]), atol=1e-6):
             raise ValueError("One visible state has inconsistent frozen features.")
+    del comparisons
 
     transitions, shared_transitions = [], {}
     for scenario in scenarios:
@@ -1408,31 +1420,35 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
             shared_transitions[structure] = indexed
         transitions.append(shared_transitions[structure])
 
-    rows = []
-    case_index = {(case["scenario"], scenario["index"][State(case["candidate_mask"], case["evaluator_mask"])]): case
-                  for case in cases for scenario in [scenarios[case["scenario"]]]}
+    n = cfg.n
+    # (reach, cost, steps) for each case and target rank, filled as groups are solved.
+    continuation = array("d", [math.nan]) * (starts[-1] * n * 3)
+    case_row = [-1] * starts[-1]
+    capacity = len(groups)
+    row_case = np.empty(capacity, np.int64)
+    row_chosen = np.empty(capacity, np.int64)
+    row_support = np.zeros((capacity, cfg.action_count), bool)
+    row_values = np.empty((capacity, cfg.action_count, 3), np.float64)
+    row_key = []
     # The graph only adds items. Solve all visible-state groups backwards, so
     # every future decision is the same policy used to label that future row.
-    continuation = {}
     ordered = sorted(groups.items(), key=lambda item: -(
         bin(item[0][0]).count("1") + bin(item[0][1]).count("1")))
     for key, group in ordered:
         sid, j, _ = group[0]
-        scenario = scenarios[sid]
-        hidden, state = scenario["hidden"][j], scenario["states"][j]
-        valid = valid_by_state[state]
+        state = scenarios[sid]["states"][j]
         active = [(s, index, rank) for s, index, rank in group
-                  if case_index[s, index]["status"] is None]
+                  if status[starts[s] + index] == pending]
         if not active:
             for s, index, _ in group:
                 achieved = int(goal_ranks[s][index])
-                for target_rank in range(cfg.n):
-                    continuation[key, s, index, target_rank] = (
-                        float(achieved > target_rank), 0., 0.)
+                at = (starts[s] + index) * n * 3
+                for target_rank in range(n):
+                    continuation[at:at+3] = array("d", (float(achieved > target_rank), 0., 0.))
+                    at += 3
             continue
         values = np.zeros((cfg.action_count, 3), np.float64)
         values[:, 1:] = np.inf
-        individual = {}
         for action in actions_by_state[state]:
             outcomes = []
             for s, index, rank in active:
@@ -1443,9 +1459,10 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
                 if prefixes[s][successor, rank]:
                     outcome = (1., delta, 1.)
                 else:
-                    child = continuation[(current["keys"][successor], s, successor, rank)]
-                    outcome = (child[0], delta + child[1], 1. + child[2])
-                individual[int(action), s, index] = outcome
+                    child = ((starts[s] + successor) * n + rank) * 3
+                    if continuation[child] != continuation[child]:
+                        raise AssertionError("A successor group was used before it was solved.")
+                    outcome = (continuation[child], delta + continuation[child+1], 1. + continuation[child+2])
                 outcomes.append(outcome)
             values[action] = outcomes[0] if len(outcomes) == 1 else np.mean(outcomes, axis=0)
         preferred = actions_by_state[state]
@@ -1466,44 +1483,91 @@ def aggregate_decision_rows(scenarios, cfg, transition_table=None):
             preferred = np.asarray([chosen])
         for s, index, _ in group:
             achieved = int(goal_ranks[s][index])
-            if case_index[s, index]["status"] is not None:
-                for target_rank in range(cfg.n):
-                    continuation[key, s, index, target_rank] = (
-                        float(achieved > target_rank), 0., 0.)
+            at = (starts[s] + index) * n * 3
+            if status[starts[s] + index] != pending:
+                for target_rank in range(n):
+                    continuation[at:at+3] = array("d", (float(achieved > target_rank), 0., 0.))
+                    at += 3
                 continue
             current = scenarios[s]
             successor = transitions[s][index][chosen]
             nxt = current["states"][successor]
             delta = costs[nxt] - costs[state]
-            for target_rank in range(cfg.n):
+            child = (starts[s] + successor) * n * 3
+            for target_rank in range(n):
                 if achieved > target_rank or prefixes[s][successor, target_rank]:
                     outcome = (1., 0., 0.) if achieved > target_rank else (1., delta, 1.)
                 else:
-                    child = continuation[(current["keys"][successor], s, successor, target_rank)]
-                    outcome = (child[0], delta + child[1], 1. + child[2])
-                continuation[key, s, index, target_rank] = outcome
-        reach, cost, steps = values[chosen]
+                    if continuation[child] != continuation[child]:
+                        raise AssertionError("A successor group was used before it was solved.")
+                    outcome = (continuation[child], delta + continuation[child+1], 1. + continuation[child+2])
+                continuation[at:at+3] = array("d", outcome)
+                at += 3
+                child += 3
+        row = len(row_key)
+        row_case[row], row_chosen[row], row_values[row] = starts[sid] + j, chosen, values
+        row_support[row, preferred] = True
+        row_key.append(key)
+        reached = values[chosen, 0] > 0
+        for s, index, _ in group:
+            if status[starts[s] + index] == pending:
+                status[starts[s] + index] = action_status if reached else unreachable
+            case_row[starts[s] + index] = row
+    if pending in status:
+        raise AssertionError("A decision case was left without a disposition.")
+    rows = len(row_key)
+    return {"starts": np.asarray(starts, np.int64), "status": np.asarray(status, np.int8),
+            "goal_rank": (np.concatenate(goal_ranks) if goal_ranks else np.zeros(0, np.int64)),
+            "case_row": np.asarray(case_row, np.int64), "row_case": row_case[:rows],
+            "row_key": row_key, "row_support": row_support[:rows],
+            "row_chosen": row_chosen[:rows], "row_values": row_values[:rows],
+            "valid_by_state": valid_by_state}
+
+
+def aggregate_decision_rows(scenarios, cfg, transition_table=None):
+    """Plan, then expand into one audit dictionary per row and per case."""
+    plan = plan_decision_rows(scenarios, cfg, transition_table)
+    starts, status, goal_rank, case_row = (plan[key] for key in ("starts", "status", "goal_rank", "case_row"))
+    members = [[] for _ in range(len(plan["row_key"]))]
+    for case in np.flatnonzero(case_row >= 0).tolist():
+        members[case_row[case]].append(case)
+    trained = (DECISION_STATUSES.index("ACTION"), DECISION_STATUSES.index("UNREACHABLE"))
+    rows = []
+    for row, (first, key, support, chosen, values) in enumerate(zip(
+            plan["row_case"].tolist(), plan["row_key"], plan["row_support"],
+            plan["row_chosen"].tolist(), plan["row_values"])):
+        sid = int(np.searchsorted(starts, first, side="right")) - 1
+        scenario, j = scenarios[sid], first - int(starts[sid])
+        preferred = np.flatnonzero(support)
         target = np.zeros(cfg.action_count, np.float32)
         target[list(preferred)] = 1 / len(preferred)
-        ranks = Counter(row[2] for row in active)
+        reach, cost, steps = values[chosen]
+        ranks = Counter(int(goal_rank[case]) for case in members[row] if int(status[case]) in trained)
         rows.append({"uid": scenario["record"].uid, "state_key": key,
-                     "h": hidden, "target": target, "valid": valid,
+                     "h": scenario["hidden"][j], "target": target,
+                     "valid": plan["valid_by_state"][scenario["states"][j]],
                      "goal_rank": next(iter(ranks)) if len(ranks) == 1 else -1,
                      "goal_rank_distribution": dict(ranks), "reach": float(reach),
                      "expected_cost": float(cost), "expected_steps": float(steps),
                      "action_reach": values[:, 0], "action_expected_cost": values[:, 1],
                      "action_expected_steps": values[:, 2],
                      "objective": "rank_goal" if reach > 0 else "fill_pool_unreachable_goal"})
-        for s, index, _ in group:
-            if case_index[s, index]["status"] is None:
-                case_index[s, index]["status"] = "ACTION" if reach > 0 else "UNREACHABLE"
-            case_index[s, index]["training_row"] = len(rows)-1
+    cases = []
+    for sid, scenario in enumerate(scenarios):
+        for j, state in enumerate(scenario["states"]):
+            case = int(starts[sid]) + j
+            rank, row = int(goal_rank[case]), int(case_row[case])
+            cases.append({"scenario": sid, "candidate_mask": state.candidate_mask,
+                          "evaluator_mask": state.evaluator_mask,
+                          "status": DECISION_STATUSES[status[case]],
+                          "evaluators": evaluator_names(state.evaluator_mask, cfg),
+                          "goal_rank": None if rank == cfg.n else rank,
+                          "training_row": None if row < 0 else row})
     return rows, cases
 
 
-def build_decision_rows(record, scores, safe, maximum, predictor, cfg):
-    all_states, transitions, _, costs = decision_structure(
-        cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+def decision_question_scenarios(record, scores, safe, maximum, predictor, cfg):
+    """Every zero-shot order of one question over the in-budget states."""
     states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     scenarios = []
     for zero_order in permutations(range(cfg.zero_shots)):
@@ -1511,6 +1575,14 @@ def build_decision_rows(record, scores, safe, maximum, predictor, cfg):
         scenarios.append(decision_scenario(
             r, s, y_safe, y_max, predictor, cfg, states,
             reference_order=permuted_reference_order(scores, zero_order, cfg)))
+    return scenarios
+
+
+def build_decision_rows(record, scores, safe, maximum, predictor, cfg):
+    """Audit rows and every state/order case of one question, over-budget cases included."""
+    all_states, transitions, _, costs = decision_structure(
+        cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    scenarios = decision_question_scenarios(record, scores, safe, maximum, predictor, cfg)
     rows, cases = aggregate_decision_rows(scenarios, cfg, transitions)
     excluded = [state for state in all_states if costs[state] > cfg.budget + 1e-6]
     for sid in range(len(scenarios)):
@@ -1521,6 +1593,23 @@ def build_decision_rows(record, scores, safe, maximum, predictor, cfg):
     if len(cases) != len(all_states) * len(scenarios):
         raise AssertionError("Exhaustive decision coverage mismatch")
     return rows, cases
+
+
+def build_decision_labels(record, scores, safe, maximum, predictor, cfg):
+    """One question's stored labels and coverage, planned without audit dictionaries.
+
+    The same plan as build_decision_rows; only its arrays are kept, so a
+    default-geometry question peaks near 20 MiB instead of 60 MiB.
+    """
+    all_states, transitions, _, _ = decision_structure(
+        cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    # The scenarios (frozen features and keys) are released once the plan returns.
+    plan = plan_decision_rows(decision_question_scenarios(record, scores, safe, maximum, predictor, cfg),
+                              cfg, transitions)
+    coverage = plan_coverage(plan, cfg, (len(all_states) - len(states)) * math.factorial(cfg.zero_shots))
+    return {"coverage": coverage, **compact_label_arrays(record, plan["row_case"], plan["row_support"],
+                                                         plan["row_key"], cfg)}
 
 class SupervisedActionHead(nn.Module):
     def __init__(self, cfg):
@@ -1558,7 +1647,9 @@ def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
     return digest.hexdigest()
 
 
-DECISION_LABEL_SCHEMA = 4  # Compact numeric labels; the label fingerprint is unchanged.
+# Schema 5 stores one action byte per row plus one first-case bitmap per question;
+# schema 4 (an int32 source per row) converts in place. The label fingerprint is unchanged.
+DECISION_LABEL_SCHEMA = 5
 
 
 def question_paths(records, ids, directory):
@@ -1605,8 +1696,7 @@ def label_coverage(rows, cases, cfg):
               for case in cases}
     if len(actual) != len(cases) or actual != expected:
         raise ValueError("Decision labels have incomplete state/order coverage.")
-    allowed = {"OUT_OF_BUDGET", "COMPLETE", "EXHAUSTED", "BUDGET", "ACTION", "UNREACHABLE"}
-    if set(statuses) - allowed:
+    if set(statuses) - set(DECISION_STATUSES):
         raise ValueError("Decision labels contain an unknown status.")
     _, _, cached_valid, _ = decision_structure(
         cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
@@ -1632,6 +1722,39 @@ def label_coverage(rows, cases, cfg):
             "status_counts": dict(statuses), "trained_status_counts": dict(trained_statuses),
             "actionable_by_target_rank": dict(Counter(str(case["goal_rank"] + 1)
                 for case in cases if case["status"] == "ACTION"))}
+
+
+def plan_coverage(plan, cfg, out_of_budget):
+    """label_coverage of a question's plan, without expanding its cases.
+
+    The plan covers every in-budget state under every zero-shot order; the
+    over-budget cases, which never have a row, are only counted.
+    """
+    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    structures = structural_states(cfg.zero_shots, cfg.k)
+    orders = math.factorial(cfg.zero_shots)
+    status, case_row = plan["status"], plan["case_row"]
+    if (len(status) != orders * len(states) or
+            out_of_budget != orders * (len(structures) - len(states)) or
+            not np.array_equal(plan["starts"], np.arange(orders + 1) * len(states))):
+        raise ValueError("Decision labels have incomplete state/order coverage.")
+    valid = decision_valid_table(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    if not np.array_equal(case_row >= 0, np.tile(valid.any(1), orders)):
+        raise ValueError("Decision label action mapping is incomplete.")
+    if case_row.max(initial=-1) >= len(plan["row_case"]):
+        raise ValueError("Decision labels have an invalid training-row reference.")
+    names = [DECISION_STATUSES[code] for code in status.tolist()]
+    statuses = Counter(names)
+    if out_of_budget:
+        statuses["OUT_OF_BUDGET"] += out_of_budget
+    return {"questions": 1, "structural_states": len(structures),
+            "state_order_cases": len(status) + out_of_budget, "action_rows": len(plan["row_case"]),
+            "status_counts": dict(statuses),
+            "trained_status_counts": dict(Counter(name for name, row in zip(names, case_row.tolist())
+                                                  if row >= 0)),
+            "actionable_by_target_rank": dict(Counter(str(rank + 1) for name, rank in
+                                                      zip(names, plan["goal_rank"].tolist())
+                                                      if name == "ACTION"))}
 
 
 def combine_coverage(parts):
@@ -1701,14 +1824,81 @@ def decision_row_observations(record, source, cfg):
     return xs
 
 
-def compact_decision_labels(record, rows, cases, cfg):
-    """Keep only what the head trains on, as about five bytes per row.
+@lru_cache(maxsize=8)
+def decision_state_sizes(zero_shots, k, repeats, cost_unit, max_cost):
+    """Acquired candidates plus evaluators of each in-budget state: the planning-order key."""
+    states, _ = budget_state_index(zero_shots, k, repeats, cost_unit, max_cost)
+    sizes = np.asarray([bin(state.candidate_mask).count("1") + bin(state.evaluator_mask).count("1")
+                        for state in states], np.int64)
+    sizes.setflags(write=False)
+    return sizes
 
-    A row's source (zero-shot scenario and in-budget state of its first case)
-    fixes its observation, frozen features, and valid mask; a bitmask of tied
-    optimal actions fixes its soft target. Planner values and case dispositions
-    are deterministic audit data, recomputed by decision_question_audit.
+
+def decision_case_count(cfg):
+    """In-budget state/order cases of one question: zero-shot orders times in-budget states."""
+    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    return math.factorial(cfg.zero_shots) * len(states)
+
+
+def decision_first_cases(source, cfg):
+    """Bitmap over a question's in-budget cases marking each row's first visible case."""
+    source = np.asarray(source, np.int64)
+    cases = decision_case_count(cfg)
+    if source.ndim != 1 or len(np.unique(source)) != len(source) or (
+            len(source) and (source.min() < 0 or source.max() >= cases)):
+        raise ValueError("Decision rows need distinct in-budget first cases.")
+    bits = np.zeros(cases, bool)
+    bits[source] = True
+    return np.packbits(bits)
+
+
+def decision_row_sources(first_cases, cfg):
+    """Each row's first case (zero-shot scenario * in-budget states + state), in row order.
+
+    The planner solves visible groups from the largest structures down, in
+    order of first appearance among equal sizes, so the bitmap of first cases
+    fixes every row's source and position; no per-row index is stored.
     """
+    first_cases = np.asarray(first_cases, np.uint8)
+    cases = decision_case_count(cfg)
+    if first_cases.shape != ((cases + 7) // 8,) or np.unpackbits(first_cases)[cases:].any():
+        raise ValueError("Decision first-case bitmap has the wrong size or padding.")
+    source = np.flatnonzero(np.unpackbits(first_cases, count=cases))
+    sizes = decision_state_sizes(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    return source[np.argsort(-sizes[source % len(sizes)], kind="stable")]
+
+
+def compact_label_arrays(record, source, support, keys, cfg):
+    """Keep only what the head trains on: about one byte per row.
+
+    A row's first case (zero-shot scenario and in-budget state) fixes its
+    observation, frozen features, and valid mask; a bitmask of its tied optimal
+    actions fixes its soft target. Rows keep planning order, which a bitmap of
+    first cases reproduces, so a question stores one byte per row (up to eight
+    actions) plus one bit per in-budget case. Planner values and case
+    dispositions are deterministic audit data, recomputed by
+    decision_question_audit.
+    """
+    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    source, support = np.asarray(source, np.int64), np.asarray(support, bool)
+    first_cases = decision_first_cases(source, cfg)
+    if not np.array_equal(decision_row_sources(first_cases, cfg), source):
+        raise ValueError("Decision rows are not in planning order; their sources cannot be rebuilt.")
+    if (support.shape != (len(source), cfg.action_count) or not support.any(1).all() or
+            (support & ~decision_valid(source, cfg)).any()):
+        raise ValueError("Decision targets must use valid actions.")
+    observed = decision_row_observations(record, source, cfg)
+    for key, x, position in zip(keys, observed, source % len(states)):
+        state = states[position]
+        if tuple(key) != (state.candidate_mask, state.evaluator_mask, hashlib.sha256(x.tobytes()).hexdigest()):
+            raise ValueError("Decision rows do not reproduce their visible observations.")
+    return {"preferred": torch.from_numpy(np.packbits(support, axis=1)),
+            "first_cases": torch.from_numpy(first_cases),
+            "observation_sha256": hashlib.sha256(observed.tobytes()).hexdigest()}
+
+
+def compact_decision_labels(record, rows, cases, cfg):
+    """Stored labels from audit rows and cases, such as a migrated schema-3 shard."""
     states, index = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     source = np.full(len(rows), -1, np.int64)
     for case in cases:
@@ -1725,26 +1915,57 @@ def compact_decision_labels(record, rows, cases, cfg):
               np.zeros((0, cfg.action_count), np.float32))
     valid = (np.stack([row["valid"] for row in rows]) if rows else
              np.zeros((0, cfg.action_count), bool))
-    preferred = np.packbits(target > 0, axis=1)
-    if target.dtype != np.float32 or not np.array_equal(decision_targets(preferred, cfg), target):
+    if target.dtype != np.float32 or not np.array_equal(
+            decision_targets(np.packbits(target > 0, axis=1), cfg), target):
         raise ValueError("Decision targets must split evenly over tied optimal actions.")
     if not np.array_equal(decision_valid(source, cfg), valid):
         raise ValueError("Decision valid masks do not match their in-budget states.")
-    observed = decision_row_observations(record, source, cfg)
-    for row, x, position in zip(rows, observed, source % len(states)):
-        state = states[position]
-        if (tuple(row["state_key"]) != (state.candidate_mask, state.evaluator_mask,
-                                        hashlib.sha256(x.tobytes()).hexdigest())):
-            raise ValueError("Decision rows do not reproduce their visible observations.")
-    return {"source": torch.from_numpy(source.astype(np.int32)),
-            "preferred": torch.from_numpy(preferred),
-            "observation_sha256": hashlib.sha256(observed.tobytes()).hexdigest()}
+    return compact_label_arrays(record, source, target > 0, [row["state_key"] for row in rows], cfg)
+
+
+def schema4_first_cases(source, cfg, where):
+    """Schema 4 stored an int32 source per row; schema 5 keeps the equivalent bitmap."""
+    source = np.asarray(source, np.int64)
+    try:
+        first_cases = decision_first_cases(source, cfg)
+    except ValueError:
+        first_cases = None
+    if first_cases is None or not np.array_equal(decision_row_sources(first_cases, cfg), source):
+        raise ValueError(f"Incompatible decision labels: {where} rows are not in planning order.")
+    return torch.from_numpy(first_cases)
+
+
+def upgrade_schema4_labels(labels, cfg, where):
+    """One question's schema-4 labels in schema 5, without relabeling."""
+    upgraded = {key: value for key, value in labels.items() if key != "source"}
+    upgraded.update(schema_version=DECISION_LABEL_SCHEMA,
+                    first_cases=schema4_first_cases(labels["source"].numpy(), cfg, where))
+    return upgraded
+
+
+def upgrade_schema4_store(store, cfg, where):
+    """A merged schema-4 role file in schema 5, without relabeling."""
+    offsets, source = store["offsets"].tolist(), store["source"].numpy()
+    first_cases = [schema4_first_cases(source[start:stop], cfg, f"{where} question {position}")
+                   for position, (start, stop) in enumerate(zip(offsets[:-1], offsets[1:]))]
+    upgraded = {key: value for key, value in store.items() if key != "source"}
+    upgraded.update(schema_version=DECISION_LABEL_SCHEMA,
+                    first_cases=(torch.stack(first_cases) if first_cases else
+                                 torch.empty((0, (decision_case_count(cfg) + 7) // 8), dtype=torch.uint8)))
+    return upgraded
 
 
 def check_saved_labels(record, labels, cfg):
-    """Saved labels must rebuild their label-time observations under the current code."""
-    source, preferred = labels["source"].numpy(), labels["preferred"].numpy()
-    if (source.ndim != 1 or preferred.shape != (len(source), (cfg.action_count + 7) // 8) or
+    """Saved labels must rebuild their label-time observations under the current code.
+
+    Returns each row's source, rebuilt from the first-case bitmap.
+    """
+    preferred = labels["preferred"].numpy()
+    try:
+        source = decision_row_sources(labels["first_cases"].numpy(), cfg)
+    except ValueError as exc:
+        raise ValueError(f"Saved Stage 3 labels for {record.uid} have inconsistent shapes.") from exc
+    if (preferred.shape != (len(source), (cfg.action_count + 7) // 8) or
             len(source) != labels["coverage"]["action_rows"]):
         raise ValueError(f"Saved Stage 3 labels for {record.uid} have inconsistent shapes.")
     support = np.unpackbits(preferred, axis=1, count=cfg.action_count).astype(bool)
@@ -1754,6 +1975,7 @@ def check_saved_labels(record, labels, cfg):
     if hashlib.sha256(observed.tobytes()).hexdigest() != labels["observation_sha256"]:
         raise ValueError(f"Saved Stage 3 labels for {record.uid} no longer reproduce their "
                          "label-time observations; observation code or data changed.")
+    return source
 
 
 def decision_training_rows(record, source, preferred, predictor, cfg):
@@ -1773,8 +1995,9 @@ def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, finge
     """Build, migrate, or reuse one role's labels; returns them in RAM.
 
     Each question completes as one small atomic file, and the finished role is
-    merged into a single file. Schema-3 audit shards are converted without
-    relabeling and deleted once converted, so a full disk regains space.
+    merged into a single file. Schema-3 audit shards and schema-4 labels are
+    converted without relabeling; shards are deleted once converted, so a full
+    disk regains space.
     """
     out = Path(out)
     uids = [records[idx].uid for idx in ids]
@@ -1783,13 +2006,18 @@ def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, finge
     legacy_paths = question_paths(records, ids, out / "decision_shards" / role)
     expected_cases = len(structural_states(cfg.zero_shots, cfg.k)) * math.factorial(cfg.zero_shots)
     store = load_label_file(role_path) if role_path.exists() else None
+    upgraded = False
     if store is not None:
         offsets = store["offsets"].tolist() if isinstance(store.get("offsets"), torch.Tensor) else []
-        if (store.get("schema_version") != DECISION_LABEL_SCHEMA or store.get("fingerprint") != fingerprint
+        if (store.get("schema_version") not in (4, DECISION_LABEL_SCHEMA) or store.get("fingerprint") != fingerprint
                 or store.get("role") != role or store.get("uids") != uids
-                or len(offsets) != len(ids) + 1 or offsets[0] != 0 or offsets[-1] != len(store["source"])):
+                or len(offsets) != len(ids) + 1 or offsets[0] != 0 or offsets[-1] != len(store["preferred"])):
             raise ValueError(f"Incompatible decision labels: {role_path}")
-    sources, preferred, digests, parts = [], [], [], []
+        if store["schema_version"] == 4:
+            store, upgraded = upgrade_schema4_store(store, cfg, role_path), True
+            print(f"Stage 3 {role} labels: converting the schema-4 role file to schema "
+                  f"{DECISION_LABEL_SCHEMA} without relabeling.", flush=True)
+    preferred, first_cases, digests, parts = [], [], [], []
     started = last_print = time.monotonic()
     built = reused = migrated = 0
     print(f"Stage 3 {role} labels: building/validating {len(ids)} questions.", flush=True)
@@ -1797,17 +2025,24 @@ def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, finge
         record = records[idx]
         if store is not None:
             start, stop = offsets[position-1:position+1]
-            labels = {"source": store["source"][start:stop], "preferred": store["preferred"][start:stop],
+            labels = {"preferred": store["preferred"][start:stop],
+                      "first_cases": store["first_cases"][position-1],
                       "observation_sha256": store["observation_sha256"][position-1],
                       "coverage": store["coverage"][position-1]}
         elif path.exists():
             labels = load_label_file(path)
-            if (labels.get("schema_version") != DECISION_LABEL_SCHEMA or
+            if (labels.get("schema_version") not in (4, DECISION_LABEL_SCHEMA) or
                     labels.get("fingerprint") != fingerprint or labels.get("uid") != record.uid):
                 raise ValueError(f"Incompatible decision labels: {path}")
         else:
             labels = None
-        if labels is not None:
+        if labels is not None and labels.get("schema_version") == 4:
+            # Rewritten in place, so a later session and the mirror hold schema 5.
+            labels = upgrade_schema4_labels(labels, cfg, path)
+            check_saved_labels(record, labels, cfg)
+            atomic_torch(path, labels)
+            migrated += 1
+        elif labels is not None:
             check_saved_labels(record, labels, cfg)
             reused += 1
         else:
@@ -1818,21 +2053,22 @@ def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, finge
                     raise ValueError(f"Incompatible decision shard: {legacy}")
                 rows, cases = shard["rows"], shard["cases"]
                 del shard
+                labels = {"coverage": label_coverage(rows, cases, cfg),
+                          **compact_decision_labels(record, rows, cases, cfg)}
+                del rows, cases
                 migrated += 1
             else:
-                rows, cases = build_decision_rows(record, teacher["scores"][idx], teacher["safe"][idx],
-                                                  teacher["maximum"][idx], predictor, cfg)
+                labels = build_decision_labels(record, teacher["scores"][idx], teacher["safe"][idx],
+                                               teacher["maximum"][idx], predictor, cfg)
                 built += 1
             labels = {"schema_version": DECISION_LABEL_SCHEMA, "fingerprint": fingerprint,
-                      "uid": record.uid, "coverage": label_coverage(rows, cases, cfg),
-                      **compact_decision_labels(record, rows, cases, cfg)}
-            del rows, cases
+                      "uid": record.uid, **labels}
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_torch(path, labels)
         # The compact file is saved, so the large audit shard is no longer needed.
         legacy.unlink(missing_ok=True)
-        sources.append(labels["source"])
         preferred.append(labels["preferred"])
+        first_cases.append(labels["first_cases"])
         digests.append(labels["observation_sha256"])
         parts.append(labels["coverage"])
         last_print = decision_progress(f"Stage 3 {role} labels", position, len(ids), started, last_print, cfg,
@@ -1841,15 +2077,18 @@ def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, finge
         if sync is not None:
             sync.push(f"Stage 3: {role} labels {position}/{len(ids)} questions")
     if store is None:
-        counts = [len(source) for source in sources]
         store = {"schema_version": DECISION_LABEL_SCHEMA, "fingerprint": fingerprint, "role": role,
-                 "uids": uids, "offsets": torch.from_numpy(np.cumsum([0] + counts, dtype=np.int64)),
-                 "source": torch.cat(sources) if sources else torch.empty(0, dtype=torch.int32),
+                 "uids": uids,
+                 "offsets": torch.from_numpy(np.cumsum([0] + [len(rows) for rows in preferred], dtype=np.int64)),
                  "preferred": (torch.cat(preferred) if preferred else
                                torch.empty((0, (cfg.action_count + 7) // 8), dtype=torch.uint8)),
+                 "first_cases": (torch.stack(first_cases) if first_cases else
+                                 torch.empty((0, (decision_case_count(cfg) + 7) // 8), dtype=torch.uint8)),
                  "observation_sha256": digests, "coverage": parts}
         atomic_torch(role_path, store)
-    del sources, preferred
+    elif upgraded:
+        atomic_torch(role_path, store)
+    del preferred, first_cases
     # The merged role file is complete; remove per-question files and leftovers.
     for path in paths + legacy_paths:
         path.unlink(missing_ok=True)
@@ -1873,16 +2112,19 @@ def decision_question_audit(records, splits, teacher, predictor, cfg, out, role,
     fingerprint = decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
     path = decision_role_path(out, role)
     store = load_label_file(path)
-    if (store.get("schema_version") != DECISION_LABEL_SCHEMA or store.get("fingerprint") != fingerprint
+    if (store.get("schema_version") not in (4, DECISION_LABEL_SCHEMA) or store.get("fingerprint") != fingerprint
             or store.get("role") != role):
         raise ValueError(f"Incompatible decision labels: {path}")
+    if store["schema_version"] == 4:
+        # A head completed under schema 4 never rewrote its labels; read them as schema 5.
+        store = upgrade_schema4_store(store, cfg, path)
     idx = splits[role][position]
     rows, cases = build_decision_rows(records[idx], teacher["scores"][idx], teacher["safe"][idx],
                                       teacher["maximum"][idx], predictor, cfg)
     compact = compact_decision_labels(records[idx], rows, cases, cfg)
     start, stop = store["offsets"][position:position+2].tolist()
-    if not (torch.equal(compact["source"], store["source"][start:stop]) and
-            torch.equal(compact["preferred"], store["preferred"][start:stop]) and
+    if not (torch.equal(compact["preferred"], store["preferred"][start:stop]) and
+            torch.equal(compact["first_cases"], store["first_cases"][position]) and
             compact["observation_sha256"] == store["observation_sha256"][position]):
         raise ValueError("Rebuilt Stage 3 labels differ from the saved labels.")
     return {"uid": records[idx].uid, "rows": rows, "cases": cases,
@@ -1945,9 +2187,9 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
                 "roles": {role: decision_role_path(out, role).relative_to(out).as_posix() for role in roles}}
     previous = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
     if previous is not None:
-        # Schema-3 runs with the same label contract are migrated, not relabeled.
+        # Schema-3 and schema-4 runs with the same label contract are converted, not relabeled.
         if previous != manifest and not (
-                previous.get("schema_version") == 3 and
+                previous.get("schema_version") in (3, 4) and
                 previous.get("implementation_revision") == PIPELINE_REVISION and
                 previous.get("fingerprint") == fingerprint):
             raise ValueError("Decision dataset manifest has an incompatible teacher, predictor, split, or action contract.")
@@ -1957,19 +2199,21 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
     reclaimed = reclaim_derived_stage3_files(out)
     legacy = decision_shard_paths(records, splits, out)
     convertible = sum(path.stat().st_size for role in roles for path in legacy[role] if path.exists())
-    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
-    # Per-question files plus the merged role file, at the most rows a question can have.
-    upper = 2 * sum(len(splits[role]) for role in roles) * len(states) * math.factorial(cfg.zero_shots) * (
-        4 + (cfg.action_count + 7) // 8)
+    # Per-question files plus the merged role file, at the most rows a question can have:
+    # one per in-budget case, each with one action byte, plus one first-case bitmap.
+    cases = decision_case_count(cfg)
+    bitmap = (cases + 7) // 8
+    upper = 2 * sum(len(splits[role]) for role in roles) * (cases * ((cfg.action_count + 7) // 8) + bitmap)
     free = shutil.disk_usage(out).free
     print(f"Stage 3 storage: {out.resolve()} | {free / 1024**3:.2f} GiB free; "
           f"removed {reclaimed / 1024**2:.2f} MiB of derived companions and incomplete writes; "
           f"{convertible / 1024**2:.2f} MiB of schema-3 audit shards will be converted and deleted. "
-          f"Compact labels need at most {upper / 1024**3:.2f} GiB; frozen features and audit "
-          "fields are recomputed rather than saved.", flush=True)
+          f"Labels need at most {upper / 1024**2:.1f} MiB (one action byte per row and a "
+          f"{bitmap}-byte first-case bitmap per question); frozen features, row sources, and "
+          "audit fields are recomputed rather than saved.", flush=True)
     if upper > free + convertible:
-        print(f"WARNING: Stage 3 labels may need up to {upper / 1024**3:.2f} GiB, but only "
-              f"{(free + convertible) / 1024**3:.2f} GiB is free or reclaimable. Free space now; "
+        print(f"WARNING: Stage 3 labels may need up to {upper / 1024**2:.1f} MiB, but only "
+              f"{(free + convertible) / 1024**2:.1f} MiB is free or reclaimable. Free space now; "
               "completed questions are reused on resume.", flush=True)
     if previous != manifest:
         atomic_json(manifest_path, manifest)
@@ -1977,7 +2221,9 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
     for role in roles:
         labels[role] = decision_role_labels(role, records, splits[role], teacher, predictor,
                                             cfg, out, fingerprint, sync)
-        coverage[role] = combine_coverage(labels[role]["coverage"])
+        coverage[role] = combine_coverage(labels[role].pop("coverage"))
+        # Only head inputs stay in RAM: action bytes, first-case bitmaps, and offsets.
+        del labels[role]["observation_sha256"]
         atomic_json(out / "decision_label_coverage.json", coverage)
         print(f"Stage 3 {role}: {coverage[role]['state_order_cases']} state/order cases, "
               f"{coverage[role]['action_rows']} shared action rows; "
@@ -1986,15 +2232,16 @@ def train_decision_head(records, splits, teacher, predictor, cfg, device, out=No
         if not coverage[role]["action_rows"]:
             raise ValueError(f"No actionable Stage 3 rows for {role}: {coverage[role]}")
     held = sum(labels[role][key].numel() * labels[role][key].element_size()
-               for role in roles for key in ("source", "preferred"))
+               for role in roles for key in ("offsets", "preferred", "first_cases"))
     print(f"Stage 3 labels in RAM: {held / 1024**2:.1f} MiB for "
           f"{sum(coverage[role]['action_rows'] for role in roles)} rows.", flush=True)
     offsets = {role: labels[role]["offsets"].tolist() for role in roles}
 
     def question_rows(role, position):
         start, stop = offsets[role][position:position+2]
-        return decision_training_rows(records[splits[role][position]],
-                                      labels[role]["source"][start:stop].numpy(),
+        # Row sources are rebuilt from the question's bitmap, never held for every row.
+        source = decision_row_sources(labels[role]["first_cases"][position].numpy(), cfg)
+        return decision_training_rows(records[splits[role][position]], source,
                                       labels[role]["preferred"][start:stop].numpy(), predictor, cfg)
 
     model = SupervisedActionHead(cfg).to(device)
@@ -2711,8 +2958,8 @@ class Workflow:
         section(f"DATA AUDIT | device={self.device} | {self.cfg.n} candidates, {self.cfg.k} evaluators")
         # Names the embedded code: a notebook from before compact labels wrote audit shards.
         print(f"Implementation revision {PIPELINE_REVISION}; Stage 3 stores compact labels "
-              f"(schema {DECISION_LABEL_SCHEMA}, about 5 bytes per row) and never writes audit shards.",
-              flush=True)
+              f"(schema {DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question) "
+              "and never writes audit shards.", flush=True)
         cache_path = self.out / "compact_records.pt"
         if self.cfg.resume and cache_path.exists():
             cache = load_checkpoint(cache_path)

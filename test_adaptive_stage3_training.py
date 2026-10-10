@@ -153,7 +153,7 @@ def test_interrupted_head_resumes_last_complete_epoch_with_identical_adam_and_sh
     assert progress["schema_version"] == 1 and progress["epoch"] == 1
     assert len(progress["history"]) == 1 and progress["optimizer"]["state"]
     monkeypatch.setattr(a, "masked_action_loss", original)
-    monkeypatch.setattr(a, "build_decision_rows", lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
+    monkeypatch.setattr(a, "build_decision_labels", lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
     actual = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", interrupted)
     assert_matching_training_checkpoints(expected, actual)
     assert a.load_checkpoint(interrupted / "decision_head_progress.pt")["epoch"] == 3
@@ -192,7 +192,7 @@ def test_resuming_patience_exhausted_head_skips_every_training_epoch(tmp_path, m
     progress = a.load_checkpoint(tmp_path / "decision_head_progress.pt")
     assert progress["stale"] == cfg.patience
     monkeypatch.setattr(a, "masked_action_loss", lambda *args, **kwargs: pytest.fail("Stopped head must not restart epochs"))
-    monkeypatch.setattr(a, "build_decision_rows", lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
+    monkeypatch.setattr(a, "build_decision_labels", lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
     actual = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
     assert_matching_training_checkpoints(expected, actual)
 
@@ -209,12 +209,21 @@ def test_compact_labels_rebuild_exact_targets_valid_masks_and_features():
     rows, cases = a.build_decision_rows(record, teacher["scores"][0], teacher["safe"][0],
                                         teacher["maximum"][0], predictor, cfg)
     labels = a.compact_decision_labels(record, rows, cases, cfg)
-    assert set(labels) == {"source", "preferred", "observation_sha256"}
-    assert labels["source"].dtype == torch.int32 and labels["preferred"].dtype == torch.uint8
+    assert set(labels) == {"preferred", "first_cases", "observation_sha256"}
+    assert labels["preferred"].dtype == labels["first_cases"].dtype == torch.uint8
     states, _ = a.budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     orders = list(itertools.permutations(range(cfg.zero_shots)))
+    assert labels["preferred"].shape == (len(rows), 1)
+    assert labels["first_cases"].shape == ((len(orders) * len(states) + 7) // 8,)
+    # Rows keep planning order, so the bitmap of first cases alone rebuilds every source.
+    first = {}
+    for case in cases:
+        if case["training_row"] is not None:
+            first.setdefault(case["training_row"], case["scenario"] * len(states) + states.index(
+                a.State(case["candidate_mask"], case["evaluator_mask"])))
+    source = a.decision_row_sources(labels["first_cases"].numpy(), cfg)
+    assert source.tolist() == [first[row] for row in range(len(rows))]
     blank = np.zeros(cfg.n, np.float32)
-    source = labels["source"].numpy()
     observed = a.decision_row_observations(record, source, cfg)
     for x, value in zip(observed, source.tolist()):
         scenario, position = divmod(value, len(states))
@@ -262,12 +271,64 @@ def test_saved_labels_reject_observations_that_changed_after_labeling():
     changed.ccs[0, 0] = 1 - changed.ccs[0, 0]
     with pytest.raises(ValueError, match="no longer reproduce"):
         a.check_saved_labels(changed, labels, cfg)
-    truncated = dict(labels, source=labels["source"][:-1], preferred=labels["preferred"][:-1])
+    truncated = dict(labels, preferred=labels["preferred"][:-1])
     with pytest.raises(ValueError, match="inconsistent shapes"):
         a.check_saved_labels(records[0], truncated, cfg)
+    with pytest.raises(ValueError, match="inconsistent shapes"):
+        a.check_saved_labels(records[0], dict(labels, first_cases=labels["first_cases"][:-1]), cfg)
+    # Moving a row to another case changes its rebuilt observation.
+    bits = np.unpackbits(labels["first_cases"].numpy())
+    bits[[np.flatnonzero(bits)[0], np.flatnonzero(~bits.astype(bool))[0]]] ^= 1
+    with pytest.raises(ValueError, match="no longer reproduce|invalid actions"):
+        a.check_saved_labels(records[0], dict(labels, first_cases=torch.from_numpy(np.packbits(bits))), cfg)
 
 
-def test_default_geometry_question_labels_need_about_five_bytes_per_row(tmp_path):
+@pytest.mark.parametrize("overrides", [{}, {"max_cost": 60.}, {"later_rank_filter": False}])
+def test_lean_labels_equal_compacted_audit_rows_and_coverage(overrides):
+    cfg, records, _, teacher, predictor = small_stage3_problem(questions=3, **overrides)
+    for idx, record in enumerate(records):
+        args = (record, teacher["scores"][idx], teacher["safe"][idx], teacher["maximum"][idx], predictor, cfg)
+        rows, cases = a.build_decision_rows(*args)
+        labels = a.build_decision_labels(*args)
+        # Same plan: the array path never builds the audit dictionaries it matches.
+        assert labels.pop("coverage") == a.label_coverage(rows, cases, cfg)
+        compact = a.compact_decision_labels(record, rows, cases, cfg)
+        assert labels.keys() == compact.keys()
+        assert all(torch.equal(labels[key], compact[key]) for key in ("preferred", "first_cases"))
+        assert labels["observation_sha256"] == compact["observation_sha256"]
+        if overrides.get("max_cost"):
+            assert {case["status"] for case in cases} >= {"OUT_OF_BUDGET", "BUDGET"}
+
+
+def test_first_case_bitmaps_round_trip_planning_order_and_reject_corruption():
+    cfg = a.Config()
+    cases = a.decision_case_count(cfg)
+    assert cases == 6 * 1912
+    sizes = a.decision_state_sizes(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    rng = np.random.RandomState(5)
+    chosen = np.flatnonzero(rng.rand(cases) < .6)
+    # Planning order: larger structures first, ties in case order.
+    source = chosen[np.argsort(-sizes[chosen % len(sizes)], kind="stable")]
+    first_cases = a.decision_first_cases(source, cfg)
+    assert first_cases.shape == (cases // 8,)
+    np.testing.assert_array_equal(a.decision_row_sources(first_cases, cfg), source)
+    np.testing.assert_array_equal(a.schema4_first_cases(source, cfg, "q").numpy(), first_cases)
+    with pytest.raises(ValueError, match="not in planning order"):
+        a.schema4_first_cases(source[::-1], cfg, "q")
+    with pytest.raises(ValueError, match="distinct in-budget"):
+        a.decision_first_cases(np.r_[source, source[:1]], cfg)
+    with pytest.raises(ValueError, match="distinct in-budget"):
+        a.decision_first_cases([cases], cfg)
+    tiny = a.Config(k=1, zero_shots=1)
+    assert a.decision_case_count(tiny) == 4
+    # Cases 1 and 3 hold one- and three-item structures: the larger one is planned first.
+    np.testing.assert_array_equal(a.decision_row_sources(np.array([0b01010000], np.uint8), tiny), [3, 1])
+    for corrupt in (np.array([0b01011000], np.uint8), np.zeros(2, np.uint8)):
+        with pytest.raises(ValueError, match="wrong size or padding"):
+            a.decision_row_sources(corrupt, tiny)
+
+
+def test_default_geometry_question_labels_need_about_one_byte_per_row(tmp_path):
     torch.set_num_threads(1)
     cfg = a.Config()
     rng = np.random.RandomState(3)
@@ -284,35 +345,43 @@ def test_default_geometry_question_labels_need_about_five_bytes_per_row(tmp_path
     model = a.ResNet(cfg.input_dim, 3 * cfg.n + 2, cfg)
     predictor = a.FrozenPredictor({"weights": a.cpu_state(model), "temperatures": np.ones(5)},
                                   cfg, torch.device("cpu"))
-    rows, cases = a.build_decision_rows(record, scores, safe, maximum, predictor, cfg)
+    labels = a.build_decision_labels(record, scores, safe, maximum, predictor, cfg)
     path = tmp_path / "question.pt"
-    a.atomic_torch(path, question_labels(record, rows, cases, cfg))
+    a.atomic_torch(path, {"schema_version": a.DECISION_LABEL_SCHEMA, "fingerprint": "f" * 64,
+                          "uid": record.uid, **labels})
     # Pickled audit rows took about 1 MiB per question (about 8 MiB while they
-    # stored frozen features), which filled Kaggle's disk part-way through Stage 3.
-    assert len(rows) > 5000
-    assert path.stat().st_size < 6 * len(rows) + 16 * 1024
+    # stored frozen features), which filled Kaggle's disk part-way through Stage 3;
+    # schema 4 still kept an int32 source per row, about 5 bytes per row.
+    rows = labels["coverage"]["action_rows"]
+    assert rows > 5000
+    assert path.stat().st_size < rows + a.decision_case_count(cfg) // 8 + 4 * 1024
+    audit_rows, cases = a.build_decision_rows(record, scores, safe, maximum, predictor, cfg)
+    compact = a.compact_decision_labels(record, audit_rows, cases, cfg)
+    assert all(torch.equal(labels[key], compact[key]) for key in ("preferred", "first_cases"))
+    assert labels["observation_sha256"] == compact["observation_sha256"]
+    assert labels["coverage"] == a.label_coverage(audit_rows, cases, cfg)
 
 
 def run_with_build_counter(monkeypatch, *args):
     built = []
-    original = a.build_decision_rows
+    original = a.build_decision_labels
 
     def counted(record, *rest, **kwargs):
         built.append(record.uid)
         return original(record, *rest, **kwargs)
 
-    monkeypatch.setattr(a, "build_decision_rows", counted)
+    monkeypatch.setattr(a, "build_decision_labels", counted)
     try:
         return a.train_decision_head(*args), built
     finally:
-        monkeypatch.setattr(a, "build_decision_rows", original)
+        monkeypatch.setattr(a, "build_decision_labels", original)
 
 
 def test_interrupted_label_build_reuses_completed_questions_then_merges_each_role(tmp_path, monkeypatch, capsys):
     cfg, records, splits, teacher, predictor = small_stage3_problem(questions=4)
     expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path / "complete")
     run = tmp_path / "interrupted"
-    original = a.build_decision_rows
+    original = a.build_decision_labels
     calls = 0
 
     def stop_on_second_question(*args, **kwargs):
@@ -322,12 +391,12 @@ def test_interrupted_label_build_reuses_completed_questions_then_merges_each_rol
             raise KeyboardInterrupt("simulated interrupted Stage 3 label build")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(a, "build_decision_rows", stop_on_second_question)
+    monkeypatch.setattr(a, "build_decision_labels", stop_on_second_question)
     with pytest.raises(KeyboardInterrupt, match="simulated interrupted"):
         a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", run)
     assert len(list((run / "decision_labels" / "policy").glob("*.pt"))) == 1
     assert not a.decision_role_path(run, "policy").exists()
-    monkeypatch.setattr(a, "build_decision_rows", original)
+    monkeypatch.setattr(a, "build_decision_labels", original)
     capsys.readouterr()
     actual, built = run_with_build_counter(monkeypatch, records, splits, teacher, predictor, cfg, "cpu", run)
     log = capsys.readouterr().out
@@ -337,7 +406,7 @@ def test_interrupted_label_build_reuses_completed_questions_then_merges_each_rol
     assert sorted(path.name for path in (run / "decision_labels").iterdir()) == ["dev.pt", "policy.pt"]
     store = a.load_label_file(a.decision_role_path(run, "policy"))
     assert store["uids"] == [records[i].uid for i in splits["policy"]]
-    assert store["offsets"].tolist()[-1] == len(store["source"]) == expected["coverage"]["policy"]["action_rows"]
+    assert store["offsets"].tolist()[-1] == len(store["preferred"]) == expected["coverage"]["policy"]["action_rows"]
     assert_matching_training_checkpoints(expected, actual)
 
 
@@ -432,6 +501,61 @@ def test_full_disk_run_migrates_completed_shards_and_builds_only_the_rest(tmp_pa
     assert_matching_training_checkpoints(expected, actual)
 
 
+def write_schema4_layout(run, records, splits, cfg, merged):
+    """Rewrite finished labels as schema-4 code left them: an int32 source per row."""
+    manifest_path = run / "decision_dataset_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    a.atomic_json(manifest_path, dict(manifest, schema_version=4))
+    for role in ("policy", "dev"):
+        role_path = a.decision_role_path(run, role)
+        store = a.load_label_file(role_path)
+        offsets = store["offsets"].tolist()
+        sources = [torch.from_numpy(a.decision_row_sources(first.numpy(), cfg).astype(np.int32))
+                   for first in store["first_cases"]]
+        if merged:
+            schema4 = {key: value for key, value in store.items() if key != "first_cases"}
+            a.atomic_torch(role_path, dict(schema4, schema_version=4, source=torch.cat(sources)))
+            continue
+        role_path.unlink()
+        paths = a.question_paths(records, splits[role], run / "decision_labels" / role)
+        for position, (path, source) in enumerate(zip(paths, sources)):
+            start, stop = offsets[position:position+2]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            a.atomic_torch(path, {"schema_version": 4, "fingerprint": store["fingerprint"],
+                                  "uid": store["uids"][position], "coverage": store["coverage"][position],
+                                  "source": source, "preferred": store["preferred"][start:stop],
+                                  "observation_sha256": store["observation_sha256"][position]})
+
+
+@pytest.mark.parametrize("merged", [True, False])
+def test_schema4_labels_convert_in_place_without_relabeling(tmp_path, monkeypatch, capsys, merged):
+    cfg, records, splits, teacher, predictor = small_stage3_problem(questions=3)
+    fresh, run = tmp_path / "fresh", tmp_path / "schema4"
+    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", fresh)
+    a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", run)
+    # Retrain from the converted labels alone.
+    (run / "decision_head_progress.pt").unlink()
+    write_schema4_layout(run, records, splits, cfg, merged)
+    capsys.readouterr()
+    actual, built = run_with_build_counter(monkeypatch, records, splits, teacher, predictor, cfg, "cpu", run)
+    log = capsys.readouterr().out
+    assert built == []
+    if merged:
+        assert "converting the schema-4 role file to schema 5 without relabeling" in log
+        assert "built 0, reused 2" in log and "built 0, reused 1" in log
+    else:
+        assert "built 0, reused 0, migrated 2" in log and "built 0, reused 0, migrated 1" in log
+    manifest = json.loads((run / "decision_dataset_manifest.json").read_text(encoding="utf-8"))
+    assert manifest == json.loads((fresh / "decision_dataset_manifest.json").read_text(encoding="utf-8"))
+    assert sorted(path.name for path in (run / "decision_labels").iterdir()) == ["dev.pt", "policy.pt"]
+    for role in ("policy", "dev"):
+        converted, built_fresh = (a.load_label_file(a.decision_role_path(path, role)) for path in (run, fresh))
+        assert converted.keys() == built_fresh.keys()
+        assert all(torch.equal(value, built_fresh[key]) if isinstance(value, torch.Tensor)
+                   else value == built_fresh[key] for key, value in converted.items())
+    assert_matching_training_checkpoints(expected, actual)
+
+
 def test_incompatible_schema3_manifest_or_shard_is_never_migrated(tmp_path, monkeypatch):
     cfg, records, splits, teacher, predictor = small_stage3_problem()
     shards = write_legacy_layout(tmp_path, records, splits, teacher, predictor, cfg, "uncompressed")
@@ -460,6 +584,10 @@ def test_question_audit_recomputes_the_saved_rows_and_cases(tmp_path):
     assert [row["state_key"] for row in audit["rows"]] == [row["state_key"] for row in rows]
     assert {"goal_rank", "reach", "action_expected_cost", "objective"} <= set(audit["rows"][0])
     assert audit["coverage"]["action_rows"] == checkpoint["coverage"]["dev"]["action_rows"]
+    # A head completed under schema 4 never rewrote its role files; the audit reads them too.
+    write_schema4_layout(tmp_path, records, splits, cfg, merged=True)
+    schema4_audit = a.decision_question_audit(records, splits, teacher, predictor, cfg, tmp_path, "dev", 0)
+    assert schema4_audit["cases"] == audit["cases"] and schema4_audit["coverage"] == audit["coverage"]
     path = a.decision_role_path(tmp_path, "dev")
     store = a.load_label_file(path)
     store["preferred"] = torch.zeros_like(store["preferred"])

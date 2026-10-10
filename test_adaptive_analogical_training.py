@@ -903,7 +903,8 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     work = a.run_pipeline(cfg)
     # Stage 0 names the embedded code before any stage trains, so a stale notebook is visible.
     assert (f"Implementation revision {a.PIPELINE_REVISION}; Stage 3 stores compact labels "
-            f"(schema {a.DECISION_LABEL_SCHEMA}, about 5 bytes per row)") in capsys.readouterr().out
+            f"(schema {a.DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question)"
+            ) in capsys.readouterr().out
     assert snapshot_training_ids and all(ids == work.splits["supervised"] for ids in snapshot_training_ids)
     assert set(work.results["external"]["adaptive"]["policies"]) == {
         "full", "fixed", "fixed_evaluators_first", "fixed_zero_shots_first", "supervised"}
@@ -924,17 +925,20 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     assert work.audit["second"]["duplicate_or_cross_file_overlap"] == 2
     assert (tmp_path/"run"/"decision_head_completed.pt").exists()
     manifest = json.loads((tmp_path/"run"/"decision_dataset_manifest.json").read_text())
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == a.DECISION_LABEL_SCHEMA == 5
     assert manifest["roles"] == {"policy": "decision_labels/policy.pt", "dev": "decision_labels/dev.pt"}
     stores = {role: a.load_label_file(tmp_path/"run"/path) for role, path in manifest["roles"].items()}
-    # Only head inputs are stored: about five bytes per row, no features or audit rows.
+    # Only head inputs are stored: one action byte per row and one bitmap per question.
     assert set(stores["policy"]) == {"schema_version", "fingerprint", "role", "uids", "offsets",
-                                     "source", "preferred", "observation_sha256", "coverage"}
+                                     "preferred", "first_cases", "observation_sha256", "coverage"}
     assert sorted(path.name for path in (tmp_path/"run"/"decision_labels").iterdir()) == ["dev.pt", "policy.pt"]
     assert not (tmp_path/"run"/"decision_shards").exists()
     for store in stores.values():
+        assert store["preferred"].dtype == store["first_cases"].dtype == torch.uint8
+        assert store["preferred"].shape[1] == 1 and len(store["first_cases"]) == len(store["uids"])
         target = a.decision_targets(store["preferred"].numpy(), cfg)
-        valid = a.decision_valid(store["source"].numpy(), cfg)
+        valid = a.decision_valid(np.concatenate([a.decision_row_sources(first.numpy(), cfg)
+                                                 for first in store["first_cases"]]), cfg)
         assert len(target) and np.allclose(target.sum(1), 1) and not target[~valid].any()
     role_uids = {role: {work.records[i].uid for i in ids} for role, ids in work.splits.items()}
     assert stores["policy"]["uids"] == [work.records[i].uid for i in work.splits["policy"]]
@@ -942,7 +946,7 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     assert work.splits["policy"] == work.splits["supervised"]
     assert set(stores["dev"]["uids"]) == role_uids["dev"]
     coverage = work.decision_checkpoint["coverage"]["policy"]
-    assert coverage["action_rows"] == len(stores["policy"]["source"])
+    assert coverage["action_rows"] == len(stores["policy"]["preferred"])
     assert coverage["state_order_cases"] == (
         len(a.structural_states(cfg.zero_shots, cfg.k)) * 2 * len(work.splits["policy"]))
     audit = work.decision_label_audit("policy", 0)
@@ -1002,12 +1006,12 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     dev_mtime = dev_file.stat().st_mtime_ns
     policy_file.unlink()
     (tmp_path/"run"/"decision_head_completed.pt").unlink()
-    build = a.build_decision_rows
+    build = a.build_decision_labels
     built = []
-    monkeypatch.setattr(a, "build_decision_rows",
+    monkeypatch.setattr(a, "build_decision_labels",
                         lambda record, *args: built.append(record.uid) or build(record, *args))
     repaired = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
-    monkeypatch.setattr(a, "build_decision_rows", build)
+    monkeypatch.setattr(a, "build_decision_labels", build)
     assert built == [work.records[i].uid for i in work.splits["policy"]]
     assert policy_file.exists() and dev_file.stat().st_mtime_ns == dev_mtime
     assert repaired.decision_checkpoint["coverage"] == work.decision_checkpoint["coverage"]
@@ -1153,11 +1157,11 @@ def test_decision_progress_and_single_coverage_check_preserve_label_resume(tmp_p
     teacher = {"scores": scores, "safe": safe, "maximum": maximum}
     predictor = fake_predictor(cfg)
     checks = []
-    original = a.label_coverage
-    def track_coverage(rows, cases, config):
-        checks.append(len(cases))
-        return original(rows, cases, config)
-    monkeypatch.setattr(a, "label_coverage", track_coverage)
+    original = a.plan_coverage
+    def track_coverage(plan, config, out_of_budget):
+        checks.append(len(plan["status"]))
+        return original(plan, config, out_of_budget)
+    monkeypatch.setattr(a, "plan_coverage", track_coverage)
     first = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
     assert len(checks) == 2
     log = capsys.readouterr().out
@@ -1168,7 +1172,7 @@ def test_decision_progress_and_single_coverage_check_preserve_label_resume(tmp_p
     # Resume saved role labels: no relabeling and no second coverage pass.
     interrupted = a.decision_role_path(tmp_path, "dev").with_suffix(".pt.tmp")
     interrupted.write_bytes(b"leftover from failed dev label write")
-    monkeypatch.setattr(a, "build_decision_rows", lambda *args: pytest.fail("Should reuse saved labels"))
+    monkeypatch.setattr(a, "build_decision_labels", lambda *args: pytest.fail("Should reuse saved labels"))
     resumed = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
     assert not interrupted.exists()
     assert len(checks) == 2
