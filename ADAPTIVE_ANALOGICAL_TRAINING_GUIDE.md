@@ -252,14 +252,18 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
 
 - **Pull.** Constructing `Workflow(CFG)` downloads the mirrored run into an
   empty output folder (a non-empty folder is used as is). The repository is
-  created on the first upload if it does not exist.
+  created on the first upload if it does not exist. The traced Stage 4 rows
+  that earlier revisions mirrored (`final_trajectories.jsonl`) are not
+  downloaded.
 - **Push.** Stage 0 ends with a required upload, so a bad token, repository
   id, or disabled Internet fails in the first minute. Each later stage uploads
   when it completes. Inside long loops the run uploads every `hf_sync_minutes`
   (default 15): after Stage 1 folds, during the Stage 3 label build, and after
   Stage 3 epochs; each merged role uploads immediately. Uploads skip unchanged
   files by content hash, never include `.tmp` files, and remove per-question
-  label files and migrated shards from the mirror once they are gone locally.
+  label files, migrated shards, and an earlier revision's
+  `final_trajectories.jsonl` from the mirror once they are gone locally (the
+  dataset repository's history keeps earlier versions).
   A failed periodic upload prints a warning and retries at the next sync
   point; local files are never discarded. `WORK.push()` uploads on demand,
   and `WORK.sync.describe()` reports the upload state.
@@ -442,6 +446,8 @@ and heads; CUDA context, reserved allocator memory, and other processes are
 outside that number. Its single-pass timings include first-use overhead and
 are not representative speedup measurements. This was not a Kaggle/T4 run.
 
+### Stage 4 reports
+
 Offline reports compare the complete-pool baseline, configurable fixed
 sequences, and learned acquisitions. Defaults for five evaluators and three
 zero-shot candidates are:
@@ -481,7 +487,8 @@ complete**, even if MAX/SAFE lights or later recognition goals fail. It differs
 from the dataset's `COMPLETE` status, which requires all recognition goals.
 The result also exposes `acquisition_complete` and `final_max_recognized`
 separately, so callers can distinguish pool completion from current MAX
-recognition without interpreting the legacy reason string. Full-pool reference
+recognition without interpreting the legacy reason string; `candidate_mask`
+and `evaluator_mask` give the final acquired state. Full-pool reference
 runs record recognition at their observed full state as well.
 Pass `continue_after_max=False` to stop that call at predicted MAX, or change
 the configuration default. This runtime-only choice does not change the
@@ -541,7 +548,8 @@ Retrieval and target-answer grading are excluded. This accounting follows
 the recorded-pool simulator, not observed live traffic. Costs and savings
 are averaged across zero-shot orders within each question before aggregating,
 so a question is counted once. Empty MAX-present cohorts have null metrics.
-Trajectories name each acquired evaluator/candidate and its incremental cost.
+Trajectories, recomputed on demand by `WORK.rollout_audit` (see Storage
+below), name each acquired evaluator/candidate and its incremental cost.
 Every prediction check, including the initial ZS1 and the final state, records
 available candidate IDs, the selected candidate, the four MAX/SAFE signals,
 and the threshold. These make the reason for stopping inspectable.
@@ -554,7 +562,73 @@ Reports keep answer correctness, exact reference-MAX recovery, no-MAX results,
 costs and savings, and temporary loss of earlier recognition goals separately.
 They also expose exhaustive status counts, actionable coverage by target
 rank, evaluator masks, and action names. The run saves teacher/snapshot/head
-checkpoints, an inference bundle, trajectories, and `results.json`.
+checkpoints, an inference bundle, compact rollout outcomes, and `results.json`.
+
+**Storage.** Stage 4 rolls out each question once per method and zero-shot
+order. With `use_test_files_for_dev_and_audit=True` the pooled audit is the
+union of the benchmark files, so each benchmark report reuses the audit's
+rollouts instead of repeating them; the continuation diagnostic is shared the
+same way. Evaluation rollouts are untraced. As each finishes, its outcome is
+appended to `final_rollouts.jsonl`, and the rows are reduced to what the
+reports need: per-question means over zero-shot orders (the first step of
+`policy_summary`), stop reasons, and per-order correctness for the paired
+bootstrap. Each report is then aggregated from those per-question inputs in
+its own question order, so `results.json` is byte-identical to the earlier
+per-report computation, bootstrap intervals included. Stage 4 prints question
+progress, elapsed time, and estimated remaining time like Stage 3.
+
+Each line of `final_rollouts.jsonl` holds only what the models decide:
+
+| Field | Meaning |
+| --- | --- |
+| `uid`, `method`, `zero_shot_order` | The rollout's question, method, and zero-shot permutation |
+| `candidate_mask`, `evaluator_mask` | Final acquired candidate slots (under that permutation) and evaluators |
+| `selected` | Returned candidate ID |
+| `reason` | Stop reason |
+| `final_max_recognized` | All four MAX/SAFE signals pass at the final state |
+
+Everything else is derived. Costs, call counts, and savings follow from the
+masks; correctness and exact MAX recovery from `selected` with the records and
+teacher labels. Because evaluation stops at the first recognition,
+`first_max_recognition` is the final state whenever `reason` is
+`predicted_max` (for `full`, whenever `final_max_recognized`). Ranked lists
+and trajectories need the models again: `WORK.rollout_audit(name, position)`
+(or `question_rollout_audit(...)`) repeats one question's rollouts for every
+method and order with tracing (a fraction of a second at the default
+geometry), checks them against the saved lines, and returns the rows earlier
+revisions wrote. `name` is `"audit"` or a
+benchmark's file stem, and `position` indexes that report's questions. Run it
+on the reporting device with the reporting configuration: other hardware can
+round probabilities differently, and changed fixed orders need a new
+`report()` first.
+
+Measured on a synthetic default-geometry evaluation with 1,879 test questions
+(the full run's test-file count) in four benchmarks, six zero-shot orders,
+five methods, and a small trained model, one local CPU process per version:
+
+| Stage 4 | Before | After |
+| --- | --- | --- |
+| Rollouts | 112,740, traced (pooled audit, then each benchmark again) | 56,370, untraced |
+| Per-rollout file | `final_trajectories.jsonl`, 658 MiB (6.1 KB per row) | `final_rollouts.jsonl`, 11.1 MiB (about 205 bytes per line) |
+| Python heap per question | 474 KiB of traced rows, for every question of a report at once | 14 KiB of summary inputs |
+| Peak RSS increase during `report()` | 1,230 MiB | 142 MiB |
+| Time | about 20 minutes | about 9 minutes |
+
+`results.json` was byte-identical. About 105 MiB of the remaining peak is the
+unchanged per-report snapshot diagnostic. The old writer also needed room for
+two copies of its file when an earlier one was present.
+
+Earlier revisions wrote `final_trajectories.jsonl`: every traced row with its
+group hash, ranked list, call-count dictionaries, and per-step signals, about
+6 KB of JSON and 18 KB of Python objects per row. All five methods' rows of a
+report were held in RAM before summarizing, and pooled-audit questions were
+rolled out and written twice. Once the new file is complete, an old
+`final_trajectories.jsonl` in the output folder is deleted, and the mirror
+drops it at the next upload. Stage 0's version line ends with `Stage 4 rolls
+out each question once and saves compact outcomes to final_rollouts.jsonl, not
+trajectories`; a notebook copy without it still writes the traced file.
+
+### Versions
 
 This implementation uses **revision 5**, **contract/inference schema 4**,
 **decision-dataset schema 3** (the label fingerprint), and **label-file

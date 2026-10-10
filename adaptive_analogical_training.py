@@ -2345,7 +2345,12 @@ def paired_interval(a, b, repetitions, seed):
     grouped = {}
     for x, y in zip(a, b):
         grouped.setdefault(x["uid"], []).append(x["correct"]-y["correct"])
-    difference = np.asarray([np.mean(values) for values in grouped.values()], float)
+    return bootstrap_difference([np.mean(values) for values in grouped.values()], repetitions, seed)
+
+
+def bootstrap_difference(question_differences, repetitions, seed):
+    """Mean paired difference with a bootstrap over questions, in report order."""
+    difference = np.asarray(question_differences, float)
     rng = np.random.RandomState(seed)
     sampled = [float(rng.choice(difference, len(difference), replace=True).mean())
                for _ in range(max(1, repetitions))]
@@ -2539,6 +2544,7 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
             "selected": record.candidate_ids[selected],
             "ranked_candidates": [record.candidate_ids[i] for i in order],
             "first_max_recognition": first_max_recognition,
+            "candidate_mask": int(state.candidate_mask), "evaluator_mask": int(state.evaluator_mask),
             "acquisition_complete": (state.candidate_mask == (1 << cfg.n)-1 and
                                      state.evaluator_mask == (1 << cfg.k)-1),
             "final_max_recognized": max_recognized(probabilities, state, cfg),
@@ -2551,22 +2557,26 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
             "saved_fraction": 1 - state_cost(state, cfg)/cfg.full_cost,
             "reason": reason, "trajectory": trajectory}
 
+def question_rollouts(record, scores, safe, maximum, predictor, cfg, head=None,
+                      policy="supervised", trace=False):
+    """One question's evaluation rollouts, one per zero-shot order."""
+    rows = []
+    for order in permutations(range(cfg.zero_shots)):
+        scenario, _, _, scenario_maximum = permute_zero_shots(record, scores, safe, maximum, order, cfg)
+        # Evaluation measures the first predicted MAX stop, regardless of
+        # the application wrapper's configurable continuation behavior.
+        row = rollout(scenario, scenario_maximum, predictor, cfg, policy, head, trace,
+                      continue_after_max=False)
+        row["zero_shot_order"] = list(order)
+        rows.append(row)
+    return rows
+
+
 def evaluate_policy(records, ids, teacher, predictor, cfg, head=None,
                     policy="supervised", trace=False):
-    rows = []
-    for idx in ids:
-        record = records[idx]
-        for order in permutations(range(cfg.zero_shots)):
-            scenario, _, _, maximum = permute_zero_shots(
-                record, teacher["scores"][idx], teacher["safe"][idx],
-                teacher["maximum"][idx], order, cfg)
-            # Evaluation measures the first predicted MAX stop, regardless of
-            # the application wrapper's configurable continuation behavior.
-            row = rollout(scenario, maximum, predictor, cfg, policy, head, trace,
-                          continue_after_max=False)
-            row["zero_shot_order"] = list(order)
-            rows.append(row)
-    return rows
+    return [row for idx in ids
+            for row in question_rollouts(records[idx], teacher["scores"][idx], teacher["safe"][idx],
+                                         teacher["maximum"][idx], predictor, cfg, head, policy, trace)]
 
 def call_savings_summary(question_means):
     groups = {"all": question_means,
@@ -2608,33 +2618,44 @@ def call_savings_summary(question_means):
     return result
 
 
+def question_summary(group):
+    """One question's rows averaged over its zero-shot orders, so each question counts once."""
+    return {"correct": np.mean([r["correct"] for r in group]),
+            "cost": np.mean([r["cost"] for r in group]),
+            "saved": np.mean([r["saved_fraction"] for r in group]),
+            "call_counts": {unit: np.mean([r["call_counts"][unit] for r in group])
+                            for unit in ("solver_calls", "total_calls")},
+            "full_call_counts": {unit: np.mean([r["full_call_counts"][unit] for r in group])
+                                 for unit in ("solver_calls", "total_calls")},
+            "savings_by_stop": {unit: {stop: np.mean([
+                (r["full_call_counts"][unit] - r["call_counts"][unit])
+                if savings_stop_category(r) == stop else 0. for r in group])
+                for stop in ("correct_max", "wrong_max", "other")}
+                for unit in ("solver_calls", "total_calls")},
+            "has_max": group[0]["has_max"],
+            "exact_max": np.mean([r["exact_max"] for r in group]) if group[0]["has_max"] else None,
+            "predicted_max": np.mean([r["reason"] == "predicted_max" for r in group]),
+            "max_recognized": np.mean([r.get("first_max_recognition") is not None or
+                                       r["reason"] == "predicted_max" for r in group]),
+            "wrong_predicted_max": np.mean([r["reason"] == "predicted_max" and not r["exact_max"] for r in group]),
+            "false_max": np.mean([r["reason"] == "predicted_max" for r in group])
+            if not group[0]["has_max"] else None}
+
+
 def policy_summary(rows):
     if not rows:
         return None
     by_question = {}
     for row in rows:
         by_question.setdefault(row["uid"], []).append(row)
-    means = [{"correct": np.mean([r["correct"] for r in group]),
-              "cost": np.mean([r["cost"] for r in group]),
-              "saved": np.mean([r["saved_fraction"] for r in group]),
-              "call_counts": {unit: np.mean([r["call_counts"][unit] for r in group])
-                              for unit in ("solver_calls", "total_calls")},
-              "full_call_counts": {unit: np.mean([r["full_call_counts"][unit] for r in group])
-                                   for unit in ("solver_calls", "total_calls")},
-              "savings_by_stop": {unit: {stop: np.mean([
-                  (r["full_call_counts"][unit] - r["call_counts"][unit])
-                  if savings_stop_category(r) == stop else 0. for r in group])
-                  for stop in ("correct_max", "wrong_max", "other")}
-                  for unit in ("solver_calls", "total_calls")},
-              "has_max": group[0]["has_max"],
-              "exact_max": np.mean([r["exact_max"] for r in group]) if group[0]["has_max"] else None,
-              "predicted_max": np.mean([r["reason"] == "predicted_max" for r in group]),
-              "max_recognized": np.mean([r.get("first_max_recognition") is not None or
-                                         r["reason"] == "predicted_max" for r in group]),
-              "wrong_predicted_max": np.mean([r["reason"] == "predicted_max" and not r["exact_max"] for r in group]),
-              "false_max": np.mean([r["reason"] == "predicted_max" for r in group])
-              if not group[0]["has_max"] else None}
-             for group in by_question.values()]
+    return summarize_questions([question_summary(group) for group in by_question.values()],
+                               Counter(r["reason"] for r in rows))
+
+
+def summarize_questions(means, reasons):
+    """A method's report from its per-question means (question_summary) and stop-reason counts."""
+    if not means:
+        return None
     with_max = [m for m in means if m["has_max"]]
     without_max = [m for m in means if not m["has_max"]]
     costs = np.asarray([m["cost"] for m in means])
@@ -2652,7 +2673,7 @@ def policy_summary(rows):
             "p95_cost": float(np.percentile(costs, 95)),
             "mean_saved_fraction": float(np.mean([m["saved"] for m in means])),
             "call_savings": call_savings_summary(means),
-            "stop_reasons": dict(Counter(r["reason"] for r in rows))}
+            "stop_reasons": dict(reasons)}
 
 
 def savings_stop_category(row):
@@ -2660,48 +2681,56 @@ def savings_stop_category(row):
         return "other"
     return "correct_max" if row["exact_max"] else "wrong_max"
 
+def question_continuation(record, scores, safe, maximum, predictor, cfg, head):
+    """One question's greedy continuation toward every reference goal, over all zero-shot orders."""
+    full_cfg = copy.deepcopy(cfg)
+    full_cfg.max_cost = None
+    question_prefix, question_lost = [], []
+    question_final_prefix, question_complete = [], []
+    for zero_order in permutations(range(cfg.zero_shots)):
+        scenario, _, scenario_safe, scenario_maximum = permute_zero_shots(
+            record, scores, safe, maximum, zero_order, cfg)
+        order = permuted_reference_order(scores, zero_order, cfg)
+        _, full = predictor.predict(scenario, State((1 << cfg.n)-1, (1 << cfg.k)-1), full_cfg)
+        state, best_prefix, lost = State(), 0, False
+        while True:
+            hidden, probabilities = predictor.predict(scenario, state)
+            flags = [goal_condition(rank, order, scenario_safe, scenario_maximum, probabilities,
+                                    full, state, cfg) for rank in range(cfg.n)]
+            prefix = next((rank for rank, good in enumerate(flags) if not good), cfg.n)
+            if prefix < best_prefix:
+                lost = True
+            best_prefix = max(best_prefix, prefix)
+            valid = valid_actions(state, cfg)
+            if not valid.any() or prefix == cfg.n:
+                break
+            state = advance(state, greedy_action(head, hidden, valid, predictor.device), cfg)
+        question_prefix.append(best_prefix)
+        question_lost.append(lost)
+        question_final_prefix.append(prefix)
+        question_complete.append(state.candidate_mask == (1 << cfg.n)-1 and
+                                 state.evaluator_mask == (1 << cfg.k)-1)
+    return {"reached": float(np.mean(question_prefix)), "lost": float(np.mean(question_lost)),
+            "final_prefix": float(np.mean(question_final_prefix)),
+            "complete": float(np.mean(question_complete)),
+            "per_rank": [float(np.mean(np.asarray(question_prefix) >= rank))
+                         for rank in range(1, cfg.n+1)],
+            "per_rank_final": [float(np.mean(np.asarray(question_final_prefix) >= rank))
+                               for rank in range(1, cfg.n+1)]}
+
+
 def continuation_diagnostic(records, ids, teacher, predictor, cfg, head):
-    reached, broken = [], []
-    final_prefixes, completed = [], []
-    per_rank, per_rank_final = [], []
-    for idx in ids:
-        question_prefix, question_lost = [], []
-        question_final_prefix, question_complete = [], []
-        for zero_order in permutations(range(cfg.zero_shots)):
-            record, _, safe, maximum = permute_zero_shots(
-                records[idx], teacher["scores"][idx], teacher["safe"][idx],
-                teacher["maximum"][idx], zero_order, cfg)
-            order = permuted_reference_order(teacher["scores"][idx], zero_order, cfg)
-            full_cfg = copy.deepcopy(cfg)
-            full_cfg.max_cost = None
-            _, full = predictor.predict(record, State((1 << cfg.n)-1, (1 << cfg.k)-1), full_cfg)
-            state, best_prefix, lost = State(), 0, False
-            while True:
-                hidden, probabilities = predictor.predict(record, state)
-                flags = [goal_condition(rank, order, safe, maximum, probabilities,
-                                        full, state, cfg) for rank in range(cfg.n)]
-                prefix = next((rank for rank, good in enumerate(flags) if not good), cfg.n)
-                if prefix < best_prefix:
-                    lost = True
-                best_prefix = max(best_prefix, prefix)
-                valid = valid_actions(state, cfg)
-                if not valid.any() or prefix == cfg.n:
-                    break
-                state = advance(state, greedy_action(head, hidden, valid, predictor.device), cfg)
-            question_prefix.append(best_prefix)
-            question_lost.append(lost)
-            question_final_prefix.append(prefix)
-            question_complete.append(state.candidate_mask == (1 << cfg.n)-1 and
-                                     state.evaluator_mask == (1 << cfg.k)-1)
-        reached.append(float(np.mean(question_prefix)))
-        broken.append(float(np.mean(question_lost)))
-        final_prefixes.append(float(np.mean(question_final_prefix)))
-        completed.append(float(np.mean(question_complete)))
-        per_rank.append([float(np.mean(np.asarray(question_prefix) >= rank))
-                          for rank in range(1, cfg.n+1)])
-        per_rank_final.append([float(np.mean(np.asarray(question_final_prefix) >= rank))
-                               for rank in range(1, cfg.n+1)])
-    return {"n": len(ids), "orders_per_question": math.factorial(cfg.zero_shots),
+    return continuation_summary([question_continuation(records[idx], teacher["scores"][idx],
+                                                       teacher["safe"][idx], teacher["maximum"][idx],
+                                                       predictor, cfg, head) for idx in ids], cfg)
+
+
+def continuation_summary(questions, cfg):
+    """Continuation diagnostics over per-question results, each question weighted equally."""
+    reached, broken = [q["reached"] for q in questions], [q["lost"] for q in questions]
+    final_prefixes, completed = [q["final_prefix"] for q in questions], [q["complete"] for q in questions]
+    per_rank, per_rank_final = [q["per_rank"] for q in questions], [q["per_rank_final"] for q in questions]
+    return {"n": len(questions), "orders_per_question": math.factorial(cfg.zero_shots),
             "mean_rank_prefix_reached": float(np.mean(reached)) if reached else None,
             "per_rank_reach": np.mean(per_rank, axis=0).tolist() if per_rank else None,
             "mean_final_rank_prefix": float(np.mean(final_prefixes)) if final_prefixes else None,
@@ -2732,15 +2761,84 @@ def stage_snapshot_audit(records, ids, teacher, predictor, cfg):
     metrics["augmented_stress"] = snapshot_summary(stress, sy, cfg)
     return metrics
 
-def policy_report(records, ids, teacher, predictor, cfg, head, title):
+
+# One line per evaluation rollout; earlier code wrote every traced row to
+# final_trajectories.jsonl instead, pooled-audit questions twice.
+ROLLOUT_FILE = "final_rollouts.jsonl"
+LEGACY_TRAJECTORY_FILE = "final_trajectories.jsonl"
+
+
+def rollout_outcome(method, row):
+    """What only the models decide in an evaluation rollout; Stage 4 saves nothing else.
+
+    Costs, call counts, correctness, and MAX recovery follow from these fields with the
+    records, teacher labels, and configuration; ranked lists and traces are recomputed
+    by repeating the rollout (question_rollout_audit).
+    """
+    return {"uid": row["uid"], "method": method, "zero_shot_order": row["zero_shot_order"],
+            "candidate_mask": row["candidate_mask"], "evaluator_mask": row["evaluator_mask"],
+            "selected": row["selected"], "reason": row["reason"],
+            "final_max_recognized": row["final_max_recognized"]}
+
+
+def question_report(record, scores, safe, maximum, predictor, cfg, head, sink=None):
+    """Roll out one question once per method and zero-shot order; keep only report inputs.
+
+    Each rollout's outcome streams to `sink` as it is produced. The question keeps its
+    per-method means (question_summary), stop reasons and per-order correctness for
+    paired intervals, and its continuation diagnostic; untraced rows are discarded.
+    """
+    methods = {}
+    for method in evaluation_methods(cfg):
+        rows = question_rollouts(record, scores, safe, maximum, predictor, cfg, head, method)
+        if sink is not None:
+            sink.writelines(json.dumps(rollout_outcome(method, row), allow_nan=False) + "\n"
+                            for row in rows)
+        methods[method] = {"means": question_summary(rows),
+                           "reasons": tuple(row["reason"] for row in rows),
+                           "correct": tuple(row["correct"] for row in rows)}
+    return {"methods": methods,
+            "continuation": question_continuation(record, scores, safe, maximum, predictor, cfg, head)}
+
+
+def paired_top1(questions, cfg):
+    """Learned minus each baseline's top-1, paired within questions as in paired_interval."""
+    return {baseline: bootstrap_difference(
+                [np.mean([x - y for x, y in zip(question["methods"]["supervised"]["correct"],
+                                                question["methods"][baseline]["correct"])])
+                 for question in questions], cfg.bootstrap_samples, cfg.seed)
+            for baseline in evaluation_methods(cfg) if baseline != "supervised"}
+
+
+def policy_report(records, ids, teacher, predictor, cfg, head, title, evaluated=None, sink=None):
+    """One report's acquisition comparison and its questions' report inputs, in `ids` order.
+
+    `evaluated` maps question indices to question_report results, so reports that share
+    questions (the pooled audit and each benchmark) roll every question out once per
+    method and zero-shot order. New rollouts stream their outcomes to `sink`.
+    """
     section(title)
     if not ids:
         print("No eligible questions; metrics are unavailable.")
-        return None, {}
-    rows = {name: evaluate_policy(records, ids, teacher, predictor, cfg, head,
-                                  policy=name, trace=True)
-            for name in evaluation_methods(cfg)}
-    summary = {name: policy_summary(data) for name, data in rows.items()}
+        return None, []
+    evaluated = {} if evaluated is None else evaluated
+    missing = [idx for idx in ids if idx not in evaluated]
+    shared = f"; {len(ids) - len(missing)} reuse earlier rollouts" if len(missing) < len(ids) else ""
+    print(f"Stage 4 rollouts: {len(missing)} questions x {math.factorial(cfg.zero_shots)} zero-shot "
+          f"orders x {len(evaluation_methods(cfg))} methods{shared}.", flush=True)
+    started = last_print = time.monotonic()
+    for position, idx in enumerate(missing, 1):
+        evaluated[idx] = question_report(records[idx], teacher["scores"][idx], teacher["safe"][idx],
+                                         teacher["maximum"][idx], predictor, cfg, head, sink)
+        last_print = decision_progress("Stage 4 rollouts", position, len(missing), started, last_print, cfg)
+    questions = [evaluated[idx] for idx in ids]
+    summary = {}
+    for name in evaluation_methods(cfg):
+        reasons = Counter()
+        for question in questions:  # In row order, as policy_summary counts them.
+            reasons.update(question["methods"][name]["reasons"])
+        summary[name] = summarize_questions([question["methods"][name]["means"] for question in questions],
+                                            reasons)
     print(f"{'Method':<26} | {'Top-1 correct':>13} | {'Exact MAX':>9} | {'Mean cost':>10} | {'Saved':>7}")
     for name, item in summary.items():
         exact = "--" if item["exact_max_recovery"] is None else f"{item['exact_max_recovery']:.1%}"
@@ -2782,7 +2880,40 @@ def policy_report(records, ids, teacher, predictor, cfg, head, title):
                                 "signals": ["global_MAX", "global_SAFE", "selected_MAX", "selected_SAFE"]},
             "call_accounting": "Recorded generation, baseline/cross measurement solves, and their grading calls; excludes retrieval and target-answer grading.",
             "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg),
-            "continuation": continuation_diagnostic(records, ids, teacher, predictor, cfg, head)}, rows
+            "continuation": continuation_summary([question["continuation"] for question in questions],
+                                                 cfg)}, questions
+
+
+def question_rollout_audit(records, idx, teacher, predictor, cfg, head, out, benchmark):
+    """Rebuild one question's traced Stage 4 rollouts, checked against its saved outcomes.
+
+    Stage 4 saves only rollout_outcome fields. Traces (every prediction check with its
+    MAX/SAFE signals, every acquisition and its cost), ranked lists, costs, and
+    correctness are deterministic, so they are recomputed here (use the reporting
+    device; another device may round probabilities differently and fail the check).
+    """
+    record, saved = records[idx], {}
+    needle = json.dumps(record.uid)
+    with (Path(out) / ROLLOUT_FILE).open(encoding="utf-8") as handle:
+        for line in handle:
+            if needle in line:
+                outcome = json.loads(line)
+                if outcome["uid"] == record.uid:
+                    saved[outcome["method"], tuple(outcome["zero_shot_order"])] = outcome
+    rows = []
+    for method in evaluation_methods(cfg):
+        for row in question_rollouts(record, teacher["scores"][idx], teacher["safe"][idx],
+                                     teacher["maximum"][idx], predictor, cfg, head, method, trace=True):
+            if saved.pop((method, tuple(row["zero_shot_order"])), None) != rollout_outcome(method, row):
+                raise ValueError(f"Recomputed Stage 4 rollout of {record.uid} ({method}, zero-shot order "
+                                 f"{row['zero_shot_order']}) differs from {ROLLOUT_FILE}. Rerun report() "
+                                 "after changing evaluation settings, and audit on the reporting device.")
+            rows.append({"benchmark": benchmark, "method": method, **row})
+    if saved:
+        raise ValueError(f"{ROLLOUT_FILE} has rollouts of {record.uid} that this configuration does not "
+                         f"evaluate: {sorted(saved)}. Rerun report() after changing evaluation settings.")
+    return {"uid": record.uid, "rows": rows}
+
 
 def hub_access_token():
     """A Hub token from the environment, Kaggle Secrets, or an existing login; never printed."""
@@ -2829,7 +2960,9 @@ class OutputSync:
     folder, Stages 0-2 load their completed checkpoints, and Stage 3 continues
     from its completed questions and epochs. Uploads skip unchanged files by
     content hash, never include `.tmp` files, and remove per-question label
-    files from the mirror once a role is merged. Run one session per repo.
+    files from the mirror once a role is merged. The traced Stage 4 rows of
+    earlier code (final_trajectories.jsonl, derived and superseded) are never
+    downloaded and leave the mirror at the next upload. Run one session per repo.
     """
     def __init__(self, out, repo, interval_minutes, api=None):
         self.out, self.repo, self.interval = Path(out), repo, interval_minutes * 60
@@ -2844,7 +2977,7 @@ class OutputSync:
         if not self.api.repo_exists(self.repo, repo_type="dataset"):
             return "new"
         self.api.snapshot_download(repo_id=self.repo, repo_type="dataset", local_dir=str(self.out),
-                                   ignore_patterns=[".gitattributes"])
+                                   ignore_patterns=[".gitattributes", LEGACY_TRAJECTORY_FILE])
         shutil.rmtree(self.out / ".cache", ignore_errors=True)  # Download bookkeeping only.
         return "pulled"
 
@@ -2865,7 +2998,8 @@ class OutputSync:
                 self.api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
                 self.api.upload_folder(folder_path=str(self.out), repo_id=self.repo, repo_type="dataset",
                                        commit_message=message, ignore_patterns=["*.tmp"],
-                                       delete_patterns=["decision_labels/*/*.pt", "decision_shards/*/*"])
+                                       delete_patterns=["decision_labels/*/*.pt", "decision_shards/*/*",
+                                                        LEGACY_TRAJECTORY_FILE])
             except Exception as exc:  # Network, rate limit, or credentials; local files stay complete.
                 error = exc
                 continue
@@ -2959,7 +3093,8 @@ class Workflow:
         # Names the embedded code: a notebook from before compact labels wrote audit shards.
         print(f"Implementation revision {PIPELINE_REVISION}; Stage 3 stores compact labels "
               f"(schema {DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question) "
-              "and never writes audit shards.", flush=True)
+              "and never writes audit shards; Stage 4 rolls out each question once and saves "
+              f"compact outcomes to {ROLLOUT_FILE}, not trajectories.", flush=True)
         cache_path = self.out / "compact_records.pt"
         if self.cfg.resume and cache_path.exists():
             cache = load_checkpoint(cache_path)
@@ -3080,6 +3215,13 @@ class Workflow:
         return decision_question_audit(self.records, self.splits, self.teacher, self.predictor,
                                        self.cfg, self.out, role, position)
 
+    def rollout_audit(self, name, position):
+        """Traced Stage 4 rollouts of one report question (`audit` or a benchmark), recomputed."""
+        if not hasattr(self, "head"):
+            self.train_decision_head()
+        return question_rollout_audit(self.records, self.splits[name][position], self.teacher,
+                                      self.predictor, self.cfg, self.head, self.out, name)
+
     def report(self):
         if not hasattr(self, "head"):
             self.train_decision_head()
@@ -3090,28 +3232,30 @@ class Workflow:
                                          "action_names": action_names(self.cfg)}}
         external = [Path(path).stem for path in self.cfg.test_files]
         names = ["audit"] + external
-        trajectory_path = self.out / "final_trajectories.jsonl"
-        tmp = trajectory_path.with_suffix(".jsonl.tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
-            for name in names:
-                ids = self.splits[name]
-                ranking = teacher_report(self.records, ids, self.cfg,
-                                         self.teacher["scores"], self.heuristics,
-                                         f"RANKING | {name} ({len(ids)} eligible questions)")
-                policy, rows = policy_report(self.records, ids, self.teacher, self.predictor,
-                                             self.cfg, self.head,
-                                             f"ACQUISITION | {name}")
-                results[name] = {"ranking": ranking, "adaptive": policy}
-                if rows:
-                    results[name]["paired_top1"] = {
-                        baseline: paired_interval(rows["supervised"], rows[baseline],
-                                                   self.cfg.bootstrap_samples, self.cfg.seed)
-                        for baseline in rows if baseline != "supervised"}
-                for method, method_rows in rows.items():
-                    for row in method_rows:
-                        handle.write(json.dumps({"benchmark": name, "method": method, **row},
-                                                allow_nan=False) + "\n")
-        os.replace(tmp, trajectory_path)
+        rollout_path = self.out / ROLLOUT_FILE
+        tmp = rollout_path.with_suffix(".jsonl.tmp")
+        # Pooled audit questions are also benchmark questions: each question is rolled
+        # out once, and only its summary inputs stay in RAM until the last report.
+        evaluated = {}
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                for name in names:
+                    ids = self.splits[name]
+                    ranking = teacher_report(self.records, ids, self.cfg,
+                                             self.teacher["scores"], self.heuristics,
+                                             f"RANKING | {name} ({len(ids)} eligible questions)")
+                    policy, questions = policy_report(self.records, ids, self.teacher, self.predictor,
+                                                      self.cfg, self.head, f"ACQUISITION | {name}",
+                                                      evaluated, handle)
+                    results[name] = {"ranking": ranking, "adaptive": policy}
+                    if questions:
+                        results[name]["paired_top1"] = paired_top1(questions, self.cfg)
+        except BaseException:
+            tmp.unlink(missing_ok=True)  # Stage 4 restarts; partial outcomes are never reused.
+            raise
+        os.replace(tmp, rollout_path)
+        # Superseded: earlier code wrote every traced row there, pooled-audit rows twice.
+        (self.out / LEGACY_TRAJECTORY_FILE).unlink(missing_ok=True)
         available = [name for name in external if results[name]["adaptive"] is not None]
         if available:
             results["external_macro"] = {
@@ -3131,10 +3275,12 @@ class Workflow:
                         for name in available]))}
                     for method in evaluation_methods(self.cfg)}}
         atomic_json(self.out / "results.json", results)
-        print(f"Saved reports, trajectories, checkpoints, and inference bundle to {self.out}")
+        print(f"Saved reports, rollout outcomes, checkpoints, and inference bundle to {self.out}")
+        print(f"{ROLLOUT_FILE}: one line per question, zero-shot order, and method; "
+              "WORK.rollout_audit(name, position) recomputes a question's full trajectories.")
         print("These are cached historical outcomes, not live API or Kaggle evidence.")
         self.results = results
-        self.push("Stage 4 complete: reports and trajectories")
+        self.push("Stage 4 complete: reports and rollout outcomes")
         return results
 
 

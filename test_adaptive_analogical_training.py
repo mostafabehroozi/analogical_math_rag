@@ -900,11 +900,17 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
             snapshot_training_ids.append(list(args[1]))
         return build_snapshots(*args, **kwargs)
     monkeypatch.setattr(a, "build_snapshots", track_snapshot_training)
+    rolled_out, rollout = [], a.rollout
+    monkeypatch.setattr(a, "rollout", lambda record, *args, **kwargs: rolled_out.append(record.uid) or
+                        rollout(record, *args, **kwargs))
     work = a.run_pipeline(cfg)
+    monkeypatch.setattr(a, "rollout", rollout)
     # Stage 0 names the embedded code before any stage trains, so a stale notebook is visible.
+    log = capsys.readouterr().out
     assert (f"Implementation revision {a.PIPELINE_REVISION}; Stage 3 stores compact labels "
             f"(schema {a.DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question)"
-            ) in capsys.readouterr().out
+            ) in log
+    assert f"Stage 4 rolls out each question once and saves compact outcomes to {a.ROLLOUT_FILE}" in log
     assert snapshot_training_ids and all(ids == work.splits["supervised"] for ids in snapshot_training_ids)
     assert set(work.results["external"]["adaptive"]["policies"]) == {
         "full", "fixed", "fixed_evaluators_first", "fixed_zero_shots_first", "supervised"}
@@ -976,7 +982,45 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
         assert protocol["dev_audit_overlap_questions"] == 0
         assert protocol["external_files_used_for_model_selection"] == []
     assert (tmp_path/"run"/"results.json").exists()
-    assert (tmp_path/"run"/"final_trajectories.jsonl").exists()
+    assert not (tmp_path/"run"/a.LEGACY_TRAJECTORY_FILE).exists()
+    rollout_path = tmp_path/"run"/a.ROLLOUT_FILE
+    rollouts = [json.loads(line) for line in rollout_path.read_text(encoding="utf-8").splitlines()]
+    reported = {i for name in ("audit", "external", "second") for i in work.splits[name]}
+    # Pooled audit questions are benchmark questions too; each rollout is saved once, untraced.
+    keys = [(row["uid"], row["method"], tuple(row["zero_shot_order"])) for row in rollouts]
+    assert len(keys) == len(set(keys)) == len(rolled_out) == len(reported) * 2 * len(a.evaluation_methods(cfg))
+    assert {row["uid"] for row in rollouts} == {work.records[i].uid for i in reported}
+    assert all(set(row) == {"uid", "method", "zero_shot_order", "candidate_mask", "evaluator_mask",
+                            "selected", "reason", "final_max_recognized"} for row in rollouts)
+    # Reports built from per-question summaries equal the per-report computation from traced rows.
+    for name in ("audit", "external", "second"):
+        ids = work.splits[name]
+        rows = {method: a.evaluate_policy(work.records, ids, work.teacher, work.predictor, cfg,
+                                          work.head, policy=method, trace=True)
+                for method in a.evaluation_methods(cfg)}
+        assert work.results[name]["adaptive"]["policies"] == {
+            method: a.policy_summary(method_rows) for method, method_rows in rows.items()}
+        assert work.results[name]["paired_top1"] == {
+            baseline: a.paired_interval(rows["supervised"], rows[baseline], cfg.bootstrap_samples, cfg.seed)
+            for baseline in rows if baseline != "supervised"}
+        assert work.results[name]["adaptive"]["continuation"] == a.continuation_diagnostic(
+            work.records, ids, work.teacher, work.predictor, cfg, work.head)
+    # Full trajectories are recomputed on demand and checked against the saved outcomes.
+    external_uid = work.records[work.splits["external"][0]].uid
+    traced = work.rollout_audit("external", 0)
+    assert traced["uid"] == external_uid
+    assert [(row["method"], row["zero_shot_order"]) for row in traced["rows"]] == [
+        (method, list(order)) for method in a.evaluation_methods(cfg) for order in ((0, 1), (1, 0))]
+    assert all(row["benchmark"] == "external" and (
+        row["trajectory"][-1]["reason"] == row["reason"] if row["method"] != "full" else
+        not row["trajectory"] and row["reason"] == "full_budget_reference") for row in traced["rows"])
+    saved_text = rollout_path.read_text(encoding="utf-8")
+    tampered = next(row for row in rollouts if row["uid"] == external_uid)
+    rollout_path.write_text(saved_text.replace(json.dumps(tampered), json.dumps(
+        {**tampered, "candidate_mask": tampered["candidate_mask"] ^ 1})), encoding="utf-8")
+    with pytest.raises(ValueError, match="differs from final_rollouts.jsonl"):
+        work.rollout_audit("external", 0)
+    rollout_path.write_text(saved_text, encoding="utf-8")
     for fold in work.teacher["folds"]:
         assert not set(fold["heldout_ids"]) & (set(fold["train_ids"]) |
                                                set(fold["validation_ids"]))
@@ -999,8 +1043,15 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     comparison_cfg.fixed_acquisition_orders = {"fixed_short": ["ZS1", "R1", "OS1"]}
     comparison = a.Workflow(comparison_cfg).prepare().train_teacher().train_snapshot().train_decision_head()
     assert comparison.decision_checkpoint["dataset_fingerprint"] == work.decision_checkpoint["dataset_fingerprint"]
+    # Earlier code's traced rows are superseded and removed once the new outcomes are saved.
+    (tmp_path/"run"/a.LEGACY_TRAJECTORY_FILE).write_text('{"trajectory": []}\n', encoding="utf-8")
     comparison_report = comparison.report()["external"]["adaptive"]
     assert set(comparison_report["policies"]) == {"full", "fixed_short", "supervised"}
+    assert not (tmp_path/"run"/a.LEGACY_TRAJECTORY_FILE).exists()
+    assert len(comparison.rollout_audit("external", 0)["rows"]) == 2 * 3
+    # Saved outcomes belong to the evaluation settings of the last report.
+    with pytest.raises(ValueError, match="differs from final_rollouts.jsonl"):
+        work.rollout_audit("external", 0)
     # A missing role file is rebuilt; the other role's saved labels are reused untouched.
     policy_file, dev_file = (tmp_path/"run"/manifest["roles"][role] for role in ("policy", "dev"))
     dev_mtime = dev_file.stat().st_mtime_ns

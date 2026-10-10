@@ -183,12 +183,15 @@ def test_output_sync_pushes_changed_files_pulls_into_empty_folders_and_survives_
     (out / "decision_labels" / "policy.pt").write_bytes(b"merged")
     assert sync.push("merged", force=True) is True
     assert set(hub.repos["user/run"]) == {"a.json", "b.json", "decision_labels/policy.pt"}
-    # A fresh session pulls the mirror into an empty folder without download bookkeeping.
+    # A fresh session pulls the mirror into an empty folder without download bookkeeping,
+    # and without the traced Stage 4 rows an earlier revision mirrored (derived, superseded).
+    hub.repos["user/run"]["final_trajectories.jsonl"] = b"traced rows"
     fresh = tmp_path / "fresh"
     pulled = a.OutputSync(fresh, "user/run", 1000, api=hub)
     assert pulled.pull() == "pulled"
     assert (fresh / "decision_labels" / "policy.pt").read_bytes() == b"merged"
     assert not (fresh / ".cache").exists() and not (fresh / "partial.pt.tmp").exists()
+    assert not (fresh / "final_trajectories.jsonl").exists()
     assert pulled.pull() == "local"
     # Failures never discard local work: periodic pushes warn, required pushes raise.
     monkeypatch.setattr(a.time, "sleep", lambda seconds: None)
@@ -201,6 +204,7 @@ def test_output_sync_pushes_changed_files_pulls_into_empty_folders_and_survives_
         sync.push("needed", force=True, required=True)
     hub.fail_uploads = 2
     assert sync.push("retried", force=True) is True and sync.last_error is None
+    assert set(hub.repos["user/run"]) == {"a.json", "b.json", "decision_labels/policy.pt"}
     assert hub.messages == ["first", "interval elapsed", "merged", "retried"]
     assert "4 uploads" in sync.describe() and "last upload: retried" in sync.describe()
 
@@ -262,7 +266,7 @@ def test_pipeline_resumes_from_the_mirror_in_a_fresh_session(tmp_path, monkeypat
         "decision_dataset_manifest.json", "decision_label_coverage.json",
         "decision_labels/policy.pt", "decision_labels/dev.pt",
         "decision_head_progress.pt", "decision_head_completed.pt", "inference_bundle.pt",
-        "final_trajectories.jsonl", "results.json"}
+        "final_rollouts.jsonl", "results.json"}
     for relative, data in remote.items():
         assert (tmp_path / "run" / relative).read_bytes() == data
     assert hub.messages[0].startswith("Stage 0") and hub.messages[-1].startswith("Stage 4")
