@@ -19,9 +19,9 @@ teacher ranks, correctness labels, or future measurements.
    predictions from the fold model that did not train on that question;
    development questions use the final teacher. The final saved teacher need
    not reproduce the reference ranking used for each training question.
-   Its loss masks absent candidates. Training includes complete
-   observations, candidate/evaluator masking, individual missing measurements,
-   slot permutations, and training-only hidden-source examples.
+   Its loss masks absent candidates. Training visits every presence state
+   under every zero-shot order (see "Exhaustive Stage 1-2 training views");
+   only the complete-state predictions define the ranking.
 2. **Stage 2: recognition predictor.** A second ResNet uses the same observation
    representation. It predicts eight correctness values, eight SAFE memberships,
    eight MAX memberships, and global SAFE/MAX presence: 26 outputs. Its
@@ -32,8 +32,59 @@ teacher ranks, correctness labels, or future measurements.
    acquisition from the frozen hidden vector. It is supervised with masked
    cross-entropy. There is no STOP output, reward, replay buffer, or Bellman
    target. Stage 3 uses complete measurements for coherent structural states;
-   hidden-source and individual missing-measurement augmentations belong to
-   Stages 1 and 2 only.
+   states with a one-shot whose evaluator is hidden belong to Stages 1 and 2
+   only.
+
+## Exhaustive Stage 1-2 training views
+
+Stages 1 and 2 train on every view of every training question; nothing is
+sampled. A view is a presence state seen under one zero-shot order:
+
+- **Presence states:** every nonempty candidate subset with every evaluator
+  subset, `(2**8 - 1) * 2**5 = 8,160` by default. These are all states that
+  hiding candidates or evaluators can produce, including the 1,912 coherent
+  structural states of Stage 3 and one-shots whose evaluator is hidden.
+- **Zero-shot orders:** all `3! = 6`, so each question has
+  `8,160 * 6 = 48,960` views. Candidate IDs, labels, SAFE/MAX, and
+  measurements move together, exactly as in Stage 3.
+- **Measurements:** complete for every present candidate/evaluator pair.
+  Individual failed or missing measurements (about `3**45` combinations per
+  state) and evaluator shuffles cannot be enumerated and are not used; the
+  offline rollouts and Stage 3 never contain them either.
+
+The partial states only train the models. The teacher's reference ranking,
+its out-of-fold scores, and the SAFE/MAX labels built from them always come
+from **complete-state** predictions, and teacher checkpoints are selected by
+complete-state development AP. Stage 2 is selected and calibrated on every
+reachable runtime state (189 by default) of every development question under
+every zero-shot order.
+
+One epoch visits every view once: about 98 million views for 2,000 training
+questions. The defaults are therefore `batch_size=16384`,
+`teacher_epochs=snapshot_epochs=10`, and `dev_checks_per_epoch=8`. Development
+checks are spread evenly through each epoch, `patience` counts checks without
+improvement in Stages 1-2 (epochs in Stage 3), and the selected checkpoint's
+position is a fractional epoch such as `1.375`. The training loop prints one
+line per epoch with the latest check, the best position, and patience.
+
+**Memory and disk.** No view is stored, on disk or in RAM. A shared state
+table (about 7 MiB) holds the state-only observation bytes and masks; each
+question adds its measurements, labels, and SAFE/MAX under each order (under
+1 KiB). `SnapshotViews` assembles each minibatch on the selected device from
+those tensors, bit-identical to `observation(..., allow_hidden_source=True)`.
+Each epoch shuffles question order, then shuffles the views of about 40
+questions at a time (a 16 MiB permutation), so every minibatch mixes dozens of
+questions without a 98-million-entry permutation. Development metrics,
+temperature calibration, and the Stage 4 snapshot diagnostic stream per-batch
+sums; no logits are kept. Adam uses its fused CUDA kernel.
+
+Measured on a local RTX 3050 Ti laptop GPU with 120 synthetic default-geometry
+questions: about **1.8 million views/s** for Stage 2 training including its
+development checks and calibration, a flat host RSS (+1 MiB after CUDA
+initialization), and 180 MiB peak CUDA memory. At that rate one epoch takes
+about 1 minute for Stage 2 and about 4 minutes for Stage 1's five folds plus
+final teacher, so the 10-epoch maximum is under an hour for both stages before
+early stopping. Kaggle hardware will differ.
 
 SAFE is the leading uninterrupted run of actually correct candidates in the
 teacher order; MAX is its first member. If rank one is wrong, both are empty.
@@ -378,9 +429,12 @@ while writing `decision_shards/<role>/<position>_<hash>.pt`, and its Stage 3
 progress reads `building/validating N question shards`; the current code has
 neither that call nor that directory as a write target. Stage 0 of the current
 workflow prints the implementation revision and the label schema
-(`Implementation revision 5; Stage 3 stores compact labels (schema 5, one byte
+(`Implementation revision 6; Stage 3 stores compact labels (schema 5, one byte
 per row plus one bitmap per question)`) before any stage trains, so the running
-code can be checked in the first minute rather than hours later.
+code can be checked in the first minute rather than hours later. The same line
+ends with `Stages 1-2 train on every presence state under every zero-shot order
+(8,160 x 6 views per question)`; a copy without it still samples random
+snapshots.
 
 **Recovering such a run.** Keep the same `output_dir`, input files, and
 training configuration with `resume=True`. Constructing `Workflow(CFG)` on an
@@ -396,7 +450,9 @@ merged schema-4 role file is rewritten once. Only missing questions are built,
 and a matching schema-3 or schema-4 manifest is upgraded in place. Head
 training resumes from `decision_head_progress.pt` with the same row order.
 Revision-4 runs cannot resume under the revision-5 action and label contract;
-start revision 5 in a new output directory.
+start revision 5 in a new output directory. These conversions keep revision-5
+runs going under revision-5 code; revision 6 retrains Stages 1-2 and starts in
+a new output directory (see Versions).
 
 A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
 write failure, commonly caused by exhausted disk space or a storage quota.
@@ -640,9 +696,13 @@ five methods, and a small trained model, one local CPU process per version:
 | Peak RSS increase during `report()` | 1,230 MiB | 142 MiB |
 | Time | about 20 minutes | about 9 minutes |
 
-`results.json` was byte-identical. About 105 MiB of the remaining peak is the
-unchanged per-report snapshot diagnostic. The old writer also needed room for
-two copies of its file when an earlier one was present.
+`results.json` was byte-identical. About 105 MiB of the remaining peak was the
+per-report snapshot diagnostic, which then held sampled observations and
+logits. It now streams per-question sums over every reachable state and, under
+`every_presence_state`, over all 8,160 presence states, each under every
+zero-shot order; like the rollouts, each question's sums are computed once and
+shared by the pooled audit and its benchmark report. The old writer also needed
+room for two copies of its file when an earlier one was present.
 
 Earlier revisions wrote `final_trajectories.jsonl`: every traced row with its
 group hash, ranked list, call-count dictionaries, and per-step signals, about
@@ -656,12 +716,15 @@ trajectories`; a notebook copy without it still writes the traced file.
 
 ### Versions
 
-This implementation uses **revision 5**, **contract/inference schema 4**,
+This implementation uses **revision 6**, **contract/inference schema 4**,
 **decision-dataset schema 4** (the label fingerprint, without input log
 paths; schema-3 files are upgraded in place), and **label-file
-schema 5**. Older action/state bundles and checkpoints are
-rejected. Use the new default output directory
-`/kaggle/working/adaptive_analogical_shared_training_v5_run` for a fresh run; old runs are
-not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
+schema 5**. Revision 6 trains Stages 1-2 on exhaustive views instead of random
+snapshots, so their checkpoints, and the Stage 3 labels built from the frozen
+predictor, differ from revision 5: a revision-5 output folder is rejected as a
+different contract. Older action/state bundles and checkpoints are rejected.
+Use the new default output directory
+`/kaggle/working/adaptive_analogical_shared_training_v6_run` and a new `hf_repo`
+mirror for a fresh run; old runs are not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
 quality. Recorded outcomes cannot establish live provider behavior or the
 results of newly generated candidates.

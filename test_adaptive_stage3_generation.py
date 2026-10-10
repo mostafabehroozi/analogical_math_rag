@@ -50,7 +50,10 @@ def test_augmented_snapshot_batches_keep_the_scalar_observation_contract():
     cfg = a.Config(k=2, zero_shots=2)
     record = make_record(cfg)
     full = a.complete_snapshot_state((1 << cfg.n)-1, 3, 3, cfg)
-    missing = a.augment_measurements(full, cfg, np.random.RandomState(28))
+    # One failed baseline and two unattempted cross evaluations.
+    missing = a.SnapshotState(full.candidates, full.retrieved, full.evaluators, full.similarity_observed,
+                              full.baseline_attempted, full.baseline_observed & ~1,
+                              full.ccs_attempted & ~0b101, full.ccs_observed & ~0b101)
     states = [a.State(), missing, full]
     expected = np.stack([a.observation(record, state, cfg, True) for state in states])
     assert a.observation_many(record, states, cfg, True).tobytes() == expected.tobytes()

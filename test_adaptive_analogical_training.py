@@ -1,6 +1,7 @@
 """Offline checks for the three supervised adaptive acquisition stages."""
 import ast
 import copy
+import itertools
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -139,47 +140,97 @@ def test_arbitrary_evaluator_subsets_zero_shot_and_exact_budget_cost():
     assert a.state_cost(a.State((1 << a.Config().n)-1, (1 << a.Config().k)-1), a.Config()) == 458
 
 
-def test_independent_masks_include_training_only_hidden_source():
-    cfg = a.Config(candidate_mask_fraction=0, evaluator_mask_fraction=1,
-                   hidden_source_fraction=1)
+def test_presence_states_cover_every_candidate_and_evaluator_mask_including_hidden_sources():
+    cfg = a.Config()
+    states = a.presence_states(cfg.zero_shots, cfg.k)
+    independent = {(c, e) for c in range(1, 1 << cfg.n) for e in range(1 << cfg.k)}
+    assert len(states) == len(independent) == 8160
+    assert {(s.candidate_mask, s.evaluator_mask) for s in states} == independent
+    assert set(a.structural_states(cfg.zero_shots, cfg.k)) <= set(states)
     r = record(cfg)
-    state = a.complete_snapshot_state((1 << cfg.n)-1, (1 << cfg.k)-1,
-                                       (1 << cfg.k)-1, cfg)
-    hidden = a.augment_structure(state, cfg, np.random.RandomState(3))
-    assert hidden.retrieved == hidden.evaluators == 0
-    assert hidden.candidates & (1 << cfg.zero_shots)
+    hidden = a.State(1 << cfg.zero_shots, 0)  # OS1 visible, R1 hidden.
     with pytest.raises(ValueError, match="without retrieved source"):
-        a.validate_snapshot_state(hidden, cfg)
+        a.observation(r, hidden, cfg)
     x = a.observation(r, hidden, cfg, allow_hidden_source=True)
-    assert x.shape == (cfg.input_dim,)
-    assert np.isfinite(x).all()
-    assert hidden.ccs_observed == 0 and hidden.baseline_observed == 0
+    assert x.shape == (cfg.input_dim,) and np.isfinite(x).all()
+    assert a.as_snapshot_state(hidden, cfg, True).ccs_observed == 0
 
 
-def test_first_and_second_training_share_full_and_augmented_inputs():
-    cfg = a.Config(snapshots_per_query=6, candidate_mask_fraction=.5,
-                   evaluator_mask_fraction=.5)
-    r = record(cfg)
-    teacher = {"safe": np.ones((1, cfg.n), np.float32),
-               "maximum": np.eye(1, cfg.n, 0).astype(np.float32)}
-    first_x, first_y = a.build_snapshots([r], [0], None, cfg, 6, 1, augmented=True)
-    second_x, second_y = a.build_snapshots([r], [0], teacher, cfg, 6, 1, augmented=True)
-    full = a.observation(r, a.State((1 << cfg.n)-1, (1 << cfg.k)-1), cfg)
-    assert first_x.shape == second_x.shape == (6, cfg.input_dim)
-    assert first_y.shape == (6, 2*cfg.n)
-    assert second_y.shape == (6, 4*cfg.n+2)
-    assert np.array_equal(first_x[0], full)
-    assert np.array_equal(second_x[0], full)
-    assert np.array_equal(first_x, second_x)
-    assert np.array_equal(first_y[0, cfg.n:], np.ones(cfg.n))
+def test_snapshot_views_equal_scalar_observations_and_targets_for_every_order_and_state():
+    cfg = a.Config(k=2, zero_shots=3)
+    records = [record(cfg, i) for i in range(3)]
+    rng = np.random.RandomState(4)
+    teacher = {"safe": rng.randint(0, 2, (3, cfg.n)).astype(np.float32),
+               "maximum": rng.randint(0, 2, (3, cfg.n)).astype(np.float32)}
+    states = a.presence_states(cfg.zero_shots, cfg.k)
+    orders = list(itertools.permutations(range(cfg.zero_shots)))
+    first = a.SnapshotViews(records, [2, 0], cfg, "cpu")
+    second = a.SnapshotViews(records, [2, 0], cfg, "cpu", teacher)
+    assert first.rows == second.rows == 2 * len(orders) * len(states)
+    _, x1, y1 = next(first.ordered(first.rows))
+    _, x2, y2 = next(second.ordered(second.rows))
+    assert torch.equal(x1, x2)  # Stages 1 and 2 see identical inputs.
+    assert y1.shape == (first.rows, 2*cfg.n) and y2.shape == (second.rows, 4*cfg.n+2)
+    expected_x, expected_y = [], []
+    for idx in (2, 0):
+        for order in orders:
+            r, _, safe, maximum = a.permute_zero_shots(records[idx], np.zeros(cfg.n), teacher["safe"][idx],
+                                                       teacher["maximum"][idx], order, cfg)
+            for state in states:
+                expected_x.append(a.observation(r, state, cfg, allow_hidden_source=True))
+                expected_y.append(a.snapshot_target(r, safe, maximum, state, cfg))
+    assert np.stack(expected_x).tobytes() == x1.numpy().tobytes()
+    assert np.stack(expected_y).tobytes() == y2.numpy().tobytes()
+    assert torch.equal(y1, torch.cat([y2[:, :cfg.n], y2[:, 3*cfg.n+2:]], 1))
 
 
-@pytest.mark.parametrize("count,batch", [(3, 2), (9, 4), (129, 128)])
-def test_training_batches_keep_every_example_without_singletons(count, batch):
-    x = np.arange(count, dtype=np.float32)[:, None]
-    batches = list(a.make_loader(x, x.copy(), batch))
-    assert min(len(bx) for bx, _ in batches) >= 2
-    assert sorted(torch.cat([bx[:, 0] for bx, _ in batches]).tolist()) == list(range(count))
+@pytest.mark.parametrize("group,batch", [(1 << 21, 4), (130, 64), (100, 7)])
+def test_snapshot_batches_visit_every_view_once_without_singletons(group, batch, monkeypatch):
+    cfg = a.Config(k=2, zero_shots=2)
+    monkeypatch.setattr(a, "SNAPSHOT_GROUP_VIEWS", group)
+    views = a.SnapshotViews([record(cfg, i) for i in range(5)], list(range(5)), cfg, "cpu")
+    monkeypatch.setattr(views, "batch", lambda index: (index, index))
+    sizes = [len(index) for index, _ in views.batches(batch, np.random.RandomState(1))]
+    seen = torch.cat([index for index, _ in views.batches(batch, np.random.RandomState(1))])
+    assert min(sizes) >= 2
+    assert sorted(seen.tolist()) == list(range(views.rows))
+    again = torch.cat([index for index, _ in views.batches(batch, np.random.RandomState(1))])
+    assert torch.equal(seen, again) and not torch.equal(seen, torch.arange(views.rows))
+
+
+def test_streamed_snapshot_metrics_and_temperatures_match_materialized_arrays():
+    cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1, recognition_threshold=.3)
+    records = [record(cfg, i) for i in range(4)]
+    teacher = {"safe": np.eye(4, cfg.n, dtype=np.float32), "maximum": np.eye(4, cfg.n, dtype=np.float32)}
+    torch.manual_seed(0)
+    model = a.ResNet(cfg.input_dim, 3*cfg.n+2, cfg).eval()
+    views = a.SnapshotViews(records, [0, 1, 2, 3], cfg, "cpu", teacher)
+    _, x, y = next(views.ordered(views.rows))
+    with torch.no_grad():
+        logits = model(x).double().numpy()
+    y = y.numpy()
+    mask = y[:, 3*cfg.n+2:].astype(bool)
+    chosen = np.where(mask, logits[:, :cfg.n], -np.inf).argmax(1)
+    p = 1 / (1 + np.exp(-logits))
+    summary = a.summarize_snapshot_sums(a.snapshot_sums(model, views, np.ones(3*cfg.n+2), cfg))
+    assert summary["snapshots"] == views.rows
+    assert summary["top1"] == pytest.approx(y[np.arange(len(y)), chosen].mean())
+    assert summary["brier"] == pytest.approx(((p[:, :cfg.n] - y[:, :cfg.n])**2)[mask].mean(), rel=1e-5)
+    positive, true = p[:, 3*cfg.n] >= .3, y[:, 3*cfg.n].astype(bool)
+    assert summary["safe_precision"] == pytest.approx(true[positive].mean() if positive.any() else None)
+    # Per-question sums add up to the pooled sums, so reports can share them.
+    per_question = a.snapshot_sums(model, views, np.ones(3*cfg.n+2), cfg)
+    assert a.summarize_snapshot_sums(per_question[:2])["snapshots"] == views.rows // 2
+    temps = a.fit_temperatures(model, views, cfg)
+    expected = []
+    for block in range(5):
+        sl = slice(block*cfg.n, (block+1)*cfg.n) if block < 3 else slice(3*cfg.n+block-3, 3*cfg.n+block-2)
+        z, t = logits[:, sl], y[:, sl]
+        if block < 3:
+            z, t = z[mask], t[mask]
+        nlls = [np.mean(np.logaddexp(0, z/g) - t*z/g) for g in a.TEMPERATURE_GRID]
+        expected.append(a.TEMPERATURE_GRID[int(np.argmin(nlls))])
+    assert np.allclose(temps, expected)
 
 
 def test_reference_score_ties_preserve_max_identity_after_slot_permutation():
@@ -193,26 +244,6 @@ def test_reference_score_ties_preserve_max_identity_after_slot_permutation():
     assert new_max[order[0]] == 1
     # With no acquired evaluator, the head has no evidence about candidate identity.
     assert a.visible_state_key(r, a.State(), cfg) == a.visible_state_key(shuffled, a.State(), cfg)
-
-
-def test_slot_permutation_keeps_measurements_provenance_and_labels_aligned():
-    cfg = a.Config()
-    r = record(cfg)
-    safe = np.arange(cfg.n, dtype=np.float32)
-    maximum = np.arange(cfg.n, dtype=np.float32) + 10
-    state = a.complete_snapshot_state((1 << cfg.n)-1, (1 << cfg.k)-1,
-                                       (1 << cfg.k)-1, cfg)
-    permuted, new_state, new_safe, new_max = a.permute_snapshot(
-        r, state, safe, maximum, cfg, np.random.RandomState(19))
-    original_candidates = {cid: i for i, cid in enumerate(r.candidate_ids)}
-    original_evaluators = {eid: j for j, eid in enumerate(r.evaluator_ids)}
-    for i, cid in enumerate(permuted.candidate_ids):
-        source_i = original_candidates[cid]
-        assert permuted.labels[i] == r.labels[source_i]
-        assert new_safe[i] == safe[source_i] and new_max[i] == maximum[source_i]
-        for j, eid in enumerate(permuted.evaluator_ids):
-            assert permuted.ccs[i,j] == r.ccs[source_i, original_evaluators[eid]]
-    assert a.observation(permuted, new_state, cfg).shape == (cfg.input_dim,)
 
 
 def test_hidden_future_measurements_and_labels_do_not_change_observation_or_action():
@@ -883,7 +914,7 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
                    output_dir=str(tmp_path/"run"), device="cpu", cpu_threads=1,
                    k=2, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
                    batch_size=16, teacher_epochs=2, snapshot_epochs=2, decision_epochs=2,
-                   patience=2, snapshots_per_query=4, dev_snapshots_per_query=4,
+                   patience=2, dev_checks_per_epoch=2,
                    decision_batch_size=16, recognition_threshold=.1,
                    bootstrap_samples=20)
     train.write_text(json.dumps([raw_record(i,cfg) for i in range(40)]))
@@ -894,12 +925,13 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
         duplicate["target_query_original_hard_list_idx"] = 100 + i
     second.write_text(json.dumps([raw_record(i,cfg,prefix="second") for i in range(2)] + duplicates))
     snapshot_training_ids = []
-    build_snapshots = a.build_snapshots
-    def track_snapshot_training(*args, **kwargs):
-        if "epoch" in kwargs and args[2] is not None:
-            snapshot_training_ids.append(list(args[1]))
-        return build_snapshots(*args, **kwargs)
-    monkeypatch.setattr(a, "build_snapshots", track_snapshot_training)
+    train_on_views = a.train_on_views
+    def track_snapshot_training(model, views, *args):
+        if args[-1] == "Snapshot":
+            snapshot_training_ids.append(views.ids)
+            assert views.safe is not None and views.state_count == len(a.presence_states(cfg.zero_shots, cfg.k))
+        return train_on_views(model, views, *args)
+    monkeypatch.setattr(a, "train_on_views", track_snapshot_training)
     rolled_out, rollout = [], a.rollout
     monkeypatch.setattr(a, "rollout", lambda record, *args, **kwargs: rolled_out.append(record.uid) or
                         rollout(record, *args, **kwargs))

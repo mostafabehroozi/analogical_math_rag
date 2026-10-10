@@ -73,7 +73,7 @@ def small_config(root, **overrides):
                    output_dir=str(root / "run"), device="cpu", cpu_threads=1,
                    k=2, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
                    batch_size=16, teacher_epochs=2, snapshot_epochs=2, decision_epochs=2,
-                   patience=2, snapshots_per_query=4, dev_snapshots_per_query=4,
+                   patience=2, dev_checks_per_epoch=2,
                    decision_batch_size=16, recognition_threshold=.1,
                    bootstrap_samples=20, **overrides)
     if not train.exists():
@@ -179,10 +179,11 @@ def test_stage3_fingerprint_ignores_log_paths_and_reproduces_the_path_bound_form
     moved.train_file = "/content/working/logs/" + Path(cfg.train_file).name
     moved.test_files = ["/content/working/logs/" + Path(path).name for path in cfg.test_files]
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, moved) == current
-    # Code through e4b82f0 also hashed the configured paths; this is the value it computed.
+    # Code through e4b82f0 also hashed the configured paths. The pinned value guards that
+    # formula; it was re-pinned when revision 6 changed the Stage 1-2 config fields.
     legacy = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
                                             [cfg.train_file] + cfg.test_files)
-    assert legacy == "4bf5e8fa5b7d05e1bb5afe79cc01ad489572e73b222dc98d6de31c08d17a7591" != current
+    assert legacy == "dc24e53615c20864478b52c894a698c6c893ecef23f782bb7677015ad44b4cd5" != current
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
                                           [moved.train_file] + moved.test_files) not in (legacy, current)
 

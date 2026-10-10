@@ -26,9 +26,8 @@ from typing import Optional
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
 
-PIPELINE_REVISION = 5  # Ordered evaluator acquisition and revised supervised goals.
+PIPELINE_REVISION = 6  # Stages 1-2 train on every presence state and zero-shot order.
 
 
 # %% Configuration and compact data
@@ -41,7 +40,7 @@ class Config:
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ])
-    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v5_run"
+    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v6_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
     device: str = "auto"
@@ -55,20 +54,15 @@ class Config:
     hidden_dim: int = 128
     residual_blocks: int = 2
     dropout: float = .10
-    batch_size: int = 128
+    # Stages 1-2: one epoch visits every presence state of every question under
+    # every zero-shot order once (48,960 views per default question).
+    batch_size: int = 16384
     learning_rate: float = .0003
     weight_decay: float = 1e-4
-    teacher_epochs: int = 100
-    snapshot_epochs: int = 100
-    patience: int = 15
-    snapshots_per_query: int = 24
-    dev_snapshots_per_query: int = 16
-    snapshot_reachable_fraction: float = .50
-    snapshot_missing_fraction: float = .25
-    snapshot_permutation_fraction: float = .10
-    candidate_mask_fraction: float = .25
-    evaluator_mask_fraction: float = .25
-    hidden_source_fraction: float = .10
+    teacher_epochs: int = 10
+    snapshot_epochs: int = 10
+    dev_checks_per_epoch: int = 8   # Stages 1-2 development checks, evenly spaced in each epoch.
+    patience: int = 15              # Checks without improvement (Stages 1-2) or epochs (Stage 3).
     auxiliary_weight: float = .25
     calibrate: bool = True          # Development-only temperature selection.
     recognition_threshold: float = .50
@@ -133,13 +127,7 @@ class Config:
         assert self.teacher_epochs > 0 and self.snapshot_epochs > 0 and self.patience > 0
         assert self.decision_epochs > 0 and self.decision_batch_size >= 2 and self.decision_lr > 0
         assert self.decision_eval_batch_size >= 2
-        assert self.snapshots_per_query >= 2 and self.dev_snapshots_per_query >= 2
-        assert 0 <= self.snapshot_reachable_fraction <= 1
-        assert 0 <= self.snapshot_missing_fraction <= 1
-        assert 0 <= self.snapshot_permutation_fraction <= 1
-        assert all(0 <= p <= 1 for p in (self.candidate_mask_fraction,
-                                         self.evaluator_mask_fraction,
-                                         self.hidden_source_fraction))
+        assert self.dev_checks_per_epoch >= 1
         assert self.print_every > 0
         assert self.hf_sync_minutes > 0
         if self.hf_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", str(self.hf_repo)):
@@ -527,18 +515,6 @@ def heuristic_scores(r, cfg, mode, mask, strategy):
     return {"ScoreTake": take, "ScoreMake": make, "Holistic": take + make}[strategy]
 
 
-def make_loader(x, y, batch_size, shuffle=True):
-    # Keep every complete-state example while avoiding singleton BatchNorm batches.
-    size = min(batch_size, len(x))
-    if size < 2 and shuffle:
-        raise ValueError("BatchNorm training requires at least two samples.")
-    order = torch.randperm(len(x)).tolist() if shuffle else list(range(len(x)))
-    batches = [order[start:start + max(1, size)] for start in range(0, len(x), max(1, size))]
-    if shuffle and len(batches) > 1 and len(batches[-1]) == 1:
-        batches[-2].extend(batches.pop())
-    return DataLoader(TensorDataset(torch.from_numpy(x), torch.from_numpy(y)), batch_sampler=batches)
-
-
 def predict_array(model, x, device, batch=1024, hidden=False):
     model.eval()
     values = []
@@ -549,39 +525,33 @@ def predict_array(model, x, device, batch=1024, hidden=False):
     return np.concatenate(values)
 
 
+def teacher_loss(logits, targets, cfg):
+    """Correctness of present candidates only; absent candidates carry no target."""
+    present = targets[:, cfg.n:]
+    raw = nn.functional.binary_cross_entropy_with_logits(logits, targets[:, :cfg.n], reduction="none")
+    return ((raw * present).sum(1) / present.sum(1).clamp_min(1)).mean()
+
+
 def train_teacher(records, train_ids, val_ids, cfg, device, seed, name):
+    """Train on every presence state and zero-shot order; select on complete-state AP."""
     seed_everything(seed)
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
+    # The ranking passed to later stages is read from complete states, so selection is too.
     vx = np.stack([observation(records[i], full, cfg) for i in val_ids])
+    views = SnapshotViews(records, train_ids, cfg, device)
     model = ResNet(cfg.input_dim, cfg.n, cfg).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    best, best_state, stale, best_epoch = -1.0, None, 0, 0
-    for epoch in range(cfg.teacher_epochs):
-        x, targets = build_snapshots(records, train_ids, None, cfg,
-                                     cfg.snapshots_per_query, seed + epoch,
-                                     epoch=epoch, augmented=True)
-        loader = make_loader(x, targets, cfg.batch_size)
-        model.train()
-        for bx, by in loader:
-            opt.zero_grad(set_to_none=True)
-            present = by[:, cfg.n:].to(device)
-            raw = nn.functional.binary_cross_entropy_with_logits(
-                model(bx.to(device)), by[:, :cfg.n].to(device), reduction="none")
-            loss = ((raw * present).sum(1) / present.sum(1).clamp_min(1)).mean()
-            loss.backward()
-            opt.step()
+
+    def evaluate(model):
         pred = predict_array(model, vx, device)
-        score = np.mean([ap_score(ranked_indices(p, retrieval_order(cfg)), records[i].labels)
-                         for p, i in zip(pred, val_ids)])
-        if score > best + 1e-8:
-            best, best_state, stale, best_epoch = score, cpu_state(model), 0, epoch + 1
-        else:
-            stale += 1
-        if stale >= cfg.patience:
-            break
-    model.load_state_dict(best_state)
-    print(f"{name:<24} | epochs {epoch+1:3d} | best {best_epoch:3d} | development AP {best:.4f}")
-    return {"weights": best_state, "best_epoch": best_epoch,
+        score = float(np.mean([ap_score(ranked_indices(p, retrieval_order(cfg)), records[i].labels)
+                               for p, i in zip(pred, val_ids)]))
+        return score, f"development AP {score:.4f}"
+
+    fit = train_on_views(model, views, cfg.teacher_epochs, seed, lambda logits, y: teacher_loss(logits, y, cfg),
+                         evaluate, lambda new, old: new > old + 1e-8, cfg, name)
+    print(f"{name:<24} | epochs {fit['epochs']:6.2f} | best {fit['best_epoch']:6.2f} | "
+          f"development AP {fit['best']:.4f}")
+    return {"weights": fit["weights"], "best_epoch": fit["best_epoch"], "history": fit["history"],
             "train_ids": [records[i].uid for i in train_ids],
             "validation_ids": [records[i].uid for i in val_ids]}
 
@@ -951,134 +921,158 @@ def observation_many(record, states, cfg, allow_hidden_source=False):
 
 
 def snapshot_target(record, safe, maximum, state, cfg):
+    """Scalar reference for SnapshotViews targets."""
     cm = present_mask(state, cfg).astype(np.float32)
     return np.r_[record.labels, safe, maximum,
                  float(np.any(safe * cm)), float(np.any(maximum * cm)), cm].astype(np.float32)
 
 
-def augment_structure(state, cfg, rng):
-    """Independently hide candidates/evaluators, including occasional OS sources."""
-    state = as_snapshot_state(state, cfg)
-    candidates, evaluators = state.candidates, state.evaluators
-    for i in range(cfg.n):
-        if candidates & (1 << i) and rng.rand() < cfg.candidate_mask_fraction:
-            candidates &= ~(1 << i)
-    for j in range(cfg.k):
-        if evaluators & (1 << j) and rng.rand() < cfg.evaluator_mask_fraction:
-            evaluators &= ~(1 << j)
-            if candidates & (1 << (cfg.zero_shots + j)) and rng.rand() >= cfg.hidden_source_fraction:
-                candidates &= ~(1 << (cfg.zero_shots + j))
-    if not candidates:
-        original = np.flatnonzero(bit_array(state.candidates, cfg.n))
-        i = int(rng.choice(original))
-        candidates = 1 << i
-        if i >= cfg.zero_shots:
-            evaluators |= 1 << (i - cfg.zero_shots)
-    cells = sum(evaluators << (i * cfg.k) for i in range(cfg.n) if candidates & (1 << i))
-    result = SnapshotState(candidates, evaluators, evaluators, evaluators,
-                           evaluators, evaluators, cells, cells)
-    validate_snapshot_state(result, cfg, allow_hidden_source=True)
-    return result
+@lru_cache(maxsize=4)
+def presence_states(zero_shots, k):
+    """Every nonempty candidate subset with every evaluator subset.
 
-def augment_measurements(state, cfg, rng):
-    """Hide real measurements or mark recorded calls as failed; never invent values."""
-    state = as_snapshot_state(state, cfg)
-    attempted, observed = state.ccs_attempted, state.ccs_observed
-    eligible = np.flatnonzero(bit_array(attempted, cfg.n * cfg.k))
-    if len(eligible):
-        pattern = int(rng.randint(5))
-        if pattern == 0:                   # Independent sparse cells.
-            chosen = rng.choice(eligible, max(1, len(eligible)//2), replace=False)
-        elif pattern == 1:                 # Whole candidate row.
-            row = int(rng.choice(eligible)) // cfg.k
-            chosen = eligible[eligible // cfg.k == row]
-        elif pattern == 2:                 # Whole evaluator column.
-            col = int(rng.choice(eligible)) % cfg.k
-            chosen = eligible[eligible % cfg.k == col]
-        elif pattern == 3:                 # No successful CCS.
-            chosen = eligible
-        else:                              # Exactly one missing cell.
-            chosen = rng.choice(eligible, 1)
-        remove = bits_from_array(np.isin(np.arange(cfg.n * cfg.k), chosen))
-        observed &= ~remove
-        if rng.rand() < .5:                # Unattempted rather than failed.
-            attempted &= ~remove
-    base_observed, base_attempted = state.baseline_observed, state.baseline_attempted
-    base_cells = np.flatnonzero(bit_array(base_observed, cfg.k))
-    if len(base_cells) and rng.rand() < .35:
-        bit = 1 << int(rng.choice(base_cells))
-        base_observed &= ~bit
-        if rng.rand() < .5:
-            base_attempted &= ~bit
-    similarity = state.similarity_observed
-    sim_cells = np.flatnonzero(bit_array(similarity, cfg.k))
-    if len(sim_cells) and rng.rand() < .15:
-        similarity &= ~(1 << int(rng.choice(sim_cells)))
-    result = SnapshotState(state.candidates, state.retrieved, state.evaluators,
-                           similarity, base_attempted, base_observed, attempted, observed)
-    validate_snapshot_state(result, cfg, allow_hidden_source=True)
-    return result
+    These are all states that hiding candidates or evaluators can produce,
+    including one-shots whose evaluator is hidden: (2**8 - 1) * 2**5 = 8,160 by
+    default, a superset of the 1,912 structural_states.
+    """
+    return tuple(State(candidates, evaluators)
+                 for candidates in range(1, 1 << (zero_shots + k))
+                 for evaluators in range(1 << k))
 
 
-def permute_snapshot(record, state, safe, maximum, cfg, rng):
-    """Apply the same slot permutation to evidence, provenance and labels."""
-    state = as_snapshot_state(state, cfg)
-    eorder = rng.permutation(cfg.k)
-    corder = np.r_[rng.permutation(cfg.zero_shots), cfg.zero_shots + eorder]
-    def remap(bits, size, order):
-        return bits_from_array(bit_array(bits, size)[order])
-    cell_order = (corder[:, None] * cfg.k + eorder[None, :]).ravel()
-    new_state = SnapshotState(remap(state.candidates, cfg.n, corder),
-                              remap(state.retrieved, cfg.k, eorder),
-                              remap(state.evaluators, cfg.k, eorder),
-                              remap(state.similarity_observed, cfg.k, eorder),
-                              remap(state.baseline_attempted, cfg.k, eorder),
-                              remap(state.baseline_observed, cfg.k, eorder),
-                              remap(state.ccs_attempted, cfg.n*cfg.k, cell_order),
-                              remap(state.ccs_observed, cfg.n*cfg.k, cell_order))
-    new_record = Record(record.uid, record.group, record.benchmark,
-                        [record.candidate_ids[i] for i in corder],
-                        [record.evaluator_ids[i] for i in eorder],
-                        record.similarity[eorder], record.baseline[eorder],
-                        record.ccs[np.ix_(corder, eorder)], record.labels[corder])
-    validate_snapshot_state(new_state, cfg, allow_hidden_source=True)
-    return new_record, new_state, safe[corder], maximum[corder]
+# Views of this many questions are shuffled together: the permutation stays near
+# 16 MiB while each minibatch still mixes dozens of questions.
+SNAPSHOT_GROUP_VIEWS = 1 << 21
+SNAPSHOT_EVAL_BATCH = 16384
 
 
-def build_snapshots(records, ids, teacher, cfg, per_query, seed, epoch=0, augmented=False):
-    rng = np.random.RandomState(seed)
-    xs, ys = [], []
-    reachable = reachable_states(cfg)
-    catalog = structural_catalog(cfg.zero_shots, cfg.k) if augmented else ()
-    others = per_query - 1
-    n_reachable = round(others * cfg.snapshot_reachable_fraction) if augmented else others
-    for rank, idx in enumerate(ids):
-        states = [State((1 << cfg.n)-1, (1 << cfg.k)-1)]
-        for j in range(n_reachable):
-            position = (epoch * len(ids) + rank) * max(1, n_reachable) + j
-            states.append(reachable[(position * 53) % len(reachable)])
-        for j in range(others - n_reachable):
-            position = ((epoch * len(ids) + rank) * max(1, others - n_reachable) + j)
-            candidates, retrieved, evaluators = catalog[(position * 7919) % len(catalog)]
-            states.append(complete_snapshot_state(candidates, retrieved, evaluators, cfg))
-        for position, state in enumerate(states):
-            r = records[idx]
-            safe = teacher["safe"][idx] if teacher is not None else None
-            maximum = teacher["maximum"][idx] if teacher is not None else None
-            if augmented and position:
-                state = augment_structure(state, cfg, rng)
-                if rng.rand() < cfg.snapshot_missing_fraction:
-                    state = augment_measurements(state, cfg, rng)
-                if rng.rand() < cfg.snapshot_permutation_fraction:
-                    if teacher is None:
-                        dummy = np.zeros(cfg.n, np.float32)
-                        r, state, _, _ = permute_snapshot(r, state, dummy, dummy, cfg, rng)
-                    else:
-                        r, state, safe, maximum = permute_snapshot(r, state, safe, maximum, cfg, rng)
-            xs.append(observation(r, state, cfg, allow_hidden_source=augmented))
-            ys.append((np.r_[r.labels, present_mask(state, cfg)].astype(np.float32)
-                       if teacher is None else snapshot_target(r, safe, maximum, state, cfg)))
-    return np.stack(xs), np.stack(ys)
+class SnapshotViews:
+    """Every (question, zero-shot order, presence state) view, assembled per batch.
+
+    Nothing is materialized or written. A shared state table (about 7 MiB for the
+    default 8,160 states) holds the state-only observation bytes and masks; each
+    question adds its measurements, labels, and SAFE/MAX under each zero-shot order
+    (under 1 KiB). Rows equal observation(..., allow_hidden_source=True) and
+    snapshot_target of the permuted record bit for bit. Views are indexed
+    question-major, then zero-shot order, then state.
+    """
+    def __init__(self, records, ids, cfg, device, teacher=None, states=None):
+        self.cfg, self.device, self.ids = cfg, torch.device(device), list(ids)
+        states = presence_states(cfg.zero_shots, cfg.k) if states is None else tuple(states)
+        template, masks, (sim, base, ccs) = structural_observation_template(
+            states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, True)
+        orders = list(permutations(range(cfg.zero_shots)))
+        slots = np.asarray([list(order) + list(range(cfg.zero_shots, cfg.n)) for order in orders])
+
+        def put(values, shape):
+            array = np.stack(values) if values else np.zeros((0, *shape))
+            return torch.as_tensor(array.astype(np.float32), device=self.device)
+
+        rows = [records[i] for i in self.ids]
+        self.template = torch.tensor(template, device=self.device)
+        self.masks = tuple(torch.tensor(mask, device=self.device) for mask in masks)
+        self.columns = ((sim, cfg.k), (base, cfg.k), (ccs, cfg.n * cfg.k))
+        self.values = (put([r.similarity for r in rows], (cfg.k,)),
+                       put([r.baseline for r in rows], (cfg.k,)),
+                       put([r.ccs[slots].reshape(len(orders), -1) for r in rows],
+                           (len(orders), cfg.n * cfg.k)))
+        self.labels = put([r.labels[slots] for r in rows], (len(orders), cfg.n))
+        self.safe = self.maximum = None
+        if teacher is not None:
+            self.safe = put([teacher["safe"][i][slots] for i in self.ids], (len(orders), cfg.n))
+            self.maximum = put([teacher["maximum"][i][slots] for i in self.ids], (len(orders), cfg.n))
+        self.state_count, self.order_count = len(states), len(orders)
+        self.per_question = self.state_count * self.order_count
+        self.rows = len(self.ids) * self.per_question
+
+    def batch(self, index):
+        """Observations and targets for flat view indices on the device."""
+        s = index % self.state_count
+        o = index // self.state_count % self.order_count
+        q = index // self.per_question
+        x = self.template[s]
+        for (start, width), mask, value in zip(self.columns, self.masks, self.values):
+            block = value[q] if value.dim() == 2 else value[q, o]
+            x[:, start:start+width] = torch.where(mask[s], block, x[:, start:start+width])
+        cm, labels = x[:, :self.cfg.n], self.labels[q, o]
+        if self.safe is None:
+            return x, torch.cat([labels, cm], 1)
+        safe, maximum = self.safe[q, o], self.maximum[q, o]
+        return x, torch.cat([labels, safe, maximum,
+                             (safe * cm).amax(1, keepdim=True).gt(0).float(),
+                             (maximum * cm).amax(1, keepdim=True).gt(0).float(), cm], 1)
+
+    def batches(self, batch_size, rng):
+        """Every view once, shuffled within groups of questions taken in random order."""
+        group = max(1, SNAPSHOT_GROUP_VIEWS // self.per_question)
+        order = rng.permutation(len(self.ids)).astype(np.int64)
+        for start in range(0, len(order), group):
+            members = order[start:start+group]
+            flat = rng.permutation(len(members) * self.per_question).astype(np.int64)
+            flat = members[flat // self.per_question] * self.per_question + flat % self.per_question
+            flat = torch.from_numpy(flat).to(self.device)
+            bounds = list(range(0, len(flat), batch_size)) + [len(flat)]
+            if len(bounds) > 2 and bounds[-1] - bounds[-2] == 1:
+                del bounds[-2]  # BatchNorm cannot train on a single row.
+            for lo, hi in zip(bounds, bounds[1:]):
+                yield self.batch(flat[lo:hi])
+
+    def ordered(self, batch_size=SNAPSHOT_EVAL_BATCH):
+        """Every view in index order, with each row's question position."""
+        for lo in range(0, self.rows, batch_size):
+            index = torch.arange(lo, min(self.rows, lo + batch_size), device=self.device)
+            yield (index // self.per_question, *self.batch(index))
+
+
+def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, name):
+    """Every epoch visits every view once; development checks are spread through it.
+
+    `evaluate(model)` returns a comparable score and its description. Patience counts
+    checks without improvement, so training can stop inside a long epoch.
+    """
+    if views.rows < 2:
+        raise ValueError(f"{name}: too few training views.")
+    # One fused update kernel on CUDA: small-model steps are otherwise launch-bound.
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+                           fused=views.device.type == "cuda")
+    best, weights, best_epoch, stale, history = None, None, 0., 0, []
+    checks, position, started = cfg.dev_checks_per_epoch, 0., time.monotonic()
+    print(f"{name}: {len(views.ids)} questions x {views.order_count} zero-shot orders x "
+          f"{views.state_count} presence states = {views.rows:,} views per epoch; "
+          f"{checks} development checks per epoch.", flush=True)
+    for epoch in range(epochs):
+        done = seen = check = 0
+        total = torch.zeros((), device=views.device)
+        model.train()
+        for bx, by in views.batches(cfg.batch_size, np.random.RandomState(seed + epoch)):
+            opt.zero_grad(set_to_none=True)
+            loss = loss_of(model(bx), by)
+            loss.backward()
+            opt.step()
+            total += loss.detach() * len(bx)
+            done, seen = done + len(bx), seen + len(bx)
+            due = done * checks // views.rows
+            if due <= check:
+                continue
+            check, position = due, epoch + done / views.rows
+            score, text = evaluate(model)
+            model.train()
+            history.append({"epoch": position, "train_loss": float(total) / seen, "score": score})
+            total.zero_()
+            seen = 0
+            if best is None or better(score, best):
+                best, weights, best_epoch, stale = score, cpu_state(model), position, 0
+            else:
+                stale += 1
+            if stale >= cfg.patience:
+                break
+        print(f"{name} | epoch {position:6.2f} | train loss {history[-1]['train_loss']:.4f} | {text} | "
+              f"best at epoch {best_epoch:.2f} | patience {stale}/{cfg.patience} | "
+              f"elapsed {(time.monotonic() - started) / 60:.1f} min", flush=True)
+        if stale >= cfg.patience:
+            break
+    return {"weights": weights, "best": best, "best_epoch": best_epoch,
+            "epochs": position, "history": history}
 
 
 def snapshot_loss(logits, targets, cfg):
@@ -1090,84 +1084,104 @@ def snapshot_loss(logits, targets, cfg):
     return losses[0] + cfg.auxiliary_weight * (losses[1] + losses[2] + raw[:, 3*n:].mean(0).sum())
 
 
-def snapshot_summary(logits, targets, cfg):
-    mask = targets[:, 3*cfg.n+2:].astype(bool)
-    chosen = np.where(mask, logits[:, :cfg.n], -np.inf).argmax(1)
-    selected = targets[np.arange(len(targets)), chosen]
-    p = 1 / (1 + np.exp(-np.clip(logits[:, :cfg.n], -40, 40)))
-    return {"snapshots": len(targets), "top1": float(selected.mean()),
-            "brier": float(((p - targets[:, :cfg.n])**2)[mask].mean())}
+SNAPSHOT_SUM_FIELDS = ("views", "top1", "brier", "brier_cells",
+                       "safe_predicted", "safe_true_positive", "safe_true",
+                       "max_predicted", "max_true_positive", "max_true")
+
+
+def snapshot_sums(model, views, temperatures, cfg):
+    """Per-question metric sums over every view, streamed; logits are never kept."""
+    n = cfg.n
+    temperatures = torch.as_tensor(temperatures, dtype=torch.float32, device=views.device)
+    sums = torch.zeros((len(views.ids), len(SNAPSHOT_SUM_FIELDS)), dtype=torch.float64,
+                       device=views.device)
+    model.eval()
+    with torch.no_grad():
+        for q, x, y in views.ordered():
+            logits = model(x) / temperatures
+            p = torch.sigmoid(logits)
+            mask = y[:, 3*n+2:].bool()
+            chosen = torch.where(mask, logits[:, :n], torch.full_like(logits[:, :n], -math.inf)).argmax(1)
+            error = torch.where(mask, (p[:, :n] - y[:, :n]) ** 2, torch.zeros_like(p[:, :n]))
+            columns = [torch.ones_like(p[:, 0]), y[:, :n].gather(1, chosen[:, None])[:, 0],
+                       error.sum(1), mask.sum(1)]
+            for col in (3*n, 3*n+1):
+                predicted, true = p[:, col] >= cfg.recognition_threshold, y[:, col] > .5
+                columns += [predicted, predicted & true, true]
+            sums.index_add_(0, q, torch.stack([c.double() for c in columns], 1))
+    return sums.cpu().numpy()
+
+
+def summarize_snapshot_sums(sums):
+    total = np.asarray(sums, np.float64).reshape(-1, len(SNAPSHOT_SUM_FIELDS)).sum(0)
+    value = dict(zip(SNAPSHOT_SUM_FIELDS, total))
+    ratio = lambda a, b: float(a / b) if b else None
+    return {"snapshots": int(value["views"]), "top1": ratio(value["top1"], value["views"]),
+            "brier": ratio(value["brier"], value["brier_cells"]),
+            **{f"{name}_{metric}": ratio(value[f"{name}_true_positive"], value[f"{name}_{base}"])
+               for name in ("safe", "max")
+               for metric, base in (("precision", "predicted"), ("recall", "true"))}}
 
 
 def temperature_vector(temperatures, cfg):
     return np.r_[np.repeat(temperatures[:3], cfg.n), temperatures[3:]].astype(np.float32)
 
 
-def fit_temperatures(logits, targets, cfg):
+TEMPERATURE_GRID = np.geomspace(.25, 4., 41)
+
+
+def fit_temperatures(model, views, cfg):
+    """Development-only temperature per output block, from streamed NLL sums."""
     temps = np.ones(5, np.float32)
     if not cfg.calibrate:
         return temps
-    masks = targets[:, 3*cfg.n+2:].astype(bool)
-    for block in range(5):
-        sl = slice(block*cfg.n, (block+1)*cfg.n) if block < 3 else slice(3*cfg.n+block-3, 3*cfg.n+block-2)
-        z, y = logits[:, sl], targets[:, sl]
-        if block < 3:
-            z, y = z[masks], y[masks]
-        candidates = np.geomspace(.25, 4., 41)
-        nlls = [np.mean(np.logaddexp(0, z/t) - y*z/t) for t in candidates]
-        temps[block] = candidates[int(np.argmin(nlls))]
-    return temps
+    n = cfg.n
+    grid = torch.as_tensor(TEMPERATURE_GRID, device=views.device)
+    nll = torch.zeros((5, len(grid)), dtype=torch.float64, device=views.device)
+    count = torch.zeros(5, dtype=torch.float64, device=views.device)
+    model.eval()
+    with torch.no_grad():
+        for _, x, y in views.ordered():
+            logits, y = model(x).double(), y.double()
+            mask = y[:, 3*n+2:].bool()
+            for block in range(5):
+                if block < 3:
+                    z, t = logits[:, block*n:(block+1)*n][mask], y[:, block*n:(block+1)*n][mask]
+                else:
+                    z, t = logits[:, 3*n+block-3], y[:, 3*n+block-3]
+                scaled = z[None] / grid[:, None]
+                nll[block] += (torch.logaddexp(torch.zeros_like(scaled), scaled) - t * scaled).sum(1)
+                count[block] += len(z)
+    return TEMPERATURE_GRID[(nll / count[:, None]).argmin(1).cpu().numpy()].astype(np.float32)
 
 
 def fit_snapshot(records, splits, teacher, cfg, device):
     seed_everything(cfg.seed + 200)
-    vx, vy = build_snapshots(records, splits["dev"], teacher, cfg,
-                             cfg.dev_snapshots_per_query, cfg.seed + 202)
+    views = SnapshotViews(records, splits["supervised"], cfg, device, teacher)
+    # Selection and calibration use what the runtime visits: every reachable state.
+    dev = SnapshotViews(records, splits["dev"], cfg, device, teacher, reachable_states(cfg))
     model = ResNet(cfg.input_dim, 3*cfg.n+2, cfg).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    best, weights, stale, history = (-1., -math.inf), None, 0, []
-    catalog_size = len(structural_catalog(cfg.zero_shots, cfg.k))
-    print(f"Snapshot training: {len(reachable_states(cfg))} application states; "
-          f"{catalog_size} coherent structures; {cfg.snapshots_per_query} samples/question/epoch.")
-    for epoch in range(cfg.snapshot_epochs):
-        x, y = build_snapshots(records, splits["supervised"], teacher, cfg,
-                               cfg.snapshots_per_query, cfg.seed + 201 + epoch,
-                               epoch=epoch, augmented=True)
-        loader = make_loader(x, y, cfg.batch_size)
-        model.train()
-        total = 0.
-        for bx, by in loader:
-            opt.zero_grad(set_to_none=True)
-            loss = snapshot_loss(model(bx.to(device)), by.to(device), cfg)
-            loss.backward()
-            opt.step()
-            total += float(loss.item())
-        logits = predict_array(model, vx, device)
-        metrics = snapshot_summary(logits, vy, cfg)
-        candidate = (metrics["top1"], -metrics["brier"])
-        history.append({"epoch": epoch + 1, "loss": total/len(loader), **metrics})
-        if candidate > best:
-            best, weights, stale, best_epoch = candidate, cpu_state(model), 0, epoch + 1
-        else:
-            stale += 1
-        if epoch == 0 or (epoch + 1) % cfg.print_every == 0:
-            print(f"Snapshot epoch {epoch+1:3d} | loss {total/len(loader):.4f} | "
-                  f"development Top-1 {metrics['top1']:.1%} | Brier {metrics['brier']:.4f}")
-        if stale >= cfg.patience:
-            break
-    model.load_state_dict(weights)
-    logits = predict_array(model, vx, device)
-    temps = fit_temperatures(logits, vy, cfg)
-    print(f"Snapshot selected epoch {best_epoch}; development Top-1 {best[0]:.1%}.")
-    off_per_query = (cfg.snapshots_per_query - 1) - round(
-        (cfg.snapshots_per_query - 1) * cfg.snapshot_reachable_fraction)
-    covered = min(catalog_size, len(history) * len(splits["supervised"]) * off_per_query)
-    print(f"Coherent structural catalog visited during training: {covered}/{catalog_size} "
-          f"(shared across questions; development remains reachable-only).")
-    return {"weights": weights, "temperatures": temps, "history": history,
-            "best_epoch": best_epoch, "input_dim": cfg.input_dim,
-            "structural_catalog_size": catalog_size, "structural_visited": covered,
-            "dev_summary": snapshot_summary(logits / temperature_vector(temps, cfg), vy, cfg)}
+    print(f"Snapshot development: {len(dev.ids)} questions x {dev.order_count} zero-shot orders x "
+          f"{dev.state_count} reachable states = {dev.rows:,} views.", flush=True)
+    uncalibrated = temperature_vector(np.ones(5, np.float32), cfg)
+
+    def evaluate(model):
+        metrics = summarize_snapshot_sums(snapshot_sums(model, dev, uncalibrated, cfg))
+        return ((metrics["top1"], -metrics["brier"]),
+                f"development Top-1 {metrics['top1']:.1%} | Brier {metrics['brier']:.4f}")
+
+    fit = train_on_views(model, views, cfg.snapshot_epochs, cfg.seed + 201,
+                         lambda logits, y: snapshot_loss(logits, y, cfg), evaluate,
+                         lambda new, old: new > old, cfg, "Snapshot")
+    model.load_state_dict(fit["weights"])
+    temps = fit_temperatures(model, dev, cfg)
+    print(f"Snapshot selected at epoch {fit['best_epoch']:.2f}; development Top-1 {fit['best'][0]:.1%}.")
+    return {"weights": fit["weights"], "temperatures": temps, "history": fit["history"],
+            "best_epoch": fit["best_epoch"], "input_dim": cfg.input_dim,
+            "presence_states": views.state_count, "zero_shot_orders": views.order_count,
+            "views_per_epoch": views.rows,
+            "dev_summary": summarize_snapshot_sums(
+                snapshot_sums(model, dev, temperature_vector(temps, cfg), cfg))}
 
 
 class FrozenPredictor:
@@ -2845,23 +2859,24 @@ def continuation_summary(questions, cfg):
             "prior_goal_loss_rate": float(np.mean(broken)) if broken else None,
             "questions_with_prior_goal_lost": int(np.count_nonzero(broken))}
 
-def stage_snapshot_audit(records, ids, teacher, predictor, cfg):
+def stage_snapshot_audit(records, ids, teacher, predictor, cfg, cache=None):
+    """Calibrated predictor metrics over every reachable and every presence state.
+
+    Each question's metric sums are computed once and reused by every report that
+    contains it (`cache`), as its rollouts are; no observation or logit is kept.
+    """
     if not ids:
         return None
-    x, y = build_snapshots(records, ids, teacher, cfg, cfg.dev_snapshots_per_query,
-                           cfg.seed + 401)
-    logits = predict_array(predictor.model, x, predictor.device) / predictor.temperatures
-    metrics = snapshot_summary(logits, y, cfg)
-    p = 1/(1+np.exp(-np.clip(logits, -40, 40)))
-    for name, col in (("safe", 3*cfg.n), ("max", 3*cfg.n+1)):
-        positive = p[:, col] >= cfg.recognition_threshold
-        true = y[:, col].astype(bool)
-        metrics[name + "_precision"] = float(true[positive].mean()) if positive.any() else None
-        metrics[name + "_recall"] = float(positive[true].mean()) if true.any() else None
-    sx, sy = build_snapshots(records, ids, teacher, cfg, cfg.dev_snapshots_per_query,
-                             cfg.seed + 402, augmented=True)
-    stress = predict_array(predictor.model, sx, predictor.device) / predictor.temperatures
-    metrics["augmented_stress"] = snapshot_summary(stress, sy, cfg)
+    cache = {} if cache is None else cache
+    missing = [idx for idx in ids if idx not in cache]
+    for name, states in (("reachable", reachable_states(cfg)), ("every", None)):
+        if missing:
+            views = SnapshotViews(records, missing, cfg, predictor.device, teacher, states)
+            sums = snapshot_sums(predictor.model, views, predictor.temperatures, cfg)
+            for idx, row in zip(missing, sums):
+                cache.setdefault(idx, {})[name] = row
+    metrics = summarize_snapshot_sums([cache[idx]["reachable"] for idx in ids])
+    metrics["every_presence_state"] = summarize_snapshot_sums([cache[idx]["every"] for idx in ids])
     return metrics
 
 
@@ -2913,12 +2928,14 @@ def paired_top1(questions, cfg):
             for baseline in evaluation_methods(cfg) if baseline != "supervised"}
 
 
-def policy_report(records, ids, teacher, predictor, cfg, head, title, evaluated=None, sink=None):
+def policy_report(records, ids, teacher, predictor, cfg, head, title, evaluated=None, sink=None,
+                  snapshot_cache=None):
     """One report's acquisition comparison and its questions' report inputs, in `ids` order.
 
     `evaluated` maps question indices to question_report results, so reports that share
     questions (the pooled audit and each benchmark) roll every question out once per
-    method and zero-shot order. New rollouts stream their outcomes to `sink`.
+    method and zero-shot order. New rollouts stream their outcomes to `sink`;
+    `snapshot_cache` shares the snapshot diagnostic's per-question sums the same way.
     """
     section(title)
     if not ids:
@@ -2982,7 +2999,8 @@ def policy_report(records, ids, teacher, predictor, cfg, head, title, evaluated=
             "early_stop_rule": {"reason": "predicted_max", "threshold": cfg.recognition_threshold,
                                 "signals": ["global_MAX", "global_SAFE", "selected_MAX", "selected_SAFE"]},
             "call_accounting": "Recorded generation, baseline/cross measurement solves, and their grading calls; excludes retrieval and target-answer grading.",
-            "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg),
+            "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg,
+                                                         snapshot_cache),
             "continuation": continuation_summary([question["continuation"] for question in questions],
                                                  cfg)}, questions
 
@@ -3194,7 +3212,10 @@ class Workflow:
               f"(schema {DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question), "
               "binds them to the input logs' content rather than their paths, and never writes "
               "audit shards; Stage 4 rolls out each question once and saves "
-              f"compact outcomes to {ROLLOUT_FILE}, not trajectories.", flush=True)
+              f"compact outcomes to {ROLLOUT_FILE}, not trajectories. Stages 1-2 train on every "
+              f"presence state under every zero-shot order ({len(presence_states(self.cfg.zero_shots, self.cfg.k)):,} "
+              f"x {math.factorial(self.cfg.zero_shots)} views per question), assembled on the "
+              "device and never stored.", flush=True)
         cache_path = self.out / "compact_records.pt"
         if self.cfg.resume and cache_path.exists():
             cache = load_checkpoint(cache_path)
@@ -3250,6 +3271,8 @@ class Workflow:
         ids = self.splits["supervised"]
         empty = int((self.teacher["safe"][ids].sum(1) == 0).sum())
         print(f"OOF labels: {len(ids)} supervised questions; empty SAFE/MAX: {empty}/{len(ids)}.")
+        print("Reference rankings and SAFE/MAX labels come from complete-state predictions; "
+              "partial states only train the models.")
         teacher_report(self.records, self.splits["dev"], self.cfg, self.teacher["scores"],
                        self.heuristics, "TEACHER DEVELOPMENT REPORT (used for model selection)")
         self.push("Stage 1 complete: teacher folds and out-of-fold labels")
@@ -3338,7 +3361,7 @@ class Workflow:
         tmp = rollout_path.with_suffix(".jsonl.tmp")
         # Pooled audit questions are also benchmark questions: each question is rolled
         # out once, and only its summary inputs stay in RAM until the last report.
-        evaluated = {}
+        evaluated, snapshots = {}, {}
         try:
             with tmp.open("w", encoding="utf-8") as handle:
                 for name in names:
@@ -3348,7 +3371,7 @@ class Workflow:
                                              f"RANKING | {name} ({len(ids)} eligible questions)")
                     policy, questions = policy_report(self.records, ids, self.teacher, self.predictor,
                                                       self.cfg, self.head, f"ACQUISITION | {name}",
-                                                      evaluated, handle)
+                                                      evaluated, handle, snapshots)
                     results[name] = {"ranking": ranking, "adaptive": policy}
                     if questions:
                         results[name]["paired_top1"] = paired_top1(questions, self.cfg)
