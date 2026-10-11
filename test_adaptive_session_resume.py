@@ -183,7 +183,7 @@ def test_stage3_fingerprint_ignores_log_paths_and_reproduces_the_path_bound_form
     # formula; it was re-pinned when revision 6 changed the Stage 1-2 config fields.
     legacy = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
                                             [cfg.train_file] + cfg.test_files)
-    assert legacy == "dc24e53615c20864478b52c894a698c6c893ecef23f782bb7677015ad44b4cd5" != current
+    assert legacy == "5c21f1cdbe69f5cccc7b7a56223eaa94bc50a3921d7fa387245cb65a5b326b9d" != current
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
                                           [moved.train_file] + moved.test_files) not in (legacy, current)
 

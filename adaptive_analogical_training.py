@@ -61,6 +61,9 @@ class Config:
     weight_decay: float = 1e-4
     teacher_epochs: int = 10
     snapshot_epochs: int = 10
+    # Complete views (6 of 48,960 per question) are repeated to this share of each epoch.
+    teacher_complete_share: float = .15
+    snapshot_complete_share: float = 0.   # 0: complete views appear once per order, like any other.
     dev_checks_per_epoch: int = 8   # Stages 1-2 development checks, evenly spaced in each epoch.
     patience: int = 15              # Checks without improvement (Stages 1-2) or epochs (Stage 3).
     auxiliary_weight: float = .25
@@ -128,6 +131,7 @@ class Config:
         assert self.decision_epochs > 0 and self.decision_batch_size >= 2 and self.decision_lr > 0
         assert self.decision_eval_batch_size >= 2
         assert self.dev_checks_per_epoch >= 1
+        assert 0 <= self.teacher_complete_share < 1 and 0 <= self.snapshot_complete_share < 1
         assert self.print_every > 0
         assert self.hf_sync_minutes > 0
         if self.hf_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", str(self.hf_repo)):
@@ -538,7 +542,8 @@ def train_teacher(records, train_ids, val_ids, cfg, device, seed, name):
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
     # The ranking passed to later stages is read from complete states, so selection is too.
     vx = np.stack([observation(records[i], full, cfg) for i in val_ids])
-    views = SnapshotViews(records, train_ids, cfg, device)
+    # The complete view is the one later stages read, so it gets its own share of training.
+    views = SnapshotViews(records, train_ids, cfg, device, complete_share=cfg.teacher_complete_share)
     model = ResNet(cfg.input_dim, cfg.n, cfg).to(device)
 
     def evaluate(model):
@@ -956,9 +961,10 @@ class SnapshotViews:
     snapshot_target of the permuted record bit for bit. Views are indexed
     question-major, then zero-shot order, then state.
     """
-    def __init__(self, records, ids, cfg, device, teacher=None, states=None):
+    def __init__(self, records, ids, cfg, device, teacher=None, states=None, complete_share=0.):
         self.cfg, self.device, self.ids = cfg, torch.device(device), list(ids)
         states = presence_states(cfg.zero_shots, cfg.k) if states is None else tuple(states)
+        full = State((1 << cfg.n) - 1, (1 << cfg.k) - 1)
         template, masks, (sim, base, ccs) = structural_observation_template(
             states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, True)
         orders = list(permutations(range(cfg.zero_shots)))
@@ -984,6 +990,18 @@ class SnapshotViews:
         self.state_count, self.order_count = len(states), len(orders)
         self.per_question = self.state_count * self.order_count
         self.rows = len(self.ids) * self.per_question
+        # Training repeats each complete view so complete views make up `complete_share`
+        # of an epoch; every partial view is still visited exactly once.
+        self.complete_state = states.index(full) if full in states else None
+        self.complete_share = complete_share
+        self.complete_copies = 1
+        if complete_share:
+            if self.complete_state is None:
+                raise ValueError("complete_share needs the complete state among the views.")
+            self.complete_copies = max(1, round(complete_share * (self.state_count - 1)
+                                                / (1 - complete_share)))
+        self.epoch_per_question = self.per_question + (self.complete_copies - 1) * self.order_count
+        self.epoch_rows = len(self.ids) * self.epoch_per_question
 
     def batch(self, index):
         """Observations and targets for flat view indices on the device."""
@@ -1003,14 +1021,20 @@ class SnapshotViews:
                              (maximum * cm).amax(1, keepdim=True).gt(0).float(), cm], 1)
 
     def batches(self, batch_size, rng):
-        """Every view once, shuffled within groups of questions taken in random order."""
-        group = max(1, SNAPSHOT_GROUP_VIEWS // self.per_question)
+        """One epoch: every view once plus the complete-view repeats, shuffled within
+        groups of questions taken in random order."""
+        per = self.epoch_per_question
+        group = max(1, SNAPSHOT_GROUP_VIEWS // per)
         order = rng.permutation(len(self.ids)).astype(np.int64)
         for start in range(0, len(order), group):
             members = order[start:start+group]
-            flat = rng.permutation(len(members) * self.per_question).astype(np.int64)
-            flat = members[flat // self.per_question] * self.per_question + flat % self.per_question
-            flat = torch.from_numpy(flat).to(self.device)
+            slot = rng.permutation(len(members) * per).astype(np.int64)
+            local = slot % per
+            if per > self.per_question:  # Slots past the views repeat a complete view per order.
+                repeat = local >= self.per_question
+                local[repeat] = ((local[repeat] - self.per_question) % self.order_count
+                                 * self.state_count + self.complete_state)
+            flat = torch.from_numpy(members[slot // per] * self.per_question + local).to(self.device)
             bounds = list(range(0, len(flat), batch_size)) + [len(flat)]
             if len(bounds) > 2 and bounds[-1] - bounds[-2] == 1:
                 del bounds[-2]  # BatchNorm cannot train on a single row.
@@ -1025,7 +1049,8 @@ class SnapshotViews:
 
 
 def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, name):
-    """Every epoch visits every view once; development checks are spread through it.
+    """Every epoch visits every view once, plus the views' complete-state repeats;
+    development checks are spread through it.
 
     `evaluate(model)` returns a comparable score and its description. Patience counts
     checks without improvement, so training can stop inside a long epoch.
@@ -1037,9 +1062,12 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
                            fused=views.device.type == "cuda")
     best, weights, best_epoch, stale, history = None, None, 0., 0, []
     checks, position, started = cfg.dev_checks_per_epoch, 0., time.monotonic()
+    complete = len(views.ids) * views.order_count * views.complete_copies
     print(f"{name}: {len(views.ids)} questions x {views.order_count} zero-shot orders x "
-          f"{views.state_count} presence states = {views.rows:,} views per epoch; "
-          f"{checks} development checks per epoch.", flush=True)
+          f"{views.state_count} presence states = {views.rows:,} views; each complete view "
+          f"{views.complete_copies:,}x, so {views.epoch_rows:,} rows per epoch, "
+          f"{complete / views.epoch_rows:.1%} complete; {checks} development checks per epoch.",
+          flush=True)
     for epoch in range(epochs):
         done = seen = check = 0
         total = torch.zeros((), device=views.device)
@@ -1051,10 +1079,10 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
             opt.step()
             total += loss.detach() * len(bx)
             done, seen = done + len(bx), seen + len(bx)
-            due = done * checks // views.rows
+            due = done * checks // views.epoch_rows
             if due <= check:
                 continue
-            check, position = due, epoch + done / views.rows
+            check, position = due, epoch + done / views.epoch_rows
             score, text = evaluate(model)
             model.train()
             history.append({"epoch": position, "train_loss": float(total) / seen, "score": score})
@@ -1157,7 +1185,8 @@ def fit_temperatures(model, views, cfg):
 
 def fit_snapshot(records, splits, teacher, cfg, device):
     seed_everything(cfg.seed + 200)
-    views = SnapshotViews(records, splits["supervised"], cfg, device, teacher)
+    views = SnapshotViews(records, splits["supervised"], cfg, device, teacher,
+                          complete_share=cfg.snapshot_complete_share)
     # Selection and calibration use what the runtime visits: every reachable state.
     dev = SnapshotViews(records, splits["dev"], cfg, device, teacher, reachable_states(cfg))
     model = ResNet(cfg.input_dim, 3*cfg.n+2, cfg).to(device)
@@ -1179,7 +1208,8 @@ def fit_snapshot(records, splits, teacher, cfg, device):
     return {"weights": fit["weights"], "temperatures": temps, "history": fit["history"],
             "best_epoch": fit["best_epoch"], "input_dim": cfg.input_dim,
             "presence_states": views.state_count, "zero_shot_orders": views.order_count,
-            "views_per_epoch": views.rows,
+            "views_per_epoch": views.rows, "rows_per_epoch": views.epoch_rows,
+            "complete_copies": views.complete_copies,
             "dev_summary": summarize_snapshot_sums(
                 snapshot_sums(model, dev, temperature_vector(temps, cfg), cfg))}
 

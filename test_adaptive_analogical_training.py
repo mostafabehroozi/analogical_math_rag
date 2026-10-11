@@ -3,6 +3,7 @@ import ast
 import copy
 import itertools
 import json
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
@@ -196,6 +197,31 @@ def test_snapshot_batches_visit_every_view_once_without_singletons(group, batch,
     assert sorted(seen.tolist()) == list(range(views.rows))
     again = torch.cat([index for index, _ in views.batches(batch, np.random.RandomState(1))])
     assert torch.equal(seen, again) and not torch.equal(seen, torch.arange(views.rows))
+
+
+@pytest.mark.parametrize("share,group", [(.5, 1 << 21), (.1, 200), (.9, 1000)])
+def test_complete_views_fill_their_share_of_every_epoch(share, group, monkeypatch):
+    cfg = a.Config(k=2, zero_shots=2)
+    monkeypatch.setattr(a, "SNAPSHOT_GROUP_VIEWS", group)
+    views = a.SnapshotViews([record(cfg, i) for i in range(5)], list(range(5)), cfg, "cpu",
+                            complete_share=share)
+    full = a.presence_states(cfg.zero_shots, cfg.k).index(a.State((1 << cfg.n)-1, (1 << cfg.k)-1))
+    assert views.complete_state == full
+    assert views.complete_copies == round(share * (views.state_count - 1) / (1 - share))
+    monkeypatch.setattr(views, "batch", lambda index: (index, index))
+    batches = [index for index, _ in views.batches(16, np.random.RandomState(2))]
+    assert min(map(len, batches)) >= 2
+    counts = Counter(torch.cat(batches).tolist())
+    assert sum(counts.values()) == views.epoch_rows
+    complete = {i for i in range(views.rows) if i % views.state_count == full}
+    assert set(counts) == set(range(views.rows))  # Every partial view is still visited.
+    assert all(counts[i] == (views.complete_copies if i in complete else 1) for i in counts)
+    assert len(complete) * views.complete_copies / views.epoch_rows == pytest.approx(share, abs=.02)
+    # Batches are built from the same views, so complete rows are complete observations.
+    real = a.SnapshotViews([record(cfg, i) for i in range(5)], list(range(5)), cfg, "cpu",
+                           complete_share=share)
+    x, y = real.batch(torch.as_tensor(sorted(complete)))
+    assert torch.all(y[:, cfg.n:] == 1)
 
 
 def test_streamed_snapshot_metrics_and_temperatures_match_materialized_arrays():

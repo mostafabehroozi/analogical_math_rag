@@ -59,8 +59,29 @@ complete-state development AP. Stage 2 is selected and calibrated on every
 reachable runtime state (189 by default) of every development question under
 every zero-shot order.
 
-One epoch visits every view once: about 98 million views for 2,000 training
-questions. The defaults are therefore `batch_size=16384`,
+**Complete-view share.** Each question has only 6 complete views among its
+48,960, so an unweighted epoch would spend 0.012% of its training on the one
+state whose predictions later stages use. A larger loss weight would not fix
+this: a 16,384-row batch holds about two complete rows, and weighting them by
+thousands makes the gradient follow those two rows. Instead, each epoch
+repeats every complete view until complete views form a configured share of
+its rows, and shuffles the repeats in with the partial views; every partial
+view is still visited exactly once. The copy count is
+`round(share * (8,160 - 1) / (1 - share))`:
+
+| Setting | Default | Copies of each complete view | Rows per question per epoch |
+| --- | --- | --- | --- |
+| `teacher_complete_share` | 0.15 | 1,440 | 57,594 |
+| `snapshot_complete_share` | 0 | 1 (no repeats) | 48,960 |
+
+The teacher's ranking is read only from complete views, so 15% of its
+training is on them. The snapshot model's main job is partial-state
+recognition, so by default its complete views count like any other view
+(0.012% of its rows). `0` disables the repeats. Checkpoint selection is unchanged: the teacher is
+selected on complete-state AP, Stage 2 on every reachable state.
+
+One epoch visits every view once (plus those repeats): about 98 million views
+for 2,000 training questions. The defaults are therefore `batch_size=16384`,
 `teacher_epochs=snapshot_epochs=10`, and `dev_checks_per_epoch=8`. Development
 checks are spread evenly through each epoch, `patience` counts checks without
 improvement in Stages 1-2 (epochs in Stage 3), and the selected checkpoint's
@@ -82,8 +103,9 @@ Measured on a local RTX 3050 Ti laptop GPU with 120 synthetic default-geometry
 questions: about **1.8 million views/s** for Stage 2 training including its
 development checks and calibration, a flat host RSS (+1 MiB after CUDA
 initialization), and 180 MiB peak CUDA memory. At that rate one epoch takes
-about 1 minute for Stage 2 and about 4 minutes for Stage 1's five folds plus
-final teacher, so the 10-epoch maximum is under an hour for both stages before
+about 1 minute for Stage 2 and, with the teacher's complete-view repeats
+adding 18% to its rows, about 5 minutes for Stage 1's five folds plus final
+teacher, so the 10-epoch maximum is about an hour for both stages before
 early stopping. Kaggle hardware will differ.
 
 SAFE is the leading uninterrupted run of actually correct candidates in the
