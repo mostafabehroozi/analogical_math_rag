@@ -5,7 +5,6 @@ import itertools
 import json
 import re
 from collections import Counter
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -85,26 +84,35 @@ def test_retrieval_ties_keep_log_order_and_missing_similarity_is_auditable():
         a.parse_record(raw, 0, "train", cfg)
 
 
-def test_initial_state_retrieval_order_one_shot_independence_and_cost():
+def test_initial_state_opening_order_and_cost():
     cfg = a.Config()
-    assert cfg.full_cost == 458
+    assert cfg.full_cost == 458 and cfg.action_count == 11 and cfg.head_input_dim == cfg.hidden_dim + 13
     assert a.state_cost(a.State(), cfg) == 1
-    # 3 zero-shot prefixes x 6 evaluator prefixes x 32 subsets of the five one-shot candidates.
-    assert len(a.reachable_states(cfg)) == 3 * 6 * 32 == 576
-    # Every acquisition is open from the start: a one-shot candidate needs no evaluator.
-    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0, 1, 2, 3, 4, 5, 6]
-    first = a.advance(a.State(), 0, cfg)
-    assert first.evaluator_mask == 1
-    assert 2 in np.flatnonzero(a.valid_actions(first, cfg))
-    lone = a.advance(a.State(), 4, cfg)  # OS3 before any evaluator: its generation is the only call.
-    assert lone == a.State(1 | (1 << 5), 0) and a.state_cost(lone, cfg) == 2
+    # 3 zero-shot prefixes x the 1 + 3 + 9 + 27 + 81 + 243 ways to use the nearest m sources
+    # (one-shot candidate only, evaluator only, or both).
+    assert len(a.reachable_states(cfg)) == 3 * sum(3 ** m for m in range(cfg.k + 1)) == 1092
+    names = a.action_names(cfg)
+    assert names[0] == "add_zero_shot" and names[1] == "add_evaluator_R1"
+    assert names[6] == "generate_one_shot_from_R1" and len(names) == 11
+
+    def legal(state):
+        return [names[i] for i in np.flatnonzero(a.valid_actions(state, cfg))]
+
+    # Only the nearest unused source can be opened, as its evaluator or as its one-shot candidate.
+    assert legal(a.State()) == ["add_zero_shot", "add_evaluator_R1", "generate_one_shot_from_R1"]
+    first = a.advance(a.State(), 1, cfg)
+    assert first == a.State(1, 1)
+    assert legal(first) == ["add_zero_shot", "add_evaluator_R2", "generate_one_shot_from_R1",
+                            "generate_one_shot_from_R2"]
+    lone = a.advance(a.State(), 6, cfg)  # OS1 before any evaluator: its generation is the only call.
+    assert lone == a.State(1 | (1 << 3), 0) and a.state_cost(lone, cfg) == 2
+    # A used source may be completed in either order, and source 2 is now the one to open.
+    assert legal(lone) == ["add_zero_shot", "add_evaluator_R1", "add_evaluator_R2", "generate_one_shot_from_R2"]
     with pytest.raises(ValueError, match="Unavailable"):
-        a.advance(lone, 4, cfg)  # Already generated.
-    # The evaluator action still adds the next evaluator in similarity order, whichever one-shots exist.
-    assert a.advance(a.State(), 0, cfg).evaluator_mask == 1
-    assert a.advance(lone, 0, cfg).evaluator_mask == 1
-    assert a.advance(first, 0, cfg).evaluator_mask == 3
-    assert a.fixed_order_actions(cfg) == [0, 2, 1, 0, 3, 1, 0, 4, 0, 5, 0, 6]
+        a.advance(a.State(), 8, cfg)  # OS3 while sources 1 and 2 are unused.
+    with pytest.raises(ValueError, match="Unavailable"):
+        a.advance(lone, 6, cfg)  # Already generated.
+    assert a.fixed_order_actions(cfg) == [1, 6, 0, 2, 7, 0, 3, 8, 4, 9, 5, 10]
 
 
 def test_exhaustive_catalog_matches_independent_enumerator_and_transition_graph():
@@ -117,41 +125,45 @@ def test_exhaustive_catalog_matches_independent_enumerator_and_transition_graph(
     assert len(independent) == len(states) == 8160
     assert {(s.candidate_mask, s.evaluator_mask) for s in states} == independent
     assert len(states) * 6 == 48960
-    zero_mask, all_evaluators = (1 << cfg.zero_shots) - 1, (1 << cfg.k) - 1
+    zero_mask = (1 << cfg.zero_shots) - 1
     for state, edges in zip(states, graph):
         assert len(edges) == len(set(edges.values()))
-        # Independent action rule: the next evaluator, the next zero-shot, and every absent one-shot.
-        expected = ({0} if state.evaluator_mask != all_evaluators else set()) | (
-            {1} if state.candidate_mask & zero_mask != zero_mask else set()) | {
-            2 + source for source in range(cfg.k)
-            if not state.candidate_mask >> (cfg.zero_shots + source) & 1}
+        # Independent statement of the rule, by the status of each source.
+        sources = [(bool(state.candidate_mask >> (cfg.zero_shots + j) & 1), bool(state.evaluator_mask >> j & 1))
+                   for j in range(cfg.k)]
+        opening = next((j for j, (one_shot, evaluator) in enumerate(sources) if not one_shot and not evaluator), None)
+        expected = {0} if state.candidate_mask & zero_mask != zero_mask else set()
+        for j, (one_shot, evaluator) in enumerate(sources):
+            if j == opening or one_shot or evaluator:
+                expected |= ({1 + j} if not evaluator else set()) | ({1 + cfg.k + j} if not one_shot else set())
         assert set(edges) == expected
         for action, successor in edges.items():
             nxt = states[successor]
             assert nxt == a.raw_next_state(state, action, cfg)
             assert nxt.candidate_mask | state.candidate_mask == nxt.candidate_mask
             assert nxt.evaluator_mask | state.evaluator_mask == nxt.evaluator_mask
+    assert sum(1 for edges in graph if not edges) == 1  # Only the complete state has no acquisition.
 
 
 def test_arbitrary_evaluator_subsets_zero_shot_and_exact_budget_cost():
     cfg = a.Config(k=3, zero_shots=3, max_cost=32)
     state = a.State(1, 4)  # ZS1 with only R3 active.
     assert a.state_cost(state, cfg) == 21
-    # The next evaluator no longer fits the budget; the zero-shot and every one-shot do,
-    # whichever evaluator they came from.
-    assert np.flatnonzero(a.valid_actions(state, cfg)).tolist() == [1, 2, 3, 4]
-    zs = a.advance(state, 1, cfg)
-    os = a.advance(state, 4, cfg)
-    assert zs == a.State(3, 4) and os == a.State(1 | (1 << 5), 4)
-    snapshot = a.as_snapshot_state(os, cfg)
+    # R1 no longer fits the budget. The zero-shot, the nearest source's one-shot candidate, and the
+    # one-shot candidate of the already used source 3 do; source 2 is neither used nor the nearest.
+    assert np.flatnonzero(a.valid_actions(state, cfg)).tolist() == [0, 4, 6]
+    zs = a.advance(state, 0, cfg)
+    os3 = a.advance(state, 6, cfg)
+    assert zs == a.State(3, 4) and os3 == a.State(1 | (1 << 5), 4)
+    snapshot = a.as_snapshot_state(os3, cfg)
     assert snapshot.baseline_attempted == snapshot.baseline_observed == 4
     assert snapshot.ccs_attempted == snapshot.ccs_observed == (4 | (4 << (5*cfg.k)))
     # OS1 needs neither R1 nor any other evaluator; a lone one-shot candidate measures nothing.
-    assert a.advance(state, 2, cfg) == a.State(1 | (1 << 3), 4)
+    assert a.advance(state, 4, cfg) == a.State(1 | (1 << 3), 4)
     lone = a.as_snapshot_state(a.State(1 << 5, 0), cfg)
     assert lone.candidates == 1 << 5 and lone.baseline_attempted == lone.ccs_attempted == 0
     assert a.state_cost(zs, cfg) - a.state_cost(state, cfg) == 11
-    assert a.state_cost(os, cfg) - a.state_cost(state, cfg) == 11
+    assert a.state_cost(os3, cfg) - a.state_cost(state, cfg) == 11
     cfg.max_cost = 20
     assert not a.valid_actions(state, cfg).any()
     assert a.state_cost(a.State((1 << a.Config().n)-1, (1 << a.Config().k)-1), a.Config()) == 458
@@ -398,138 +410,6 @@ def test_no_max_fallback_and_strict_optional_later_filter():
     assert a.goal_condition(0, order, empty, empty, p, full, state, disabled)
 
 
-def test_recognition_can_require_an_evaluator_or_a_one_shot_candidate():
-    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
-    r = record(cfg)
-    class EvaluatorRecognition:
-        def predict(self, rec, state, cfg_override=None):
-            p = np.zeros(3*cfg.n+2, np.float32)
-            if state.evaluator_mask:
-                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
-            return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states):
-            values = [self.predict(rec, state) for state in states]
-            return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
-    states = a.presence_states(cfg.zero_shots, cfg.k)
-    safe = maximum = np.array([1, 0, 0], np.float32)
-    scenario = a.decision_scenario(r, np.array([.9, .8, .7]), safe, maximum,
-                                   EvaluatorRecognition(), cfg, states)
-    root = next(j for j, state in enumerate(states) if state == a.State())
-    assert not scenario["goal"][root, 0]  # Presence alone is insufficient.
-    assert scenario["goal"][scenario["index"][a.State(1, 1)], 0]
-    rows, cases = a.aggregate_decision_rows([scenario], cfg)
-    case = next(c for c in cases if c["candidate_mask"] == 1 and c["evaluator_mask"] == 0)
-    assert case["status"] == "ACTION"
-    assert rows[case["training_row"]]["target"][0] == 1  # Only R1 is needed.
-
-    # Rank one is now the one-shot candidate, and recognizing it also needs an evaluator.
-    # Generating it first and adding R1 first both reach the goal in two steps at the same
-    # cost, so the tie goes to the evaluator action.
-    one_shot_safe = one_shot_max = np.array([0, 0, 1], np.float32)
-    class OneShotRecognition(EvaluatorRecognition):
-        def predict(self, rec, state, cfg_override=None):
-            p = np.zeros(3*cfg.n+2, np.float32)
-            if state.candidate_mask & 4 and state.evaluator_mask:
-                p[[cfg.n+2, 2*cfg.n+2, 3*cfg.n, 3*cfg.n+1]] = .9
-                p[2] = .9
-            return np.zeros(cfg.hidden_dim, np.float32), p
-    scenario = a.decision_scenario(r, np.array([.8, .7, .9]), one_shot_safe,
-                                   one_shot_max, OneShotRecognition(), cfg, states)
-    rows, cases = a.aggregate_decision_rows([scenario], cfg)
-    case = next(c for c in cases if c["candidate_mask"] == 1 and c["evaluator_mask"] == 0)
-    assert case["status"] == "ACTION"
-    row = rows[case["training_row"]]
-    assert row["target"][0] == 1
-    assert row["action_reach"][2] == 1  # Generating OS1 before R1 reaches the goal as well.
-    assert a.valid_actions(a.State(), cfg)[2] and a.valid_actions(a.State(1, 1), cfg)[2]
-
-
-def test_planner_generates_a_one_shot_before_any_evaluator_when_that_alone_reaches_the_goal():
-    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
-    r = record(cfg)
-    # Rank one is the one-shot candidate, and recognizing it needs no evaluator.
-    safe = maximum = np.array([0, 0, 1], np.float32)
-    class Predictor:
-        def predict(self, rec, state, cfg_override=None):
-            p = np.zeros(3*cfg.n+2, np.float32)
-            if state.candidate_mask & 4:
-                p[[cfg.n+2, 2*cfg.n+2, 3*cfg.n, 3*cfg.n+1]] = .9
-                p[2] = .9
-            return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states):
-            values = [self.predict(rec, state) for state in states]
-            return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
-    scenario = a.decision_scenario(r, np.array([.8, .7, .9]), safe, maximum, Predictor(), cfg,
-                                   a.presence_states(cfg.zero_shots, cfg.k))
-    rows, cases = a.aggregate_decision_rows([scenario], cfg)
-    case = next(c for c in cases if c["candidate_mask"] == 1 and c["evaluator_mask"] == 0)
-    row = rows[case["training_row"]]
-    # OS1 alone is one step and one call; reaching it through R1 first would cost 30 more calls.
-    assert case["status"] == "ACTION" and row["reach"] == 1
-    np.testing.assert_array_equal(row["target"], [0., 0., 1.])
-    assert row["expected_steps"] == 1 and row["expected_cost"] == 1
-
-
-def test_explicit_status_precedence_and_case_reconciliation():
-    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
-    r = record(cfg)
-    scores = np.array([.9, .7, .3])
-    empty = np.zeros(cfg.n, np.float32)
-    class Scripted:
-        def __init__(self, values):
-            self.values = values
-        def predict(self, rec, state, cfg_override=None):
-            p = np.zeros(3*cfg.n+2, np.float32)
-            for i in range(cfg.n):
-                if state.candidate_mask & (1 << i):
-                    p[i] = self.values[i]
-            return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states):
-            values = [self.predict(rec, state) for state in states]
-            return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
-    rows, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([.9, .7, .3]), cfg)
-    assert len(cases) == 28
-    assert a.Counter(c["status"] for c in cases)["COMPLETE"] > 0
-    rank_by_mask = {c["candidate_mask"]: c for c in cases
-                    if c["scenario"] == 0 and c["evaluator_mask"] == 0}
-    assert rank_by_mask[1]["goal_rank"] == 1 and rank_by_mask[1]["status"] == "ACTION"
-    assert rank_by_mask[3]["goal_rank"] == 2 and rank_by_mask[3]["status"] == "ACTION"
-    assert next(c for c in cases if c["scenario"] == 0 and c["candidate_mask"] == 7
-                and c["evaluator_mask"] == 1)["status"] == "COMPLETE"
-    # A case has a row exactly when an action is affordable, unless every reference goal holds:
-    # the goals need every candidate but no evaluator, so a COMPLETE state can still have R1 to add.
-    assert all((c["training_row"] is not None) == bool(a.valid_actions(
-        a.State(c["candidate_mask"], c["evaluator_mask"]), cfg).any())
-        for c in cases if c["status"] != "COMPLETE")
-    full = {c["scenario"]: c for c in cases if c["candidate_mask"] == 7 and c["evaluator_mask"] == 1}
-    # The swapped zero-shot order never recognizes its rank one, so its full pool is EXHAUSTED.
-    assert full[0]["status"] == "COMPLETE" and full[1]["status"] == "EXHAUSTED"
-    assert all(c["training_row"] is None for c in full.values())
-    complete_without_evaluator = next(c for c in cases if c["scenario"] == 0 and c["candidate_mask"] == 7
-                                      and c["evaluator_mask"] == 0)
-    assert complete_without_evaluator["status"] == "COMPLETE"
-    assert a.valid_actions(a.State(7, 0), cfg).tolist() == [True, False, False]
-    # It keeps a row only through an unfinished case with the same visible observation.
-    sharer = next(c for c in cases if c["scenario"] == 1 and c["candidate_mask"] == 7
-                  and c["evaluator_mask"] == 0)
-    assert sharer["status"] in ("ACTION", "UNREACHABLE")
-    assert complete_without_evaluator["training_row"] == sharer["training_row"] is not None
-    assert all(np.isclose(row["target"].sum(), 1) and not row["target"][~row["valid"]].any()
-               for row in rows)
-    rows, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([0, 0, 0]), cfg)
-    assert a.Counter(c["status"] for c in cases)["EXHAUSTED"] == 2
-    assert a.Counter(c["status"] for c in cases)["UNREACHABLE"] > 0
-    assert rows and all(c["training_row"] is not None for c in cases
-                        if c["status"] == "UNREACHABLE")
-    assert any(row["objective"] == "fill_pool_unreachable_goal" for row in rows)
-    cfg.max_cost = 1
-    _, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([0, 0, 0]), cfg)
-    counts = a.Counter(c["status"] for c in cases)
-    assert counts["OUT_OF_BUDGET"] > 0 and counts["BUDGET"] > 0
-    assert counts["EXHAUSTED"] == 0  # Full state exceeds the budget first.
-    assert sum(counts.values()) == 28
-
-
 def test_max_requires_all_four_correct_lights_and_recovers_after_temporary_loss():
     cfg = a.Config(k=1, zero_shots=2)
     order = [0, 1, 2]
@@ -553,100 +433,28 @@ def test_max_requires_all_four_correct_lights_and_recovers_after_temporary_loss(
                 q[1] = .8
             if state.candidate_mask not in (1, 7):
                 q[2*cfg.n] = .1  # Either intermediate addition loses MAX; full state restores it.
-            return np.zeros(cfg.hidden_dim, np.float32), q
+            return np.zeros(cfg.head_input_dim, np.float32), q
         def predict_many(self, rec, states):
             values = [self.predict(rec, state) for state in states]
             return np.stack([v[0] for v in values]), np.stack([v[1] for v in values])
     r = record(cfg)
-    states = a.reachable_states(cfg)
-    scenario = a.decision_scenario(
-        r, np.array([.9,.8,.7]), safe, maximum, Scripted(), cfg, states)
-    after_first = states.index(a.State(1, 1))
-    assert scenario["goal"][after_first].tolist() == [True, False, False]
-    assert scenario["goal"][states.index(a.State(7, 1)), 0]
-    rows, cases = a.aggregate_decision_rows([scenario], cfg)
-    assert next(case for case in cases if case["candidate_mask"] == 1 and case["evaluator_mask"] == 1)["status"] == "ACTION"
-
-
-def test_planner_shares_future_actions_until_zero_shot_evidence_is_observed():
-    cfg = a.Config(k=1, zero_shots=2, repeats=1, hidden_dim=4)
-    r = record(cfg)
-    r.ccs[:, 0] = [1, 0, 0]
-    states = a.presence_states(cfg.zero_shots, cfg.k)
-    scores = np.array([.9, .7, .3])
-    safe = maximum = np.array([1, 0, 0], np.float32)
-
-    class Scripted:
-        def predict(self, rec, state, cfg_override=None):
-            p = np.zeros(3*cfg.n+2, np.float32)
-            if state.evaluator_mask:
-                for i in range(cfg.n):
-                    if state.candidate_mask & (1 << i) and rec.ccs[i, 0] == 1:
-                        p[[cfg.n+i, 2*cfg.n+i, 3*cfg.n, 3*cfg.n+1]] = .9
-                        p[i] = .9
-            return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states):
-            values = [self.predict(rec, state) for state in states]
-            return np.stack([v[0] for v in values]), np.stack([v[1] for v in values])
-
-    scenarios = []
-    for order in ((0, 1), (1, 0)):
-        rec, s, sf, mx = a.permute_zero_shots(r, scores, safe, maximum, order, cfg)
-        scenarios.append(a.decision_scenario(rec, s, sf, mx, Scripted(), cfg, states,
-                          reference_order=a.permuted_reference_order(scores, order, cfg)))
-    rows, cases = a.aggregate_decision_rows(scenarios, cfg)
-    roots = [case for case in cases if case["candidate_mask"] == 1 and case["evaluator_mask"] == 0]
-    assert len(roots) == 2 and all(case["status"] == "ACTION" for case in roots)
-    assert roots[0]["training_row"] == roots[1]["training_row"]
-    row = rows[roots[0]["training_row"]]
-    assert np.isclose(row["target"].sum(), 1)
-    assert np.isclose(row["reach"], 1)
-    assert not row["target"][~row["valid"]].any()
-    # Before the evaluator is acquired, swapping unseen answer identities leaves the input unchanged.
-    assert scenarios[0]["keys"][scenarios[0]["index"][a.State()]] == scenarios[1]["keys"][scenarios[1]["index"][a.State()]]
-    future = [case for case in cases if case["candidate_mask"] == 3 and case["evaluator_mask"] == 0]
-    assert len(future) == 2 and future[0]["training_row"] == future[1]["training_row"]
-
-
-def test_future_group_stays_shared_when_only_one_scenario_has_reached_its_goal():
-    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
-    r = record(cfg)
-    states = a.presence_states(cfg.zero_shots, cfg.k)
-    safe = maximum = np.array([1, 0, 0], np.float32)
-    class Scripted:
-        def predict(self, rec, state, cfg_override=None):
-            p = np.zeros(3*cfg.n+2, np.float32)
-            if state.candidate_mask & 3 == 3:
-                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
-                p[0] = .9
-                if state.evaluator_mask:
-                    p[[cfg.n+1, 2*cfg.n+1]] = .9
-                    p[1] = .8
-            return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states):
-            values = [self.predict(rec, state) for state in states]
-            return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
-    scenarios = []
-    scores = np.array([.9, .8, .3])
-    for order in ((0, 1), (1, 0)):
-        rec, s, sf, mx = a.permute_zero_shots(r, scores, safe, maximum, order, cfg)
-        scenarios.append(a.decision_scenario(rec, s, sf, mx, Scripted(), cfg, states,
-                          reference_order=a.permuted_reference_order(scores, order, cfg)))
-    rows, cases = a.aggregate_decision_rows(scenarios, cfg)
-    future = [case for case in cases if case["candidate_mask"] == 3 and case["evaluator_mask"] == 0]
-    assert len(future) == 2
-    assert sorted(case["goal_rank"] for case in future) == [0, 1]
-    assert future[0]["training_row"] == future[1]["training_row"]
-    assert rows[future[0]["training_row"]]["target"][0] == 1
+    scores = np.array([.9, .8, .7])
+    scenario = a.decision_scenarios(r, scores, safe, maximum, Scripted(), cfg)
+    index = {state: i for i, state in enumerate(scenario["graph"].states)}
+    assert scenario["goal"][0, index[a.State(1, 1)]].tolist() == [True, False, False]
+    assert scenario["goal"][0, index[a.State(7, 1)], 0]
+    # The temporarily lost MAX does not make the state a dead end: the full pool restores it.
+    plan = a.question_plan(r, scores, safe, maximum, Scripted(), cfg)
+    assert plan["status"][0, index[a.State(1, 1)]] == a.DECISION_STATUSES.index("ACTION")
 
 
 def test_fixed_policy_does_not_skip_an_unaffordable_step():
     cfg = a.Config(max_cost=55)
     class NoStop:
         def predict(self, rec, state, cfg_override=None):
-            return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
+            return np.zeros(cfg.head_input_dim), np.zeros(3*cfg.n+2)
     row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed", trace=True)
-    assert [step["action"] for step in row["trajectory"] if step["action"] is not None] == [0, 2, 1]
+    assert [step["action"] for step in row["trajectory"] if step["action"] is not None] == [1, 6, 0]
     assert row["cost"] == 43 and row["reason"] == "budget"
 
 
@@ -683,6 +491,7 @@ def test_fixed_sequences_acquire_each_item_once_and_stay_in_the_pool(k, zero_sho
 
 @pytest.mark.parametrize("items", [[], ["R1"], ["ZS1", "R1", "R1"],
                                    ["ZS1", "R2"],
+                                   ["ZS1", "OS2"], ["ZS1", "R3"],
                                    ["ZS1", "ZS3"], ["ZS1", "ZS1"], ["ZS1", "R6"],
                                    ["ZS1", "OS6"], ["ZS1", "ZS4"], ["ZS1", "X1"]])
 def test_custom_fixed_sequence_rejects_invalid_steps(items):
@@ -692,13 +501,13 @@ def test_custom_fixed_sequence_rejects_invalid_steps(items):
 
 
 def test_custom_fixed_sequence_may_generate_a_one_shot_before_or_without_its_evaluator():
-    items = ["ZS1", "OS2", "OS1", "R1", "ZS2"]
+    items = ["ZS1", "OS1", "OS2", "R1", "ZS2"]
     cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={"fixed_custom": items})
     cfg.validate()
-    assert a.fixed_order_actions(cfg, items) == [3, 2, 0, 1]
+    assert a.fixed_order_actions(cfg, items) == [3, 4, 1, 0]
     class NoStop:
         def predict(self, rec, state, cfg_override=None):
-            return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
+            return np.zeros(cfg.head_input_dim), np.zeros(3*cfg.n+2)
     row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed_custom", trace=True)
     steps = [step for step in row["trajectory"] if step["action"] is not None]
     assert [step["acquired_item"] for step in steps] == items[1:]
@@ -722,14 +531,15 @@ def test_fixed_and_learned_policies_stop_after_recognizing_generated_max():
             if state.candidate_mask & (1 << 2):
                 p[2] = .9
                 p[[cfg.n+2, 2*cfg.n+2, 3*cfg.n, 3*cfg.n+1]] = .9
-            hidden = np.zeros(cfg.hidden_dim)
+            hidden = np.zeros(cfg.head_input_dim)
             hidden[0] = state.evaluator_mask
             return hidden, p
     class Head(torch.nn.Module):
+        # Actions: next zero-shot, R1, R2, OS1, OS2.
         def forward(self, hidden):
-            return torch.tensor([[3., 0., 2., -1.] if row[0] == 0 else
-                                 [1., 0., 3., -1.] for row in hidden])
-    for method in ("fixed_custom", "supervised"):
+            return torch.tensor([[0., 3., 0., 2., -1.] if row[0] == 0 else
+                                 [0., 1., 0., 3., -1.] for row in hidden])
+    for method in ("fixed_custom", "supervised", "supervised_pretrained"):
         row = a.rollout(r, maximum, Predictor(), cfg, policy=method, head=Head(), trace=True)
         assert row["reason"] == "predicted_max" and row["exact_max"] and row["correct"] == 1
         assert [step["acquired_item"] for step in row["trajectory"] if step["action"] is not None] == ["R1", "OS1"]
@@ -746,14 +556,14 @@ def test_custom_fixed_sequence_exhaustion_is_separate_from_budget():
     cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={"fixed_short": ["ZS1", "R1"]})
     class NoStop:
         def predict(self, rec, state, cfg_override=None):
-            return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
+            return np.zeros(cfg.head_input_dim), np.zeros(3*cfg.n+2)
     row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed_short", trace=True)
     assert row["reason"] == "fixed_sequence_exhaustion"
     assert row["cost"] == 21
     cfg.max_cost = 5
     row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed_short", trace=True)
     assert row["reason"] == "budget" and row["cost"] == 1
-    assert row["trajectory"][-1]["blocked_fixed_action"] == 0
+    assert row["trajectory"][-1]["blocked_fixed_action"] == 1
 
 
 def test_call_savings_average_orders_per_question_and_keep_max_cohort_separate():
@@ -856,14 +666,20 @@ def test_recognition_outcomes_add_up_and_pair_each_order_with_the_full_pool():
     cfg = a.Config(fixed_acquisition_orders={"fixed": "interleaved"}, bootstrap_samples=50)
     for question_ in questions:
         question_["methods"]["fixed"] = question_["methods"]["full"]
+        question_["methods"]["supervised_pretrained"] = question_["methods"]["supervised"]
     comparisons = a.method_comparisons(questions, cfg)
-    assert list(comparisons) == ["fixed vs full", "supervised vs full", "supervised vs fixed"]
+    assert list(comparisons) == ["fixed vs full", "supervised_pretrained vs full", "supervised vs full",
+                                 "supervised_pretrained vs fixed", "supervised vs fixed",
+                                 "supervised vs supervised_pretrained"]
     learned = comparisons["supervised vs full"]
     assert learned["saved_calls"]["delta"] == pytest.approx(200/6)
     assert learned["top1"]["delta"] == pytest.approx(0)  # One lost and one gained order.
     # Exact MAX is compared on MAX-present questions only: (1/2 + 0) / 2 - 1.
     assert learned["exact_max"]["delta"] == pytest.approx(-.75)
     assert comparisons["supervised vs fixed"] == learned
+    # The same outcomes for both heads leave nothing between them.
+    assert comparisons["supervised vs supervised_pretrained"]["saved_calls"]["delta"] == 0
+    assert comparisons["supervised_pretrained vs full"] == learned
     assert a.interval_text(learned["top1"], 100, "pp").startswith("+0.0pp [")
     assert a.interval_text(None) == "--"
 
@@ -899,15 +715,16 @@ def test_max_is_checked_at_initial_state_and_after_every_kind_of_acquisition(met
             if ready:
                 p[target] = .95
                 p[[cfg.n+target, 2*cfg.n+target, 3*cfg.n, 3*cfg.n+1]] = cfg.recognition_threshold
-            hidden = np.zeros(cfg.hidden_dim)
+            hidden = np.zeros(cfg.head_input_dim)
             hidden[0] = state.evaluator_mask
             hidden[1] = state.candidate_mask
             return hidden, p
     class Head(torch.nn.Module):
+        # Actions: next zero-shot, R1, R2, OS1, OS2. R1 first, then ZS2, then OS1.
         def forward(self, hidden):
-            return torch.tensor([[4., 1., 0., -1.] if row[0] == 0 else
-                                 [1., 4., 0., -1.] if row[1] == 1 else
-                                 [1., 0., 4., -1.] for row in hidden])
+            return torch.tensor([[0., 4., 1., 0., -1.] if row[0] == 0 else
+                                 [4., 1., 0., 1., -1.] if row[1] == 1 else
+                                 [1., 0., 0., 4., -1.] for row in hidden])
     row = a.rollout(rec, maximum, Predictor(), cfg, policy=method, head=Head(), trace=True)
     assert row["reason"] == "predicted_max" and row["cost"] == cost and row["exact_max"]
     assert len(row["trajectory"]) == steps+1
@@ -951,31 +768,8 @@ def test_planner_max_goal_requires_runtime_to_select_the_reference_candidate():
     assert a.goal_condition(0, order, safe, maximum, p, p, state, cfg)
 
 
-def test_tied_goal_paths_prioritize_retrieved_evidence():
-    cfg = a.Config(k=1, zero_shots=2, repeats=1, hidden_dim=4)
-    r = record(cfg)
-    safe = maximum = np.array([1, 0, 0], np.float32)
-    class Predictor:
-        def predict(self, rec, state, cfg_override=None):
-            p = np.zeros(3*cfg.n+2, np.float32)
-            p[0] = .9
-            if state.evaluator_mask and state.candidate_mask & 2:
-                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
-            return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states):
-            pairs = [self.predict(rec, state) for state in states]
-            return np.stack([x[0] for x in pairs]), np.stack([x[1] for x in pairs])
-    scenario = a.decision_scenario(r, np.array([.9, .8, .1]), safe, maximum,
-                                   Predictor(), cfg, a.presence_states(cfg.zero_shots, cfg.k))
-    rows, cases = a.aggregate_decision_rows([scenario], cfg)
-    case = next(c for c in cases if (c["candidate_mask"], c["evaluator_mask"]) == (1, 0))
-    row = rows[case["training_row"]]
-    assert row["reach"] == 1
-    assert row["action_expected_cost"][0] == row["action_expected_cost"][1]
-    np.testing.assert_array_equal(row["target"], [1., 0., 0.])
-
-
-def test_learned_rollout_continues_after_max_and_returns_ranked_pool():
+@pytest.mark.parametrize("method", a.LEARNED_METHODS)
+def test_learned_rollout_continues_after_max_and_returns_ranked_pool(method):
     cfg = a.Config(k=1, zero_shots=2)
     r = record(cfg)
     maximum = np.array([1, 0, 0], np.float32)
@@ -987,14 +781,17 @@ def test_learned_rollout_continues_after_max_and_returns_ranked_pool():
             p[1] = .6
             p[2] = .4
             p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
-            hidden = np.zeros(cfg.hidden_dim, np.float32)
+            hidden = np.zeros(cfg.head_input_dim, np.float32)
             hidden[0] = state.evaluator_mask
+            hidden[1] = state.candidate_mask
             return hidden, p
     class Head(torch.nn.Module):
+        # Actions: next zero-shot, R1, OS1. The zero-shot first, then the evaluator, then the one-shot.
         def forward(self, hidden):
-            return torch.tensor([[0., 3., -1.] if row[0] == 0 else
-                                 [0., -1., 3.] for row in hidden])
-    row = a.rollout(r, maximum, Predictor(), cfg, head=Head(), trace=True)
+            return torch.tensor([[3., 1., 0.] if row[1] == 1 else
+                                 [-1., 3., 0.] if row[0] == 0 else
+                                 [-1., -1., 3.] for row in hidden])
+    row = a.rollout(r, maximum, Predictor(), cfg, policy=method, head=Head(), trace=True)
     assert row["reason"] == "ranked_list_complete"
     assert row["first_max_recognition"] == {"candidate": r.candidate_ids[0], "cost": 1.}
     assert row["ranked_candidates"] == r.candidate_ids
@@ -1006,7 +803,7 @@ def test_learned_rollout_continues_after_max_and_returns_ranked_pool():
     # when direct application rollouts use the continuing default.
     scores = np.array([.9, .6, .4], np.float32)
     teacher = {"scores": [scores], "safe": [maximum], "maximum": [maximum]}
-    evaluation = a.evaluate_policy([r], [0], teacher, Predictor(), cfg, head=Head())
+    evaluation = a.evaluate_policy([r], [0], teacher, Predictor(), cfg, head=Head(), policy=method)
     assert len(evaluation) == 2
     assert all(result["reason"] == "predicted_max" and result["cost"] == 1
                for result in evaluation)
@@ -1060,7 +857,7 @@ def test_rollout_separates_pool_completion_from_final_max_recognition(policy, re
             probabilities[:cfg.n] = [.9, .6, .4]
             if recognized:
                 probabilities[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
-            return np.zeros(cfg.hidden_dim, np.float32), probabilities
+            return np.zeros(cfg.head_input_dim, np.float32), probabilities
     class Head(torch.nn.Module):
         def forward(self, hidden):
             return torch.zeros((len(hidden), cfg.action_count))
@@ -1108,10 +905,11 @@ def test_continuation_counts_all_orders_and_allows_recovery_after_a_dipped_goal(
     class Predictor:
         device = "cpu"
         def predict(self, rec, state, cfg_override=None):
-            return np.zeros(cfg.hidden_dim, np.float32), np.zeros(3*cfg.n+2)
+            return np.zeros(cfg.head_input_dim, np.float32), np.zeros(3*cfg.n+2)
     class Head(torch.nn.Module):
+        # Actions: next zero-shot, R1, OS1.
         def forward(self, hidden):
-            return torch.tensor([[1., 2., 0.]]).repeat(len(hidden), 1)
+            return torch.tensor([[2., 1., 0.]]).repeat(len(hidden), 1)
     # Initial rank recognized; adding ZS2 loses it; the final pool would restore all goals.
     # The head acquires ZS2, then R1, then OS1.
     def flags(rank, order, safe, maximum, probabilities, full_probabilities, state, config):
@@ -1136,10 +934,11 @@ def test_continuation_reports_final_recognition_after_an_unrecovered_goal_loss(m
     class Predictor:
         device = "cpu"
         def predict(self, rec, state, cfg_override=None):
-            return np.zeros(cfg.hidden_dim, np.float32), np.zeros(3*cfg.n+2)
+            return np.zeros(cfg.head_input_dim, np.float32), np.zeros(3*cfg.n+2)
     class Head(torch.nn.Module):
+        # Actions: next zero-shot, R1, OS1.
         def forward(self, hidden):
-            return torch.tensor([[1., 2., 0.]]).repeat(len(hidden), 1)
+            return torch.tensor([[2., 1., 0.]]).repeat(len(hidden), 1)
     # Two ranks are recognized after ZS2, then retrieval loses both permanently.
     # The head acquires ZS2, then R1, then OS1.
     def flags(rank, order, safe, maximum, probabilities, full_probabilities, state, config):
@@ -1165,7 +964,7 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
                    output_dir=str(tmp_path/"run"), device="cpu", cpu_threads=1,
                    k=2, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
                    batch_size=16, teacher_epochs=2, snapshot_epochs=2, decision_epochs=2,
-                   patience=2, dev_checks_per_epoch=2,
+                   decision_finetune_epochs=2, patience=2, dev_checks_per_epoch=2,
                    decision_batch_size=16, recognition_threshold=.1,
                    bootstrap_samples=20)
     train.write_text(json.dumps([raw_record(i,cfg) for i in range(40)]))
@@ -1190,22 +989,28 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     monkeypatch.setattr(a, "rollout", rollout)
     # Stage 0 names the embedded code before any stage trains, so a stale notebook is visible.
     log = capsys.readouterr().out
-    assert (f"Implementation revision {a.PIPELINE_REVISION}; Stage 3 stores compact labels "
-            f"(schema {a.DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question)"
+    assert (f"Implementation revision {a.PIPELINE_REVISION}; Stage 3 labels every presence state with its "
+            "cheapest routes to the next goal and pretrains on them (Stage 3a), then fine-tunes on the route "
+            "its own continuations make cheapest (Stage 3b). Compact labels "
+            f"(schema {a.DECISION_LABEL_SCHEMA}: a bit mask per state/order case for 3a, one byte for 3b)"
             ) in log
     assert f"Stage 4 rolls out each question once and saves compact outcomes to {a.ROLLOUT_FILE}" in log
     # Stages 1-2 report and select on development loss; AP appears only in the report tables.
     assert "development loss" in log and "development AP" not in log
     assert "Mean AP" in log
+    assert "STAGE 3a" in log and "STAGE 3b" in log and "Stage 3a epoch 1/2" in log and "Stage 3b epoch 1/2" in log
     assert snapshot_training_ids and all(ids == work.splits["supervised"] for ids in snapshot_training_ids)
-    assert set(work.results["external"]["adaptive"]["policies"]) == {
-        "full", "fixed", "fixed_evaluators_first", "fixed_zero_shots_first", "supervised"}
+    methods = {"full", "fixed", "fixed_evaluators_first", "fixed_zero_shots_first",
+               "supervised_pretrained", "supervised"}
+    assert set(work.results["external"]["adaptive"]["policies"]) == methods == set(a.evaluation_methods(cfg))
     assert work.results["external"]["adaptive"]["policies"]["supervised"]["n"] == 3
-    assert work.results["second"]["adaptive"]["policies"]["supervised"]["n"] == 2
+    assert work.results["second"]["adaptive"]["policies"]["supervised_pretrained"]["n"] == 2
     for name in ("audit", "external", "second"):
         report = work.results[name]["adaptive"]
         assert set(report["fixed_acquisition_sequences"]) == set(cfg.fixed_acquisition_orders)
-        assert set(work.results[name]["paired_top1"]) == {"full", *cfg.fixed_acquisition_orders}
+        # The fine-tuned head is compared with every other method, the pretrained head included.
+        assert set(work.results[name]["paired_top1"]) == methods - {"supervised"}
+        assert set(report["continuation"]) == set(a.LEARNED_METHODS)
         for method, summary in report["policies"].items():
             savings = summary["call_savings"]
             assert savings["all"]["n"] == summary["n"]
@@ -1224,7 +1029,8 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
             assert sum(cell["top1_gained"] - cell["top1_lost"] for cell in table.values()) == pytest.approx(change)
         assert set(report["comparisons"]) == {
             *(f"{method} vs full" for method in a.evaluation_methods(cfg) if method != "full"),
-            *(f"supervised vs {method}" for method in cfg.fixed_acquisition_orders)}
+            *(f"{learned} vs {method}" for learned in a.LEARNED_METHODS for method in cfg.fixed_acquisition_orders),
+            "supervised vs supervised_pretrained"}
     # The external file's all-wrong question has its own savings group.
     assert all(summary["call_savings"]["all_wrong"]["n"] >= 1
                for summary in work.results["external"]["adaptive"]["policies"].values())
@@ -1232,46 +1038,65 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
                   "4) MAX recognition outcomes"):
         assert log.count(title) == 3  # audit, external, second
     assert re.search(r"^supervised vs fixed +\| +[+-]\d", log, re.M)
+    assert re.search(r"^supervised vs supervised_pretrained +\| +[+-]\d", log, re.M)
     assert re.search(r"^ +\| Total +\| +100\.0% \|", log, re.M)
     assert set(work.results["external_macro"]["methods"]) == set(a.evaluation_methods(cfg))
     assert work.audit["second"]["duplicate_or_cross_file_overlap"] == 2
-    assert (tmp_path/"run"/"decision_head_completed.pt").exists()
-    manifest = json.loads((tmp_path/"run"/"decision_dataset_manifest.json").read_text())
-    assert manifest["schema_version"] == a.DECISION_LABEL_SCHEMA == 5
-    assert manifest["roles"] == {"policy": "decision_labels/policy.pt", "dev": "decision_labels/dev.pt"}
-    stores = {role: a.load_label_file(tmp_path/"run"/path) for role, path in manifest["roles"].items()}
-    # Only head inputs are stored: one action byte per row and one bitmap per question.
-    assert set(stores["policy"]) == {"schema_version", "fingerprint", "role", "uids", "offsets",
-                                     "preferred", "first_cases", "observation_sha256", "coverage"}
-    assert sorted(path.name for path in (tmp_path/"run"/"decision_labels").iterdir()) == ["dev.pt", "policy.pt"]
-    assert not (tmp_path/"run"/"decision_shards").exists()
-    for store in stores.values():
-        assert store["preferred"].dtype == store["first_cases"].dtype == torch.uint8
-        assert store["preferred"].shape[1] == 1 and len(store["first_cases"]) == len(store["uids"])
-        target = a.decision_targets(store["preferred"].numpy(), cfg)
-        valid = a.decision_valid(np.concatenate([a.decision_row_sources(first.numpy(), cfg)
-                                                 for first in store["first_cases"]]), cfg)
-        assert len(target) and np.allclose(target.sum(1), 1) and not target[~valid].any()
+    run = tmp_path/"run"
+    assert (run/"decision_head_pretrained.pt").exists() and (run/"decision_head_completed.pt").exists()
+    training = work.results["decision_training"]
+    assert set(training) == {"supervised_pretrained", "supervised", "action_names"}
+    assert training["supervised"]["best_epoch"] == work.decision_checkpoint["best_epoch"]
+    assert training["supervised_pretrained"]["best_epoch"] == work.pretrained_checkpoint["best_epoch"]
+    manifest = json.loads((run/"decision_dataset_manifest.json").read_text())
+    assert manifest["schema_version"] == a.DECISION_LABEL_SCHEMA == 6
+    assert manifest["roles"] == {
+        "pretrain": {"policy": "decision_labels/pretrain_policy.pt", "dev": "decision_labels/pretrain_dev.pt"},
+        "finetune": {"policy": "decision_labels/finetune_policy.pt", "dev": "decision_labels/finetune_dev.pt"}}
+    stores = {phase: {role: a.load_label_file(run/path) for role, path in roles.items()}
+              for phase, roles in manifest["roles"].items()}
+    # Only head targets are stored: a bit mask per case for 3a and one action byte per case for 3b.
+    assert set(stores["pretrain"]["policy"]) == {"schema_version", "fingerprint", "phase", "role", "uids",
+                                                 "options", "observation_sha256", "coverage"}
+    assert set(stores["finetune"]["policy"]) == {"schema_version", "fingerprint", "phase", "role", "uids",
+                                                 "choice", "coverage"}
+    assert sorted(path.name for path in (run/"decision_labels").iterdir()) == [
+        "finetune_dev.pt", "finetune_policy.pt", "pretrain_dev.pt", "pretrain_policy.pt"]
+    cases = a.decision_case_count(cfg)
+    for role in ("policy", "dev"):
+        options, choice = stores["pretrain"][role]["options"], stores["finetune"][role]["choice"]
+        assert options.dtype == choice.dtype == torch.uint8
+        assert options.shape == (len(stores["pretrain"][role]["uids"]), cases, 1) and choice.shape == options.shape[:2]
+        for position in range(len(options)):
+            rows = a.label_rows(options[position].numpy(), "pretrain")
+            assert np.array_equal(rows, a.label_rows(choice[position].numpy(), "finetune")) and len(rows)
+            valid = a.decision_valid(rows, cfg)
+            target = a.decision_targets(options[position].numpy()[rows], "pretrain", cfg)
+            assert np.allclose(target.sum(1), 1) and not target[~valid].any()
+            assert valid[np.arange(len(rows)), choice[position].numpy()[rows]].all()
     role_uids = {role: {work.records[i].uid for i in ids} for role, ids in work.splits.items()}
-    assert stores["policy"]["uids"] == [work.records[i].uid for i in work.splits["policy"]]
-    assert set(stores["policy"]["uids"]) == role_uids["supervised"] == role_uids["policy"]
+    assert stores["pretrain"]["policy"]["uids"] == [work.records[i].uid for i in work.splits["policy"]]
+    assert set(stores["pretrain"]["policy"]["uids"]) == role_uids["supervised"] == role_uids["policy"]
     assert work.splits["policy"] == work.splits["supervised"]
-    assert set(stores["dev"]["uids"]) == role_uids["dev"]
-    coverage = work.decision_checkpoint["coverage"]["policy"]
-    assert coverage["action_rows"] == len(stores["policy"]["preferred"])
+    assert set(stores["pretrain"]["dev"]["uids"]) == role_uids["dev"]
+    coverage = work.pretrained_checkpoint["coverage"]["policy"]
+    assert coverage["action_rows"] == sum(part["action_rows"] for part in stores["pretrain"]["policy"]["coverage"])
     assert coverage["state_order_cases"] == (
         len(a.presence_states(cfg.zero_shots, cfg.k)) * 2 * len(work.splits["policy"]))
+    assert work.decision_checkpoint["coverage"]["policy"]["action_rows"] == coverage["action_rows"]
     audit = work.decision_label_audit("policy", 0)
-    assert len(audit["rows"]) == stores["policy"]["offsets"][1].item()
-    assert {"uid", "state_key", "target", "valid", "goal_rank"} <= set(audit["rows"][0])
-    assert not {"truth", "teacher_scores", "future_measurements", "weight"} & set(audit["rows"][0])
-    assert {row["uid"] for row in audit["rows"]} == {stores["policy"]["uids"][0]}
     assert len(audit["cases"]) == len(a.presence_states(cfg.zero_shots, cfg.k)) * 2
+    assert {"scenario", "candidate_mask", "evaluator_mask", "status", "goal_rank", "has_row", "targets"
+            } <= set(audit["cases"][0])
+    assert not {"truth", "teacher_scores", "future_measurements", "weight"} & set(audit["cases"][0])
+    assert audit["uid"] == stores["pretrain"]["policy"]["uids"][0]
+    full_cases = [case for case in audit["cases"] if case["candidate_mask"] == 15 and case["evaluator_mask"] == 3]
+    assert len(full_cases) == 2 and not any(case["has_row"] for case in full_cases)  # The complete state has no move.
     external_uids = role_uids["external"] | role_uids["second"]
     assert not role_uids["supervised"] & (role_uids["dev"] | role_uids["audit"] | external_uids)
     protocol = work.results["evaluation_protocol"]
     assert protocol["audit_used_for_model_selection"] is external_dev_audit
-    split_manifest = json.loads((tmp_path/"run"/"split_manifest.json").read_text())
+    split_manifest = json.loads((run/"split_manifest.json").read_text())
     assert split_manifest["evaluation_protocol"] == protocol
     assert split_manifest["roles"]["supervised"] == split_manifest["roles"]["policy"]
     if external_dev_audit:
@@ -1287,22 +1112,23 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
         assert not (role_uids["dev"] | role_uids["audit"]) & external_uids
         assert protocol["dev_audit_overlap_questions"] == 0
         assert protocol["external_files_used_for_model_selection"] == []
-    assert (tmp_path/"run"/"results.json").exists()
-    assert not (tmp_path/"run"/a.LEGACY_TRAJECTORY_FILE).exists()
-    rollout_path = tmp_path/"run"/a.ROLLOUT_FILE
+    assert (run/"results.json").exists()
+    assert not (run/a.LEGACY_TRAJECTORY_FILE).exists()
+    rollout_path = run/a.ROLLOUT_FILE
     rollouts = [json.loads(line) for line in rollout_path.read_text(encoding="utf-8").splitlines()]
     reported = {i for name in ("audit", "external", "second") for i in work.splits[name]}
     # Pooled audit questions are benchmark questions too; each rollout is saved once, untraced.
     keys = [(row["uid"], row["method"], tuple(row["zero_shot_order"])) for row in rollouts]
     assert len(keys) == len(set(keys)) == len(rolled_out) == len(reported) * 2 * len(a.evaluation_methods(cfg))
     assert {row["uid"] for row in rollouts} == {work.records[i].uid for i in reported}
+    assert {row["method"] for row in rollouts} == methods
     assert all(set(row) == {"uid", "method", "zero_shot_order", "candidate_mask", "evaluator_mask",
                             "selected", "reason", "final_max_recognized"} for row in rollouts)
     # Reports built from per-question summaries equal the per-report computation from traced rows.
     for name in ("audit", "external", "second"):
         ids = work.splits[name]
         rows = {method: a.evaluate_policy(work.records, ids, work.teacher, work.predictor, cfg,
-                                          work.head, policy=method, trace=True)
+                                          work.heads.get(method), policy=method, trace=True)
                 for method in a.evaluation_methods(cfg)}
         assert work.results[name]["adaptive"]["policies"] == {
             method: a.policy_summary(method_rows) for method, method_rows in rows.items()}
@@ -1314,8 +1140,9 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
         assert work.results[name]["paired_top1"] == {
             baseline: a.paired_interval(rows["supervised"], rows[baseline], cfg.bootstrap_samples, cfg.seed)
             for baseline in rows if baseline != "supervised"}
-        assert work.results[name]["adaptive"]["continuation"] == a.continuation_diagnostic(
-            work.records, ids, work.teacher, work.predictor, cfg, work.head)
+        assert work.results[name]["adaptive"]["continuation"] == {
+            method: a.continuation_diagnostic(work.records, ids, work.teacher, work.predictor, cfg,
+                                              work.heads[method]) for method in a.LEARNED_METHODS}
     # Full trajectories are recomputed on demand and checked against the saved outcomes.
     external_uid = work.records[work.splits["external"][0]].uid
     traced = work.rollout_audit("external", 0)
@@ -1340,52 +1167,73 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     assert set(work.teacher["teacher"]["validation_ids"]) == role_uids["dev"]
     frozen = a.cpu_state(work.predictor.model)
     assert not any(p.requires_grad for p in work.predictor.model.parameters())
-    restored_cfg, predictor, head = a.load_inference_bundle(tmp_path/"run"/"inference_bundle.pt")
-    assert all(torch.equal(frozen[k], v.cpu()) for k,v in predictor.model.state_dict().items())
-    assert not predictor.model.training
-    assert np.array_equal(predictor.temperatures, work.predictor.temperatures)
+    # The bundle holds both heads; each reproduces the decisions of the head it was saved from.
     r = work.records[work.splits["external"][0]]
     maximum = work.teacher["maximum"][work.splits["external"][0]]
-    assert a.rollout(r,maximum,predictor,restored_cfg,head=head)["selected"] == (
-        a.rollout(r,maximum,work.predictor,cfg,head=work.head)["selected"])
+    for variant in a.LEARNED_METHODS:
+        restored_cfg, predictor, head = a.load_inference_bundle(run/"inference_bundle.pt", variant=variant)
+        assert all(torch.equal(frozen[k], v.cpu()) for k,v in predictor.model.state_dict().items())
+        assert not predictor.model.training
+        assert np.array_equal(predictor.temperatures, work.predictor.temperatures)
+        assert a.rollout(r, maximum, predictor, restored_cfg, policy=variant, head=head)["selected"] == (
+            a.rollout(r, maximum, work.predictor, cfg, policy=variant, head=work.heads[variant])["selected"])
+        # Each variant is exactly the head it names: same weights, not merely the same decision.
+        assert all(torch.equal(v.cpu(), work.heads[variant].state_dict()[k].cpu()) for k, v in head.state_dict().items())
+    checkpoints = {"supervised_pretrained": work.pretrained_checkpoint, "supervised": work.decision_checkpoint}
+    for variant, checkpoint in checkpoints.items():
+        assert all(torch.equal(v.cpu(), checkpoint["weights"][k]) for k, v in work.heads[variant].state_dict().items())
+    bundle = a.load_checkpoint(run/"inference_bundle.pt")
+    assert bundle["pretrained_head"]["phase"] == "pretrain" and bundle["decision_head"]["phase"] == "finetune"
+    assert bundle["pretrained_head"]["best_epoch"] == work.pretrained_checkpoint["best_epoch"]
+    assert work.heads["supervised"] is work.head
+    # Fine-tuning moved the weights away from the pretrained head.
+    assert any(not torch.equal(work.pretrained_checkpoint["weights"][k], work.decision_checkpoint["weights"][k])
+               for k in work.pretrained_checkpoint["weights"])
+    with pytest.raises(ValueError, match="Unknown decision head variant"):
+        a.load_inference_bundle(run/"inference_bundle.pt", variant="fixed")
+    # Fine-tuning starts from the pretrained weights and its checkpoint names the head it came from.
+    assert work.decision_checkpoint["pretrained_fingerprint"] == a.head_fingerprint(work.pretrained_checkpoint["weights"])
     resumed = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
     assert resumed.decision_checkpoint["best_epoch"] == work.decision_checkpoint["best_epoch"]
+    assert resumed.pretrained_checkpoint["best_epoch"] == work.pretrained_checkpoint["best_epoch"]
     comparison_cfg = copy.deepcopy(cfg)
     comparison_cfg.fixed_acquisition_orders = {"fixed_short": ["ZS1", "R1", "OS1"]}
     comparison = a.Workflow(comparison_cfg).prepare().train_teacher().train_snapshot().train_decision_head()
     assert comparison.decision_checkpoint["dataset_fingerprint"] == work.decision_checkpoint["dataset_fingerprint"]
     # Earlier code's traced rows are superseded and removed once the new outcomes are saved.
-    (tmp_path/"run"/a.LEGACY_TRAJECTORY_FILE).write_text('{"trajectory": []}\n', encoding="utf-8")
+    (run/a.LEGACY_TRAJECTORY_FILE).write_text('{"trajectory": []}\n', encoding="utf-8")
     comparison_report = comparison.report()["external"]["adaptive"]
-    assert set(comparison_report["policies"]) == {"full", "fixed_short", "supervised"}
-    assert not (tmp_path/"run"/a.LEGACY_TRAJECTORY_FILE).exists()
-    assert len(comparison.rollout_audit("external", 0)["rows"]) == 2 * 3
+    assert set(comparison_report["policies"]) == {"full", "fixed_short", "supervised_pretrained", "supervised"}
+    assert not (run/a.LEGACY_TRAJECTORY_FILE).exists()
+    assert len(comparison.rollout_audit("external", 0)["rows"]) == 2 * 4
     # Saved outcomes belong to the evaluation settings of the last report.
     with pytest.raises(ValueError, match="differs from final_rollouts.jsonl"):
         work.rollout_audit("external", 0)
     # A missing role file is rebuilt; the other role's saved labels are reused untouched.
-    policy_file, dev_file = (tmp_path/"run"/manifest["roles"][role] for role in ("policy", "dev"))
+    policy_file, dev_file = (run/manifest["roles"]["pretrain"][role] for role in ("policy", "dev"))
     dev_mtime = dev_file.stat().st_mtime_ns
     policy_file.unlink()
-    (tmp_path/"run"/"decision_head_completed.pt").unlink()
-    build = a.build_decision_labels
+    (run/"decision_head_pretrained.pt").unlink()
+    (run/"decision_head_completed.pt").unlink()
+    build = a.build_route_labels
     built = []
-    monkeypatch.setattr(a, "build_decision_labels",
+    monkeypatch.setattr(a, "build_route_labels",
                         lambda record, *args: built.append(record.uid) or build(record, *args))
     repaired = a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
-    monkeypatch.setattr(a, "build_decision_labels", build)
+    monkeypatch.setattr(a, "build_route_labels", build)
     assert built == [work.records[i].uid for i in work.splits["policy"]]
     assert policy_file.exists() and dev_file.stat().st_mtime_ns == dev_mtime
-    assert repaired.decision_checkpoint["coverage"] == work.decision_checkpoint["coverage"]
+    assert repaired.pretrained_checkpoint["coverage"] == work.pretrained_checkpoint["coverage"]
+    assert repaired.decision_checkpoint["dataset_fingerprint"] == work.decision_checkpoint["dataset_fingerprint"]
     store = a.load_label_file(dev_file)
     store["schema_version"] = 3
     a.atomic_torch(dev_file, store)
-    (tmp_path/"run"/"decision_head_completed.pt").unlink()
+    (run/"decision_head_pretrained.pt").unlink()
     with pytest.raises(ValueError, match="Incompatible decision labels"):
         a.Workflow(cfg).prepare().train_teacher().train_snapshot().train_decision_head()
     store["schema_version"] = a.DECISION_LABEL_SCHEMA
     a.atomic_torch(dev_file, store)
-    contract_path = tmp_path/"run"/"contract.json"
+    contract_path = run/"contract.json"
     contract = json.loads(contract_path.read_text())
     assert contract.pop("implementation_revision") == a.PIPELINE_REVISION
     contract_path.write_text(json.dumps(contract))
@@ -1398,10 +1246,14 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     with pytest.raises(ValueError, match="different config"):
         a.Workflow(changed)
     changed = copy.deepcopy(cfg)
+    changed.decision_finetune_lr = 1e-3
+    with pytest.raises(ValueError, match="different config"):
+        a.Workflow(changed)
+    changed = copy.deepcopy(cfg)
     changed.use_test_files_for_dev_and_audit = not external_dev_audit
     with pytest.raises(ValueError, match="different config"):
         a.Workflow(changed)
-    old_bundle = a.load_checkpoint(tmp_path/"run"/"inference_bundle.pt")
+    old_bundle = a.load_checkpoint(run/"inference_bundle.pt")
     old_bundle["implementation_revision"] = 3
     a.atomic_torch(tmp_path/"old_bundle.pt", old_bundle)
     with pytest.raises(ValueError, match="training contract"):
@@ -1434,7 +1286,7 @@ def test_internal_fractions_and_stage3_shared_training_requirement(tmp_path):
     assert splits == a.split_records(records, cfg)
     splits["policy"] = splits["policy"][:-1]
     with pytest.raises(ValueError, match="must match"):
-        a.train_decision_head(records, splits, None, None, cfg, "cpu", tmp_path)
+        a.train_pretrained_head(records, splits, None, None, cfg, "cpu", tmp_path)
     cfg.split_fractions = (.60, .20, .10, .10)
     with pytest.raises(AssertionError):
         cfg.validate()
@@ -1483,7 +1335,7 @@ def test_packed_head_batches_preserve_losses_updates_and_row_order(train):
         valid = rng.rand(cfg.action_count) > .4
         valid[0] = True
         target = valid.astype(np.float32) / valid.sum()
-        rows.append({"h": rng.randn(cfg.hidden_dim).astype(np.float32), "target": target, "valid": valid})
+        rows.append({"h": rng.randn(cfg.head_input_dim).astype(np.float32), "target": target, "valid": valid})
     order = rng.permutation(len(rows))
     reference = a.SupervisedActionHead(cfg)
     optimized = copy.deepcopy(reference)
@@ -1505,43 +1357,6 @@ def test_packed_head_batches_preserve_losses_updates_and_row_order(train):
     assert count == len(rows) and actual == total
     assert all(torch.equal(value, optimized.state_dict()[key]) for key, value in reference.state_dict().items())
     assert a.masked_action_loss(optimized, [], [], cfg, "cpu") == (0., 0)
-
-
-def test_decision_progress_and_single_coverage_check_preserve_label_resume(tmp_path, monkeypatch, capsys):
-    cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1,
-                   decision_epochs=1, decision_batch_size=16, recognition_threshold=.1)
-    records = [record(cfg, index=i) for i in range(2)]
-    splits = {"supervised": [0], "policy": [0], "dev": [1]}
-    scores = np.tile(np.arange(cfg.n, 0, -1, dtype=np.float32), (2, 1))
-    safe = np.ones_like(scores)
-    maximum = np.zeros_like(scores)
-    maximum[:, 0] = 1
-    teacher = {"scores": scores, "safe": safe, "maximum": maximum}
-    predictor = fake_predictor(cfg)
-    checks = []
-    original = a.plan_coverage
-    def track_coverage(plan, config, out_of_budget):
-        checks.append(len(plan["status"]))
-        return original(plan, config, out_of_budget)
-    monkeypatch.setattr(a, "plan_coverage", track_coverage)
-    first = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    assert len(checks) == 2
-    log = capsys.readouterr().out
-    assert "Stage 3 dev labels: 1/1" in log
-    assert "Stage 3 epoch 1 train: 1/1" in log
-    assert "Stage 3 epoch 1 dev: 1/1" in log
-    assert "train loss" in log and "dev loss" in log and "ETA" in log
-    # Resume saved role labels: no relabeling and no second coverage pass.
-    interrupted = a.decision_role_path(tmp_path, "dev").with_suffix(".pt.tmp")
-    interrupted.write_bytes(b"leftover from failed dev label write")
-    monkeypatch.setattr(a, "build_decision_labels", lambda *args: pytest.fail("Should reuse saved labels"))
-    resumed = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    assert not interrupted.exists()
-    assert len(checks) == 2
-    assert "built 0, reused 1" in capsys.readouterr().out
-    assert first["coverage"] == resumed["coverage"]
-    assert first["history"] == resumed["history"]
-    assert all(torch.equal(value, resumed["weights"][key]) for key, value in first["weights"].items())
 
 
 @pytest.mark.parametrize("failure", ["save", "replace"])
@@ -1611,3 +1426,43 @@ def test_legacy_rl_script_uses_the_same_training_and_evaluation_questions(extern
     splits["policy"] = []
     with pytest.raises(ValueError, match="must match"):
         namespace["fit_dqn"](records, splits, None, legacy_cfg, None)
+
+
+def test_each_learned_method_is_reported_and_audited_with_its_own_head(tmp_path):
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
+    r = record(cfg)
+    scores, flags = np.array([.9, .6, .4], np.float32), np.array([1, 0, 0], np.float32)
+    class Predictor:
+        device = "cpu"
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            if state.evaluator_mask:  # MAX is recognized once an evaluator is active.
+                p[0] = .9
+                p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
+            return np.zeros(cfg.head_input_dim, np.float32), p
+    class Head(torch.nn.Module):
+        def __init__(self, logits):
+            super().__init__()
+            self.logits = torch.tensor([logits])
+        def forward(self, hidden):
+            return self.logits.repeat(len(hidden), 1)
+    # Actions: next zero-shot, R1, OS1. One head adds R1 at once; the other adds a zero-shot first.
+    heads = {"supervised_pretrained": Head([0., 3., 0.]), "supervised": Head([3., 1., 0.])}
+    sink = tmp_path / a.ROLLOUT_FILE
+    with sink.open("w", encoding="utf-8") as handle:
+        report = a.question_report(r, scores, flags, flags, Predictor(), cfg, heads, handle)
+    costs = {method: report["methods"][method]["means"]["cost"] for method in a.LEARNED_METHODS}
+    assert costs == {"supervised_pretrained": 21., "supervised": 32.}
+    for method in a.LEARNED_METHODS:
+        assert report["continuation"][method] == a.question_continuation(
+            r, scores, flags, flags, Predictor(), cfg, heads[method])
+    saved = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
+    assert {(row["method"], row["evaluator_mask"], row["candidate_mask"]) for row in saved
+            if row["method"] in a.LEARNED_METHODS} == {("supervised_pretrained", 1, 1), ("supervised", 1, 3)}
+    # The audit repeats each method's rollouts with the head named for it, and notices a swap.
+    teacher = {"scores": [scores], "safe": [flags], "maximum": [flags]}
+    audit = a.question_rollout_audit([r], 0, teacher, Predictor(), cfg, heads, tmp_path, "benchmark")
+    assert {row["method"] for row in audit["rows"]} == set(a.evaluation_methods(cfg))
+    swapped = {"supervised_pretrained": heads["supervised"], "supervised": heads["supervised_pretrained"]}
+    with pytest.raises(ValueError, match="differs from final_rollouts.jsonl"):
+        a.question_rollout_audit([r], 0, teacher, Predictor(), cfg, swapped, tmp_path, "benchmark")

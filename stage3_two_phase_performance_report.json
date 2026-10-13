@@ -1,0 +1,86 @@
+{
+  "evidence": "synthetic microbenchmark with an untrained predictor; not a live Kaggle run",
+  "device": "cuda",
+  "torch_version": "2.8.0+cu128",
+  "config": {
+    "k": 5,
+    "zero_shots": 3,
+    "decision_batch_size": 128,
+    "decision_eval_batch_size": 4096
+  },
+  "state_order_cases_per_question": 48960,
+  "questions": [
+    {
+      "question": 0,
+      "route_label_seconds": 0.7853037999999994,
+      "finetune_label_seconds": 0.7095710000000004,
+      "route_file_bytes": 100009,
+      "finetune_file_bytes": 51049,
+      "rows": 42970,
+      "informative_rows": 7585,
+      "rows_moved_by_finetuning": 4931
+    },
+    {
+      "question": 1,
+      "route_label_seconds": 0.6564404999999995,
+      "finetune_label_seconds": 0.7091513999999997,
+      "route_file_bytes": 100009,
+      "finetune_file_bytes": 51049,
+      "rows": 41801,
+      "informative_rows": 11954,
+      "rows_moved_by_finetuning": 8208
+    },
+    {
+      "question": 2,
+      "route_label_seconds": 0.7120005999999997,
+      "finetune_label_seconds": 0.6872965999999998,
+      "route_file_bytes": 100009,
+      "finetune_file_bytes": 51049,
+      "rows": 41267,
+      "informative_rows": 12647,
+      "rows_moved_by_finetuning": 8913
+    },
+    {
+      "question": 3,
+      "route_label_seconds": 0.7023934000000001,
+      "finetune_label_seconds": 0.6959414000000006,
+      "route_file_bytes": 100009,
+      "finetune_file_bytes": 50985,
+      "rows": 48067,
+      "informative_rows": 21490,
+      "rows_moved_by_finetuning": 18318
+    },
+    {
+      "question": 4,
+      "route_label_seconds": 0.736066000000001,
+      "finetune_label_seconds": 0.7176922000000001,
+      "route_file_bytes": 100009,
+      "finetune_file_bytes": 50985,
+      "rows": 45817,
+      "informative_rows": 8629,
+      "rows_moved_by_finetuning": 5915
+    },
+    {
+      "question": 5,
+      "route_label_seconds": 0.710579000000001,
+      "finetune_label_seconds": 0.7095178999999998,
+      "route_file_bytes": 100009,
+      "finetune_file_bytes": 51049,
+      "rows": 40879,
+      "informative_rows": 12750,
+      "rows_moved_by_finetuning": 8644
+    }
+  ],
+  "head_epoch_seconds_per_question": {
+    "assemble": 0.053046800000000616,
+    "train_steps": 0.4993661999999972,
+    "dev_pass": 0.010600000000000165
+  },
+  "route_label_peak_mib": 102.56617259979248,
+  "finetune_label_peak_mib": 79.3769121170044,
+  "median_route_label_seconds": 0.7112898000000003,
+  "median_finetune_label_seconds": 0.7093346499999997,
+  "median_route_file_bytes": 100009.0,
+  "median_finetune_file_bytes": 51049.0,
+  "median_rows": 42385.5
+}

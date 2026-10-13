@@ -1,16 +1,15 @@
-"""Offline synthetic CPU comparison against the pre-optimization Stage 3 source.
+"""Offline synthetic timing of the two-phase Stage 3 at the default geometry.
 
-Run: python -B benchmark_adaptive_stage3.py --output stage3_performance_report.json
-No provider calls, dataset downloads, or Kaggle/GPU runtime claims.
+Run: python -B benchmark_adaptive_stage3.py --output stage3_two_phase_performance_report.json
+No provider calls, dataset downloads, or Kaggle runtime claims. The predictor is untrained, so how many
+goals are reachable (and with it the share of informative rows) says nothing about real logs.
 """
 import argparse
-import importlib.util
 import json
 import statistics
-import subprocess
-import sys
 import tempfile
 import time
+import tracemalloc
 from pathlib import Path
 
 import numpy as np
@@ -22,148 +21,95 @@ import adaptive_analogical_training as current
 def timed(call):
     started = time.perf_counter()
     value = call()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     return value, time.perf_counter() - started
 
 
-def check_labels(expected, actual):
-    old_rows, old_cases = expected
-    rows, cases = actual
-    assert cases == old_cases and len(rows) == len(old_rows)
-    for before, after in zip(old_rows, rows):
-        assert before.keys() == after.keys()
-        for key in before:
-            if isinstance(before[key], np.ndarray):
-                np.testing.assert_array_equal(before[key], after[key])
-            else:
-                assert before[key] == after[key], key
-
-
-def measure_files_and_head(record, rows, cases, cfg, directory, repeats):
-    audit, labels = directory / "audit.pt", directory / "labels.pt"
-    current.atomic_torch(audit, {"rows": rows, "cases": cases})
-    current.atomic_torch(labels, current.compact_decision_labels(record, rows, cases, cfg))
-    measurements = {"audit_file_bytes": audit.stat().st_size,
-                    "label_file_bytes": labels.stat().st_size}
-    for name, path, loader in (("audit", audit, current.load_checkpoint),
-                               ("labels", labels, current.load_label_file)):
-        times = [timed(lambda: loader(path))[1] for _ in range(repeats)]
-        measurements[name + "_load_seconds_median"] = statistics.median(times)
-    measurements["projected_2000_question_storage_gib"] = labels.stat().st_size * 2000 / 1024**3
-    return measurements
+def synthetic_question(cfg, index):
+    rng = np.random.RandomState(810 + index)
+    record = current.Record(
+        f"synthetic::{index}", str(index), "synthetic", [f"c{i}" for i in range(cfg.n)],
+        [f"e{i}" for i in range(cfg.k)], np.sort(rng.rand(cfg.k).astype(np.float32))[::-1].copy(),
+        (rng.randint(cfg.repeats + 1, size=cfg.k) / cfg.repeats).astype(np.float32),
+        (rng.randint(cfg.repeats + 1, size=(cfg.n, cfg.k)) / cfg.repeats).astype(np.float32),
+        (rng.rand(cfg.n) > .5).astype(np.float32))
+    scores = rng.rand(cfg.n).astype(np.float32)
+    safe, maximum = current.teacher_labels(scores, record.labels, cfg)
+    return record, scores, safe, maximum
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline-ref", default="1034634")
+    parser.add_argument("--questions", type=int, default=6)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--output", type=Path, default=Path("stage3_full_dataset_performance_report.json"))
+    parser.add_argument("--output", type=Path, default=Path("stage3_two_phase_performance_report.json"))
     args = parser.parse_args()
-    if args.repeats < 1:
-        parser.error("--repeats must be positive")
-    root = Path(__file__).resolve().parent
-    source = subprocess.run(["git", "show", f"{args.baseline_ref}:adaptive_analogical_training.py"],
-                            cwd=root, check=True, capture_output=True, text=True).stdout
-    torch.set_num_threads(1)
+    if args.questions < 2 or args.repeats < 1:
+        parser.error("--questions needs at least 2 and --repeats at least 1")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(7)
     cfg = current.Config()
-    model = current.ResNet(cfg.input_dim, 3*cfg.n+2, cfg)
-    checkpoint = {"weights": current.cpu_state(model), "temperatures": np.ones(5)}
-    report = {"evidence": "synthetic CPU microbenchmark; not a live Kaggle/GPU run",
-              "baseline_ref": args.baseline_ref, "torch_version": torch.__version__,
-              "cpu_threads": 1, "config": {"k": cfg.k, "zero_shots": cfg.zero_shots,
-                                           "decision_batch_size": cfg.decision_batch_size,
-                                           "decision_eval_batch_size": cfg.decision_eval_batch_size},
-              "questions": []}
+    model = current.ResNet(cfg.input_dim, 3 * cfg.n + 2, cfg)
+    predictor = current.FrozenPredictor({"weights": current.cpu_state(model), "temperatures": np.ones(5)},
+                                        cfg, device)
+    questions = [synthetic_question(cfg, i) for i in range(args.questions)]
+    head = current.SupervisedActionHead(cfg).to(device)
+    cases = current.decision_case_count(cfg)
+    report = {"evidence": "synthetic microbenchmark with an untrained predictor; not a live Kaggle run",
+              "device": str(device), "torch_version": torch.__version__,
+              "config": {"k": cfg.k, "zero_shots": cfg.zero_shots, "decision_batch_size": cfg.decision_batch_size,
+                         "decision_eval_batch_size": cfg.decision_eval_batch_size},
+              "state_order_cases_per_question": cases, "questions": []}
+    # Warm the shared, question-independent tables so each figure is the per-question increment.
+    current.build_route_labels(*questions[0], predictor, cfg)
+    current.build_finetune_labels(*questions[0], predictor, head, cfg)
     with tempfile.TemporaryDirectory(prefix="adaptive_stage3_benchmark_") as temp:
-        directory = Path(temp)
-        baseline_path = directory / "baseline.py"
-        baseline_path.write_text(source, encoding="utf-8")
-        spec = importlib.util.spec_from_file_location("adaptive_stage3_baseline", baseline_path)
-        baseline = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = baseline
-        spec.loader.exec_module(baseline)
-        predictors = {"baseline": baseline.FrozenPredictor(checkpoint, baseline.Config(), "cpu"),
-                      "optimized": current.FrozenPredictor(checkpoint, cfg, "cpu")}
-        for index in range(args.repeats):
-            rng = np.random.RandomState(810 + index)
-            data = dict(uid=f"synthetic_{index}", group=f"synthetic_{index}", benchmark="synthetic",
-                        candidate_ids=[f"c{i}" for i in range(cfg.n)],
-                        evaluator_ids=[f"e{i}" for i in range(cfg.k)],
-                        similarity=np.linspace(.9, .5, cfg.k, dtype=np.float32),
-                        baseline=(rng.randint(cfg.repeats+1, size=cfg.k)/cfg.repeats).astype(np.float32),
-                        ccs=(rng.randint(cfg.repeats+1, size=(cfg.n, cfg.k))/cfg.repeats).astype(np.float32),
-                        labels=np.ones(cfg.n, np.float32))
-            scores = np.arange(cfg.n, 0, -1, dtype=np.float32)
-            safe, maximum = np.ones(cfg.n, np.float32), np.zeros(cfg.n, np.float32)
-            maximum[0] = 1
-            results, entry = {}, {"question": index}
-            # Alternate measurement order to reduce systematic cache-order bias.
-            names = ("baseline", "optimized") if index % 2 == 0 else ("optimized", "baseline")
-            for name in names:
-                module = baseline if name == "baseline" else current
-                record = module.Record(**data)
-                module_cfg = baseline.Config() if name == "baseline" else cfg
-                results[name], seconds = timed(lambda: module.build_decision_rows(
-                    record, scores, safe, maximum, predictors[name], module_cfg))
-                entry[name + "_label_seconds"] = seconds
-            check_labels(results["baseline"], results["optimized"])
-            rows, cases = results["optimized"]
-            entry.update(action_rows=len(rows), state_order_cases=len(cases), exact_label_match=True)
-            print(json.dumps(entry), flush=True)
+        for index, question in enumerate(questions):
+            entry = {"question": index}
+            route, entry["route_label_seconds"] = timed(lambda: current.build_route_labels(*question, predictor, cfg))
+            fine, entry["finetune_label_seconds"] = timed(
+                lambda: current.build_finetune_labels(*question, predictor, head, cfg))
+            for name, labels in (("route", route), ("finetune", fine)):
+                path = Path(temp) / f"{name}.pt"
+                current.atomic_torch(path, {"schema_version": current.DECISION_LABEL_SCHEMA, **labels})
+                entry[f"{name}_file_bytes"] = path.stat().st_size
+            entry["rows"] = route["coverage"]["action_rows"]
+            entry["informative_rows"] = route["coverage"]["informative_rows"]
+            entry["rows_moved_by_finetuning"] = fine["coverage"]["changed_rows"]
             report["questions"].append(entry)
-        assert rows, "Need actionable rows for head benchmark"
-        report["files"] = measure_files_and_head(current.Record(**data), rows, cases, cfg, directory,
-                                                 max(5, args.repeats))
-        order = np.random.RandomState(91).permutation(len(rows))
-        packed = current.pack_decision_rows(rows, cfg)
-        torch.manual_seed(19)
-        head = current.SupervisedActionHead(cfg)
-        # Warm optimizer imports before timing either implementation.
-        torch.optim.Adam(head.parameters(), lr=cfg.decision_lr)
-        head_results, times = {}, {"baseline": [], "optimized": []}
-        # Match the baseline's actual epoch path: recent revisions already load
-        # packed tensors, while older revisions pack individual audit rows.
-        baseline_inputs = packed if hasattr(baseline, "pack_decision_rows") else rows
-        for name, module, inputs in (("baseline", baseline, baseline_inputs), ("optimized", current, packed)):
-            for _ in range(args.repeats):
-                trained = current.SupervisedActionHead(cfg)
-                trained.load_state_dict(head.state_dict())
-                opt = torch.optim.Adam(trained.parameters(), lr=cfg.decision_lr, weight_decay=cfg.weight_decay)
-                result, seconds = timed(lambda: module.masked_action_loss(trained, inputs, order, cfg, "cpu", opt))
-                times[name].append(seconds)
-                head_results[name] = (result, current.cpu_state(trained))
-        before, after = head_results["baseline"], head_results["optimized"]
-        assert before[0] == after[0]
-        assert all(torch.equal(value, after[1][key]) for key, value in before[1].items())
-        report["head"] = {name + "_train_seconds_median": statistics.median(values)
-                          for name, values in times.items()}
-        report["head"]["exact_loss_and_weights_match"] = True
-        evaluation, eval_results = {}, {}
-        head.eval()
-        with torch.no_grad():
-            for name in ("baseline", "optimized"):
-                eval_times = []
-                for _ in range(args.repeats):
-                    if name == "baseline":
-                        result, seconds = timed(lambda: baseline.masked_action_loss(
-                            head, packed, range(len(rows)), cfg, "cpu"))
-                    else:
-                        result, seconds = timed(lambda: current.masked_action_loss(
-                            head, packed, range(len(rows)), cfg, "cpu",
-                            batch_size=cfg.decision_eval_batch_size))
-                    eval_times.append(seconds)
-                eval_results[name] = result
-                evaluation[name + "_seconds_median"] = statistics.median(eval_times)
-        assert eval_results["baseline"][1] == eval_results["optimized"][1] == len(rows)
-        np.testing.assert_allclose(eval_results["baseline"][0], eval_results["optimized"][0], rtol=1e-6)
-        evaluation["same_row_count_and_loss_within_float_roundoff"] = True
-        evaluation["speedup"] = evaluation["baseline_seconds_median"] / evaluation["optimized_seconds_median"]
-        report["development_forward"] = evaluation
-    old = statistics.median(q["baseline_label_seconds"] for q in report["questions"])
-    new = statistics.median(q["optimized_label_seconds"] for q in report["questions"])
-    report["label_seconds_median"] = {"baseline": old, "optimized": new, "speedup": old/new}
-    args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report, indent=2))
+            print(json.dumps(entry), flush=True)
+        # One training question and one development question of a head epoch.
+        record, scores, safe, maximum = questions[1]
+        route = current.build_route_labels(record, scores, safe, maximum, predictor, cfg)
+        values = route["options"].numpy()
+        source = current.label_rows(values, "pretrain")
+        optimizer = torch.optim.Adam(head.parameters(), lr=cfg.decision_lr,
+                                     fused=device.type == "cuda")
+        epoch = {}
+        for repeat in range(args.repeats + 1):
+            rows, assemble = timed(lambda: current.decision_training_rows(record, source, values[source],
+                                                                          "pretrain", predictor, cfg))
+            order = np.random.RandomState(repeat).permutation(len(source))
+            _, train = timed(lambda: current.masked_action_loss(head, rows, order, cfg, device, optimizer))
+            with torch.no_grad():
+                _, dev = timed(lambda: current.masked_action_loss(head, rows, range(len(source)), cfg, device,
+                                                                  batch_size=cfg.decision_eval_batch_size))
+            if repeat:  # The first pass warms the device.
+                for key, value in (("assemble", assemble), ("train_steps", train), ("dev_pass", dev)):
+                    epoch.setdefault(key, []).append(value)
+        report["head_epoch_seconds_per_question"] = {key: statistics.median(values) for key, values in epoch.items()}
+        # Peak Python/NumPy allocations of one question's label build.
+        for name, build in (("route", lambda: current.build_route_labels(*questions[1], predictor, cfg)),
+                            ("finetune", lambda: current.build_finetune_labels(*questions[1], predictor, head, cfg))):
+            tracemalloc.start()
+            build()
+            report[f"{name}_label_peak_mib"] = tracemalloc.get_traced_memory()[1] / 2**20
+            tracemalloc.stop()
+    for key in ("route_label_seconds", "finetune_label_seconds", "route_file_bytes", "finetune_file_bytes", "rows"):
+        report[f"median_{key}"] = statistics.median(entry[key] for entry in report["questions"])
+    args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(json.dumps({key: value for key, value in report.items() if key != "questions"}, indent=2))
 
 
 if __name__ == "__main__":

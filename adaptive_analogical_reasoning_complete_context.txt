@@ -7,6 +7,13 @@ Prepared: 20 September 2026
 Status: design context plus 24 September 2026 implementation update; no new
 real-data training or benchmark result established.
 
+Later note: this document describes the reinforcement-learning formulation (a
+seven-action DQN head). The supervised pipeline in adaptive_analogical_training.py
+replaced it; since revision 9 its head has eleven actions (the next zero-shot, and
+per source its evaluator and its one-shot candidate, offered for a source in use or
+the nearest unused one) and is trained in two phases. See
+ADAPTIVE_ANALOGICAL_TRAINING_GUIDE.md for the current rules.
+
 HOW TO READ THIS DOCUMENT
 
 This document consolidates the author's research idea and the subsequent design discussions. It is a standalone specification for understanding, implementing, and evaluating the proposed system. It complements research_story_analogical_transfer_neural_verification.txt rather than replacing that earlier account of the analogical-transfer research.
@@ -1190,7 +1197,9 @@ Losses/freezing:
   frozen hidden output is deterministic under identical observations.
 
 Simulator/cost:
-  a one-shot action never requires its source's evaluator;
+  a one-shot action never requires its source's evaluator (since revision 9 the supervised head has eleven
+  actions: the next zero-shot and, per source, its evaluator and its one-shot candidate, offered for a
+  source already in use or the nearest unused one);
   no duplicate acquisition or unrecorded generation is possible;
   all routes to the same full pool have the same solver-call total;
   initialization is charged in reporting;

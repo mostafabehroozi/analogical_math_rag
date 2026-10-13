@@ -4,6 +4,7 @@ import copy
 import fnmatch
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,7 +74,7 @@ def small_config(root, **overrides):
                    output_dir=str(root / "run"), device="cpu", cpu_threads=1,
                    k=2, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
                    batch_size=16, teacher_epochs=2, snapshot_epochs=2, decision_epochs=2,
-                   patience=2, dev_checks_per_epoch=2,
+                   decision_finetune_epochs=2, patience=2, dev_checks_per_epoch=2,
                    decision_batch_size=16, recognition_threshold=.1,
                    bootstrap_samples=20, **overrides)
     if not train.exists():
@@ -118,24 +119,20 @@ def test_contract_identifies_input_logs_by_content_not_path_or_mtime(tmp_path):
         a.Workflow(cfg)
 
 
-def test_legacy_mtime_contract_is_upgraded_only_when_it_still_matches(tmp_path):
+def test_contract_from_before_content_hashing_is_rejected(tmp_path):
     torch.set_num_threads(1)
     cfg = small_config(tmp_path)
     a.Workflow(cfg)
     path = tmp_path / "run" / "contract.json"
     contract = json.loads(path.read_text(encoding="utf-8"))
-    # Earlier code kept the configured paths in the config and bound each log to its mtime.
+    # Code from before content hashing bound each log to its path, size, and mtime. It never wrote
+    # this revision, and its contracts cannot be verified, so the folder is not reused.
     legacy = dict(contract,
                   config={**contract["config"], "train_file": cfg.train_file, "test_files": list(cfg.test_files)},
                   sources=[{"path": source["path"], "bytes": source["bytes"],
                             "mtime_ns": Path(source["path"]).stat().st_mtime_ns}
                            for source in contract["sources"]])
     path.write_text(json.dumps(legacy), encoding="utf-8")
-    a.Workflow(cfg)
-    assert json.loads(path.read_text(encoding="utf-8")) == contract
-    # A legacy contract from another session cannot be verified and is rejected as before.
-    stale = dict(legacy, sources=[dict(source, mtime_ns=source["mtime_ns"] + 1) for source in legacy["sources"]])
-    path.write_text(json.dumps(stale), encoding="utf-8")
     with pytest.raises(ValueError, match="different config/data contract"):
         a.Workflow(cfg)
 
@@ -160,7 +157,7 @@ def test_mirror_settings_are_runtime_only_and_validated():
         a.Config(hf_sync_minutes=0).validate()
 
 
-def test_stage3_fingerprint_ignores_log_paths_and_reproduces_the_path_bound_form():
+def test_stage3_fingerprint_ignores_log_paths():
     cfg = a.Config(hidden_dim=4)
     records = [a.Record(f"bench::{i}", str(i), "bench", list(range(cfg.n)), list(range(cfg.k)),
                         np.full(cfg.k, .5, np.float32), np.full(cfg.k, .4, np.float32),
@@ -179,15 +176,15 @@ def test_stage3_fingerprint_ignores_log_paths_and_reproduces_the_path_bound_form
     moved.train_file = "/content/working/logs/" + Path(cfg.train_file).name
     moved.test_files = ["/content/working/logs/" + Path(path).name for path in cfg.test_files]
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, moved) == current
-    # Code through e4b82f0 also hashed the configured paths. The pinned value guards that
-    # formula; it was re-pinned when revision 6 changed the Stage 1-2 config fields, and again for
-    # revisions 7 and 8 (the digest includes the revision; at revision 6 the formula still gives
-    # 5c21f1cdbe69f5cccc7b7a56223eaa94bc50a3921d7fa387245cb65a5b326b9d).
-    legacy = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
-                                            [cfg.train_file] + cfg.test_files)
-    assert legacy == "16415eca116d061dd02d2ebc0bf1ec892c84c54b55a2f3ff3c22ae32cb589230" != current
-    assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
-                                          [moved.train_file] + moved.test_files) not in (legacy, current)
+    # Content still matters: another record, teacher label, or predictor is another dataset.
+    changed = copy.deepcopy(records)
+    changed[0].ccs[0, 0] = .9
+    assert a.decision_dataset_fingerprint(changed, splits, teacher, predictor, cfg) != current
+    other_teacher = {name: value + .01 for name, value in teacher.items()}
+    assert a.decision_dataset_fingerprint(records, splits, other_teacher, predictor, cfg) != current
+    with torch.no_grad():
+        linear.bias.add_(.1)
+    assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg) != current
 
 
 def test_output_sync_pushes_changed_files_pulls_into_empty_folders_and_survives_failures(
@@ -294,22 +291,26 @@ def test_pipeline_resumes_from_the_mirror_in_a_fresh_session(tmp_path, monkeypat
         "teacher_fold_1.pt", "teacher_fold_2.pt", "teacher_final.pt", "teacher_completed.pt",
         "heuristics_selected_on_dev.json", "snapshot_completed.pt",
         "decision_dataset_manifest.json", "decision_label_coverage.json",
-        "decision_labels/policy.pt", "decision_labels/dev.pt",
-        "decision_head_progress.pt", "decision_head_completed.pt", "inference_bundle.pt",
+        "decision_labels/pretrain_policy.pt", "decision_labels/pretrain_dev.pt",
+        "decision_labels/finetune_policy.pt", "decision_labels/finetune_dev.pt",
+        "decision_head_pretrain_progress.pt", "decision_head_pretrained.pt",
+        "decision_head_finetune_progress.pt", "decision_head_completed.pt", "inference_bundle.pt",
         "final_rollouts.jsonl", "results.json"}
     for relative, data in remote.items():
         assert (tmp_path / "run" / relative).read_bytes() == data
     assert hub.messages[0].startswith("Stage 0") and hub.messages[-1].startswith("Stage 4")
-    stages = [int(message.split()[1].rstrip(":")) for message in hub.messages]
+    stages = [int(re.match(r"Stage (\d)", message).group(1)) for message in hub.messages]
     assert stages == sorted(stages) and set(stages) == {0, 1, 2, 3, 4}
     assert any("teacher fold" in message for message in hub.messages)
     assert any("labels" in message and "questions" in message for message in hub.messages)
     assert any("labels complete" in message for message in hub.messages)
     assert any("epoch" in message for message in hub.messages)
+    assert any(message.startswith("Stage 3a complete") for message in hub.messages)
+    assert any(message.startswith("Stage 3b: ") or message.startswith("Stage 3 complete") for message in hub.messages)
     # A new session: empty working disk, logs downloaded again, same configuration.
     shutil.rmtree(tmp_path / "run")
     os.utime(cfg.train_file, (1, 1))
-    for name in ("fit_teachers", "fit_snapshot", "train_decision_head"):
+    for name in ("fit_teachers", "fit_snapshot", "train_pretrained_head", "train_finetuned_head"):
         monkeypatch.setattr(a, name, lambda *args, _name=name, **kwargs: pytest.fail(
             f"{_name} must resume from the mirror instead of training again"))
     capsys.readouterr()
@@ -318,7 +319,8 @@ def test_pipeline_resumes_from_the_mirror_in_a_fresh_session(tmp_path, monkeypat
     assert "Mirror user/adaptive-run: downloaded" in log and "completed stages resume" in log
     assert "Loaded completed teacher stage." in log
     assert "Loaded completed snapshot stage." in log
-    assert "Loaded completed supervised decision head." in log
+    assert "Loaded completed pretrained decision head." in log
+    assert "Loaded completed fine-tuned decision head." in log
     assert resumed.results["decision_training"] == work.results["decision_training"]
     assert resumed.results["audit"]["adaptive"]["policies"]["supervised"]["n"] == \
         work.results["audit"]["adaptive"]["policies"]["supervised"]["n"]
@@ -351,31 +353,19 @@ def forbid(monkeypatch, *names):
 
 
 def stage3_files(run):
-    """Every saved Stage 3 fingerprint: manifest, labels, progress, and completed head."""
-    found = {"manifest": json.loads((run / "decision_dataset_manifest.json").read_text(encoding="utf-8"))["fingerprint"]}
-    for path in sorted(run.glob("decision_labels/**/*.pt")) + [run / "decision_head_progress.pt"]:
-        if path.exists():
-            found[path.relative_to(run).as_posix()] = a.load_checkpoint(path)["fingerprint"]
-    for name in ("decision_head_completed.pt", "inference_bundle.pt"):
+    """Every saved Stage 3 fingerprint by phase: manifest, labels, progress, and completed heads."""
+    manifest = json.loads((run / "decision_dataset_manifest.json").read_text(encoding="utf-8"))["fingerprint"]
+    found = {"pretrain": {"manifest": manifest}, "finetune": {}}
+    for path in sorted(run.glob("decision_labels/**/*.pt")):
+        found[path.name.split("_")[0]][path.relative_to(run).as_posix()] = a.load_checkpoint(path)["fingerprint"]
+    for phase, name in (("pretrain", "decision_head_pretrain_progress.pt"),
+                        ("finetune", "decision_head_finetune_progress.pt")):
         if (run / name).exists():
-            checkpoint = a.load_checkpoint(run / name)
-            found[name] = checkpoint.get("decision_head", checkpoint)["dataset_fingerprint"]
+            found[phase][name] = a.load_checkpoint(run / name)["fingerprint"]
+    for phase, name in (("pretrain", "decision_head_pretrained.pt"), ("finetune", "decision_head_completed.pt")):
+        if (run / name).exists():
+            found[phase][name] = a.load_checkpoint(run / name)["dataset_fingerprint"]
     return found
-
-
-def bind_to_log_paths(run, current, legacy):
-    """Stage 3 files as earlier code wrote them: identical, but fingerprinted with the log paths."""
-    assert set(stage3_files(run).values()) == {current}
-    manifest = run / "decision_dataset_manifest.json"
-    a.atomic_json(manifest, dict(json.loads(manifest.read_text(encoding="utf-8")), fingerprint=legacy))
-    for relative in stage3_files(run):
-        if relative == "manifest":
-            continue
-        checkpoint = a.load_checkpoint(run / relative)
-        target = checkpoint.get("decision_head", checkpoint)
-        target["dataset_fingerprint" if "dataset_fingerprint" in target else "fingerprint"] = legacy
-        a.atomic_torch(run / relative, checkpoint)
-    return [relative for relative in stage3_files(run) if relative not in ("manifest", "inference_bundle.pt")]
 
 
 def assert_same_head(actual, reference):
@@ -389,119 +379,69 @@ def test_moved_input_logs_resume_stages_0_to_3_without_relabeling_or_retraining(
     cfg = small_config(tmp_path)
     reference_cfg = copy.deepcopy(cfg)
     reference_cfg.output_dir = str(tmp_path / "reference")
-    reference = a.Workflow(reference_cfg).train_decision_head().decision_checkpoint
+    reference_work = a.Workflow(reference_cfg).train_decision_head()
+    reference, pretrained = reference_work.decision_checkpoint, reference_work.pretrained_checkpoint
     run = tmp_path / "run"
     original = a.masked_action_loss
 
     def stop_in_second_epoch(model, rows, order, config, device, optimizer=None, **kwargs):
-        if optimizer is not None and (run / "decision_head_progress.pt").exists():
+        if optimizer is not None and (run / "decision_head_pretrain_progress.pt").exists():
             raise KeyboardInterrupt("simulated session end")
         return original(model, rows, order, config, device, optimizer, **kwargs)
 
     monkeypatch.setattr(a, "masked_action_loss", stop_in_second_epoch)
     with pytest.raises(KeyboardInterrupt, match="simulated session end"):
         a.Workflow(cfg).train_decision_head()
-    assert a.load_checkpoint(run / "decision_head_progress.pt")["epoch"] == 1
+    assert a.load_checkpoint(run / "decision_head_pretrain_progress.pt")["epoch"] == 1
     monkeypatch.setattr(a, "masked_action_loss", original)
     # The next session downloads the same logs elsewhere; the old directory is gone.
     moved = move_logs(cfg, tmp_path / "session2")
     assert not Path(cfg.train_file).exists()
-    forbid(monkeypatch, "fit_teachers", "fit_snapshot", "build_decision_labels")
+    forbid(monkeypatch, "fit_teachers", "fit_snapshot", "build_route_labels")
     capsys.readouterr()
-    resumed = a.Workflow(moved).train_decision_head().decision_checkpoint
+    resumed = a.Workflow(moved).train_decision_head()
     log = capsys.readouterr().out
     assert "Using compact cached records" in log and "Loaded completed teacher stage." in log
     assert "Loaded completed snapshot stage." in log and "built 0, reused" in log
-    assert "Stage 3 head resume: 1 completed epochs" in log and "Stage 3 fingerprint" not in log
-    assert_same_head(resumed, reference)
-    # The fingerprint no longer depends on the directory: the reference used the first one.
-    assert set(stage3_files(run).values()) == {reference["dataset_fingerprint"]}
-    # A third directory loads the completed head.
+    assert "Stage 3a head resume: 1 completed epochs" in log
+    assert_same_head(resumed.pretrained_checkpoint, pretrained)
+    assert_same_head(resumed.decision_checkpoint, reference)
+    # The fingerprints no longer depend on the directory: the reference used the first one.
+    files = stage3_files(run)
+    assert set(files["pretrain"].values()) == {pretrained["dataset_fingerprint"]}
+    assert set(files["finetune"].values()) == {reference["dataset_fingerprint"]}
+    assert len(files["pretrain"]) == 5 and len(files["finetune"]) == 4
+    # A third directory loads both completed heads.
     again = move_logs(moved, tmp_path / "session3")
-    forbid(monkeypatch, "train_decision_head")
+    forbid(monkeypatch, "train_pretrained_head", "train_finetuned_head")
     a.Workflow(again).train_decision_head()
-    assert "Loaded completed supervised decision head." in capsys.readouterr().out
+    log = capsys.readouterr().out
+    assert "Loaded completed pretrained decision head." in log and "Loaded completed fine-tuned decision head." in log
 
 
-@pytest.mark.parametrize("moved", [False, True])
-def test_path_bound_labels_from_earlier_code_upgrade_in_place(tmp_path, monkeypatch, capsys, moved):
+def test_completed_heads_with_another_dataset_or_pretrained_head_are_rejected(tmp_path):
     torch.set_num_threads(1)
     cfg = small_config(tmp_path)
-    reference_cfg = copy.deepcopy(cfg)
-    reference_cfg.output_dir = str(tmp_path / "reference")
-    reference = a.Workflow(reference_cfg).train_decision_head().decision_checkpoint
     run = tmp_path / "run"
-    original, built = a.build_decision_labels, []
-
-    def stop_on_third_question(record, *args, **kwargs):
-        built.append(record.uid)
-        if len(built) == 3:
-            raise KeyboardInterrupt("simulated session end")
-        return original(record, *args, **kwargs)
-
-    monkeypatch.setattr(a, "build_decision_labels", stop_on_third_question)
-    work = a.Workflow(cfg)
-    with pytest.raises(KeyboardInterrupt, match="simulated session end"):
-        work.train_decision_head()
-    current = reference["dataset_fingerprint"]
-    legacy = a.decision_dataset_fingerprint(work.records, work.splits, work.teacher, work.predictor, cfg,
-                                            [cfg.train_file] + cfg.test_files)
-    assert bind_to_log_paths(run, current, legacy) == [
-        path.relative_to(run).as_posix() for path in a.question_paths(
-            work.records, work.splits["policy"][:2], run / "decision_labels" / "policy")]
-    if moved:
-        # Only contract.json still names the directory the labels were built with.
-        cfg = move_logs(cfg, tmp_path / "session2")
-    built.clear()
-    monkeypatch.setattr(a, "build_decision_labels",
-                        lambda record, *args, **kwargs: built.append(record.uid) or original(record, *args, **kwargs))
-    forbid(monkeypatch, "fit_teachers", "fit_snapshot")
-    capsys.readouterr()
-    resumed = a.Workflow(cfg).train_decision_head().decision_checkpoint
-    log = capsys.readouterr().out
-    assert "the manifest and 2 label, progress, or head files hashed the input log paths" in log
-    assert "built 0, reused 1" in log and built == [
-        work.records[i].uid for i in work.splits["policy"][2:] + work.splits["dev"]]
-    assert_same_head(resumed, reference)
-    assert set(stage3_files(run).values()) == {current}
-    capsys.readouterr()
     a.Workflow(cfg).train_decision_head()
-    log = capsys.readouterr().out
-    assert "Loaded completed supervised decision head." in log and "Stage 3 fingerprint" not in log
-
-
-def test_completed_head_from_earlier_code_upgrades_with_the_paths_its_bundle_recorded(tmp_path, monkeypatch, capsys):
-    torch.set_num_threads(1)
-    monkeypatch.chdir(tmp_path)
-    # Relative paths: earlier code hashed these strings, while contract.json records resolved ones.
-    cfg = move_logs(small_config(tmp_path), Path("logs"))
-    work = a.Workflow(cfg).train_decision_head()
-    current = work.decision_checkpoint["dataset_fingerprint"]
-    legacy = a.decision_dataset_fingerprint(work.records, work.splits, work.teacher, work.predictor, cfg,
-                                            [cfg.train_file] + cfg.test_files)
-    run = tmp_path / "run"
-    rebound = bind_to_log_paths(run, current, legacy)
-    assert rebound == ["decision_labels/dev.pt", "decision_labels/policy.pt",
-                       "decision_head_progress.pt", "decision_head_completed.pt"]
-    moved = move_logs(cfg, Path("downloads"))
-    forbid(monkeypatch, "fit_teachers", "fit_snapshot", "train_decision_head")
-    # Neither the new paths nor the contract's resolved paths reproduce the old fingerprint,
-    # so without the bundle's configured strings the files are rejected and left as they are.
-    bundle = run / "inference_bundle.pt"
-    hidden = bundle.rename(run / "bundle.hidden")
-    saved = {relative: (run / relative).read_bytes() for relative in rebound + ["decision_dataset_manifest.json"]}
-    capsys.readouterr()
+    # A final head fine-tuned from other pretrained weights is never reused with this pretrained head.
+    final = a.load_checkpoint(run / "decision_head_completed.pt")
+    original = dict(final)
+    final["dataset_fingerprint"] = "fine-tuned from another head"
+    a.atomic_torch(run / "decision_head_completed.pt", final)
     with pytest.raises(ValueError, match="Completed decision head has an incompatible"):
-        a.Workflow(moved).train_decision_head()
-    assert "NOTE: Stage 3 files match neither this run nor its path-bound fingerprint" in capsys.readouterr().out
-    assert all((run / relative).read_bytes() == data for relative, data in saved.items())
-    hidden.rename(bundle)
-    resumed = a.Workflow(moved).train_decision_head()
-    log = capsys.readouterr().out
-    assert "the manifest and 4 label, progress, or head files hashed the input log paths" in log
-    assert "Loaded completed supervised decision head." in log
-    assert set(stage3_files(run).values()) == {current}
-    assert_same_head(resumed.decision_checkpoint, work.decision_checkpoint)
-    a.Workflow(moved).train_decision_head()
-    log = capsys.readouterr().out
-    assert "Loaded completed supervised decision head." in log and "Stage 3 fingerprint" not in log
+        a.Workflow(cfg).train_decision_head()
+    a.atomic_torch(run / "decision_head_completed.pt", original)
+    pretrained = a.load_checkpoint(run / "decision_head_pretrained.pt")
+    original = dict(pretrained)
+    pretrained["dataset_fingerprint"] = "another dataset"
+    a.atomic_torch(run / "decision_head_pretrained.pt", pretrained)
+    with pytest.raises(ValueError, match="Completed pretrained decision head has an incompatible"):
+        a.Workflow(cfg).train_decision_head()
+    for field, value in (("phase", "finetune"), ("action_count", 3)):
+        a.atomic_torch(run / "decision_head_pretrained.pt", dict(original, **{field: value}))
+        with pytest.raises(ValueError, match="Completed pretrained decision head has an incompatible"):
+            a.Workflow(cfg).train_decision_head()
+    a.atomic_torch(run / "decision_head_pretrained.pt", original)
+    resumed = a.Workflow(cfg).train_decision_head()
+    assert resumed.decision_checkpoint["best_epoch"] == final["best_epoch"]

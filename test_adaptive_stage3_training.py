@@ -1,10 +1,7 @@
-"""Offline checks for compact Stage 3 labels, migration, and unchanged training updates."""
+"""Offline checks for two-phase Stage 3 labels, their storage, and resumable head training."""
 import copy
-import gzip
 import itertools
 import json
-import math
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,7 +17,7 @@ def packed_rows(cfg, count, seed=17):
     valid[:, 0] = True
     target = valid.astype(np.float32)
     target /= target.sum(axis=1, keepdims=True)
-    return {"h": torch.from_numpy(rng.randn(count, cfg.hidden_dim).astype(np.float32)),
+    return {"h": torch.from_numpy(rng.randn(count, cfg.head_input_dim).astype(np.float32)),
             "target": torch.from_numpy(target), "valid": torch.from_numpy(valid)}
 
 
@@ -71,6 +68,16 @@ def test_runtime_storage_controls_preserve_dataset_fingerprint():
     changed.decision_eval_batch_size = 128
     changed.continue_after_max = False
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, changed) == first
+    # Every training setting is part of the identity, including the fine-tuning ones.
+    for name, value in (("decision_finetune_lr", 1e-3), ("decision_epochs", 7), ("recognition_threshold", .4)):
+        changed = copy.deepcopy(cfg)
+        setattr(changed, name, value)
+        assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, changed) != first
+    # The fine-tuning labels also depend on the pretrained head they were rolled out from.
+    head = a.SupervisedActionHead(cfg)
+    other = a.SupervisedActionHead(cfg)
+    assert a.finetune_fingerprint(first, a.cpu_state(head)) == a.finetune_fingerprint(first, a.cpu_state(head))
+    assert a.finetune_fingerprint(first, a.cpu_state(head)) != a.finetune_fingerprint(first, a.cpu_state(other))
 
 
 def test_runtime_storage_controls_preserve_existing_workflow_contract(tmp_path):
@@ -82,6 +89,7 @@ def test_runtime_storage_controls_preserve_existing_workflow_contract(tmp_path):
     a.Workflow(cfg)
     contract = json.loads((tmp_path / "run" / "contract.json").read_text(encoding="utf-8"))
     assert not {"decision_eval_batch_size", "continue_after_max"} & set(contract["config"])
+    assert {"decision_finetune_epochs", "decision_finetune_lr"} <= set(contract["config"])
     cfg.decision_eval_batch_size = 4096
     cfg.continue_after_max = False
     a.Workflow(cfg)
@@ -89,10 +97,9 @@ def test_runtime_storage_controls_preserve_existing_workflow_contract(tmp_path):
 
 def small_stage3_problem(questions=2, **overrides):
     torch.set_num_threads(1)
-    cfg = a.Config(k=2, zero_shots=2, hidden_dim=4, residual_blocks=1,
-                   decision_hidden=4, decision_epochs=3, patience=3,
-                   decision_batch_size=4,
-                   recognition_threshold=.1, **overrides)
+    settings = dict(k=2, zero_shots=2, hidden_dim=4, residual_blocks=1, decision_hidden=4, decision_epochs=3,
+                    decision_finetune_epochs=3, patience=3, decision_batch_size=4, recognition_threshold=.1)
+    cfg = a.Config(**{**settings, **overrides})
     records = []
     for index in range(questions):
         rng = np.random.RandomState(index + 40)
@@ -125,13 +132,29 @@ def assert_matching_training_checkpoints(reference, actual):
                for key, value in reference["weights"].items())
 
 
+PHASE_FILES = {"pretrain": "decision_head_pretrain_progress.pt", "finetune": "decision_head_finetune_progress.pt"}
+
+
+def train_phase(phase, problem, out, pretrained=None):
+    """Run one Stage 3 phase; fine-tuning needs a pretrained checkpoint."""
+    cfg, records, splits, teacher, predictor = problem
+    if phase == "pretrain":
+        return a.train_pretrained_head(records, splits, teacher, predictor, cfg, "cpu", out)
+    return a.train_finetuned_head(records, splits, teacher, predictor, pretrained, cfg, "cpu", out)
+
+
+@pytest.mark.parametrize("phase", ["pretrain", "finetune"])
 def test_interrupted_head_resumes_last_complete_epoch_with_identical_adam_and_shuffle(
-        tmp_path, monkeypatch):
-    cfg, records, splits, teacher, predictor = small_stage3_problem()
+        tmp_path, monkeypatch, phase):
+    problem = small_stage3_problem()
     complete, interrupted = tmp_path / "complete", tmp_path / "interrupted"
     complete.mkdir()
     interrupted.mkdir()
-    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", complete)
+    pretrained = train_phase("pretrain", problem, complete)
+    expected = pretrained if phase == "pretrain" else train_phase("finetune", problem, complete, pretrained)
+    if phase == "finetune":
+        train_phase("pretrain", problem, interrupted)
+        (interrupted / PHASE_FILES["pretrain"]).unlink()
     original = a.masked_action_loss
     train_calls = 0
 
@@ -148,37 +171,43 @@ def test_interrupted_head_resumes_last_complete_epoch_with_identical_adam_and_sh
 
     monkeypatch.setattr(a, "masked_action_loss", stop_during_second_epoch)
     with pytest.raises(KeyboardInterrupt, match="simulated interrupted"):
-        a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", interrupted)
-    progress = a.load_checkpoint(interrupted / "decision_head_progress.pt")
-    assert progress["schema_version"] == 1 and progress["epoch"] == 1
+        train_phase(phase, problem, interrupted, pretrained)
+    progress = a.load_checkpoint(interrupted / PHASE_FILES[phase])
+    assert progress["schema_version"] == 2 and progress["phase"] == phase and progress["epoch"] == 1
     assert len(progress["history"]) == 1 and progress["optimizer"]["state"]
     monkeypatch.setattr(a, "masked_action_loss", original)
-    monkeypatch.setattr(a, "build_decision_labels", lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
-    actual = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", interrupted)
+    for builder in ("build_route_labels", "build_finetune_labels"):
+        monkeypatch.setattr(a, builder, lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
+    actual = train_phase(phase, problem, interrupted, pretrained)
     assert_matching_training_checkpoints(expected, actual)
-    assert a.load_checkpoint(interrupted / "decision_head_progress.pt")["epoch"] == 3
+    assert a.load_checkpoint(interrupted / PHASE_FILES[phase])["epoch"] == 3
 
 
+@pytest.mark.parametrize("phase", ["pretrain", "finetune"])
 @pytest.mark.parametrize("field,value,message", [
     ("schema_version", 99, "incompatible training contract"),
+    ("phase", "other", "incompatible training contract"),
     ("fingerprint", "stale dataset", "incompatible training contract"),
     ("epoch", 99, "inconsistent epoch bookkeeping"),
 ])
-def test_incompatible_or_inconsistent_head_progress_is_rejected(tmp_path, monkeypatch, field, value, message):
-    cfg, records, splits, teacher, predictor = small_stage3_problem()
-    a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    path = tmp_path / "decision_head_progress.pt"
+def test_incompatible_or_inconsistent_head_progress_is_rejected(tmp_path, monkeypatch, phase, field, value, message):
+    problem = small_stage3_problem()
+    pretrained = train_phase("pretrain", problem, tmp_path)
+    if phase == "finetune":
+        train_phase("finetune", problem, tmp_path, pretrained)
+    path = tmp_path / PHASE_FILES[phase]
     progress = a.load_checkpoint(path)
     progress[field] = value
     a.atomic_torch(path, progress)
     monkeypatch.setattr(a, "masked_action_loss", lambda *args, **kwargs: pytest.fail("Invalid progress must not train"))
     with pytest.raises(ValueError, match=message):
-        a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
+        train_phase(phase, problem, tmp_path, pretrained)
 
 
-def test_resuming_patience_exhausted_head_skips_every_training_epoch(tmp_path, monkeypatch):
-    cfg, records, splits, teacher, predictor = small_stage3_problem()
-    cfg.patience = 1
+@pytest.mark.parametrize("phase", ["pretrain", "finetune"])
+def test_resuming_patience_exhausted_head_skips_every_training_epoch(tmp_path, monkeypatch, phase):
+    problem = small_stage3_problem()
+    problem[0].patience = 1
     original = a.masked_action_loss
 
     def constant_dev(model, rows, order, config, device, optimizer=None, **kwargs):
@@ -187,42 +216,99 @@ def test_resuming_patience_exhausted_head_skips_every_training_epoch(tmp_path, m
         return original(model, rows, order, config, device, optimizer, **kwargs)
 
     monkeypatch.setattr(a, "masked_action_loss", constant_dev)
-    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    assert len(expected["history"]) == 2 < cfg.decision_epochs
-    progress = a.load_checkpoint(tmp_path / "decision_head_progress.pt")
-    assert progress["stale"] == cfg.patience
+    pretrained = train_phase("pretrain", problem, tmp_path)
+    expected = pretrained if phase == "pretrain" else train_phase("finetune", problem, tmp_path, pretrained)
+    assert len(expected["history"]) == 2 < problem[0].decision_epochs
+    assert a.load_checkpoint(tmp_path / PHASE_FILES[phase])["stale"] == problem[0].patience
     monkeypatch.setattr(a, "masked_action_loss", lambda *args, **kwargs: pytest.fail("Stopped head must not restart epochs"))
-    monkeypatch.setattr(a, "build_decision_labels", lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
-    actual = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    assert_matching_training_checkpoints(expected, actual)
+    for builder in ("build_route_labels", "build_finetune_labels"):
+        monkeypatch.setattr(a, builder, lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
+    assert_matching_training_checkpoints(expected, train_phase(phase, problem, tmp_path, pretrained))
 
 
-def question_labels(record, rows, cases, cfg):
-    return {"schema_version": a.DECISION_LABEL_SCHEMA, "fingerprint": "f" * 64, "uid": record.uid,
-            "coverage": a.label_coverage(rows, cases, cfg),
-            **a.compact_decision_labels(record, rows, cases, cfg)}
+def test_stage3_logs_progress_and_reuses_saved_labels_on_resume(tmp_path, monkeypatch, capsys):
+    problem = small_stage3_problem()
+    cfg, records, splits, teacher, predictor = problem
+    cfg.decision_epochs = 1
+    first = train_phase("pretrain", problem, tmp_path)
+    log = capsys.readouterr().out
+    assert "Stage 3a dev labels: 1/1" in log and "Stage 3a epoch 1 train: 1/1" in log
+    assert "Stage 3a epoch 1 dev: 1/1" in log and "Stage 3a epoch 1/1: train loss" in log
+    assert "dev loss" in log and "ETA" in log and "head rows" in log and "cheapest first steps" in log
+    # Resume saved role labels: no relabeling, and an interrupted write is cleaned up.
+    interrupted = a.decision_role_path(tmp_path, "pretrain", "dev").with_suffix(".pt.tmp")
+    interrupted.write_bytes(b"leftover from failed dev label write")
+    monkeypatch.setattr(a, "build_route_labels", lambda *args: pytest.fail("Should reuse saved labels"))
+    resumed = train_phase("pretrain", problem, tmp_path)
+    assert not interrupted.exists()
+    assert "built 0, reused 1" in capsys.readouterr().out
+    assert first["coverage"] == resumed["coverage"] and first["history"] == resumed["history"]
+    assert all(torch.equal(value, resumed["weights"][key]) for key, value in first["weights"].items())
+    coverage = json.loads((tmp_path / "decision_label_coverage.json").read_text(encoding="utf-8"))
+    assert set(coverage["pretrain"]) == {"policy", "dev"}
 
 
-def test_compact_labels_rebuild_exact_targets_valid_masks_and_features():
-    cfg, records, _, teacher, predictor = small_stage3_problem()
+def test_finetuning_starts_from_the_pretrained_weights_and_is_bound_to_that_head(tmp_path):
+    problem = small_stage3_problem(decision_finetune_epochs=1, decision_finetune_lr=1e-12)
+    cfg, records, splits, teacher, predictor = problem
+    pretrained = train_phase("pretrain", problem, tmp_path)
+    # A negligible learning rate leaves the weights where fine-tuning started: at the pretrained head.
+    nearly_unchanged = train_phase("finetune", problem, tmp_path, pretrained)
+    assert all(torch.allclose(value, pretrained["weights"][key], atol=1e-6)
+               for key, value in nearly_unchanged["weights"].items())
+    assert nearly_unchanged["phase"] == "finetune" and pretrained["phase"] == "pretrain"
+    assert nearly_unchanged["pretrained_fingerprint"] == a.head_fingerprint(pretrained["weights"])
+    # Saved fine-tuning labels were rolled out from that head and are rejected for another.
+    other = copy.deepcopy(pretrained)
+    other["weights"] = {key: value + 1e-3 for key, value in other["weights"].items()}
+    with pytest.raises(ValueError, match="Incompatible decision labels"):
+        train_phase("finetune", problem, tmp_path, other)
+    foreign = dict(pretrained, dataset_fingerprint="another dataset")
+    with pytest.raises(ValueError, match="different dataset or action contract"):
+        train_phase("finetune", problem, tmp_path, foreign)
+
+
+def test_finetuning_labels_cover_exactly_the_pretraining_rows_and_choose_allowed_actions(tmp_path):
+    problem = small_stage3_problem(questions=3)
+    cfg, records, splits, teacher, predictor = problem
+    pretrained = train_phase("pretrain", problem, tmp_path)
+    finetuned = train_phase("finetune", problem, tmp_path, pretrained)
+    for role in ("policy", "dev"):
+        options = a.load_label_file(a.decision_role_path(tmp_path, "pretrain", role))["options"]
+        choice = a.load_label_file(a.decision_role_path(tmp_path, "finetune", role))["choice"]
+        for position in range(len(options)):
+            rows = a.label_rows(options[position].numpy(), "pretrain")
+            assert np.array_equal(rows, a.label_rows(choice[position].numpy(), "finetune")) and len(rows)
+            assert a.decision_valid(rows, cfg)[np.arange(len(rows)), choice[position].numpy()[rows]].all()
+        assert finetuned["coverage"][role]["action_rows"] == pretrained["coverage"][role]["action_rows"]
+        coverage = finetuned["coverage"][role]
+        # Several cheapest first steps are what Stage 3b decides; "changed" also counts head mistakes.
+        assert 0 <= coverage["tied_rows_moved"] <= coverage["tied_rows"] <= coverage["informative_rows"]
+        assert coverage["tied_rows_moved"] <= coverage["changed_rows"] <= coverage["action_rows"]
+        assert coverage["no_thread_reaches_rows"] <= coverage["informative_rows"]
+        assert coverage["tied_rows"] >= sum(count for options, count in coverage["option_counts"].items()
+                                            if int(options) > 1)
+        assert "tied_rows" not in pretrained["coverage"][role]
+
+
+def one_question_labels(problem, index=0):
+    cfg, records, splits, teacher, predictor = problem
+    args = (records[index], teacher["scores"][index], teacher["safe"][index], teacher["maximum"][index], predictor)
+    return (*args, cfg), a.build_route_labels(*args, cfg)
+
+
+def test_pretraining_labels_rebuild_exact_targets_valid_masks_and_features():
+    problem = small_stage3_problem()
+    cfg, records, _, teacher, predictor = problem
+    args, labels = one_question_labels(problem)
     record = records[0]
-    rows, cases = a.build_decision_rows(record, teacher["scores"][0], teacher["safe"][0],
-                                        teacher["maximum"][0], predictor, cfg)
-    labels = a.compact_decision_labels(record, rows, cases, cfg)
-    assert set(labels) == {"preferred", "first_cases", "observation_sha256"}
-    assert labels["preferred"].dtype == labels["first_cases"].dtype == torch.uint8
+    assert set(labels) == {"options", "observation_sha256", "coverage"}
     states, _ = a.budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     orders = list(itertools.permutations(range(cfg.zero_shots)))
-    assert labels["preferred"].shape == (len(rows), 1)
-    assert labels["first_cases"].shape == ((len(orders) * len(states) + 7) // 8,)
-    # Rows keep planning order, so the bitmap of first cases alone rebuilds every source.
-    first = {}
-    for case in cases:
-        if case["training_row"] is not None:
-            first.setdefault(case["training_row"], case["scenario"] * len(states) + states.index(
-                a.State(case["candidate_mask"], case["evaluator_mask"])))
-    source = a.decision_row_sources(labels["first_cases"].numpy(), cfg)
-    assert source.tolist() == [first[row] for row in range(len(rows))]
+    assert labels["options"].dtype == torch.uint8
+    assert labels["options"].shape == (len(orders) * len(states), (cfg.action_count + 7) // 8)
+    source = a.check_route_labels(record, labels, cfg)
+    assert len(source) == labels["coverage"]["action_rows"]
     blank = np.zeros(cfg.n, np.float32)
     observed = a.decision_row_observations(record, source, cfg)
     for x, value in zip(observed, source.tolist()):
@@ -230,105 +316,85 @@ def test_compact_labels_rebuild_exact_targets_valid_masks_and_features():
         permuted = a.permute_zero_shots(record, blank, blank, blank, orders[scenario], cfg)[0]
         # The scalar observation is an independent oracle for the batched rebuild.
         np.testing.assert_array_equal(x, a.observation(permuted, states[position], cfg))
-    rebuilt = a.decision_training_rows(record, source, labels["preferred"].numpy(), predictor, cfg)
-    stored = a.pack_decision_rows(rows, cfg)
-    torch.testing.assert_close(rebuilt["h"], stored["h"], rtol=1e-6, atol=1e-6)
-    # Targets and masks are decoded bit for bit, not approximately.
-    assert all(rebuilt[key].dtype == stored[key].dtype and torch.equal(rebuilt[key], stored[key])
-               for key in ("target", "valid"))
-
-
-def test_compact_labels_reject_rows_that_do_not_reproduce_their_state_or_target():
-    cfg, records, _, teacher, predictor = small_stage3_problem()
-    rows, cases = a.build_decision_rows(records[0], teacher["scores"][0], teacher["safe"][0],
-                                        teacher["maximum"][0], predictor, cfg)
-    tampered = copy.deepcopy(rows)
-    tampered[0]["state_key"] = (*tampered[0]["state_key"][:2], "0" * 64)
-    with pytest.raises(ValueError, match="do not reproduce"):
-        a.compact_decision_labels(records[0], tampered, cases, cfg)
-    # Another question's measurements cannot stand in for this question's rows.
-    with pytest.raises(ValueError, match="do not reproduce"):
-        a.compact_decision_labels(records[1], rows, cases, cfg)
-    orphaned = [dict(case, training_row=None) if case["training_row"] == 0 else case for case in cases]
-    with pytest.raises(ValueError, match="without an in-budget visible case"):
-        a.compact_decision_labels(records[0], rows, orphaned, cfg)
-    uneven = copy.deepcopy(rows)
-    row = next(row for row in uneven if row["valid"].sum() >= 2)
-    support = np.flatnonzero(row["valid"])
-    row["target"] = np.zeros(cfg.action_count, np.float32)
-    row["target"][support[:2]] = [.75, .25]
-    with pytest.raises(ValueError, match="split evenly"):
-        a.compact_decision_labels(records[0], uneven, cases, cfg)
+    plan = a.question_plan(*args)
+    rebuilt = a.decision_training_rows(record, source, labels["options"].numpy()[source], "pretrain", predictor, cfg)
+    torch.testing.assert_close(rebuilt["h"].cpu(), torch.from_numpy(plan["features"].reshape(-1, cfg.head_input_dim)[source]),
+                               rtol=1e-5, atol=1e-5)
+    # Targets and masks are decoded bit for bit: an even split over each row's cheapest first steps.
+    targets = plan["targets"].reshape(-1, cfg.action_count)[source]
+    expected = (targets / targets.sum(1, keepdims=True)).astype(np.float32)
+    np.testing.assert_array_equal(rebuilt["target"].numpy(), expected)
+    np.testing.assert_array_equal(rebuilt["valid"].numpy(), plan["graph"].legal[source % len(states)])
+    assert not rebuilt["target"].numpy()[~rebuilt["valid"].numpy()].any()
+    # Fine-tuning rows are one-hot at the chosen action.
+    chosen = np.arange(len(source)) % cfg.action_count
+    one_hot = a.decision_targets(chosen, "finetune", cfg)
+    assert one_hot.shape == (len(source), cfg.action_count) and (one_hot.sum(1) == 1).all()
+    assert (one_hot.argmax(1) == chosen).all()
 
 
 def test_saved_labels_reject_observations_that_changed_after_labeling():
-    cfg, records, _, teacher, predictor = small_stage3_problem()
-    rows, cases = a.build_decision_rows(records[0], teacher["scores"][0], teacher["safe"][0],
-                                        teacher["maximum"][0], predictor, cfg)
-    labels = question_labels(records[0], rows, cases, cfg)
-    a.check_saved_labels(records[0], labels, cfg)
+    problem = small_stage3_problem()
+    cfg, records, _, teacher, predictor = problem
+    _, labels = one_question_labels(problem)
+    a.check_route_labels(records[0], labels, cfg)
     changed = copy.deepcopy(records[0])
     changed.ccs[0, 0] = 1 - changed.ccs[0, 0]
     with pytest.raises(ValueError, match="no longer reproduce"):
-        a.check_saved_labels(changed, labels, cfg)
-    truncated = dict(labels, preferred=labels["preferred"][:-1])
+        a.check_route_labels(changed, labels, cfg)
     with pytest.raises(ValueError, match="inconsistent shapes"):
-        a.check_saved_labels(records[0], truncated, cfg)
+        a.check_route_labels(records[0], dict(labels, options=labels["options"][:-1]), cfg)
     with pytest.raises(ValueError, match="inconsistent shapes"):
-        a.check_saved_labels(records[0], dict(labels, first_cases=labels["first_cases"][:-1]), cfg)
-    # Moving a row to another case changes its rebuilt observation.
-    bits = np.unpackbits(labels["first_cases"].numpy())
-    bits[[np.flatnonzero(bits)[0], np.flatnonzero(~bits.astype(bool))[0]]] ^= 1
-    with pytest.raises(ValueError, match="no longer reproduce|invalid actions"):
-        a.check_saved_labels(records[0], dict(labels, first_cases=torch.from_numpy(np.packbits(bits))), cfg)
+        a.check_route_labels(records[0], dict(labels, options=labels["options"].to(torch.int16)), cfg)
+    padded = labels["options"].clone()
+    padded[0, -1] |= 1  # Bit 7 of the only byte is not an action.
+    with pytest.raises(ValueError, match="inconsistent shapes"):
+        a.check_route_labels(records[0], dict(labels, options=padded), cfg)
+    # A bit for an action that is not allowed in that state, and a lost row.
+    graph = a.decision_graph(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    state, action = np.argwhere(~graph.legal & graph.legal.any(1)[:, None])[0]
+    bits = np.unpackbits(labels["options"].numpy(), axis=1)
+    bits[state, action] = 1
+    with pytest.raises(ValueError, match="invalid actions"):
+        a.check_route_labels(records[0], dict(labels, options=torch.from_numpy(np.packbits(bits, axis=1))), cfg)
+    lost = labels["options"].clone()
+    lost[np.flatnonzero(lost.numpy().any(1))[0]] = 0
+    with pytest.raises(ValueError, match="invalid actions"):
+        a.check_route_labels(records[0], dict(labels, options=lost), cfg)
 
 
-@pytest.mark.parametrize("overrides", [{}, {"max_cost": 60.}, {"later_rank_filter": False}])
-def test_lean_labels_equal_compacted_audit_rows_and_coverage(overrides):
-    cfg, records, _, teacher, predictor = small_stage3_problem(questions=3, **overrides)
-    for idx, record in enumerate(records):
-        args = (record, teacher["scores"][idx], teacher["safe"][idx], teacher["maximum"][idx], predictor, cfg)
-        rows, cases = a.build_decision_rows(*args)
-        labels = a.build_decision_labels(*args)
-        # Same plan: the array path never builds the audit dictionaries it matches.
-        assert labels.pop("coverage") == a.label_coverage(rows, cases, cfg)
-        compact = a.compact_decision_labels(record, rows, cases, cfg)
-        assert labels.keys() == compact.keys()
-        assert all(torch.equal(labels[key], compact[key]) for key in ("preferred", "first_cases"))
-        assert labels["observation_sha256"] == compact["observation_sha256"]
-        if overrides.get("max_cost"):
-            assert {case["status"] for case in cases} >= {"OUT_OF_BUDGET", "BUDGET"}
+def test_saved_fine_tuning_labels_reject_invalid_choices_and_misaligned_rows():
+    problem = small_stage3_problem()
+    cfg, records, _, teacher, predictor = problem
+    args, route = one_question_labels(problem)
+    head = a.SupervisedActionHead(cfg)
+    labels = a.build_finetune_labels(*args[:5], head, cfg)
+    assert set(labels) == {"choice", "coverage"} and labels["choice"].dtype == torch.uint8
+    a.check_finetune_labels(records[0], labels, cfg, route["options"])
+    with pytest.raises(ValueError, match="inconsistent shapes"):
+        a.check_finetune_labels(records[0], dict(labels, choice=labels["choice"][:-1]), cfg)
+    rows = np.flatnonzero(labels["choice"].numpy() != a.NO_CHOICE)
+    for bad in (cfg.action_count, 200):
+        invalid = labels["choice"].clone()
+        invalid[rows[0]] = bad
+        with pytest.raises(ValueError, match="choose invalid actions"):
+            a.check_finetune_labels(records[0], dict(labels, choice=invalid), cfg)
+    # A choice the state does not allow.
+    legal = a.decision_valid(rows, cfg)
+    row, action = next((r, int(np.flatnonzero(~mask)[0])) for r, mask in enumerate(legal) if not mask.all())
+    illegal = labels["choice"].clone()
+    illegal[rows[row]] = action
+    with pytest.raises(ValueError, match="choose invalid actions"):
+        a.check_finetune_labels(records[0], dict(labels, choice=illegal), cfg)
+    # Rows that Stage 3a does not have.
+    moved = labels["choice"].clone()
+    moved[rows[0]] = a.NO_CHOICE
+    moved[np.flatnonzero(labels["choice"].numpy() == a.NO_CHOICE)[0]] = 0
+    with pytest.raises(ValueError, match="choose invalid actions|do not cover"):
+        a.check_finetune_labels(records[0], dict(labels, choice=moved), cfg, route["options"])
 
 
-def test_first_case_bitmaps_round_trip_planning_order_and_reject_corruption():
-    cfg = a.Config()
-    cases = a.decision_case_count(cfg)
-    assert cases == 6 * 8160  # Every nonempty candidate subset with every evaluator subset.
-    sizes = a.decision_state_sizes(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
-    rng = np.random.RandomState(5)
-    chosen = np.flatnonzero(rng.rand(cases) < .6)
-    # Planning order: larger structures first, ties in case order.
-    source = chosen[np.argsort(-sizes[chosen % len(sizes)], kind="stable")]
-    first_cases = a.decision_first_cases(source, cfg)
-    assert first_cases.shape == (cases // 8,)
-    np.testing.assert_array_equal(a.decision_row_sources(first_cases, cfg), source)
-    np.testing.assert_array_equal(a.schema4_first_cases(source, cfg, "q").numpy(), first_cases)
-    with pytest.raises(ValueError, match="not in planning order"):
-        a.schema4_first_cases(source[::-1], cfg, "q")
-    with pytest.raises(ValueError, match="distinct in-budget"):
-        a.decision_first_cases(np.r_[source, source[:1]], cfg)
-    with pytest.raises(ValueError, match="distinct in-budget"):
-        a.decision_first_cases([cases], cfg)
-    tiny = a.Config(k=1, zero_shots=1)
-    assert a.decision_case_count(tiny) == 6
-    # Cases 0 and 5 hold one- and three-item structures: the larger one is planned first.
-    np.testing.assert_array_equal(a.decision_row_sources(np.array([0b10000100], np.uint8), tiny), [5, 0])
-    for corrupt in (np.array([0b10000110], np.uint8), np.zeros(2, np.uint8)):
-        with pytest.raises(ValueError, match="wrong size or padding"):
-            a.decision_row_sources(corrupt, tiny)
-
-
-def test_default_geometry_question_labels_need_about_one_byte_per_row(tmp_path):
+def test_default_geometry_question_labels_stay_small(tmp_path):
     torch.set_num_threads(1)
     cfg = a.Config()
     rng = np.random.RandomState(3)
@@ -345,43 +411,46 @@ def test_default_geometry_question_labels_need_about_one_byte_per_row(tmp_path):
     model = a.ResNet(cfg.input_dim, 3 * cfg.n + 2, cfg)
     predictor = a.FrozenPredictor({"weights": a.cpu_state(model), "temperatures": np.ones(5)},
                                   cfg, torch.device("cpu"))
-    labels = a.build_decision_labels(record, scores, safe, maximum, predictor, cfg)
-    path = tmp_path / "question.pt"
-    a.atomic_torch(path, {"schema_version": a.DECISION_LABEL_SCHEMA, "fingerprint": "f" * 64,
-                          "uid": record.uid, **labels})
-    # Pickled audit rows took about 1 MiB per question (about 8 MiB while they
-    # stored frozen features), which filled Kaggle's disk part-way through Stage 3;
-    # schema 4 still kept an int32 source per row, about 5 bytes per row.
-    rows = labels["coverage"]["action_rows"]
-    assert rows > 20000  # About 48,960 cases merge into about 32,000 visible rows.
-    assert path.stat().st_size < rows + a.decision_case_count(cfg) // 8 + 4 * 1024
-    audit_rows, cases = a.build_decision_rows(record, scores, safe, maximum, predictor, cfg)
-    compact = a.compact_decision_labels(record, audit_rows, cases, cfg)
-    assert all(torch.equal(labels[key], compact[key]) for key in ("preferred", "first_cases"))
-    assert labels["observation_sha256"] == compact["observation_sha256"]
-    assert labels["coverage"] == a.label_coverage(audit_rows, cases, cfg)
+    route = a.build_route_labels(record, scores, safe, maximum, predictor, cfg)
+    fine = a.build_finetune_labels(record, scores, safe, maximum, predictor, a.SupervisedActionHead(cfg), cfg)
+    cases = a.decision_case_count(cfg)
+    assert cases == 6 * 8160  # Every nonempty candidate subset with every evaluator subset.
+    paths = {}
+    for name, labels in (("route", route), ("fine", fine)):
+        paths[name] = tmp_path / f"{name}.pt"
+        a.atomic_torch(paths[name], {"schema_version": a.DECISION_LABEL_SCHEMA, "fingerprint": "f" * 64,
+                                     "uid": record.uid, "phase": name, **labels})
+    # Pickled audit rows once took about 1 MiB per question and stored features 8 MiB, which filled
+    # Kaggle's disk. Now a case costs two bytes of first-step bits plus one byte of choice.
+    rows = route["coverage"]["action_rows"]
+    assert 30000 < rows < cases  # Only the complete state, and unlabeled group mates, lack a row.
+    assert route["options"].shape == (cases, 2) and fine["choice"].shape == (cases,)
+    assert paths["route"].stat().st_size < 2 * cases + 4 * 1024
+    assert paths["fine"].stat().st_size < cases + 4 * 1024
+    assert route["coverage"]["state_order_cases"] == cases == fine["coverage"]["state_order_cases"]
+    assert fine["coverage"]["action_rows"] == rows
+    a.check_route_labels(record, route, cfg)
+    a.check_finetune_labels(record, fine, cfg, route["options"])
 
 
-def run_with_build_counter(monkeypatch, *args):
+def count_builds(monkeypatch, name):
     built = []
-    original = a.build_decision_labels
+    original = getattr(a, name)
 
     def counted(record, *rest, **kwargs):
         built.append(record.uid)
         return original(record, *rest, **kwargs)
 
-    monkeypatch.setattr(a, "build_decision_labels", counted)
-    try:
-        return a.train_decision_head(*args), built
-    finally:
-        monkeypatch.setattr(a, "build_decision_labels", original)
+    monkeypatch.setattr(a, name, counted)
+    return built, original
 
 
 def test_interrupted_label_build_reuses_completed_questions_then_merges_each_role(tmp_path, monkeypatch, capsys):
-    cfg, records, splits, teacher, predictor = small_stage3_problem(questions=4)
-    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path / "complete")
+    problem = small_stage3_problem(questions=4)
+    cfg, records, splits, teacher, predictor = problem
+    expected = train_phase("pretrain", problem, tmp_path / "complete")
     run = tmp_path / "interrupted"
-    original = a.build_decision_labels
+    original = a.build_route_labels
     calls = 0
 
     def stop_on_second_question(*args, **kwargs):
@@ -391,251 +460,98 @@ def test_interrupted_label_build_reuses_completed_questions_then_merges_each_rol
             raise KeyboardInterrupt("simulated interrupted Stage 3 label build")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(a, "build_decision_labels", stop_on_second_question)
+    monkeypatch.setattr(a, "build_route_labels", stop_on_second_question)
     with pytest.raises(KeyboardInterrupt, match="simulated interrupted"):
-        a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", run)
-    assert len(list((run / "decision_labels" / "policy").glob("*.pt"))) == 1
-    assert not a.decision_role_path(run, "policy").exists()
-    monkeypatch.setattr(a, "build_decision_labels", original)
+        train_phase("pretrain", problem, run)
+    assert len(list((run / "decision_labels" / "pretrain_policy").glob("*.pt"))) == 1
+    assert not a.decision_role_path(run, "pretrain", "policy").exists()
+    monkeypatch.setattr(a, "build_route_labels", original)
     capsys.readouterr()
-    actual, built = run_with_build_counter(monkeypatch, records, splits, teacher, predictor, cfg, "cpu", run)
+    built, _ = count_builds(monkeypatch, "build_route_labels")
+    actual = train_phase("pretrain", problem, run)
     log = capsys.readouterr().out
     assert built == [records[i].uid for i in splits["policy"][1:] + splits["dev"]]
-    assert "Stage 3 policy labels: 3/3 questions" in log and "built 2, reused 1" in log
+    assert "Stage 3a policy labels: 3/3 questions" in log and "built 2, reused 1" in log
     # Completed roles are single files; per-question files are removed after merging.
-    assert sorted(path.name for path in (run / "decision_labels").iterdir()) == ["dev.pt", "policy.pt"]
-    store = a.load_label_file(a.decision_role_path(run, "policy"))
+    assert sorted(path.name for path in (run / "decision_labels").iterdir()) == ["pretrain_dev.pt", "pretrain_policy.pt"]
+    store = a.load_label_file(a.decision_role_path(run, "pretrain", "policy"))
     assert store["uids"] == [records[i].uid for i in splits["policy"]]
-    assert store["offsets"].tolist()[-1] == len(store["preferred"]) == expected["coverage"]["policy"]["action_rows"]
+    rows = sum(len(a.label_rows(options.numpy(), "pretrain")) for options in store["options"])
+    assert rows == expected["coverage"]["policy"]["action_rows"]
     assert_matching_training_checkpoints(expected, actual)
+    # Stage 3b labels are built the same way, one question at a time.
+    built, _ = count_builds(monkeypatch, "build_finetune_labels")
+    train_phase("finetune", problem, run, actual)
+    assert built == [records[i].uid for i in splits["policy"] + splits["dev"]]
+    assert sorted(path.name for path in (run / "decision_labels").iterdir()) == [
+        "finetune_dev.pt", "finetune_policy.pt", "pretrain_dev.pt", "pretrain_policy.pt"]
 
 
-def write_legacy_layout(out, records, splits, teacher, predictor, cfg, layout, fingerprint=None):
-    """Schema-3 shards as earlier revision-5 code wrote them, with their companions."""
-    if fingerprint is None:
-        fingerprint = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
-    paths = a.decision_shard_paths(records, splits, out)
-    structures = len(a.presence_states(cfg.zero_shots, cfg.k))
-    for role in ("policy", "dev"):
-        for idx, path in zip(splits[role], paths[role]):
-            rows, cases = a.build_decision_rows(records[idx], teacher["scores"][idx], teacher["safe"][idx],
-                                                teacher["maximum"][idx], predictor, cfg)
-            shard = {"schema_version": 3, "implementation_revision": a.PIPELINE_REVISION,
-                     "fingerprint": fingerprint, "uid": records[idx].uid,
-                     "presence_states": structures,
-                     "expected_cases": structures * math.factorial(cfg.zero_shots),
-                     "rows": rows, "cases": cases}
-            path.parent.mkdir(parents=True, exist_ok=True)
-            companion = path.with_suffix(".training.pt")
-            if layout == "reencoded_features":
-                # Rows without "h", pickle protocol 4, compact companions.
-                shard["rows"] = [{key: value for key, value in row.items() if key != "h"} for row in rows]
-                with path.open("wb") as handle:
-                    with gzip.GzipFile(fileobj=handle, mode="wb", compresslevel=1, mtime=0) as zipped:
-                        torch.save(shard, zipped, pickle_protocol=4)
-                a.atomic_torch(companion, {**a.pack_decision_rows(rows, cfg, ("target", "valid")),
-                                           "scenario": torch.zeros(len(rows), dtype=torch.int32),
-                                           "state": torch.zeros(len(rows), dtype=torch.int32)})
-            elif layout == "stored_features":
-                # The full-disk run: protocol-2 gzip rows with "h", companions with "h".
-                with path.open("wb") as handle:
-                    with gzip.GzipFile(fileobj=handle, mode="wb", compresslevel=1, mtime=0) as zipped:
-                        torch.save(shard, zipped)
-                a.atomic_torch(companion, a.pack_decision_rows(rows, cfg))
-            else:
-                a.atomic_torch(path, shard)
-    a.atomic_json(out / "decision_dataset_manifest.json", {
-        "schema_version": 3, "implementation_revision": a.PIPELINE_REVISION, "fingerprint": fingerprint,
-        "roles": {role: [str(path.relative_to(out)) for path in paths[role]] for role in ("policy", "dev")}})
-    return [path for role in ("policy", "dev") for path in paths[role]]
-
-
-@pytest.mark.parametrize("layout", ["stored_features", "reencoded_features", "uncompressed"])
-def test_schema3_shards_migrate_without_relabeling_and_are_deleted(tmp_path, monkeypatch, capsys, layout):
-    cfg, records, splits, teacher, predictor = small_stage3_problem(questions=3)
-    fresh, legacy = tmp_path / "fresh", tmp_path / "legacy"
-    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", fresh)
-    shards = write_legacy_layout(legacy, records, splits, teacher, predictor, cfg, layout)
-    companions = [path.with_suffix(".training.pt") for path in shards]
-    interrupted = shards[0].with_suffix(".pt.tmp")
-    interrupted.write_bytes(b"leftover from the failed full-disk write")
-    writes = []
-    original = a.atomic_torch
-
-    def track_writes(path, value):
-        # Derived companions and failed writes are reclaimed before anything is written.
-        writes.append((Path(path), [p for p in companions + [interrupted] if p.exists()]))
-        return original(path, value)
-
-    monkeypatch.setattr(a, "atomic_torch", track_writes)
-    capsys.readouterr()
-    actual, built = run_with_build_counter(monkeypatch, records, splits, teacher, predictor, cfg, "cpu", legacy)
-    log = capsys.readouterr().out
-    assert built == [] and writes and all(not remaining for _, remaining in writes)
-    assert "built 0, reused 0, migrated 2" in log and "built 0, reused 0, migrated 1" in log
-    assert not (legacy / "decision_shards").exists()
-    manifest = json.loads((legacy / "decision_dataset_manifest.json").read_text(encoding="utf-8"))
-    assert manifest == json.loads((fresh / "decision_dataset_manifest.json").read_text(encoding="utf-8"))
-    for role in ("policy", "dev"):
-        migrated, built_fresh = (a.load_label_file(a.decision_role_path(run, role)) for run in (legacy, fresh))
-        assert migrated.keys() == built_fresh.keys()
-        assert all(torch.equal(value, built_fresh[key]) if isinstance(value, torch.Tensor) else value == built_fresh[key]
-                   for key, value in migrated.items())
-    assert_matching_training_checkpoints(expected, actual)
-
-
-def test_full_disk_run_migrates_completed_shards_and_builds_only_the_rest(tmp_path, monkeypatch, capsys):
-    # The v5 run stopped part-way through policy labels, before any dev question.
-    cfg, records, splits, teacher, predictor = small_stage3_problem(questions=4)
-    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path / "fresh")
-    run = tmp_path / "full_disk"
-    shards = write_legacy_layout(run, records, splits, teacher, predictor, cfg, "stored_features")
-    for path in shards[2:]:
-        path.unlink()
-        path.with_suffix(".training.pt").unlink()
-    capsys.readouterr()
-    actual, built = run_with_build_counter(monkeypatch, records, splits, teacher, predictor, cfg, "cpu", run)
-    log = capsys.readouterr().out
-    assert built == [records[splits["policy"][2]].uid, records[splits["dev"][0]].uid]
-    assert "Stage 3 policy labels: 3/3 questions" in log and "built 1, reused 0, migrated 2" in log
-    assert not (run / "decision_shards").exists()
-    assert_matching_training_checkpoints(expected, actual)
-
-
-def test_path_bound_schema3_shards_are_rebound_compressed_then_migrated(tmp_path, monkeypatch, capsys):
-    # Earlier code also hashed the configured log paths into the shards' fingerprint.
-    cfg, records, splits, teacher, predictor = small_stage3_problem(questions=3)
-    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path / "fresh")
-    run = tmp_path / "legacy"
-    legacy = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
-                                            [cfg.train_file] + cfg.test_files)
-    shards = write_legacy_layout(run, records, splits, teacher, predictor, cfg, "stored_features", legacy)
-    capsys.readouterr()
-    current = a.upgrade_decision_fingerprints(records, splits, teacher, predictor, cfg, run)
-    assert "the manifest and 3 label, progress, or head files hashed" in capsys.readouterr().out
-    assert current == expected["dataset_fingerprint"] != legacy
-    for path in shards:
-        assert a.compressed_checkpoint(path) and a.load_checkpoint(path)["fingerprint"] == current
-        assert not path.with_suffix(".training.pt").exists()
-    actual, built = run_with_build_counter(monkeypatch, records, splits, teacher, predictor, cfg, "cpu", run)
-    assert built == [] and not (run / "decision_shards").exists()
-    assert_matching_training_checkpoints(expected, actual)
-
-
-def write_schema4_layout(run, records, splits, cfg, merged):
-    """Rewrite finished labels as schema-4 code left them: an int32 source per row."""
-    manifest_path = run / "decision_dataset_manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    a.atomic_json(manifest_path, dict(manifest, schema_version=4))
-    for role in ("policy", "dev"):
-        role_path = a.decision_role_path(run, role)
-        store = a.load_label_file(role_path)
-        offsets = store["offsets"].tolist()
-        sources = [torch.from_numpy(a.decision_row_sources(first.numpy(), cfg).astype(np.int32))
-                   for first in store["first_cases"]]
-        if merged:
-            schema4 = {key: value for key, value in store.items() if key != "first_cases"}
-            a.atomic_torch(role_path, dict(schema4, schema_version=4, source=torch.cat(sources)))
-            continue
-        role_path.unlink()
-        paths = a.question_paths(records, splits[role], run / "decision_labels" / role)
-        for position, (path, source) in enumerate(zip(paths, sources)):
-            start, stop = offsets[position:position+2]
-            path.parent.mkdir(parents=True, exist_ok=True)
-            a.atomic_torch(path, {"schema_version": 4, "fingerprint": store["fingerprint"],
-                                  "uid": store["uids"][position], "coverage": store["coverage"][position],
-                                  "source": source, "preferred": store["preferred"][start:stop],
-                                  "observation_sha256": store["observation_sha256"][position]})
-
-
-@pytest.mark.parametrize("merged", [True, False])
-def test_schema4_labels_convert_in_place_without_relabeling(tmp_path, monkeypatch, capsys, merged):
-    cfg, records, splits, teacher, predictor = small_stage3_problem(questions=3)
-    fresh, run = tmp_path / "fresh", tmp_path / "schema4"
-    expected = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", fresh)
-    a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", run)
-    # Retrain from the converted labels alone.
-    (run / "decision_head_progress.pt").unlink()
-    write_schema4_layout(run, records, splits, cfg, merged)
-    capsys.readouterr()
-    actual, built = run_with_build_counter(monkeypatch, records, splits, teacher, predictor, cfg, "cpu", run)
-    log = capsys.readouterr().out
-    assert built == []
-    if merged:
-        assert "converting the schema-4 role file to schema 5 without relabeling" in log
-        assert "built 0, reused 2" in log and "built 0, reused 1" in log
-    else:
-        assert "built 0, reused 0, migrated 2" in log and "built 0, reused 0, migrated 1" in log
-    manifest = json.loads((run / "decision_dataset_manifest.json").read_text(encoding="utf-8"))
-    assert manifest == json.loads((fresh / "decision_dataset_manifest.json").read_text(encoding="utf-8"))
-    assert sorted(path.name for path in (run / "decision_labels").iterdir()) == ["dev.pt", "policy.pt"]
-    for role in ("policy", "dev"):
-        converted, built_fresh = (a.load_label_file(a.decision_role_path(path, role)) for path in (run, fresh))
-        assert converted.keys() == built_fresh.keys()
-        assert all(torch.equal(value, built_fresh[key]) if isinstance(value, torch.Tensor)
-                   else value == built_fresh[key] for key, value in converted.items())
-    assert_matching_training_checkpoints(expected, actual)
-
-
-def test_incompatible_schema3_manifest_or_shard_is_never_migrated(tmp_path, monkeypatch):
-    cfg, records, splits, teacher, predictor = small_stage3_problem()
-    shards = write_legacy_layout(tmp_path, records, splits, teacher, predictor, cfg, "uncompressed")
-    shard = a.load_checkpoint(shards[0])
-    shard["uid"] = "another question"
-    a.atomic_torch(shards[0], shard)
-    with pytest.raises(ValueError, match="Incompatible decision shard"):
-        a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    assert shards[0].exists()
+def test_incompatible_label_manifest_or_store_is_never_reused(tmp_path):
+    problem = small_stage3_problem()
+    cfg, records, splits, teacher, predictor = problem
+    train_phase("pretrain", problem, tmp_path)
     manifest_path = tmp_path / "decision_dataset_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == a.DECISION_LABEL_SCHEMA and manifest["implementation_revision"] == a.PIPELINE_REVISION
     manifest["fingerprint"] = "stale teacher or predictor"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="incompatible teacher, predictor"):
-        a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    assert all(path.exists() for path in shards)
-
-
-def test_question_audit_recomputes_the_saved_rows_and_cases(tmp_path):
-    cfg, records, splits, teacher, predictor = small_stage3_problem()
-    checkpoint = a.train_decision_head(records, splits, teacher, predictor, cfg, "cpu", tmp_path)
-    audit = a.decision_question_audit(records, splits, teacher, predictor, cfg, tmp_path, "dev", 0)
-    rows, cases = a.build_decision_rows(records[1], teacher["scores"][1], teacher["safe"][1],
-                                        teacher["maximum"][1], predictor, cfg)
-    assert audit["uid"] == records[1].uid and audit["cases"] == cases
-    assert [row["state_key"] for row in audit["rows"]] == [row["state_key"] for row in rows]
-    assert {"goal_rank", "reach", "action_expected_cost", "objective"} <= set(audit["rows"][0])
-    assert audit["coverage"]["action_rows"] == checkpoint["coverage"]["dev"]["action_rows"]
-    # A head completed under schema 4 never rewrote its role files; the audit reads them too.
-    write_schema4_layout(tmp_path, records, splits, cfg, merged=True)
-    schema4_audit = a.decision_question_audit(records, splits, teacher, predictor, cfg, tmp_path, "dev", 0)
-    assert schema4_audit["cases"] == audit["cases"] and schema4_audit["coverage"] == audit["coverage"]
-    path = a.decision_role_path(tmp_path, "dev")
+        train_phase("pretrain", problem, tmp_path)
+    manifest["fingerprint"] = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    path = a.decision_role_path(tmp_path, "pretrain", "dev")
     store = a.load_label_file(path)
-    store["preferred"] = torch.zeros_like(store["preferred"])
+    for field, value in (("phase", "finetune"), ("role", "policy"), ("uids", ["another question"]),
+                         ("schema_version", 5), ("fingerprint", "stale")):
+        a.atomic_torch(path, dict(store, **{field: value}))
+        with pytest.raises(ValueError, match="Incompatible decision labels"):
+            train_phase("pretrain", problem, tmp_path)
+    a.atomic_torch(path, store)
+    train_phase("pretrain", problem, tmp_path)
+
+
+def test_question_audit_recomputes_the_saved_cases(tmp_path):
+    problem = small_stage3_problem()
+    cfg, records, splits, teacher, predictor = problem
+    checkpoint = train_phase("pretrain", problem, tmp_path)
+    audit = a.decision_question_audit(records, splits, teacher, predictor, cfg, tmp_path, "dev", 0)
+    args = (records[1], teacher["scores"][1], teacher["safe"][1], teacher["maximum"][1], predictor, cfg)
+    plan = a.question_plan(*args)
+    assert audit["uid"] == records[1].uid and len(audit["cases"]) == plan["status"].size
+    assert sum(case["has_row"] for case in audit["cases"]) == plan["rows"].sum()
+    assert audit["coverage"]["action_rows"] == checkpoint["coverage"]["dev"]["action_rows"]
+    names = a.action_names(cfg)
+    case = next(case for case in audit["cases"] if case["has_row"])
+    assert set(case["targets"]) <= set(names) and case["targets"]
+    assert next(case for case in audit["cases"] if case["status"] == "EXHAUSTED")["has_row"] is False
+    path = a.decision_role_path(tmp_path, "pretrain", "dev")
+    store = a.load_label_file(path)
+    store["options"] = torch.zeros_like(store["options"])
     a.atomic_torch(path, store)
     with pytest.raises(ValueError, match="differ from the saved labels"):
         a.decision_question_audit(records, splits, teacher, predictor, cfg, tmp_path, "dev", 0)
 
 
-def test_workflow_reclaims_derived_stage3_leftovers_before_stage0_writes(tmp_path, capsys):
+def test_workflow_reclaims_interrupted_stage3_writes_before_stage0_writes(tmp_path, capsys):
     train = tmp_path / "train.json"
     train.write_text("[]", encoding="utf-8")
     cfg = a.Config(train_file=str(train), test_files=[], use_test_files_for_dev_and_audit=False,
                    output_dir=str(tmp_path / "run"), device="cpu", cpu_threads=1)
     a.Workflow(cfg)
     out = tmp_path / "run"
-    # The full-disk v5 layout: derived companions and interrupted atomic writes.
-    derived = [out / "decision_shards" / "policy" / "000000_abc.training.pt",
-               out / "decision_shards" / "dev" / "000000_def.training.pt.tmp",
-               out / "decision_shards" / "policy" / "000001_abc.pt.tmp",
-               out / "decision_labels" / "policy" / "000002_abc.pt.tmp",
-               out / "decision_labels" / "policy.pt.tmp",
+    # Interrupted atomic writes from a run that filled its disk.
+    derived = [out / "decision_labels" / "pretrain_policy" / "000002_abc.pt.tmp",
+               out / "decision_labels" / "pretrain_policy.pt.tmp",
+               out / "decision_labels" / "finetune_dev.pt.tmp",
+               out / "decision_head_pretrain_progress.pt.tmp",
                out / "compact_records.pt.tmp"]
-    # Completed shards, labels, and checkpoints hold finished work and stay.
-    kept = [out / "decision_shards" / "policy" / "000000_abc.pt",
-            out / "decision_labels" / "policy" / "000003_abc.pt",
-            out / "decision_labels" / "dev.pt",
-            out / "decision_head_progress.pt"]
+    # Completed labels and checkpoints hold finished work and stay.
+    kept = [out / "decision_labels" / "pretrain_policy" / "000003_abc.pt",
+            out / "decision_labels" / "pretrain_dev.pt",
+            out / "decision_labels" / "finetune_policy.pt",
+            out / "decision_head_pretrain_progress.pt",
+            out / "decision_head_finetune_progress.pt"]
     for path in derived + kept:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x" * 1024)
@@ -649,3 +565,34 @@ def test_workflow_reclaims_derived_stage3_leftovers_before_stage0_writes(tmp_pat
     capsys.readouterr()
     a.Workflow(cfg)
     assert "Reclaimed" not in capsys.readouterr().out
+
+
+def test_stage3_fails_loudly_when_no_state_has_an_affordable_acquisition(tmp_path):
+    # A budget of one call leaves no acquisition anywhere, so there is nothing to train on.
+    problem = small_stage3_problem(max_cost=1.)
+    with pytest.raises(ValueError, match="No actionable Stage 3 rows"):
+        train_phase("pretrain", problem, tmp_path)
+
+
+def test_reused_labels_are_checked_against_the_current_rules_and_data(tmp_path):
+    problem = small_stage3_problem()
+    cfg, records, splits, teacher, predictor = problem
+    train_phase("pretrain", problem, tmp_path)
+    path = a.decision_role_path(tmp_path, "pretrain", "dev")
+    store = a.load_label_file(path)
+    graph = a.decision_graph(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    state, action = np.argwhere(~graph.legal & graph.legal.any(1)[:, None])[0]
+    bits = np.unpackbits(store["options"][0].numpy(), axis=1)
+    bits[state, action] = 1  # An acquisition the rules do not allow in that state.
+    tampered = dict(store, options=store["options"].clone())
+    tampered["options"][0] = torch.from_numpy(np.packbits(bits, axis=1))
+    a.atomic_torch(path, tampered)
+    with pytest.raises(ValueError, match="invalid actions"):
+        train_phase("pretrain", problem, tmp_path)
+    # Changed measurements change the dataset identity, which the manifest refuses before any label is read.
+    a.atomic_torch(path, store)
+    changed = copy.deepcopy(records)
+    changed[1].ccs[0, 0] = 1 - changed[1].ccs[0, 0]
+    with pytest.raises(ValueError, match="incompatible teacher, predictor, split, or action contract"):
+        a.train_pretrained_head(changed, splits, teacher, predictor, cfg, "cpu", tmp_path)
+    train_phase("pretrain", problem, tmp_path)  # The untouched labels are reused as before.

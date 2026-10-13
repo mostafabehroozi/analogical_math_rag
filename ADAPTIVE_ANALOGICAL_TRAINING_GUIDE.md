@@ -28,12 +28,17 @@ teacher ranks, correctness labels, or future measurements.
    candidate-specific losses mask absent candidates. Development-only
    temperature calibration is fitted, then the 128-dimensional encoder,
    prediction heads, normalization state, and calibration are frozen.
-3. **Stage 3: acquisition head.** A `128 → 64 → 7` network learns the next
-   acquisition from the frozen hidden vector. It is supervised with masked
-   cross-entropy. There is no STOP output, reward, replay buffer, or Bellman
-   target. Stage 3 uses complete measurements for every presence state, the
-   same 8,160 states Stages 1 and 2 train on: a one-shot candidate does not
-   need its own evaluator.
+3. **Stage 3: acquisition head.** A network reads the frozen 128-dimensional
+   hidden vector plus the plain masks of the acquired candidates and evaluators
+   (141 inputs), passes them through 64 hidden units, and scores eleven actions:
+   the next zero-shot, adding the evaluator of source j, or generating its
+   one-shot candidate. It is supervised with masked cross-entropy in two
+   phases. Stage 3a pretrains on every first step that lies on a cheapest route
+   to the next goal; Stage 3b fine-tunes from those weights on one action per
+   row, chosen by rolling the pretrained head forward. Both heads are kept and
+   reported. There is no STOP output, reward, replay buffer, or Bellman target.
+   Stage 3 uses complete measurements for every presence state, the same 8,160
+   states Stages 1 and 2 train on, except the complete state, which has no move.
 
 ## Exhaustive Stage 1-2 training views
 
@@ -43,8 +48,8 @@ sampled. A view is a presence state seen under one zero-shot order:
 - **Presence states:** every nonempty candidate subset with every evaluator
   subset, `(2**8 - 1) * 2**5 = 8,160` by default. A one-shot candidate does
   not need its own evaluator, so these are all the states that acquisition,
-  and hiding candidates or evaluators, can produce; Stage 3 labels exactly
-  these states.
+  and hiding candidates or evaluators, can produce; Stage 3 labels these
+  states too, except the complete one.
 - **Zero-shot orders:** all `3! = 6`, so each question has
   `8,160 * 6 = 48,960` views. Candidate IDs, labels, SAFE/MAX, and
   measurements move together, exactly as in Stage 3.
@@ -57,7 +62,7 @@ The partial states only train the models. The teacher's reference ranking,
 its out-of-fold scores, and the SAFE/MAX labels built from them always come
 from **complete-state** predictions, and teacher checkpoints are selected by
 the complete-state development correctness loss. Stage 2 is selected by its
-own training loss, and calibrated, on every reachable runtime state (576 by
+own training loss, and calibrated, on every reachable runtime state (1,092 by
 default) of every development question under every zero-shot order. Average
 precision (AP) is a reported metric only (see "Checkpoint selection").
 
@@ -129,8 +134,8 @@ about 1 minute for Stage 2 and, with the teacher's complete-view repeats
 adding 18% to its rows, about 5 minutes for Stage 1's five folds plus final
 teacher, so the 10-epoch maximum is about an hour for both stages before
 early stopping. Kaggle hardware will differ. This was measured when each
-Stage 2 development check covered 189 reachable states; it now covers 576, so
-a check costs about three times as much. Lower `dev_checks_per_epoch` to spend
+Stage 2 development check covered 189 reachable states; it now covers 1,092, so
+a check costs about six times as much. Lower `dev_checks_per_epoch` to spend
 less time on checks.
 
 SAFE is the leading uninterrupted run of actually correct candidates in the
@@ -151,21 +156,38 @@ A state uses complete recorded measurements for every present
 candidate/evaluator pair. A one-shot candidate whose evaluator is absent shows
 its source slot but none of that source's similarity, baseline, or
 cross-evaluation. Every state contains at least one candidate; candidate-empty
-states are outside this contract.
+states are outside this contract. Retrieval is not part of the state: the
+recorded logs already hold the retrieved samples and all their measurements.
 The runtime begins with ZS1 and no evaluators, so its first generation precedes
-the head's decisions. The zero-shot action fills the first missing slot;
-the head cannot select a specific unseen answer. The evaluator action fills
-the first missing evaluator in similarity order; the head cannot choose its
-identity. The head does choose which source's one-shot candidate to generate.
-Training still audits non-prefix presence masks from masking.
+the head's decisions.
+
+Which acquisition may come next depends on which sources are in use. Sources
+are ordered by similarity (source 1 is the nearest), and a source is **in use**
+once its evaluator or its one-shot candidate is present.
+
+- The zero-shot action fills the first missing slot; the head cannot select a
+  specific unseen answer.
+- A source in use may be completed at any time with its missing half, in either
+  order: the head chooses which evaluator to add and which one-shot candidate to
+  generate among the sources in use.
+- The nearest source that nothing has used yet may be opened with either half,
+  its evaluator or its one-shot candidate. The head cannot open a farther
+  source first or choose which unused source is nearest.
+
+At the start the available acquisitions are therefore the next zero-shot, R1,
+and OS1; after R1 they are the next zero-shot, R2, OS1, and OS2. Of the 8,160
+presence states, **1,092** are reachable from the start under these rules: three
+zero-shot prefixes times the `1 + 3 + 9 + 27 + 81 + 243 = 364` ways to use the
+nearest m sources (one-shot only, evaluator only, or both). The other states
+are never visited at run time, but they are labeled and trained on.
 
 | Action index | Operation |
 | --- | --- |
-| `0` | Add the next missing evaluator in similarity order, its baseline, and cross evaluations against present candidates. |
-| `1` | Generate another zero-shot candidate and cross-evaluate it against active evaluators. |
-| `2 … k+1` | Generate the one-shot candidate for the specified source, whether or not that source's evaluator is active, and cross-evaluate it against the active evaluators. A source added later as an evaluator is then cross-evaluated against every present candidate, this one included. |
+| `0` | Generate the next zero-shot candidate and cross-evaluate it against the active evaluators. |
+| `1 … k` | Add the evaluator of source j (`R1 … Rk`), its baseline, and its cross evaluations against the present candidates. |
+| `k+1 … 2k` | Generate the one-shot candidate of source j (`OS1 … OSk`), whether or not that source's evaluator is active, and cross-evaluate it against the active evaluators. A source added later as an evaluator is then cross-evaluated against every present candidate, this one included. |
 
-The default `k=5` gives seven actions. Invalid or unaffordable actions are
+The default `k=5` gives eleven actions. Unavailable or unaffordable actions are
 masked. The incremental cost is the difference between the existing state-cost
 formula before and after acquisition. With five repeated solves per estimate,
 the default objective counts **458 total calls**: eight generations, 25
@@ -176,32 +198,24 @@ remain outside this recorded-data accounting. There is no separate penalty
 for the number of acquired candidates or evaluators. The cost depends only on
 how many candidates and evaluators are present, so a candidate generated while
 no evaluator is active costs its single generation call, and each evaluator
-added later pays to measure it.
+added later pays to measure it. Every order of adding the same items therefore
+costs the same, which is what makes "cheapest route" well defined below.
 
-## Exhaustive Stage 3 dataset
+## Stage 3 labels
 
 For every policy and development question, Stage 3 enumerates every nonempty
-candidate subset and evaluator subset; a one-shot candidate does not need its
-own evaluator. This is **8,160 presence states** for three zero shots and five
-evaluators, the same states Stages 1 and 2 train on. It evaluates each under
-all six zero-shot permutations: **48,960 state/order cases per question**.
-Enumeration is independent of runtime acquisition order and budget. Cases
-above the budget stay in the dataset with an explicit status.
+candidate subset and evaluator subset: **8,160 presence states** for three zero
+shots and five evaluators, the same states Stages 1 and 2 train on. It
+evaluates each under all six zero-shot permutations: **48,960 state/order
+cases per question**. Enumeration is independent of runtime acquisition order
+and budget. Cases above the budget stay in the dataset with an explicit status.
+The complete state has no acquisition and so no label.
 
 Thus **2,000 training questions produce 97,920,000 state/order cases**, before
-development questions. These are exhaustive audit cases, not 97,920,000 head
-training rows: every in-budget case with a valid acquisition contributes
-(except cases whose reference goals already hold), and identical visible
-observations share one row. A synthetic default-geometry question merges into
-about 32,000 rows. This expansion, together with continuation search,
-explains why Stage 3 label construction can be slow even though the head is small:
-about 3 to 4 seconds per question on one CPU thread in a synthetic benchmark with an
-untrained predictor (a trained predictor changes how many goals are reachable),
-so a full run takes hours and resumes per question. A head epoch re-encodes
-every row: about 0.5 seconds per training question and 0.1 seconds per
-development question on a laptop GPU at `decision_batch_size=128` (roughly 18
-minutes for 2,000 + 1,900 questions). Question count alone is not its
-training-set size.
+development questions. Almost every case is a head-training row: it needs only
+an affordable acquisition, and cases that look identical to a case with a route
+to its goal defer to that case (see "Status and rows"). Rows are not merged, so
+each case counts once, like every other.
 
 The frozen Stage 2 predictor supplies recognition probabilities for each
 in-budget state, and complete-state reference probabilities once per
@@ -222,59 +236,98 @@ rank is the objective:
   the comparison to lower-ranked full-state probabilities. A later SAFE member additionally
   requires SAFE-i at the threshold.
 
-Search adds valid items toward a destination satisfying the current goal and
-all earlier goals. Teacher order prioritizes recognition goals, not physical
-generation: a lower-ranked supporting candidate may be acquired first.
-Temporary loss of an earlier light is allowed. At each successor, however,
-the continuation policy prioritizes its first unfinished rank, including an
-earlier lost goal. Cost minimization follows those continuation decisions;
-it is not an unrestricted shortest-path search holding the original goal
-fixed. A legal route to that goal can therefore be cheaper than the chosen
-recovery route, or succeed where the chosen route fails.
+Teacher order prioritizes recognition goals, not physical generation: a
+lower-ranked supporting candidate may be acquired first. A recognition
+probability can fall again as evidence arrives, and the **next goal of a case
+is recomputed from its own state**: the first rank for which ranks one through
+that rank do not all hold. A lost earlier goal is therefore restored before a
+later one is pursued.
 
-Shared visible observations within a question across zero-shot scenarios must
-choose the same action at every search depth. Only newly observed evidence
-may separate their continuations. Their hidden orders are treated as
-equiprobable. The objective is lexicographic: maximize average goal reach,
-then minimize average additional calls, then average acquisition steps. Costs
-include unsuccessful continuations up to action exhaustion. On a remaining
-tie, adding an evaluator takes priority over generating a candidate. Other
-genuine ties split the soft target evenly; the planner uses the lowest action
-index as its concrete tied continuation. A shared choice need not be cheapest
-or successful for every hidden case.
+### Stage 3a: every cheapest first step
 
-When the available actions have zero average reach under the constructed
-continuation policy, the head still gets an acquisition target so it can
-operate through the full pool. This fallback chooses the next
-similarity-ranked evaluator whenever affordable, even if a candidate is
-cheaper; otherwise it chooses the cheapest valid candidate, with action index
-breaking ties. This evaluator-first fallback is stronger than the ordinary
-objective's tie preference. It does not claim the unresolved goal was achieved
-or prove that no other legal route could reach it.
+For each case, over the acquisitions the rules allow:
+
+1. **Distance.** The fewest additional API calls from the state to a state where
+   its next goal holds. A route ends the first time it reaches such a state.
+   Because cost depends only on the items present, this is a shortest-path
+   search over which items to add, solved backwards over the acquired-item count.
+2. **Cheapest first steps.** Every allowed acquisition whose own cost plus the
+   distance that remains afterwards equals the distance. Several can tie, for
+   example R1 and OS1 when the goal needs both, since either order costs the
+   same. A step that overshoots the destination is not on any cheapest route.
+3. **Label.** An even split over the case's cheapest first steps. There is no
+   other tie rule: no preference for an evaluator over a candidate, no lowest
+   index, and no fallback acquisition.
+
+Cases that look identical to the head (byte-identical observations, which
+happens mostly where nothing was measured yet: a state without evaluators looks
+the same under all six zero-shot orders, and so does a state without zero-shot
+candidates) keep their own labels; training averages them.
+
+### Status and rows
 
 Every case has exactly one disposition, with this precedence:
 
-| Status | Meaning | Head loss |
+| Status | Meaning | Stage 3a row |
 | --- | --- | --- |
-| `OUT_OF_BUDGET` | The state itself exceeds the configured budget. | Excluded |
-| `COMPLETE` | All reference recognition goals hold. This needs every candidate, which leaves only the forced evaluator action, but not every evaluator. | Excluded, unless an unfinished case shares its visible observation (the shared row trains once). |
-| `EXHAUSTED` | The full pool is acquired and a goal remains unfinished. | Excluded |
-| `BUDGET` | The pool is incomplete and no affordable action remains. | Excluded |
-| `ACTION` | A shared continuation has positive average reach for the current goal. | Masked cross-entropy |
-| `UNREACHABLE` | Actions remain, but the current goal has zero average reach under the constructed continuation policy; other legal paths may exist. | Fill-pool fallback target. |
+| `OUT_OF_BUDGET` | The state itself exceeds the configured budget. | None |
+| `COMPLETE` | All reference recognition goals hold. This needs every candidate, which leaves only evaluator actions, but not every evaluator. | No preference: every available move |
+| `EXHAUSTED` | The full pool is acquired and a goal remains unfinished. | None (no move) |
+| `BUDGET` | The pool is incomplete and no affordable action remains. | None (no move) |
+| `ACTION` | Acquisitions remain and a state where the next goal holds can be reached by adding items. | Its cheapest first steps |
+| `UNREACHABLE` | Acquisitions remain, but no state reachable by adding items satisfies the next goal. | No preference: every available move |
 
-Cases without a valid acquisition have a null training-row reference, as do
-COMPLETE cases that share their visible observation with no unfinished case.
-Identical visible observations within a question share one training row.
-Each row has a visible state key, valid mask, normalized soft target,
-goal-rank distribution, and per-action reach/cost/steps for diagnosis. Only
-the head's inputs are saved (see below); the diagnostic fields are recomputed
-on demand. All
-ordinary Stage 3 rows have equal loss weight, regardless of how many original
-state/order cases they represent. Thus exhaustive case coverage does not mean
-one equally weighted training example per case. Terminal and over-budget
-cases remain audit records, with no STOP or abstention target. Offline rank
-and historical truth never enter the head input.
+A case with no preference is labeled with every move it has, except that it has
+no row when an identical-looking case is `ACTION`: that case speaks for the
+group. Every state but the complete one therefore has a label for its input, and
+the head is still trained through the full pool, but uninformative cases never
+dilute informative ones. All rows have equal loss weight. Terminal and
+over-budget cases remain audit records with no STOP or abstention target.
+Offline rank and historical truth never enter the head input.
+
+### Stage 3b: the pretrained head's own continuations
+
+The pretrained head labels every state with a set of tied cheapest first steps.
+Stage 3b keeps one, as follows. For each cheapest first step of a case:
+
+1. Take the step.
+2. Let the pretrained head choose every further move, greedily among the
+   available moves (the same rule as at run time), until the same next goal
+   holds or no move remains.
+3. Count the calls spent.
+
+Cases the head cannot tell apart share one decision, judged on average over
+them: the largest share of threads that reach the goal first, then the fewest
+calls, then the pretrained head's own probability of the step. If no thread
+reaches the goal, that probability alone decides. A case without a route (no
+preference) keeps the head's favorite available move. Every row then has one
+label, and the fine-tuning loss is cross-entropy against it. Threads run to the
+next goal only, not to every later goal, and the pretrained weights are the
+starting point of fine-tuning.
+
+Where a case has one cheapest first step, that step is also its Stage 3b label;
+the continuations only decide ties among several. If the pretrained head were
+perfect, tied steps would cost the same and Stage 3b would reproduce its
+choices. The log reports the rows with tied steps (`tied_rows`), how many of
+those the continuations moved away from the pretrained head's favorite move
+(`tied_rows_moved`), how many rows in all differ from that favorite
+(`changed_rows`, which includes the head's mistakes on rows with one cheapest
+step), and how many routed rows have no thread that reaches the goal
+(`no_thread_reaches_rows`). Because the continuation comes from a head trained
+on the same questions, the measured costs are slightly optimistic about how it
+continues on new ones.
+
+Measured on a local RTX 3050 Ti laptop GPU with six synthetic default-geometry
+questions and an untrained predictor (`benchmark_adaptive_stage3.py`, which
+writes `stage3_two_phase_performance_report.json`): labeling one question takes
+about **0.7 s** per phase (the previous planner took 3 to 4 s) and peaks near
+100 MiB (3a) and 80 MiB (3b) of Python/NumPy allocations. Each question has
+about 41,000 to 48,000 rows, 18 to 45% of them with a route; a trained predictor
+changes that split. One head epoch takes about **0.55 s** per training question
+and **0.06 s** per development question at `decision_batch_size=128`, roughly 20
+minutes for 2,000 + 1,900 questions: about 320 optimizer steps of 128 rows per
+question dominate it, and `decision_batch_size=1024` takes about one seventh of
+the step time. Question count alone is not a training-set size.
 
 ## Training, artifacts, and evaluation
 
@@ -292,7 +345,8 @@ still excluded. Internal `split_fractions` are ignored in this mode.
 | --- | --- | --- |
 | 1: teacher | Shared `supervised` questions | `dev`: final teacher checkpoint selection (complete-state correctness loss); the reported heuristic baselines are also chosen on `dev`, by AP |
 | 2: snapshot encoder and prediction heads | Same `supervised` questions | Same `dev`: checkpoint selection and temperature calibration |
-| 3: acquisition head | Same `supervised` questions, through the `policy` alias | Same `dev`: acquisition-head checkpoint selection |
+| 3a: pretrained head | Same `supervised` questions, through the `policy` alias | Same `dev`: checkpoint selection against the 3a labels |
+| 3b: fine-tuned head | Same `supervised` questions, starting from the 3a weights | Same `dev`: checkpoint selection against the 3b labels |
 
 The teacher's fold models still use internal training/validation folds and
 produce out-of-fold labels for all shared training questions. The final
@@ -307,7 +361,8 @@ signal in any stage; it is a metric of the final reports.
 | --- | --- | --- | --- |
 | 1: teacher | Correctness cross-entropy of the present candidates | The same loss on the complete-state `dev` views, where every candidate is present | AP, Top-1 and coverage in the ranking tables |
 | 2: snapshot | Correctness cross-entropy plus `auxiliary_weight` times the SAFE, MAX and presence cross-entropies | The same loss over every reachable state and zero-shot order of `dev`, before calibration | Top-1, Brier, SAFE/MAX precision and recall (shown during training and in the reports) |
-| 3: acquisition head | Masked action cross-entropy | The same loss on the `dev` rows | |
+| 3a: pretrained head | Masked action cross-entropy against an even split over the cheapest first steps | The same loss on the `dev` rows | |
+| 3b: fine-tuned head | Masked action cross-entropy against one chosen action | The same loss on the `dev` rows | |
 
 The heuristic baselines in the ranking tables are not trained: the best one per
 mode is picked on `dev` by AP and reported next to the teacher. None of these
@@ -326,44 +381,49 @@ not an independent held-out test. `evaluation_protocol` in both
 and the external files used for model selection. Final reports include the
 pooled audit set and each benchmark separately.
 
-Stage 3 writes `decision_labels/policy.pt` and `decision_labels/dev.pt`, with
-`decision_dataset_manifest.json` and `decision_label_coverage.json`. The
-manifest and label files bind to the config (not the input log paths), the
-records, split, teacher labels, and frozen predictor fingerprint. While a role
-builds, each completed question is one
-small atomic file in `decision_labels/<role>/`; an interrupted build resumes
-completed matching questions, and the finished role is merged into one file.
-Incompatible files fail explicitly. A role with no actionable rows fails with
-its coverage report. During training, policy question and row order are
+Stage 3 writes `decision_labels/pretrain_policy.pt`, `pretrain_dev.pt`,
+`finetune_policy.pt` and `finetune_dev.pt`, with `decision_dataset_manifest.json`
+and `decision_label_coverage.json`. The manifest and label files bind to the
+config (not the input log paths), the records, split, teacher labels, and frozen
+predictor fingerprint; the fine-tuning labels also bind to the exact pretrained
+head they were rolled out from. While a role builds, each completed question is
+one small atomic file in `decision_labels/<phase>_<role>/`; an interrupted build
+resumes completed matching questions, and the finished role is merged into one
+file. Incompatible files fail explicitly. A role with no actionable rows fails
+with its coverage report. During training, policy question and row order are
 shuffled deterministically each epoch, and dev questions are read in stable
-order for masked-loss checkpoint selection. All exhaustive labels are
-constructed **once before the head's epoch loop**; epochs reuse those rows and
-never regenerate states or planner targets. Frozen hidden vectors are not
-stored: each training and development pass rebuilds every row's observation
-and re-encodes it with the frozen predictor on the selected device. A new
-invocation verifies saved labels before reuse. The frozen Stage 2 state is
-checked after training.
+order for masked-loss checkpoint selection. All labels of a phase are
+constructed **once before that phase's epoch loop**; epochs reuse those rows and
+never regenerate states or routes. Frozen hidden vectors are not stored: each
+training and development pass rebuilds every row's observation and re-encodes it
+with the frozen predictor on the selected device. A new invocation verifies
+saved labels before reuse. The frozen Stage 2 state is checked after training.
 
 Stage 3 prints question progress, elapsed time, and estimated remaining time
 for each role's label build and each epoch's training/development pass. Updates
 appear on the first/last question, every `print_every` questions, or after 30
 seconds at the next question boundary. Each epoch also prints both losses and
-early-stopping patience. The `Stage 3 policy: ...` coverage summary means policy
-labels are complete; development labels come next, before head training.
-With the default external-development setting, all four benchmark logs supply
-development questions, and their exhaustive label build can be substantial.
-Keep the same output directory and configuration to reuse completed questions
-after interruption, including in a new Kaggle session when `hf_repo` mirrors
-the folder (see "Surviving Kaggle session limits"). After every completed
-training/development epoch,
-`decision_head_progress.pt` atomically saves current and best head weights,
-Adam state, question/row shuffle RNG, losses, and early-stopping bookkeeping.
-With `resume=True`, head optimization continues from the last completed epoch;
-an interrupted partial epoch repeats from its start. Failed checkpoint writes
-preserve the previous completed epoch. Older interrupted runs without this
-progress file begin head training at epoch 1. Keep the training and development
-settings and selected device consistent when comparing a resumed run to an
-uninterrupted run. The final selected head is saved when Stage 3 finishes.
+early-stopping patience. The `Stage 3a policy: ...` coverage summary means policy
+labels are complete; development labels come next, before head training. It
+lists the case statuses, how many rows have a route to their next goal, and how
+many cheapest first steps those rows have; the 3b summary adds the rows moved
+away from the pretrained head's favorite. With the default external-development
+setting, all four benchmark logs supply development questions, and their label
+build can be substantial. Keep the same output directory and configuration to
+reuse completed questions after interruption, including in a new Kaggle session
+when `hf_repo` mirrors the folder (see "Surviving Kaggle session limits"). After
+every completed training/development epoch, `decision_head_pretrain_progress.pt`
+(3a) or `decision_head_finetune_progress.pt` (3b) atomically saves current and
+best head weights, Adam state, question/row shuffle RNG, losses, and
+early-stopping bookkeeping. With `resume=True`, head optimization continues from
+the last completed epoch of the phase in progress; an interrupted partial epoch
+repeats from its start. Failed checkpoint writes preserve the previous
+completed epoch. Keep the training and development settings and selected device
+consistent when comparing a resumed run to an uninterrupted run. The pretrained
+head is saved as `decision_head_pretrained.pt` when Stage 3a finishes, and the
+fine-tuned head as `decision_head_completed.pt` when Stage 3b finishes.
+Fine-tuning starts from the pretrained weights with `decision_finetune_lr` for up
+to `decision_finetune_epochs`; `patience` counts epochs in each phase.
 
 ### Surviving Kaggle session limits
 
@@ -388,7 +448,7 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
   (default 15): after Stage 1 folds, during the Stage 3 label build, and after
   Stage 3 epochs; each merged role uploads immediately. Uploads skip unchanged
   files by content hash, never include `.tmp` files, and remove per-question
-  label files, migrated shards, and an earlier revision's
+  label files and an earlier revision's
   `final_trajectories.jsonl` from the mirror once they are gone locally (the
   dataset repository's history keeps earlier versions).
   A failed periodic upload prints a warning and retries at the next sync
@@ -396,158 +456,114 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
   and `WORK.sync.describe()` reports the upload state.
 - **Resume.** In a new session, download the same input logs, keep the same
   configuration, and run the cells. Inputs are identified by filename, size,
-  and SHA-256, so a new directory or mtime keeps the same run (contracts
-  written by earlier code, which recorded an mtime, are upgraded in place when
-  they still match). The logs may be downloaded to a different directory than
+  and SHA-256, so a new directory or mtime keeps the same run (a contract
+  that bound the logs to their mtime, from before content hashing, is rejected
+  as a different contract). The logs may be downloaded to a different directory than
   last session: point `train_file` and `test_files` there. The Stage 3
   fingerprint leaves those paths out too; the records' content and their uids,
   which name each log's filename stem, identify the logs. Stages 0-2 load
   their completed checkpoints; Stage 1 also reuses completed
   `teacher_fold_<n>.pt` and `teacher_final.pt` files whose question roles
   match exactly, so an interrupted Stage 1 repeats at most one fold. Stage 3
-  reuses completed questions and continues from the last completed epoch.
+  reuses completed questions and continues from the last completed epoch of
+  the phase it was in; fine-tuning labels are bound to the exact pretrained head
+  they were rolled out from.
   Stage 2 and Stage 4 restart if interrupted; neither takes long compared with
   Stage 3.
-- **Stage 3 files from earlier code.** Earlier code also hashed the
-  configured log paths into the Stage 3 fingerprint, so the same logs in a
-  new directory rejected the manifest, labels, `decision_head_progress.pt`,
-  and `decision_head_completed.pt` ("incompatible teacher, predictor, split,
-  or action contract" or "Completed decision head has an incompatible
-  dataset"). Stage 3 and `WORK.decision_label_audit` now recompute that
-  path-bound fingerprint for every path set they can find: the configured
-  paths, the same paths resolved, the resolved paths `contract.json`
-  recorded when the run was created, and the configured paths
-  `inference_bundle.pt` recorded when Stage 3 last completed. Files that
-  match are rewritten in place with the new fingerprint, the manifest last
-  (an interrupted upgrade repeats), and the run continues without relabeling
-  or retraining. Stage 3 then prints `Stage 3 fingerprint: the manifest and
-  <n> label, progress, or head files hashed the input log paths`. If none of
-  those paths reproduces the old fingerprint (for example, an unfinished
-  Stage 3 whose labels were built with relative paths, or in another
-  directory than the one that created the run), Stage 3 prints a NOTE and
-  rejects the files as before; place the logs at the paths that
-  built the labels for one session, and the upgrade runs. Stage 0's version
-  line includes `binds them to the input logs' content rather than their
-  paths`; a notebook copy without it still rejects moved logs.
 - **One session per repository.** Two sessions writing the same mirror would
   overwrite each other; use a different `hf_repo` for a different run
   (`QUICK_PILOT` appends `_pilot` to both the output folder and the mirror).
 
 ### Stage 3 label storage
 
-Stage 3 saves only what the head trains on (label-file schema 5):
+Stage 3 saves only what each head trains on (label-file schema 6): one array
+per question and phase, indexed by case (`scenario * in-budget states + state`).
 
-- `preferred`, one value per row: a bitmask of the row's tied optimal actions
-  (one byte for the default seven actions).
-- `first_cases`, one value per question: a bitmap over its in-budget
-  state/order cases (6,120 bytes for the default 6 x 8,160 cases) marking the
-  first case mapped to each row.
+- Stage 3a `options`: for every case, a bit mask of its cheapest first steps,
+  packed into `ceil(actions / 8)` bytes (two for the default eleven actions);
+  all zero when the case has no row.
+- Stage 3b `choice`: for every case, the chosen action in one byte; 255 when the
+  case has no row.
 
-Rows are stored in the planner's order: larger structures (acquired candidates
-plus evaluators) first, ties in case order. That order is a function of the
-bitmap, so each row's source (`scenario * in-budget states + state`) is rebuilt
-from it rather than stored. A synthetic default-geometry question with about
-32,000 rows takes about **40 KB** (about 1.25 bytes per row with the bitmap and
-file overhead), and 2,000 policy questions plus the pooled test-file development
-questions take roughly 150 MB. Everything else is a deterministic function of
-these values and the fingerprinted contract:
+A default-geometry question takes about **98 KiB** (3a) and **50 KiB** (3b) with
+file overhead, so 2,000 policy questions plus the pooled test-file development
+questions take roughly 590 MB on disk. Everything else is a deterministic
+function of these values and the fingerprinted contract:
 
 | Head input | Rebuilt from |
 | --- | --- |
-| Row source | The question's `first_cases` bitmap, in planning order |
+| Row source | The question's nonzero cases |
 | Observation | The question's measurements, permuted by `scenario`, at `state` |
-| Frozen hidden vector `h` | The observation, re-encoded by the frozen predictor |
+| Frozen features | The observation, re-encoded by the frozen predictor, plus the acquired-item masks |
 | Valid-action mask | The budget-filtered action table at `state` |
-| Soft target | An even split over `preferred`, rounded exactly as the planner did |
+| Target (3a) | An even split over the case's `options` bits |
+| Target (3b) | A one-hot at the case's `choice` |
 
-When a question is labeled, the bitmap must reproduce the planner's row order,
-every row's rebuilt observation is checked against the row's visible state key,
-and targets must use valid actions. Each question also stores the SHA-256 of its
-rebuilt observations. Reused questions are re-verified against that hash, so an
-observation-code or data change cannot silently alter training inputs. On CPU
-the re-encoded features match label-time features bit for bit; on a GPU they
-can differ by about 2e-7 from floating-point roundoff.
+When a question is labeled, every row's rebuilt observation is checked against
+the digest taken at label time, and each question's 3a labels store the SHA-256
+of those observations. Reused questions are re-verified against that hash, so an
+observation-code or data change cannot silently alter training inputs. Stage 3b
+labels must choose available actions for exactly the cases that have a 3a row.
+On CPU the re-encoded features match label-time features bit for bit; on a GPU
+they can differ by about 2e-7 from floating-point roundoff.
 
-Planner diagnostics (goal-rank distributions, per-action reach/cost/steps,
-objective) and the 48,960 case dispositions per question are not stored.
-`decision_label_coverage.json` keeps their counts. To inspect one question,
-`WORK.decision_label_audit("policy", position)` (or
-`decision_question_audit(...)`) rebuilds its full rows and cases and checks
-them against the saved labels. Run it on the labeling device; another device
-can round probabilities differently and fail the check.
+**Head input.** The head reads the frozen 128-dimensional hidden vector plus 13
+plain facts of the visible state: which of the eight candidates and which of the
+five evaluators are acquired (141 inputs). These masks were already inputs of the
+frozen network, so nothing hidden enters. They are added because an action's
+meaning depends on the state ("add R3" opens source 3 in one state and completes
+it in another) and the hidden vector, trained to predict correctness, is not
+guaranteed to keep them.
 
-**Memory.** The planner keeps its working state in arrays: one status, goal
-rank, and training row per case, and solved continuations at 24 bytes per case
-and target rank. The per-row and per-case audit dictionaries are built only for
-`decision_label_audit`. Labeling one default-geometry question therefore peaks
-near 70 MiB of Python/NumPy allocations, down from about 120 MiB. During head
-training only the action bytes, bitmaps, and row offsets stay in RAM, about
-145 MiB for the default run (schema 4 would hold about four times as much); each question's row
-sources are rebuilt from its bitmap when its rows are encoded. There is no cache
-setting; the earlier `decision_cache_mb` option is gone. Only one question's
-re-encoded features and training tensors occupy GPU memory at a time. Before
-writing, Stage 3 prints free disk space and an upper bound for its label files,
-and warns if the bound does not fit.
+Distances, goal ranks, and the 48,960 case dispositions per question are not
+stored; `decision_label_coverage.json` keeps their counts for each phase and
+role. To inspect one question, `WORK.decision_label_audit("policy", position)`
+(or `decision_question_audit(...)`) rebuilds its cases with their statuses, goal
+ranks, and cheapest first steps and checks them against the saved 3a labels.
+Run it on the labeling device; another device can round probabilities
+differently and fail the check.
 
-**Why the earlier layouts used more.** Earlier revision-5 code pickled every
-audit row and case per question, first with the 128-value feature vector stored
-twice (about 8 MiB per question; the v5 run hit `No space left on device` after
-1,467 policy questions), later about 1 MiB per question in two files, with a
-4 GiB in-RAM tensor cache. Most of that was derivable data, such as a
-64-character hash string per row. Schema 4 then kept an `int32` source per row
-(about 5 bytes per row), which the bitmap now replaces.
+**Memory.** The route search works on arrays: a few boolean and float tables of
+states x actions x goals, about 27 MB of head features for the six orders, and
+no per-case dictionaries. Labeling one default-geometry question peaks near
+100 MiB (3a) and 80 MiB (3b) of Python/NumPy allocations. During head training
+only the label arrays stay in RAM: about 380 MB for the 3a stores and 190 MB for
+the 3b stores of the full run (training and development questions). While 3b
+labels are built the 3a stores are also loaded, to check that the two phases
+cover the same rows, and released afterwards. Only one question's re-encoded
+features and training tensors occupy GPU memory at a time. Before writing,
+Stage 3 prints free disk space and an upper bound for its label files, and
+warns if the bound does not fit.
 
-**Recognizing the earlier code.** The notebook embeds its implementation,
-so a Kaggle copy uploaded before these changes keeps its old storage. A copy
-that still writes audit shards fails inside `atomic_torch(path, shard, compress=True)`
-while writing `decision_shards/<role>/<position>_<hash>.pt`, and its Stage 3
-progress reads `building/validating N question shards`; the current code has
-neither that call nor that directory as a write target. Stage 0 of the current
-workflow prints the implementation revision and the label schema
-(`Implementation revision 8; Stage 3 stores compact labels (schema 5, one byte
-per row plus one bitmap per question)`) before any stage trains, so the running
-code can be checked in the first minute rather than hours later. The same line
-ends with `Stages 1-2 train on every presence state under every zero-shot order
-(8,160 x 6 views per question), assembled on the device and never stored; each
-keeps the checkpoint with the lowest development loss (AP is only a reported
-metric)`; a copy without it still samples random snapshots or selects its
-checkpoints by development AP, and a copy that prints revision 7 or lower still
-requires a one-shot candidate's evaluator.
-
-**Recovering such a run.** Keep the same `output_dir`, input files, and
-training configuration with `resume=True`. Constructing `Workflow(CFG)` on an
-existing run deletes the derived `.training.pt` companions (up to 4 MiB each)
-and interrupted `.tmp` files before Stage 0 writes its reports, and prints
-the reclaimed size, so a completely full disk needs no manual cleanup.
-Stages 0-2 load their completed checkpoints; `WORK.train_decision_head()`
-then converts each completed schema-3 shard to schema-5 labels **without
-relabeling** and deletes the shard, so free space only grows; the progress
-line counts these as `migrated`. Schema-4 labels convert the same way:
-per-question files are rewritten in place and counted as `migrated`, and a
-merged schema-4 role file is rewritten once. Only missing questions are built,
-and a matching schema-3 or schema-4 manifest is upgraded in place. Head
-training resumes from `decision_head_progress.pt` with the same row order.
-Revision-4 runs cannot resume under the revision-5 action and label contract;
-start revision 5 in a new output directory. These conversions keep revision-5
-runs going under revision-5 code; revision 6 retrains Stages 1-2, and every
-later revision also starts in a new output directory (see Versions).
+**Recognizing the earlier code.** The notebook embeds its implementation, so a
+Kaggle copy uploaded before these changes keeps its old behavior. Stage 0 of
+the current workflow prints the implementation revision and the label schema
+(`Implementation revision 9; Stage 3 labels every presence state with its
+cheapest routes to the next goal and pretrains on them (Stage 3a), then
+fine-tunes on the route its own continuations make cheapest (Stage 3b). Compact
+labels (schema 6: a bit mask per state/order case for 3a, one byte for 3b)`)
+before any stage trains, so the running code can be checked in the first minute
+rather than hours later. The same line ends with `Stages 1-2 train on every
+presence state under every zero-shot order (8,160 x 6 views per question),
+assembled on the device and never stored; each keeps the checkpoint with the
+lowest development loss (AP is only a reported metric)`. A copy that prints a
+lower revision plans a single label per state with its own tie rules, or still
+requires a one-shot candidate's evaluator, and cannot continue a revision-9 run.
 
 A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
 write failure, commonly caused by exhausted disk space or a storage quota.
 It is not evidence of a GPU-memory failure. Failed writes report the affected
 path, free space, and original exception, remove the partial temporary file,
 and preserve completed files. Free filesystem space alone does not rule out a
-quota or I/O problem.
+quota or I/O problem. Constructing `Workflow(CFG)` on an existing run deletes
+the interrupted `.tmp` files and prints the reclaimed size before Stage 0 writes
+its reports, so a full disk needs no manual cleanup.
 
 The Stage 3 implementation reuses budget-specific structure/action tables
-across questions, constructs observations in NumPy batches, reuses each
-scenario's observations for both inference and visible-state grouping, and
-evaluates the scalar goal rules in arrays.
-It still enumerates every state/order case and uses shared continuation
-decisions and masked training. The evaluator action and tie rule changed in
-revision 5, so revision-4 labels cannot be reused. Training preserves the
-shuffled minibatch order and optimizer steps, and reads the accumulated loss
-back once per question.
+across questions as arrays, constructs observations in NumPy batches, reuses
+each scenario's observations for both inference and visible-state grouping,
+and evaluates the scalar goal rules in arrays. Training reads the accumulated
+loss back once per question and uses a fused Adam update on CUDA.
 
 `decision_eval_batch_size=4096` uses larger development-only forward batches
 for head evaluation. Every development row still contributes to masked loss,
@@ -561,7 +577,7 @@ selection behavior matters.
 On Kaggle, enable an available GPU in **Settings > Accelerator** and keep
 `device="auto"`. The selected device runs the frozen encoder's batched
 inference during labeling and the head's forward/backward passes. Observation
-assembly, state enumeration, continuation search, grouping, and label
+assembly, state enumeration, route search, grouping, and label
 serialization still run on the CPU; enabling CUDA does not move Python search
 or file I/O to the GPU. The Stage 0 notebook cell reports the selected device,
 available GPUs, memory, and CPU threads so the active session can be checked.
@@ -569,47 +585,28 @@ Kaggle offers GPU options such as T4 x2 and P100; this workflow uses one
 selected device and does not automatically combine two GPUs' memory.
 See [NVIDIA's Kaggle setup instructions](https://docs.nvidia.com/datascience/deployment/latest/platforms/kaggle/).
 
-The default `decision_batch_size=128` retains the same optimizer updates and
-shuffle order. For a new CUDA experiment, try `decision_batch_size=1024` to
-reduce the number of small head updates, then compare development loss and
-checkpoint quality. It keeps every training row but changes update count,
-gradient grouping, and the optimization trajectory; use a **new `output_dir`**
-when changing it. It does not accelerate label construction. The default
-head is too small to assume that adding distributed workers, mixed precision,
-or a second GPU improves total runtime. Reduced device transfers and loss
-readbacks follow the synchronization guidance in
+The default `decision_batch_size=128` takes about 320 small optimizer steps per
+training question, which dominate an epoch. For a new CUDA experiment, try
+`decision_batch_size=1024` to reduce the number of small head updates, then
+compare development loss and checkpoint quality. It keeps every training row but
+changes update count, gradient grouping, and the optimization trajectory; use a
+**new `output_dir`** when changing it. It does not accelerate label
+construction. The default head is too small to assume that adding distributed
+workers, mixed precision, or a second GPU improves total runtime. Reduced device
+transfers and loss readbacks follow the synchronization guidance in
 [PyTorch's performance tuning guide](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html).
 
-The following benchmark results are **historical revision-4 measurements**.
-They do not validate the new revision-5 labels or runtime policy. The old
-`benchmark_adaptive_stage3.py` compared against commit `1034634` and wrote
-`stage3_full_dataset_performance_report.json`, checks every row field and
-exhaustive case for exact equality, checks training losses/weights, checks
-development loss within floating-point roundoff, and measured label
-generation, shard loading, and head training/development separately. Do not
-use its old exact-parity assertion as a revision-5 validation gate.
-
-The recorded local CPU comparison uses one CPU thread and five synthetic
-questions with the default state geometry. Median label construction fell
-from **1.774 s to 0.701 s (2.53x)**; development forwards fell from **0.005934 s
-to 0.002930 s (2.03x)**. All exhaustive cases, row fields, and batch-128 training
-losses/weights matched exactly. Pure head optimization at the unchanged
-training batch size remained about **0.024-0.025 s**, so that measurement does
-not show a training-update speedup. These fixture measurements do not predict
-the runtime of the actual logs or Kaggle hardware.
-
-`stage3_local_cuda_smoke_report.json` records a separate synthetic regression
-on a local RTX 3050 Ti laptop GPU with 4 GiB memory. It verified exact case,
-label, and batch-128 head-update parity. Peak PyTorch allocated memory was
-about **24 MiB** for the comparison fixture, including both predictor replicas
-and heads; CUDA context, reserved allocator memory, and other processes are
-outside that number. Its single-pass timings include first-use overhead and
-are not representative speedup measurements. This was not a Kaggle/T4 run.
+`stage3_performance_report.json`, `stage3_full_dataset_performance_report.json`
+and `stage3_local_cuda_smoke_report.json` are **historical** measurements of
+earlier revisions' planner, compared against older commits; they say nothing
+about the labels described here. `benchmark_adaptive_stage3.py` now measures
+the current implementation.
 
 ### Stage 4 reports
 
 Offline reports compare the complete-pool baseline, configurable fixed
-sequences, and learned acquisitions. Defaults for five evaluators and three
+sequences, and the two learned heads: `supervised_pretrained` (Stage 3a) and
+`supervised`, the fine-tuned Stage 3b head. Defaults for five evaluators and three
 zero-shot candidates are:
 
 | Method | Fixed acquisition order |
@@ -621,11 +618,13 @@ zero-shot candidates are:
 Edit `fixed_acquisition_orders` in the Kaggle configuration cell to select
 these built-ins or add a method such as
 `"fixed_custom": ["ZS1", "R1", "OS1", "ZS2", "R2", "OS2", "ZS3"]`.
-`Rj` adds the next evaluator at retrieval rank j; `OSj` generates its one-shot
-candidate. Every sequence starts with the already generated `ZS1`, and
-unseen zero-shots arrive in slot order. Duplicates, out-of-range items, and
-out-of-order retrieval are rejected; a one-shot may come before, after, or
-without its evaluator. A custom sequence may be a
+`Rj` adds the evaluator of source j; `OSj` generates its one-shot candidate.
+Every sequence starts with the already generated `ZS1`, and unseen zero-shots
+arrive in slot order. Duplicates, out-of-range items, and a source that the
+similarity order has not reached are rejected: the nearest unused source may
+be opened with `Rj` or `OSj`, and a used source's other half may follow at any
+time, so a one-shot may come before, after, or without its evaluator. A custom
+sequence may be a
 partial pool; ending it produces `fixed_sequence_exhaustion` rather than
 claiming successful recognition. Fixed order stops at its next unaffordable
 scheduled action and never skips ahead.
@@ -659,10 +658,12 @@ a continuing call has no API savings against the full reference.
 The returned `ranked_candidates` list sorts present candidates by their current
 Stage 2 correctness probabilities, and `selected` is their correctness argmax.
 Stage 1 defines offline reference goals; it does not define this runtime list.
-The inference bundle contains the frozen Stage 2 predictor and action head,
-not the Stage 1 teacher. These two rankings may disagree.
+The inference bundle contains the frozen Stage 2 predictor and both action
+heads (`load_inference_bundle(path, variant="supervised_pretrained")` returns
+the pretrained one; the default is the fine-tuned head), not the Stage 1 teacher. These two rankings may disagree.
 
-Continuation diagnostics keep the best-ever prefix in
+Continuation diagnostics (one set per learned head, under
+`continuation[method]`) keep the best-ever prefix in
 `mean_rank_prefix_reached` and `per_rank_reach`. They separately report the
 ending prefix in `mean_final_rank_prefix` and `per_rank_final_recognition`,
 all-goal recognition in `all_goals_recognized_rate`, and acquired-pool
@@ -690,7 +691,8 @@ follow, then one notes block.
    stops).
 2. **Paired differences**, first method minus second, each with a 95%
    bootstrap interval over questions: every method against the full pool,
-   then the learned head against each fixed order. Columns are saved calls
+   then each learned head against each fixed order and the fine-tuned head
+   against the pretrained one. Columns are saved calls
    per question, top-1, and exact MAX (over MAX-present questions). Read
    savings and exact MAX side by side to weigh calls saved against MAX
    found; an interval that contains zero is no evidence of a difference.
@@ -716,7 +718,8 @@ correct-MAX, wrong-MAX, and other stops (`mean_saved_by_*_stop`), and the
 savings conditional on predicted-MAX stops. `predicted_max_stop_precision` is
 `null` for a group without any MAX. `comparisons["A vs B"]` holds table 2's
 `saved_calls`, `top1`, and `exact_max` intervals, and
-`recognition_outcomes[method]` holds table 4.
+`recognition_outcomes[method]` holds table 4. `decision_training` records each
+head's best epoch, development loss, and label coverage.
 
 Total API calls include candidate generations, repeated baseline/cross
 measurement solves, and their grading calls. With default settings the
@@ -811,22 +814,24 @@ trajectories`; a notebook copy without it still writes the traced file.
 
 ### Versions
 
-This implementation uses **revision 8**, **contract/inference schema 4**,
-**decision-dataset schema 4** (the label fingerprint, without input log
-paths; schema-3 files are upgraded in place), and **label-file
-schema 5**. Revision 8 lets a one-shot candidate be generated without its own
-evaluator: every nonempty candidate subset combines with every evaluator subset,
-so the one-shot action is valid whenever its candidate is absent, 576 states
-(up from 189) are reachable from the first candidate, and Stage 3 labels all
-8,160 presence states (48,960 state/order cases per question, up from 1,912
-states and 11,472 cases). Revision 7 selects Stage 1 and Stage 2 checkpoints by
-development loss instead of development AP (Stage 1) and Top-1 then Brier
-(Stage 2); AP stays a reported metric. Revision 6 trains Stages 1-2 on
-exhaustive views instead of random snapshots. Every earlier output folder is
-rejected as a different contract, and older action/state bundles and
-checkpoints are rejected.
-Use the new default output directory
-`/kaggle/working/adaptive_analogical_shared_training_v8_run` and a new `hf_repo`
-mirror for a fresh run; old runs are not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
+This implementation uses **revision 9**, **contract schema 4**,
+**inference-bundle schema 5**, **decision-dataset schema 5** (the label
+fingerprint, without input log paths), and **label-file schema 6**. Revision 9
+replaces the single planned label per state with two phases. An evaluator and a
+one-shot candidate are separate acquisitions per source (eleven actions instead
+of seven), offered for a source in use or the nearest unused one, so 1,092
+states (up from 576) are reachable from the first candidate. Stage 3 labels
+every presence state except the complete one with its cheapest first steps
+(Stage 3a) and then fine-tunes on the step that the pretrained head's own
+continuations make cheapest (Stage 3b). The head also reads the acquired-item
+masks, and the report evaluates both heads. Revision 8 let a one-shot candidate
+be generated without its own evaluator and labeled all 8,160 presence states.
+Revision 7 selects Stage 1 and Stage 2 checkpoints by development loss instead
+of development AP (Stage 1) and Top-1 then Brier (Stage 2); AP stays a reported
+metric. Revision 6 trains Stages 1-2 on exhaustive views instead of random
+snapshots. Every earlier output folder is rejected as a different contract, and
+older action/state bundles and checkpoints are rejected. Use the new default
+output directory `/kaggle/working/adaptive_analogical_shared_training_v9_run` and
+a new `hf_repo` mirror for a fresh run; old runs are not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
 quality. Recorded outcomes cannot establish live provider behavior or the
 results of newly generated candidates.

@@ -89,7 +89,7 @@ With the default five retrieved sources, the head emits **seven numbers**, one f
 
 These actions acquire **bundles**. Activating an evaluator reveals its baseline measurements and its CCS measurements against candidates already acquired. Adding a candidate reveals its generation result and CCS measurements against active evaluators. See [`raw_next_state()`](adaptive_analogical_training.py#L664).
 
-An action may be unavailable because its candidate was already acquired, the pool is exhausted, or its resulting cost exceeds the budget; a one-shot action does not need its source's evaluator. [`valid_actions()`](adaptive_analogical_training.py#L684) builds a Boolean mask. The code applies that mask during exploration, greedy choice, **and** calculation of future training targets.
+An action may be unavailable because its candidate was already acquired, the pool is exhausted, or its resulting cost exceeds the budget; a one-shot action does not need its source's evaluator. The supervised pipeline in `adaptive_analogical_training.py` has used a different action space since revision 9: eleven actions (the next zero-shot, and for each source its evaluator and its one-shot candidate), available only for a source already in use or the nearest unused one; see `ADAPTIVE_ANALOGICAL_TRAINING_GUIDE.md`. [`valid_actions()`](adaptive_analogical_training.py#L684) builds a Boolean mask. The code applies that mask during exploration, greedy choice, **and** calculation of future training targets.
 
 The seven outputs are **Q-values**, not probabilities. A Q-value estimates the future reward from taking that action and then continuing well.
 

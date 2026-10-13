@@ -104,11 +104,33 @@ def test_frozen_batch_probabilities_preserve_scalar_masking_exactly(device):
     for row, state in enumerate(states):
         for block in range(3):
             expected[row, block*cfg.n:(block+1)*cfg.n][~a.present_mask(state, cfg)] = 0
-    actual_hidden, actual = predictor.predict_many(record, states)
-    np.testing.assert_array_equal(actual_hidden, hidden)
+    features, actual = predictor.predict_many(record, states)
+    # The head's input is the frozen hidden vector followed by the acquired-item masks.
+    assert features.shape == (len(states), cfg.head_input_dim)
+    np.testing.assert_array_equal(features[:, :cfg.hidden_dim], hidden)
     np.testing.assert_array_equal(actual, expected)
     assert not predictor.model.training
     assert all(not parameter.requires_grad for parameter in predictor.model.parameters())
+
+
+def test_head_features_append_exactly_the_acquired_candidate_and_evaluator_masks():
+    cfg = a.Config(k=3, zero_shots=2, hidden_dim=8, residual_blocks=1)
+    record = make_record(cfg)
+    predictor = a.FrozenPredictor({"weights": a.cpu_state(a.ResNet(cfg.input_dim, 3*cfg.n+2, cfg)),
+                                   "temperatures": np.ones(5)}, cfg, "cpu")
+    states = a.presence_states(cfg.zero_shots, cfg.k)
+    xs = a.observation_many(record, states, cfg)
+    features, _ = predictor.predict_many(record, states, observations=xs)
+    masks = np.stack([np.r_[a.bit_array(s.candidate_mask, cfg.n), a.bit_array(s.evaluator_mask, cfg.k)]
+                      for s in states]).astype(np.float32)
+    np.testing.assert_array_equal(features[:, cfg.hidden_dim:], masks)
+    # features() on the device agrees with the batched path, and predict() returns one row of it.
+    np.testing.assert_allclose(predictor.features(xs).numpy(), features, rtol=1e-6, atol=1e-6)
+    # A single-row batch may round differently from a full batch, but never the mask columns.
+    single = predictor.predict(record, states[100])[0]
+    np.testing.assert_allclose(single, features[100], rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(single[cfg.hidden_dim:], features[100, cfg.hidden_dim:])
+    assert a.SupervisedActionHead(cfg).net[0].in_features == cfg.head_input_dim == features.shape[1]
 
 
 @pytest.mark.parametrize("left,right,accepted", [(3., 3.00001, True),
@@ -116,17 +138,26 @@ def test_frozen_batch_probabilities_preserve_scalar_masking_exactly(device):
                                                   (np.inf, np.inf, True),
                                                   (np.nan, np.nan, False)])
 def test_visible_feature_batch_validation_retains_tolerance_and_nonfinite_rules(left, right, accepted):
-    cfg = a.Config(k=1, zero_shots=1, hidden_dim=4)
-    state = a.State((1 << cfg.n)-1, (1 << cfg.k)-1)
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
     record = make_record(cfg)
-    key = a.visible_state_key(record, state, cfg)
-    scenarios = [{"record": record, "states": [state],
-                  "hidden": np.full((1, cfg.hidden_dim), value),
-                  "goal": np.ones((1, cfg.n), bool), "keys": [key],
-                  "index": {state: 0}} for value in (left, right)]
+
+    class Scripted:
+        """The first zero-shot order gets `left`, the second `right`, at every state."""
+        def __init__(self):
+            self.calls = 0
+        def predict(self, rec, state, cfg_override=None):
+            return np.zeros(cfg.head_input_dim, np.float32), np.zeros(3*cfg.n+2, np.float32)
+        def predict_many(self, rec, states):
+            value = (left, right)[self.calls]
+            self.calls += 1
+            return (np.full((len(states), cfg.head_input_dim), value, np.float32),
+                    np.zeros((len(states), 3*cfg.n+2), np.float32))
+
+    scores, flags = np.array([.9, .8, .7], np.float32), np.zeros(cfg.n, np.float32)
+    # Without an evaluator the two orders look identical, so their features must agree.
     if accepted:
-        rows, cases = a.aggregate_decision_rows(scenarios, cfg)
-        assert rows == [] and all(case["status"] == "COMPLETE" for case in cases)
+        plan = a.question_plan(record, scores, flags, flags, Scripted(), cfg)
+        assert plan["leader"][1, 0] == 0
     else:
         with pytest.raises(ValueError, match="inconsistent frozen features"):
-            a.aggregate_decision_rows(scenarios, cfg)
+            a.question_plan(record, scores, flags, flags, Scripted(), cfg)
