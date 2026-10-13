@@ -31,9 +31,9 @@ teacher ranks, correctness labels, or future measurements.
 3. **Stage 3: acquisition head.** A `128 → 64 → 7` network learns the next
    acquisition from the frozen hidden vector. It is supervised with masked
    cross-entropy. There is no STOP output, reward, replay buffer, or Bellman
-   target. Stage 3 uses complete measurements for coherent structural states;
-   states with a one-shot whose evaluator is hidden belong to Stages 1 and 2
-   only.
+   target. Stage 3 uses complete measurements for every presence state, the
+   same 8,160 states Stages 1 and 2 train on: a one-shot candidate does not
+   need its own evaluator.
 
 ## Exhaustive Stage 1-2 training views
 
@@ -41,9 +41,10 @@ Stages 1 and 2 train on every view of every training question; nothing is
 sampled. A view is a presence state seen under one zero-shot order:
 
 - **Presence states:** every nonempty candidate subset with every evaluator
-  subset, `(2**8 - 1) * 2**5 = 8,160` by default. These are all states that
-  hiding candidates or evaluators can produce, including the 1,912 coherent
-  structural states of Stage 3 and one-shots whose evaluator is hidden.
+  subset, `(2**8 - 1) * 2**5 = 8,160` by default. A one-shot candidate does
+  not need its own evaluator, so these are all the states that acquisition,
+  and hiding candidates or evaluators, can produce; Stage 3 labels exactly
+  these states.
 - **Zero-shot orders:** all `3! = 6`, so each question has
   `8,160 * 6 = 48,960` views. Candidate IDs, labels, SAFE/MAX, and
   measurements move together, exactly as in Stage 3.
@@ -55,9 +56,10 @@ sampled. A view is a presence state seen under one zero-shot order:
 The partial states only train the models. The teacher's reference ranking,
 its out-of-fold scores, and the SAFE/MAX labels built from them always come
 from **complete-state** predictions, and teacher checkpoints are selected by
-complete-state development AP. Stage 2 is selected and calibrated on every
-reachable runtime state (189 by default) of every development question under
-every zero-shot order.
+the complete-state development correctness loss. Stage 2 is selected by its
+own training loss, and calibrated, on every reachable runtime state (576 by
+default) of every development question under every zero-shot order. Average
+precision (AP) is a reported metric only (see "Checkpoint selection").
 
 **Complete-view share.** Each question has only 6 complete views among its
 48,960, so an unweighted epoch would spend 0.012% of its training on the one
@@ -77,8 +79,8 @@ view is still visited exactly once. The copy count is
 The teacher's ranking is read only from complete views, so 15% of its
 training is on them. The snapshot model's main job is partial-state
 recognition, so by default its complete views count like any other view
-(0.012% of its rows). `0` disables the repeats. Checkpoint selection is unchanged: the teacher is
-selected on complete-state AP, Stage 2 on every reachable state.
+(0.012% of its rows). `0` disables the repeats. The teacher is selected on its
+complete-state development loss, Stage 2 on its loss over every reachable state.
 
 One epoch visits every view once (plus those repeats): about 98 million views
 for 2,000 training questions. The defaults are therefore `batch_size=16384`,
@@ -88,16 +90,19 @@ improvement in Stages 1-2 (epochs in Stage 3), and the selected checkpoint's
 position is a fractional epoch such as `1.375`. Patience is therefore not reset
 at an epoch boundary: with 8 checks per epoch, `15` is just under two epochs
 without a better check. The training loop prints one line per epoch: the mean
-training loss over the epoch, the latest check's score, the best score and the
-epoch of its check, and the checks without improvement, for example
-`epoch  4.000 | train loss 0.2846 | latest development AP 0.7195 | best
-development AP 0.7447 at epoch 3.625 | checks without improvement 3/15`.
+training loss over the epoch, the latest check's development loss, the best
+development loss and the epoch of its check, and the checks without
+improvement, for example
+`epoch  4.000 | train loss 0.2846 | latest development loss 0.2951 | best
+development loss 0.2874 at epoch 3.625 | checks without improvement 3/15`.
+Stage 2 also shows Top-1 and Brier in parentheses after each loss; they are
+information, not selection criteria.
 
 **Memory and disk.** No view is stored, on disk or in RAM. A shared state
 table (about 7 MiB) holds the state-only observation bytes and masks; each
 question adds its measurements, labels, and SAFE/MAX under each order (under
 1 KiB). `SnapshotViews` assembles each minibatch on the selected device from
-those tensors, bit-identical to `observation(..., allow_hidden_source=True)`.
+those tensors, bit-identical to `observation(...)`.
 Every minibatch takes an even slice of **every** question's rows: with 1,280
 fold questions and `batch_size=16384`, 12 rows of each. Each question walks one
 shared random order of its rows from its own random start, so an epoch holds a
@@ -105,7 +110,8 @@ single permutation of one question's rows (under 0.5 MiB), not of all 98
 million. An earlier revision-6 build (`c003b05`) instead shuffled the views of
 about 36 questions at a time, so about 126 consecutive optimizer steps saw the
 same few questions. On real logs (640 GSM8K training questions, 500 MATH-500
-development questions, 4 checks per epoch, local GPU), its epoch-mean training
+development questions, 4 checks per epoch, local GPU, measured while checkpoints
+were still selected on development AP), its epoch-mean training
 loss went 0.298, 0.282, 0.277 over three epochs, with the best development AP
 0.5606 at epoch 1.25. All-question batches went 0.364, 0.221, 0.175, with the
 best AP 0.5552 at epoch 0.25 and lower AP afterward: each question appears tens
@@ -122,7 +128,10 @@ initialization), and 180 MiB peak CUDA memory. At that rate one epoch takes
 about 1 minute for Stage 2 and, with the teacher's complete-view repeats
 adding 18% to its rows, about 5 minutes for Stage 1's five folds plus final
 teacher, so the 10-epoch maximum is about an hour for both stages before
-early stopping. Kaggle hardware will differ.
+early stopping. Kaggle hardware will differ. This was measured when each
+Stage 2 development check covered 189 reachable states; it now covers 576, so
+a check costs about three times as much. Lower `dev_checks_per_epoch` to spend
+less time on checks.
 
 SAFE is the leading uninterrupted run of actually correct candidates in the
 teacher order; MAX is its first member. If rank one is wrong, both are empty.
@@ -135,21 +144,26 @@ earlier lost goal takes priority over continuing a later goal.
 
 ## Acquisition state, actions, and cost
 
-`State(candidate_mask, evaluator_mask)` records explicit presence. A one-shot
-candidate requires its own evaluator. A Stage 3 state uses complete recorded
-measurements for every present candidate/evaluator pair. Every state contains
-at least one candidate; candidate-empty states are outside this contract.
+`State(candidate_mask, evaluator_mask)` records explicit presence. Any nonempty
+candidate subset combines with any evaluator subset: a one-shot candidate does
+not need its own evaluator, and can be generated before, after, or without it.
+A state uses complete recorded measurements for every present
+candidate/evaluator pair. A one-shot candidate whose evaluator is absent shows
+its source slot but none of that source's similarity, baseline, or
+cross-evaluation. Every state contains at least one candidate; candidate-empty
+states are outside this contract.
 The runtime begins with ZS1 and no evaluators, so its first generation precedes
 the head's decisions. The zero-shot action fills the first missing slot;
 the head cannot select a specific unseen answer. The evaluator action fills
 the first missing evaluator in similarity order; the head cannot choose its
-identity. Training still audits non-prefix presence masks from masking.
+identity. The head does choose which source's one-shot candidate to generate.
+Training still audits non-prefix presence masks from masking.
 
 | Action index | Operation |
 | --- | --- |
 | `0` | Add the next missing evaluator in similarity order, its baseline, and cross evaluations against present candidates. |
 | `1` | Generate another zero-shot candidate and cross-evaluate it against active evaluators. |
-| `2 … k+1` | Generate the one-shot candidate from the specified active evaluator and cross-evaluate it against active evaluators. |
+| `2 … k+1` | Generate the one-shot candidate for the specified source, whether or not that source's evaluator is active, and cross-evaluate it against the active evaluators. A source added later as an evaluator is then cross-evaluated against every present candidate, this one included. |
 
 The default `k=5` gives seven actions. Invalid or unaffordable actions are
 masked. The incremental cost is the difference between the existing state-cost
@@ -159,23 +173,35 @@ baseline solves, 200 cross-CCS solves, and 225 corresponding graders.
 `cost_unit="solver_calls"` optionally excludes those graders and gives a
 233-call complete pool. Retrieval/embedding work and target-answer grading
 remain outside this recorded-data accounting. There is no separate penalty
-for the number of acquired candidates or evaluators.
+for the number of acquired candidates or evaluators. The cost depends only on
+how many candidates and evaluators are present, so a candidate generated while
+no evaluator is active costs its single generation call, and each evaluator
+added later pays to measure it.
 
 ## Exhaustive Stage 3 dataset
 
 For every policy and development question, Stage 3 enumerates every nonempty
-candidate subset and evaluator subset satisfying the one-shot prerequisite.
-This is **1,912 structural states** for three zero shots and five evaluators.
-It evaluates each under all six zero-shot permutations: **11,472 state/order
-cases per question**. Enumeration is independent of runtime acquisition order
-and budget. Cases above the budget stay in the dataset with an explicit status.
+candidate subset and evaluator subset; a one-shot candidate does not need its
+own evaluator. This is **8,160 presence states** for three zero shots and five
+evaluators, the same states Stages 1 and 2 train on. It evaluates each under
+all six zero-shot permutations: **48,960 state/order cases per question**.
+Enumeration is independent of runtime acquisition order and budget. Cases
+above the budget stay in the dataset with an explicit status.
 
-Thus **2,000 training questions produce 22,944,000 state/order cases**, before
-development questions. These are exhaustive audit cases, not 22,944,000 head
-training rows: every in-budget case with a valid acquisition contributes,
-and identical visible observations share one row. This expansion, together with continuation search,
-explains why Stage 3 label construction can be slow even though the head is small.
-Question count alone is not its training-set size.
+Thus **2,000 training questions produce 97,920,000 state/order cases**, before
+development questions. These are exhaustive audit cases, not 97,920,000 head
+training rows: every in-budget case with a valid acquisition contributes
+(except cases whose reference goals already hold), and identical visible
+observations share one row. A synthetic default-geometry question merges into
+about 32,000 rows. This expansion, together with continuation search,
+explains why Stage 3 label construction can be slow even though the head is small:
+about 3 to 4 seconds per question on one CPU thread in a synthetic benchmark with an
+untrained predictor (a trained predictor changes how many goals are reachable),
+so a full run takes hours and resumes per question. A head epoch re-encodes
+every row: about 0.5 seconds per training question and 0.1 seconds per
+development question on a laptop GPU at `decision_batch_size=128` (roughly 18
+minutes for 2,000 + 1,900 questions). Question count alone is not its
+training-set size.
 
 The frozen Stage 2 predictor supplies recognition probabilities for each
 in-budget state, and complete-state reference probabilities once per
@@ -231,13 +257,14 @@ Every case has exactly one disposition, with this precedence:
 | Status | Meaning | Head loss |
 | --- | --- | --- |
 | `OUT_OF_BUDGET` | The state itself exceeds the configured budget. | Excluded |
-| `COMPLETE` | All reference recognition goals hold; this requires the complete candidate and evaluator pool. | Excluded. |
+| `COMPLETE` | All reference recognition goals hold. This needs every candidate, which leaves only the forced evaluator action, but not every evaluator. | Excluded, unless an unfinished case shares its visible observation (the shared row trains once). |
 | `EXHAUSTED` | The full pool is acquired and a goal remains unfinished. | Excluded |
 | `BUDGET` | The pool is incomplete and no affordable action remains. | Excluded |
 | `ACTION` | A shared continuation has positive average reach for the current goal. | Masked cross-entropy |
 | `UNREACHABLE` | Actions remain, but the current goal has zero average reach under the constructed continuation policy; other legal paths may exist. | Fill-pool fallback target. |
 
-Cases without a valid acquisition have a null training-row reference.
+Cases without a valid acquisition have a null training-row reference, as do
+COMPLETE cases that share their visible observation with no unfinished case.
 Identical visible observations within a question share one training row.
 Each row has a visible state key, valid mask, normalized soft target,
 goal-rank distribution, and per-action reach/cost/steps for diagnosis. Only
@@ -263,7 +290,7 @@ still excluded. Internal `split_fractions` are ignored in this mode.
 
 | Stage | Weight training | Development checks |
 | --- | --- | --- |
-| 1: teacher | Shared `supervised` questions | `dev`: final teacher checkpoint selection and heuristic selection |
+| 1: teacher | Shared `supervised` questions | `dev`: final teacher checkpoint selection (complete-state correctness loss); the reported heuristic baselines are also chosen on `dev`, by AP |
 | 2: snapshot encoder and prediction heads | Same `supervised` questions | Same `dev`: checkpoint selection and temperature calibration |
 | 3: acquisition head | Same `supervised` questions, through the `policy` alias | Same `dev`: acquisition-head checkpoint selection |
 
@@ -272,9 +299,19 @@ produce out-of-fold labels for all shared training questions. The final
 teacher trains on all shared training questions. The snapshot predictor
 stays frozen while the acquisition head trains.
 
-Stage 2 selects its checkpoint by development correctness Top-1, then Brier
-score; Stage 3 selects by development action cross-entropy. These criteria do
-not directly optimize recognition-goal coverage or realized API savings.
+**Checkpoint selection.** Every stage keeps the checkpoint with the lowest
+development loss. Average precision (AP) is neither a training nor a selection
+signal in any stage; it is a metric of the final reports.
+
+| Stage | Training loss | Development loss that picks the checkpoint | Reported, never selected on |
+| --- | --- | --- | --- |
+| 1: teacher | Correctness cross-entropy of the present candidates | The same loss on the complete-state `dev` views, where every candidate is present | AP, Top-1 and coverage in the ranking tables |
+| 2: snapshot | Correctness cross-entropy plus `auxiliary_weight` times the SAFE, MAX and presence cross-entropies | The same loss over every reachable state and zero-shot order of `dev`, before calibration | Top-1, Brier, SAFE/MAX precision and recall (shown during training and in the reports) |
+| 3: acquisition head | Masked action cross-entropy | The same loss on the `dev` rows | |
+
+The heuristic baselines in the ranking tables are not trained: the best one per
+mode is picked on `dev` by AP and reported next to the teacher. None of these
+criteria directly optimizes recognition-goal coverage or realized API savings.
 
 Set `use_test_files_for_dev_and_audit=False` for separate internal development
 and audit groups. `split_fractions=(0.80, 0.10, 0.10)` then means **shared
@@ -403,16 +440,16 @@ Stage 3 saves only what the head trains on (label-file schema 5):
 - `preferred`, one value per row: a bitmask of the row's tied optimal actions
   (one byte for the default seven actions).
 - `first_cases`, one value per question: a bitmap over its in-budget
-  state/order cases (1,434 bytes for the default 6 x 1,912 cases) marking the
+  state/order cases (6,120 bytes for the default 6 x 8,160 cases) marking the
   first case mapped to each row.
 
 Rows are stored in the planner's order: larger structures (acquired candidates
 plus evaluators) first, ties in case order. That order is a function of the
 bitmap, so each row's source (`scenario * in-budget states + state`) is rebuilt
 from it rather than stored. A synthetic default-geometry question with about
-8,000 rows takes about **12 KB** (about 1.5 bytes per row with the bitmap and
+32,000 rows takes about **40 KB** (about 1.25 bytes per row with the bitmap and
 file overhead), and 2,000 policy questions plus the pooled test-file development
-questions take roughly 40 MB. Everything else is a deterministic function of
+questions take roughly 150 MB. Everything else is a deterministic function of
 these values and the fingerprinted contract:
 
 | Head input | Rebuilt from |
@@ -432,7 +469,7 @@ the re-encoded features match label-time features bit for bit; on a GPU they
 can differ by about 2e-7 from floating-point roundoff.
 
 Planner diagnostics (goal-rank distributions, per-action reach/cost/steps,
-objective) and the 11,472 case dispositions per question are not stored.
+objective) and the 48,960 case dispositions per question are not stored.
 `decision_label_coverage.json` keeps their counts. To inspect one question,
 `WORK.decision_label_audit("policy", position)` (or
 `decision_question_audit(...)`) rebuilds its full rows and cases and checks
@@ -443,9 +480,9 @@ can round probabilities differently and fail the check.
 rank, and training row per case, and solved continuations at 24 bytes per case
 and target rank. The per-row and per-case audit dictionaries are built only for
 `decision_label_audit`. Labeling one default-geometry question therefore peaks
-near 20 MiB of Python/NumPy allocations, down from about 60 MiB. During head
+near 70 MiB of Python/NumPy allocations, down from about 120 MiB. During head
 training only the action bytes, bitmaps, and row offsets stay in RAM, about
-30 MiB for the default run (schema 4 held about 125 MiB); each question's row
+145 MiB for the default run (schema 4 would hold about four times as much); each question's row
 sources are rebuilt from its bitmap when its rows are encoded. There is no cache
 setting; the earlier `decision_cache_mb` option is gone. Only one question's
 re-encoded features and training tensors occupy GPU memory at a time. Before
@@ -467,12 +504,15 @@ while writing `decision_shards/<role>/<position>_<hash>.pt`, and its Stage 3
 progress reads `building/validating N question shards`; the current code has
 neither that call nor that directory as a write target. Stage 0 of the current
 workflow prints the implementation revision and the label schema
-(`Implementation revision 6; Stage 3 stores compact labels (schema 5, one byte
+(`Implementation revision 8; Stage 3 stores compact labels (schema 5, one byte
 per row plus one bitmap per question)`) before any stage trains, so the running
 code can be checked in the first minute rather than hours later. The same line
 ends with `Stages 1-2 train on every presence state under every zero-shot order
-(8,160 x 6 views per question)`; a copy without it still samples random
-snapshots.
+(8,160 x 6 views per question), assembled on the device and never stored; each
+keeps the checkpoint with the lowest development loss (AP is only a reported
+metric)`; a copy without it still samples random snapshots or selects its
+checkpoints by development AP, and a copy that prints revision 7 or lower still
+requires a one-shot candidate's evaluator.
 
 **Recovering such a run.** Keep the same `output_dir`, input files, and
 training configuration with `resume=True`. Constructing `Workflow(CFG)` on an
@@ -489,8 +529,8 @@ and a matching schema-3 or schema-4 manifest is upgraded in place. Head
 training resumes from `decision_head_progress.pt` with the same row order.
 Revision-4 runs cannot resume under the revision-5 action and label contract;
 start revision 5 in a new output directory. These conversions keep revision-5
-runs going under revision-5 code; revision 6 retrains Stages 1-2 and starts in
-a new output directory (see Versions).
+runs going under revision-5 code; revision 6 retrains Stages 1-2, and every
+later revision also starts in a new output directory (see Versions).
 
 A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
 write failure, commonly caused by exhausted disk space or a storage quota.
@@ -584,7 +624,8 @@ these built-ins or add a method such as
 `Rj` adds the next evaluator at retrieval rank j; `OSj` generates its one-shot
 candidate. Every sequence starts with the already generated `ZS1`, and
 unseen zero-shots arrive in slot order. Duplicates, out-of-range items, and
-one-shots before their evaluators and out-of-order retrieval are rejected. A custom sequence may be a
+out-of-order retrieval are rejected; a one-shot may come before, after, or
+without its evaluator. A custom sequence may be a
 partial pool; ending it produces `fixed_sequence_exhaustion` rather than
 claiming successful recognition. Fixed order stops at its next unaffordable
 scheduled action and never skips ahead.
@@ -625,7 +666,10 @@ Continuation diagnostics keep the best-ever prefix in
 `mean_rank_prefix_reached` and `per_rank_reach`. They separately report the
 ending prefix in `mean_final_rank_prefix` and `per_rank_final_recognition`,
 all-goal recognition in `all_goals_recognized_rate`, and acquired-pool
-completion in `acquisition_complete_rate`. These are averaged over zero-shot
+completion in `acquisition_complete_rate`. The continuation stops once every
+reference goal holds, and a state with every candidate can still lack
+evaluators, so `acquisition_complete_rate` can be lower than
+`all_goals_recognized_rate`. These are averaged over zero-shot
 orders within each question, then equally across questions. An earlier
 recognition peak does not establish that those goals still hold at the end.
 
@@ -688,8 +732,8 @@ available candidate IDs, the selected candidate, the four MAX/SAFE signals,
 and the threshold. These make the reason for stopping inspectable.
 
 Fixed comparison orders affect evaluation only. They are excluded from
-training/checkpoint fingerprints, so matching revision-5 checkpoints can
-be reused when changing orders and rerunning reports.
+training/checkpoint fingerprints, so matching checkpoints of the same
+revision can be reused when changing orders and rerunning reports.
 
 Reports keep answer correctness, exact reference-MAX recovery, no-MAX results,
 costs and savings, and temporary loss of earlier recognition goals separately.
@@ -761,21 +805,28 @@ group hash, ranked list, call-count dictionaries, and per-step signals, about
 report were held in RAM before summarizing, and pooled-audit questions were
 rolled out and written twice. Once the new file is complete, an old
 `final_trajectories.jsonl` in the output folder is deleted, and the mirror
-drops it at the next upload. Stage 0's version line ends with `Stage 4 rolls
+drops it at the next upload. Stage 0's version line contains `Stage 4 rolls
 out each question once and saves compact outcomes to final_rollouts.jsonl, not
 trajectories`; a notebook copy without it still writes the traced file.
 
 ### Versions
 
-This implementation uses **revision 6**, **contract/inference schema 4**,
+This implementation uses **revision 8**, **contract/inference schema 4**,
 **decision-dataset schema 4** (the label fingerprint, without input log
 paths; schema-3 files are upgraded in place), and **label-file
-schema 5**. Revision 6 trains Stages 1-2 on exhaustive views instead of random
-snapshots, so their checkpoints, and the Stage 3 labels built from the frozen
-predictor, differ from revision 5: a revision-5 output folder is rejected as a
-different contract. Older action/state bundles and checkpoints are rejected.
+schema 5**. Revision 8 lets a one-shot candidate be generated without its own
+evaluator: every nonempty candidate subset combines with every evaluator subset,
+so the one-shot action is valid whenever its candidate is absent, 576 states
+(up from 189) are reachable from the first candidate, and Stage 3 labels all
+8,160 presence states (48,960 state/order cases per question, up from 1,912
+states and 11,472 cases). Revision 7 selects Stage 1 and Stage 2 checkpoints by
+development loss instead of development AP (Stage 1) and Top-1 then Brier
+(Stage 2); AP stays a reported metric. Revision 6 trains Stages 1-2 on
+exhaustive views instead of random snapshots. Every earlier output folder is
+rejected as a different contract, and older action/state bundles and
+checkpoints are rejected.
 Use the new default output directory
-`/kaggle/working/adaptive_analogical_shared_training_v6_run` and a new `hf_repo`
+`/kaggle/working/adaptive_analogical_shared_training_v8_run` and a new `hf_repo`
 mirror for a fresh run; old runs are not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
 quality. Recorded outcomes cannot establish live provider behavior or the
 results of newly generated candidates.

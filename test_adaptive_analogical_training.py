@@ -85,34 +85,47 @@ def test_retrieval_ties_keep_log_order_and_missing_similarity_is_auditable():
         a.parse_record(raw, 0, "train", cfg)
 
 
-def test_initial_state_retrieval_order_one_shot_dependency_and_cost():
+def test_initial_state_retrieval_order_one_shot_independence_and_cost():
     cfg = a.Config()
     assert cfg.full_cost == 458
     assert a.state_cost(a.State(), cfg) == 1
-    assert len(a.reachable_states(cfg)) == 189
-    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0, 1]
+    # 3 zero-shot prefixes x 6 evaluator prefixes x 32 subsets of the five one-shot candidates.
+    assert len(a.reachable_states(cfg)) == 3 * 6 * 32 == 576
+    # Every acquisition is open from the start: a one-shot candidate needs no evaluator.
+    assert np.flatnonzero(a.valid_actions(a.State(), cfg)).tolist() == [0, 1, 2, 3, 4, 5, 6]
     first = a.advance(a.State(), 0, cfg)
     assert first.evaluator_mask == 1
     assert 2 in np.flatnonzero(a.valid_actions(first, cfg))
+    lone = a.advance(a.State(), 4, cfg)  # OS3 before any evaluator: its generation is the only call.
+    assert lone == a.State(1 | (1 << 5), 0) and a.state_cost(lone, cfg) == 2
     with pytest.raises(ValueError, match="Unavailable"):
-        a.advance(a.State(), 2, cfg)
+        a.advance(lone, 4, cfg)  # Already generated.
+    # The evaluator action still adds the next evaluator in similarity order, whichever one-shots exist.
     assert a.advance(a.State(), 0, cfg).evaluator_mask == 1
+    assert a.advance(lone, 0, cfg).evaluator_mask == 1
     assert a.advance(first, 0, cfg).evaluator_mask == 3
     assert a.fixed_order_actions(cfg) == [0, 2, 1, 0, 3, 1, 0, 4, 0, 5, 0, 6]
 
 
 def test_exhaustive_catalog_matches_independent_enumerator_and_transition_graph():
     cfg = a.Config()
+    # Every nonempty candidate subset with every evaluator subset: a one-shot candidate needs no evaluator.
     independent = {(candidate_mask, evaluator_mask)
                    for candidate_mask in range(1, 1 << cfg.n)
-                   for evaluator_mask in range(1 << cfg.k)
-                   if not candidate_mask >> cfg.zero_shots & ~evaluator_mask}
-    states, graph = a.structural_graph(cfg.zero_shots, cfg.k)
-    assert len(independent) == len(states) == 1912
+                   for evaluator_mask in range(1 << cfg.k)}
+    states, graph = a.state_graph(cfg.zero_shots, cfg.k)
+    assert len(independent) == len(states) == 8160
     assert {(s.candidate_mask, s.evaluator_mask) for s in states} == independent
-    assert len(states) * 6 == 11472
+    assert len(states) * 6 == 48960
+    zero_mask, all_evaluators = (1 << cfg.zero_shots) - 1, (1 << cfg.k) - 1
     for state, edges in zip(states, graph):
         assert len(edges) == len(set(edges.values()))
+        # Independent action rule: the next evaluator, the next zero-shot, and every absent one-shot.
+        expected = ({0} if state.evaluator_mask != all_evaluators else set()) | (
+            {1} if state.candidate_mask & zero_mask != zero_mask else set()) | {
+            2 + source for source in range(cfg.k)
+            if not state.candidate_mask >> (cfg.zero_shots + source) & 1}
+        assert set(edges) == expected
         for action, successor in edges.items():
             nxt = states[successor]
             assert nxt == a.raw_next_state(state, action, cfg)
@@ -124,38 +137,40 @@ def test_arbitrary_evaluator_subsets_zero_shot_and_exact_budget_cost():
     cfg = a.Config(k=3, zero_shots=3, max_cost=32)
     state = a.State(1, 4)  # ZS1 with only R3 active.
     assert a.state_cost(state, cfg) == 21
-    assert np.flatnonzero(a.valid_actions(state, cfg)).tolist() == [1, 4]
+    # The next evaluator no longer fits the budget; the zero-shot and every one-shot do,
+    # whichever evaluator they came from.
+    assert np.flatnonzero(a.valid_actions(state, cfg)).tolist() == [1, 2, 3, 4]
     zs = a.advance(state, 1, cfg)
     os = a.advance(state, 4, cfg)
     assert zs == a.State(3, 4) and os == a.State(1 | (1 << 5), 4)
     snapshot = a.as_snapshot_state(os, cfg)
     assert snapshot.baseline_attempted == snapshot.baseline_observed == 4
     assert snapshot.ccs_attempted == snapshot.ccs_observed == (4 | (4 << (5*cfg.k)))
-    with pytest.raises(ValueError, match="without retrieved source"):
-        a.as_snapshot_state(a.State(1 << 5, 0), cfg)
+    # OS1 needs neither R1 nor any other evaluator; a lone one-shot candidate measures nothing.
+    assert a.advance(state, 2, cfg) == a.State(1 | (1 << 3), 4)
+    lone = a.as_snapshot_state(a.State(1 << 5, 0), cfg)
+    assert lone.candidates == 1 << 5 and lone.baseline_attempted == lone.ccs_attempted == 0
     assert a.state_cost(zs, cfg) - a.state_cost(state, cfg) == 11
     assert a.state_cost(os, cfg) - a.state_cost(state, cfg) == 11
-    with pytest.raises(ValueError, match="Unavailable"):
-        a.advance(state, 2, cfg)  # R1's one-shot source is not active.
     cfg.max_cost = 20
     assert not a.valid_actions(state, cfg).any()
     assert a.state_cost(a.State((1 << a.Config().n)-1, (1 << a.Config().k)-1), a.Config()) == 458
 
 
-def test_presence_states_cover_every_candidate_and_evaluator_mask_including_hidden_sources():
+def test_presence_states_cover_every_candidate_and_evaluator_mask():
     cfg = a.Config()
     states = a.presence_states(cfg.zero_shots, cfg.k)
     independent = {(c, e) for c in range(1, 1 << cfg.n) for e in range(1 << cfg.k)}
     assert len(states) == len(independent) == 8160
     assert {(s.candidate_mask, s.evaluator_mask) for s in states} == independent
-    assert set(a.structural_states(cfg.zero_shots, cfg.k)) <= set(states)
     r = record(cfg)
-    hidden = a.State(1 << cfg.zero_shots, 0)  # OS1 visible, R1 hidden.
-    with pytest.raises(ValueError, match="without retrieved source"):
-        a.observation(r, hidden, cfg)
-    x = a.observation(r, hidden, cfg, allow_hidden_source=True)
+    lone = a.State(1 << cfg.zero_shots, 0)  # OS1 visible, R1 absent.
+    x = a.observation(r, lone, cfg)
     assert x.shape == (cfg.input_dim,) and np.isfinite(x).all()
-    assert a.as_snapshot_state(hidden, cfg, True).ccs_observed == 0
+    assert a.as_snapshot_state(lone, cfg).ccs_observed == 0
+    # With another evaluator active, only that evaluator's measurement of OS1 is visible.
+    other = a.as_snapshot_state(a.State(1 << cfg.zero_shots, 1 << 1), cfg)
+    assert other.ccs_observed == 1 << (cfg.zero_shots * cfg.k + 1)
 
 
 def test_snapshot_views_equal_scalar_observations_and_targets_for_every_order_and_state():
@@ -179,7 +194,7 @@ def test_snapshot_views_equal_scalar_observations_and_targets_for_every_order_an
             r, _, safe, maximum = a.permute_zero_shots(records[idx], np.zeros(cfg.n), teacher["safe"][idx],
                                                        teacher["maximum"][idx], order, cfg)
             for state in states:
-                expected_x.append(a.observation(r, state, cfg, allow_hidden_source=True))
+                expected_x.append(a.observation(r, state, cfg))
                 expected_y.append(a.snapshot_target(r, safe, maximum, state, cfg))
     assert np.stack(expected_x).tobytes() == x1.numpy().tobytes()
     assert np.stack(expected_y).tobytes() == y2.numpy().tobytes()
@@ -246,6 +261,17 @@ def test_streamed_snapshot_metrics_and_temperatures_match_materialized_arrays():
     p = 1 / (1 + np.exp(-logits))
     summary = a.summarize_snapshot_sums(a.snapshot_sums(model, views, np.ones(3*cfg.n+2), cfg))
     assert summary["snapshots"] == views.rows
+    # The streamed loss is the training loss itself, averaged over every view.
+    logit_t, target_t = torch.as_tensor(logits, dtype=torch.float32), torch.as_tensor(y)
+    assert summary["loss"] == pytest.approx(
+        float(a.snapshot_row_losses(logit_t, target_t, cfg).mean()), rel=1e-5)
+    # ... and the batch loss keeps its original definition: block-wise masked means plus the global terms.
+    n, present = cfg.n, target_t[:, 3*cfg.n+2:]
+    raw = torch.nn.functional.binary_cross_entropy_with_logits(logit_t, target_t[:, :3*n+2], reduction="none")
+    blocks = [((raw[:, b*n:(b+1)*n] * present).sum(1) / present.sum(1).clamp_min(1)).mean()
+              for b in range(3)]
+    original = blocks[0] + cfg.auxiliary_weight * (blocks[1] + blocks[2] + raw[:, 3*n:].mean(0).sum())
+    assert float(a.snapshot_loss(logit_t, target_t, cfg)) == pytest.approx(float(original), rel=1e-6)
     assert summary["top1"] == pytest.approx(y[np.arange(len(y)), chosen].mean())
     assert summary["brier"] == pytest.approx(((p[:, :cfg.n] - y[:, :cfg.n])**2)[mask].mean(), rel=1e-5)
     positive, true = p[:, 3*cfg.n] >= .3, y[:, 3*cfg.n].astype(bool)
@@ -263,6 +289,61 @@ def test_streamed_snapshot_metrics_and_temperatures_match_materialized_arrays():
         nlls = [np.mean(np.logaddexp(0, z/g) - t*z/g) for g in a.TEMPERATURE_GRID]
         expected.append(a.TEMPERATURE_GRID[int(np.argmin(nlls))])
     assert np.allclose(temps, expected)
+
+
+def small_stage_cfg():
+    return a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1, batch_size=64, device="cpu",
+                    cpu_threads=1, teacher_epochs=3, snapshot_epochs=3, dev_checks_per_epoch=3, patience=100)
+
+
+def refuse_ap(*args, **kwargs):
+    pytest.fail("AP is a report metric; no training stage may compute it")
+
+
+def test_teacher_checkpoint_is_the_lowest_development_correctness_loss_and_never_uses_ap(monkeypatch):
+    cfg = small_stage_cfg()
+    records = [record(cfg, i) for i in range(12)]
+    train, dev = list(range(8)), list(range(8, 12))
+    monkeypatch.setattr(a, "ap_score", refuse_ap)
+    checkpoint = a.train_teacher(records, train, dev, cfg, "cpu", 3, "Teacher")
+    history = checkpoint["history"]
+    losses = [entry["dev_loss"] for entry in history]
+    assert len(history) > 1 and all(set(entry) == {"epoch", "train_loss", "dev_loss"} for entry in history)
+    assert checkpoint["best_epoch"] == history[int(np.argmin(losses))]["epoch"]
+    # The saved weights score that loss: mean cross-entropy over every candidate of the
+    # complete-state development questions, the same quantity the model is trained on.
+    model = a.ResNet(cfg.input_dim, cfg.n, cfg)
+    model.load_state_dict(checkpoint["weights"])
+    model.eval()
+    full = a.State((1 << cfg.n) - 1, (1 << cfg.k) - 1)
+    x = torch.as_tensor(np.stack([a.observation(records[i], full, cfg) for i in dev]), dtype=torch.float32)
+    y = torch.as_tensor(np.stack([records[i].labels for i in dev]), dtype=torch.float32)
+    with torch.no_grad():
+        expected = torch.nn.functional.binary_cross_entropy_with_logits(model(x), y).item()
+    assert expected == pytest.approx(min(losses), rel=1e-4)
+
+
+def test_snapshot_checkpoint_is_the_lowest_development_loss_over_all_outputs_and_never_uses_ap(monkeypatch):
+    cfg = small_stage_cfg()
+    records = [record(cfg, i) for i in range(12)]
+    splits = {"supervised": list(range(8)), "dev": list(range(8, 12))}
+    teacher = {"safe": np.eye(12, cfg.n, dtype=np.float32), "maximum": np.eye(12, cfg.n, dtype=np.float32)}
+    monkeypatch.setattr(a, "ap_score", refuse_ap)
+    checkpoint = a.fit_snapshot(records, splits, teacher, cfg, torch.device("cpu"))
+    history = checkpoint["history"]
+    losses = [entry["dev_loss"] for entry in history]
+    assert len(history) > 1 and all(set(entry) == {"epoch", "train_loss", "dev_loss"} for entry in history)
+    assert checkpoint["best_epoch"] == history[int(np.argmin(losses))]["epoch"]
+    # The saved weights score that loss on every reachable development state and zero-shot order.
+    model = a.ResNet(cfg.input_dim, 3*cfg.n+2, cfg)
+    model.load_state_dict(checkpoint["weights"])
+    model.eval()
+    dev = a.SnapshotViews(records, splits["dev"], cfg, "cpu", teacher, a.reachable_states(cfg))
+    _, x, y = next(dev.ordered(dev.rows))
+    with torch.no_grad():
+        expected = float(a.snapshot_loss(model(x), y, cfg))
+    assert expected == pytest.approx(min(losses), rel=1e-4)
+    assert checkpoint["dev_summary"]["loss"] > 0 and checkpoint["dev_summary"]["top1"] is not None
 
 
 def test_reference_score_ties_preserve_max_identity_after_slot_permutation():
@@ -317,7 +398,7 @@ def test_no_max_fallback_and_strict_optional_later_filter():
     assert a.goal_condition(0, order, empty, empty, p, full, state, disabled)
 
 
-def test_recognition_can_require_evaluator_or_prerequisite_path():
+def test_recognition_can_require_an_evaluator_or_a_one_shot_candidate():
     cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
     r = record(cfg)
     class EvaluatorRecognition:
@@ -326,10 +407,10 @@ def test_recognition_can_require_evaluator_or_prerequisite_path():
             if state.evaluator_mask:
                 p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
             return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states, allow_hidden_source=False):
+        def predict_many(self, rec, states):
             values = [self.predict(rec, state) for state in states]
             return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
-    states = a.structural_states(cfg.zero_shots, cfg.k)
+    states = a.presence_states(cfg.zero_shots, cfg.k)
     safe = maximum = np.array([1, 0, 0], np.float32)
     scenario = a.decision_scenario(r, np.array([.9, .8, .7]), safe, maximum,
                                    EvaluatorRecognition(), cfg, states)
@@ -341,7 +422,9 @@ def test_recognition_can_require_evaluator_or_prerequisite_path():
     assert case["status"] == "ACTION"
     assert rows[case["training_row"]]["target"][0] == 1  # Only R1 is needed.
 
-    # Rank one is now the one-shot candidate, so source acquisition precedes generation.
+    # Rank one is now the one-shot candidate, and recognizing it also needs an evaluator.
+    # Generating it first and adding R1 first both reach the goal in two steps at the same
+    # cost, so the tie goes to the evaluator action.
     one_shot_safe = one_shot_max = np.array([0, 0, 1], np.float32)
     class OneShotRecognition(EvaluatorRecognition):
         def predict(self, rec, state, cfg_override=None):
@@ -355,9 +438,36 @@ def test_recognition_can_require_evaluator_or_prerequisite_path():
     rows, cases = a.aggregate_decision_rows([scenario], cfg)
     case = next(c for c in cases if c["candidate_mask"] == 1 and c["evaluator_mask"] == 0)
     assert case["status"] == "ACTION"
-    assert rows[case["training_row"]]["target"][0] == 1
-    assert not a.valid_actions(a.State(), cfg)[2]
-    assert a.valid_actions(a.State(1, 1), cfg)[2]
+    row = rows[case["training_row"]]
+    assert row["target"][0] == 1
+    assert row["action_reach"][2] == 1  # Generating OS1 before R1 reaches the goal as well.
+    assert a.valid_actions(a.State(), cfg)[2] and a.valid_actions(a.State(1, 1), cfg)[2]
+
+
+def test_planner_generates_a_one_shot_before_any_evaluator_when_that_alone_reaches_the_goal():
+    cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
+    r = record(cfg)
+    # Rank one is the one-shot candidate, and recognizing it needs no evaluator.
+    safe = maximum = np.array([0, 0, 1], np.float32)
+    class Predictor:
+        def predict(self, rec, state, cfg_override=None):
+            p = np.zeros(3*cfg.n+2, np.float32)
+            if state.candidate_mask & 4:
+                p[[cfg.n+2, 2*cfg.n+2, 3*cfg.n, 3*cfg.n+1]] = .9
+                p[2] = .9
+            return np.zeros(cfg.hidden_dim, np.float32), p
+        def predict_many(self, rec, states):
+            values = [self.predict(rec, state) for state in states]
+            return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
+    scenario = a.decision_scenario(r, np.array([.8, .7, .9]), safe, maximum, Predictor(), cfg,
+                                   a.presence_states(cfg.zero_shots, cfg.k))
+    rows, cases = a.aggregate_decision_rows([scenario], cfg)
+    case = next(c for c in cases if c["candidate_mask"] == 1 and c["evaluator_mask"] == 0)
+    row = rows[case["training_row"]]
+    # OS1 alone is one step and one call; reaching it through R1 first would cost 30 more calls.
+    assert case["status"] == "ACTION" and row["reach"] == 1
+    np.testing.assert_array_equal(row["target"], [0., 0., 1.])
+    assert row["expected_steps"] == 1 and row["expected_cost"] == 1
 
 
 def test_explicit_status_precedence_and_case_reconciliation():
@@ -374,11 +484,11 @@ def test_explicit_status_precedence_and_case_reconciliation():
                 if state.candidate_mask & (1 << i):
                     p[i] = self.values[i]
             return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states, allow_hidden_source=False):
+        def predict_many(self, rec, states):
             values = [self.predict(rec, state) for state in states]
             return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
     rows, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([.9, .7, .3]), cfg)
-    assert len(cases) == 20
+    assert len(cases) == 28
     assert a.Counter(c["status"] for c in cases)["COMPLETE"] > 0
     rank_by_mask = {c["candidate_mask"]: c for c in cases
                     if c["scenario"] == 0 and c["evaluator_mask"] == 0}
@@ -386,9 +496,24 @@ def test_explicit_status_precedence_and_case_reconciliation():
     assert rank_by_mask[3]["goal_rank"] == 2 and rank_by_mask[3]["status"] == "ACTION"
     assert next(c for c in cases if c["scenario"] == 0 and c["candidate_mask"] == 7
                 and c["evaluator_mask"] == 1)["status"] == "COMPLETE"
+    # A case has a row exactly when an action is affordable, unless every reference goal holds:
+    # the goals need every candidate but no evaluator, so a COMPLETE state can still have R1 to add.
     assert all((c["training_row"] is not None) == bool(a.valid_actions(
-        a.State(c["candidate_mask"], c["evaluator_mask"]), cfg).any()) for c in cases)
-    assert all(c["training_row"] is None for c in cases if c["status"] == "COMPLETE")
+        a.State(c["candidate_mask"], c["evaluator_mask"]), cfg).any())
+        for c in cases if c["status"] != "COMPLETE")
+    full = {c["scenario"]: c for c in cases if c["candidate_mask"] == 7 and c["evaluator_mask"] == 1}
+    # The swapped zero-shot order never recognizes its rank one, so its full pool is EXHAUSTED.
+    assert full[0]["status"] == "COMPLETE" and full[1]["status"] == "EXHAUSTED"
+    assert all(c["training_row"] is None for c in full.values())
+    complete_without_evaluator = next(c for c in cases if c["scenario"] == 0 and c["candidate_mask"] == 7
+                                      and c["evaluator_mask"] == 0)
+    assert complete_without_evaluator["status"] == "COMPLETE"
+    assert a.valid_actions(a.State(7, 0), cfg).tolist() == [True, False, False]
+    # It keeps a row only through an unfinished case with the same visible observation.
+    sharer = next(c for c in cases if c["scenario"] == 1 and c["candidate_mask"] == 7
+                  and c["evaluator_mask"] == 0)
+    assert sharer["status"] in ("ACTION", "UNREACHABLE")
+    assert complete_without_evaluator["training_row"] == sharer["training_row"] is not None
     assert all(np.isclose(row["target"].sum(), 1) and not row["target"][~row["valid"]].any()
                for row in rows)
     rows, cases = a.build_decision_rows(r, scores, empty, empty, Scripted([0, 0, 0]), cfg)
@@ -402,7 +527,7 @@ def test_explicit_status_precedence_and_case_reconciliation():
     counts = a.Counter(c["status"] for c in cases)
     assert counts["OUT_OF_BUDGET"] > 0 and counts["BUDGET"] > 0
     assert counts["EXHAUSTED"] == 0  # Full state exceeds the budget first.
-    assert sum(counts.values()) == 20
+    assert sum(counts.values()) == 28
 
 
 def test_max_requires_all_four_correct_lights_and_recovers_after_temporary_loss():
@@ -429,7 +554,7 @@ def test_max_requires_all_four_correct_lights_and_recovers_after_temporary_loss(
             if state.candidate_mask not in (1, 7):
                 q[2*cfg.n] = .1  # Either intermediate addition loses MAX; full state restores it.
             return np.zeros(cfg.hidden_dim, np.float32), q
-        def predict_many(self, rec, states, allow_hidden_source=False):
+        def predict_many(self, rec, states):
             values = [self.predict(rec, state) for state in states]
             return np.stack([v[0] for v in values]), np.stack([v[1] for v in values])
     r = record(cfg)
@@ -447,7 +572,7 @@ def test_planner_shares_future_actions_until_zero_shot_evidence_is_observed():
     cfg = a.Config(k=1, zero_shots=2, repeats=1, hidden_dim=4)
     r = record(cfg)
     r.ccs[:, 0] = [1, 0, 0]
-    states = a.structural_states(cfg.zero_shots, cfg.k)
+    states = a.presence_states(cfg.zero_shots, cfg.k)
     scores = np.array([.9, .7, .3])
     safe = maximum = np.array([1, 0, 0], np.float32)
 
@@ -460,7 +585,7 @@ def test_planner_shares_future_actions_until_zero_shot_evidence_is_observed():
                         p[[cfg.n+i, 2*cfg.n+i, 3*cfg.n, 3*cfg.n+1]] = .9
                         p[i] = .9
             return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states, allow_hidden_source=False):
+        def predict_many(self, rec, states):
             values = [self.predict(rec, state) for state in states]
             return np.stack([v[0] for v in values]), np.stack([v[1] for v in values])
 
@@ -486,7 +611,7 @@ def test_planner_shares_future_actions_until_zero_shot_evidence_is_observed():
 def test_future_group_stays_shared_when_only_one_scenario_has_reached_its_goal():
     cfg = a.Config(k=1, zero_shots=2, hidden_dim=4)
     r = record(cfg)
-    states = a.structural_states(cfg.zero_shots, cfg.k)
+    states = a.presence_states(cfg.zero_shots, cfg.k)
     safe = maximum = np.array([1, 0, 0], np.float32)
     class Scripted:
         def predict(self, rec, state, cfg_override=None):
@@ -498,7 +623,7 @@ def test_future_group_stays_shared_when_only_one_scenario_has_reached_its_goal()
                     p[[cfg.n+1, 2*cfg.n+1]] = .9
                     p[1] = .8
             return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states, allow_hidden_source=False):
+        def predict_many(self, rec, states):
             values = [self.predict(rec, state) for state in states]
             return np.stack([x[0] for x in values]), np.stack([x[1] for x in values])
     scenarios = []
@@ -541,7 +666,7 @@ def test_no_max_evaluation_keeps_false_predicted_max_and_separate_stratum():
 
 
 @pytest.mark.parametrize("k,zero_shots", [(1, 1), (1, 5), (5, 1), (5, 3)])
-def test_fixed_sequences_acquire_each_item_once_and_obey_prerequisites(k, zero_shots):
+def test_fixed_sequences_acquire_each_item_once_and_stay_in_the_pool(k, zero_shots):
     cfg = a.Config(k=k, zero_shots=zero_shots)
     expected = {f"ZS{i+1}" for i in range(zero_shots)} | {
         item for i in range(k) for item in (f"R{i+1}", f"OS{i+1}")}
@@ -556,7 +681,7 @@ def test_fixed_sequences_acquire_each_item_once_and_obey_prerequisites(k, zero_s
     assert a.fixed_order_items(cfg, "zero_shots_first")[:zero_shots] == [f"ZS{i+1}" for i in range(zero_shots)]
 
 
-@pytest.mark.parametrize("items", [[], ["R1"], ["ZS1", "OS1"], ["ZS1", "R1", "R1"],
+@pytest.mark.parametrize("items", [[], ["R1"], ["ZS1", "R1", "R1"],
                                    ["ZS1", "R2"],
                                    ["ZS1", "ZS3"], ["ZS1", "ZS1"], ["ZS1", "R6"],
                                    ["ZS1", "OS6"], ["ZS1", "ZS4"], ["ZS1", "X1"]])
@@ -564,6 +689,22 @@ def test_custom_fixed_sequence_rejects_invalid_steps(items):
     cfg = a.Config(fixed_acquisition_orders={"fixed_custom": items})
     with pytest.raises(ValueError):
         cfg.validate()
+
+
+def test_custom_fixed_sequence_may_generate_a_one_shot_before_or_without_its_evaluator():
+    items = ["ZS1", "OS2", "OS1", "R1", "ZS2"]
+    cfg = a.Config(k=2, zero_shots=2, fixed_acquisition_orders={"fixed_custom": items})
+    cfg.validate()
+    assert a.fixed_order_actions(cfg, items) == [3, 2, 0, 1]
+    class NoStop:
+        def predict(self, rec, state, cfg_override=None):
+            return np.zeros(cfg.hidden_dim), np.zeros(3*cfg.n+2)
+    row = a.rollout(record(cfg), np.zeros(cfg.n), NoStop(), cfg, policy="fixed_custom", trace=True)
+    steps = [step for step in row["trajectory"] if step["action"] is not None]
+    assert [step["acquired_item"] for step in steps] == items[1:]
+    # Without an evaluator a one-shot candidate costs only its generation call.
+    assert [step["incremental_cost"] for step in steps] == [1, 1, 40, 11]
+    assert row["reason"] == "fixed_sequence_exhaustion" and row["evaluator_mask"] == 1
 
 
 def test_fixed_and_learned_policies_stop_after_recognizing_generated_max():
@@ -821,11 +962,11 @@ def test_tied_goal_paths_prioritize_retrieved_evidence():
             if state.evaluator_mask and state.candidate_mask & 2:
                 p[[cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1]] = .9
             return np.zeros(cfg.hidden_dim, np.float32), p
-        def predict_many(self, rec, states, allow_hidden_source=False):
+        def predict_many(self, rec, states):
             pairs = [self.predict(rec, state) for state in states]
             return np.stack([x[0] for x in pairs]), np.stack([x[1] for x in pairs])
     scenario = a.decision_scenario(r, np.array([.9, .8, .1]), safe, maximum,
-                                   Predictor(), cfg, a.structural_states(cfg.zero_shots, cfg.k))
+                                   Predictor(), cfg, a.presence_states(cfg.zero_shots, cfg.k))
     rows, cases = a.aggregate_decision_rows([scenario], cfg)
     case = next(c for c in cases if (c["candidate_mask"], c["evaluator_mask"]) == (1, 0))
     row = rows[case["training_row"]]
@@ -970,8 +1111,9 @@ def test_continuation_counts_all_orders_and_allows_recovery_after_a_dipped_goal(
             return np.zeros(cfg.hidden_dim, np.float32), np.zeros(3*cfg.n+2)
     class Head(torch.nn.Module):
         def forward(self, hidden):
-            return torch.tensor([[0., 1., 2.]]).repeat(len(hidden), 1)
+            return torch.tensor([[1., 2., 0.]]).repeat(len(hidden), 1)
     # Initial rank recognized; adding ZS2 loses it; the final pool would restore all goals.
+    # The head acquires ZS2, then R1, then OS1.
     def flags(rank, order, safe, maximum, probabilities, full_probabilities, state, config):
         return state.candidate_mask == 7 or (rank == 0 and state.candidate_mask == 1)
     monkeypatch.setattr(a, "goal_condition", flags)
@@ -997,8 +1139,9 @@ def test_continuation_reports_final_recognition_after_an_unrecovered_goal_loss(m
             return np.zeros(cfg.hidden_dim, np.float32), np.zeros(3*cfg.n+2)
     class Head(torch.nn.Module):
         def forward(self, hidden):
-            return torch.tensor([[0., 1., 2.]]).repeat(len(hidden), 1)
+            return torch.tensor([[1., 2., 0.]]).repeat(len(hidden), 1)
     # Two ranks are recognized after ZS2, then retrieval loses both permanently.
+    # The head acquires ZS2, then R1, then OS1.
     def flags(rank, order, safe, maximum, probabilities, full_probabilities, state, config):
         return state.evaluator_mask == 0 and rank < bin(state.candidate_mask).count("1")
     monkeypatch.setattr(a, "goal_condition", flags)
@@ -1051,6 +1194,9 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
             f"(schema {a.DECISION_LABEL_SCHEMA}, one byte per row plus one bitmap per question)"
             ) in log
     assert f"Stage 4 rolls out each question once and saves compact outcomes to {a.ROLLOUT_FILE}" in log
+    # Stages 1-2 report and select on development loss; AP appears only in the report tables.
+    assert "development loss" in log and "development AP" not in log
+    assert "Mean AP" in log
     assert snapshot_training_ids and all(ids == work.splits["supervised"] for ids in snapshot_training_ids)
     assert set(work.results["external"]["adaptive"]["policies"]) == {
         "full", "fixed", "fixed_evaluators_first", "fixed_zero_shots_first", "supervised"}
@@ -1114,13 +1260,13 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     coverage = work.decision_checkpoint["coverage"]["policy"]
     assert coverage["action_rows"] == len(stores["policy"]["preferred"])
     assert coverage["state_order_cases"] == (
-        len(a.structural_states(cfg.zero_shots, cfg.k)) * 2 * len(work.splits["policy"]))
+        len(a.presence_states(cfg.zero_shots, cfg.k)) * 2 * len(work.splits["policy"]))
     audit = work.decision_label_audit("policy", 0)
     assert len(audit["rows"]) == stores["policy"]["offsets"][1].item()
     assert {"uid", "state_key", "target", "valid", "goal_rank"} <= set(audit["rows"][0])
     assert not {"truth", "teacher_scores", "future_measurements", "weight"} & set(audit["rows"][0])
     assert {row["uid"] for row in audit["rows"]} == {stores["policy"]["uids"][0]}
-    assert len(audit["cases"]) == len(a.structural_states(cfg.zero_shots, cfg.k)) * 2
+    assert len(audit["cases"]) == len(a.presence_states(cfg.zero_shots, cfg.k)) * 2
     external_uids = role_uids["external"] | role_uids["second"]
     assert not role_uids["supervised"] & (role_uids["dev"] | role_uids["audit"] | external_uids)
     protocol = work.results["evaluation_protocol"]
@@ -1303,7 +1449,7 @@ def test_cached_decision_structure_matches_public_action_contract(cost_unit, max
     cfg = a.Config(k=2, zero_shots=2, repeats=3, cost_unit=cost_unit, max_cost=max_cost)
     states, transitions, valid, costs = a.decision_structure(
         cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
-    assert states == a.structural_states(cfg.zero_shots, cfg.k)
+    assert states == a.presence_states(cfg.zero_shots, cfg.k)
     for state in states:
         np.testing.assert_array_equal(valid[state], a.valid_actions(state, cfg))
         assert costs[state] == a.state_cost(state, cfg)
@@ -1315,7 +1461,7 @@ def test_cached_decision_structure_matches_public_action_contract(cost_unit, max
 @pytest.mark.parametrize("has_maximum", [False, True])
 def test_vectorized_decision_goals_match_scalar_rules_at_boundaries(later_rank_filter, has_maximum):
     cfg = a.Config(k=2, zero_shots=2, later_rank_filter=later_rank_filter)
-    states = a.structural_states(cfg.zero_shots, cfg.k)
+    states = a.presence_states(cfg.zero_shots, cfg.k)
     rng = np.random.RandomState(76)
     # Include exact recognition thresholds and tied correctness probabilities.
     probabilities = rng.choice([0., .49, .50, .51, 1.], (len(states), 3*cfg.n+2))

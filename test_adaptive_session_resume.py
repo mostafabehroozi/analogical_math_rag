@@ -180,10 +180,12 @@ def test_stage3_fingerprint_ignores_log_paths_and_reproduces_the_path_bound_form
     moved.test_files = ["/content/working/logs/" + Path(path).name for path in cfg.test_files]
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, moved) == current
     # Code through e4b82f0 also hashed the configured paths. The pinned value guards that
-    # formula; it was re-pinned when revision 6 changed the Stage 1-2 config fields.
+    # formula; it was re-pinned when revision 6 changed the Stage 1-2 config fields, and again for
+    # revisions 7 and 8 (the digest includes the revision; at revision 6 the formula still gives
+    # 5c21f1cdbe69f5cccc7b7a56223eaa94bc50a3921d7fa387245cb65a5b326b9d).
     legacy = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
                                             [cfg.train_file] + cfg.test_files)
-    assert legacy == "5c21f1cdbe69f5cccc7b7a56223eaa94bc50a3921d7fa387245cb65a5b326b9d" != current
+    assert legacy == "16415eca116d061dd02d2ebc0bf1ec892c84c54b55a2f3ff3c22ae32cb589230" != current
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg,
                                           [moved.train_file] + moved.test_files) not in (legacy, current)
 

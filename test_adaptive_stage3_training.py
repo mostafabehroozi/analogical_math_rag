@@ -303,7 +303,7 @@ def test_lean_labels_equal_compacted_audit_rows_and_coverage(overrides):
 def test_first_case_bitmaps_round_trip_planning_order_and_reject_corruption():
     cfg = a.Config()
     cases = a.decision_case_count(cfg)
-    assert cases == 6 * 1912
+    assert cases == 6 * 8160  # Every nonempty candidate subset with every evaluator subset.
     sizes = a.decision_state_sizes(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     rng = np.random.RandomState(5)
     chosen = np.flatnonzero(rng.rand(cases) < .6)
@@ -320,10 +320,10 @@ def test_first_case_bitmaps_round_trip_planning_order_and_reject_corruption():
     with pytest.raises(ValueError, match="distinct in-budget"):
         a.decision_first_cases([cases], cfg)
     tiny = a.Config(k=1, zero_shots=1)
-    assert a.decision_case_count(tiny) == 4
-    # Cases 1 and 3 hold one- and three-item structures: the larger one is planned first.
-    np.testing.assert_array_equal(a.decision_row_sources(np.array([0b01010000], np.uint8), tiny), [3, 1])
-    for corrupt in (np.array([0b01011000], np.uint8), np.zeros(2, np.uint8)):
+    assert a.decision_case_count(tiny) == 6
+    # Cases 0 and 5 hold one- and three-item structures: the larger one is planned first.
+    np.testing.assert_array_equal(a.decision_row_sources(np.array([0b10000100], np.uint8), tiny), [5, 0])
+    for corrupt in (np.array([0b10000110], np.uint8), np.zeros(2, np.uint8)):
         with pytest.raises(ValueError, match="wrong size or padding"):
             a.decision_row_sources(corrupt, tiny)
 
@@ -353,7 +353,7 @@ def test_default_geometry_question_labels_need_about_one_byte_per_row(tmp_path):
     # stored frozen features), which filled Kaggle's disk part-way through Stage 3;
     # schema 4 still kept an int32 source per row, about 5 bytes per row.
     rows = labels["coverage"]["action_rows"]
-    assert rows > 5000
+    assert rows > 20000  # About 48,960 cases merge into about 32,000 visible rows.
     assert path.stat().st_size < rows + a.decision_case_count(cfg) // 8 + 4 * 1024
     audit_rows, cases = a.build_decision_rows(record, scores, safe, maximum, predictor, cfg)
     compact = a.compact_decision_labels(record, audit_rows, cases, cfg)
@@ -415,14 +415,14 @@ def write_legacy_layout(out, records, splits, teacher, predictor, cfg, layout, f
     if fingerprint is None:
         fingerprint = a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
     paths = a.decision_shard_paths(records, splits, out)
-    structures = len(a.structural_states(cfg.zero_shots, cfg.k))
+    structures = len(a.presence_states(cfg.zero_shots, cfg.k))
     for role in ("policy", "dev"):
         for idx, path in zip(splits[role], paths[role]):
             rows, cases = a.build_decision_rows(records[idx], teacher["scores"][idx], teacher["safe"][idx],
                                                 teacher["maximum"][idx], predictor, cfg)
             shard = {"schema_version": 3, "implementation_revision": a.PIPELINE_REVISION,
                      "fingerprint": fingerprint, "uid": records[idx].uid,
-                     "structural_states": structures,
+                     "presence_states": structures,
                      "expected_cases": structures * math.factorial(cfg.zero_shots),
                      "rows": rows, "cases": cases}
             path.parent.mkdir(parents=True, exist_ok=True)

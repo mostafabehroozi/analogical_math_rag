@@ -35,7 +35,7 @@ In supervised learning, you normally train on pairs such as `(features, correct_
 
 Here, the question is sequential: **What should I do now, knowing that my choice changes the evidence I will have for the next decision?**
 
-An evaluator might cost calls now and provide no immediate improvement. But its result could reveal that the current favorite answer is weak, or enable a useful candidate on the next step. We therefore care about the **eventual answer and total cost**, rather than whether one isolated acquisition looks good.
+An evaluator might cost calls now and provide no immediate improvement. But its result could reveal that the current favorite answer is weak, or point to a useful candidate to generate next. We therefore care about the **eventual answer and total cost**, rather than whether one isolated acquisition looks good.
 
 | RL term | Meaning in this project |
 |---|---|
@@ -75,7 +75,7 @@ Predictor ranks that candidate first; stop rule fires
 Return that answer and score whether it was correct
 ```
 
-An earlier action can be useful because it enables a later one. That is the central reason to use RL here.
+Activating R2 was not required before acquiring R2's one-shot candidate; here its evidence simply changed which candidate looked worth generating. An earlier action can be useful because the evidence it reveals changes which later action is worth taking. That is the central reason to use RL here.
 
 ## Level 3: What exactly can the agent choose?
 
@@ -89,7 +89,7 @@ With the default five retrieved sources, the head emits **seven numbers**, one f
 
 These actions acquire **bundles**. Activating an evaluator reveals its baseline measurements and its CCS measurements against candidates already acquired. Adding a candidate reveals its generation result and CCS measurements against active evaluators. See [`raw_next_state()`](adaptive_analogical_training.py#L664).
 
-An action may be unavailable because its candidate was already acquired, its source has not been activated, the pool is exhausted, or its resulting cost exceeds the budget. [`valid_actions()`](adaptive_analogical_training.py#L684) builds a Boolean mask. The code applies that mask during exploration, greedy choice, **and** calculation of future training targets.
+An action may be unavailable because its candidate was already acquired, the pool is exhausted, or its resulting cost exceeds the budget; a one-shot action does not need its source's evaluator. [`valid_actions()`](adaptive_analogical_training.py#L684) builds a Boolean mask. The code applies that mask during exploration, greedy choice, **and** calculation of future training targets.
 
 The seven outputs are **Q-values**, not probabilities. A Q-value estimates the future reward from taking that action and then continuing well.
 

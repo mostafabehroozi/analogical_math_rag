@@ -27,7 +27,9 @@ import numpy as np
 import torch
 from torch import nn
 
-PIPELINE_REVISION = 6  # Stages 1-2 train on every presence state and zero-shot order.
+# Stages 1-2 train on every presence state and zero-shot order and select checkpoints by development
+# loss. A one-shot candidate does not need its own evaluator, so Stage 3 covers every presence state.
+PIPELINE_REVISION = 8
 
 
 # %% Configuration and compact data
@@ -40,7 +42,7 @@ class Config:
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ])
-    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v6_run"
+    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v8_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
     device: str = "auto"
@@ -536,26 +538,34 @@ def teacher_loss(logits, targets, cfg):
     return ((raw * present).sum(1) / present.sum(1).clamp_min(1)).mean()
 
 
+def lower_loss(new, old):
+    """A development loss is better only when it falls by more than float noise."""
+    return new < old - 1e-8
+
+
 def train_teacher(records, train_ids, val_ids, cfg, device, seed, name):
-    """Train on every presence state and zero-shot order; select on complete-state AP."""
+    """Train on every presence state and zero-shot order; keep the checkpoint with the lowest
+    development correctness loss on complete states. AP is a report metric, never a training signal."""
     seed_everything(seed)
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
     # The ranking passed to later stages is read from complete states, so selection is too.
     vx = np.stack([observation(records[i], full, cfg) for i in val_ids])
+    # Every candidate is present in a complete state, so each carries a correctness target.
+    vy = torch.as_tensor(np.stack([np.r_[records[i].labels, np.ones(cfg.n)] for i in val_ids]),
+                         dtype=torch.float32)
     # The complete view is the one later stages read, so it gets its own share of training.
     views = SnapshotViews(records, train_ids, cfg, device, complete_share=cfg.teacher_complete_share)
     model = ResNet(cfg.input_dim, cfg.n, cfg).to(device)
 
     def evaluate(model):
-        pred = predict_array(model, vx, device)
-        score = float(np.mean([ap_score(ranked_indices(p, retrieval_order(cfg)), records[i].labels)
-                               for p, i in zip(pred, val_ids)]))
-        return score, f"development AP {score:.4f}"
+        # The training loss itself, on the complete-state development views.
+        score = float(teacher_loss(torch.as_tensor(predict_array(model, vx, device)), vy, cfg))
+        return score, f"development loss {score:.4f}"
 
     fit = train_on_views(model, views, cfg.teacher_epochs, seed, lambda logits, y: teacher_loss(logits, y, cfg),
-                         evaluate, lambda new, old: new > old + 1e-8, cfg, name)
+                         evaluate, lower_loss, cfg, name)
     print(f"{name:<24} | epochs {fit['epochs']:6.2f} | best {fit['best_epoch']:6.2f} | "
-          f"development AP {fit['best']:.4f}")
+          f"development loss {fit['best']:.4f}")
     return {"weights": fit["weights"], "best_epoch": fit["best_epoch"], "history": fit["history"],
             "train_ids": [records[i].uid for i in train_ids],
             "validation_ids": [records[i].uid for i in val_ids]}
@@ -640,6 +650,11 @@ def fit_teachers(records, splits, cfg, device, out, sync=None):
 # %% Partial snapshots and supervised prediction
 @dataclass(frozen=True)
 class State:
+    """Which candidates and evaluators are acquired.
+
+    Any nonempty candidate subset combines with any evaluator subset: a one-shot
+    candidate can be generated before, after, or without its own evaluator.
+    """
     candidate_mask: int = 1         # ZS1 initially exists at runtime.
     evaluator_mask: int = 0         # Arbitrary subset of ordered evaluators.
 
@@ -670,7 +685,7 @@ def bits_from_array(values):
 
 
 def complete_snapshot_state(candidates, retrieved, evaluators, cfg):
-    """Construct the fully measured version of any coherent structural state."""
+    """Construct the fully measured version of any presence state."""
     cells = sum(evaluators << (i * cfg.k) for i in range(cfg.n) if candidates & (1 << i))
     state = SnapshotState(candidates, retrieved, evaluators, retrieved,
                           evaluators, evaluators, cells, cells)
@@ -678,8 +693,8 @@ def complete_snapshot_state(candidates, retrieved, evaluators, cfg):
     return state
 
 
-def validate_snapshot_state(state, cfg, allow_hidden_source=False):
-    """Enforce causal availability, including source without evaluator."""
+def validate_snapshot_state(state, cfg):
+    """Enforce causal availability. A one-shot candidate needs no evaluator of its own."""
     if min(state.candidates, state.retrieved, state.evaluators,
            state.similarity_observed, state.baseline_attempted,
            state.baseline_observed, state.ccs_attempted, state.ccs_observed) < 0:
@@ -690,8 +705,6 @@ def validate_snapshot_state(state, cfg, allow_hidden_source=False):
         raise ValueError("retrieval/evaluator mask out of range")
     if state.evaluators & ~state.retrieved:
         raise ValueError("evaluator without retrieved source")
-    if not allow_hidden_source and state.candidates >> cfg.zero_shots & ~state.evaluators:
-        raise ValueError("one-shot candidate without retrieved source")
     if state.similarity_observed & ~state.retrieved:
         raise ValueError("similarity without retrieved source")
     if state.baseline_attempted & ~state.evaluators or state.baseline_observed & ~state.baseline_attempted:
@@ -702,53 +715,34 @@ def validate_snapshot_state(state, cfg, allow_hidden_source=False):
         raise ValueError("invalid CCS masks")
 
 
-def as_snapshot_state(state, cfg, allow_hidden_source=False):
+def as_snapshot_state(state, cfg):
     if isinstance(state, SnapshotState):
         return state
     if not isinstance(state, State):
         raise TypeError("Expected State or SnapshotState")
-    active = state.evaluator_mask
-    if allow_hidden_source:
-        cells = sum(active << (i * cfg.k) for i in range(cfg.n)
-                    if state.candidate_mask & (1 << i))
-        result = SnapshotState(state.candidate_mask, active, active, active,
-                               active, active, cells, cells)
-        validate_snapshot_state(result, cfg, allow_hidden_source=True)
-        return result
-    return complete_snapshot_state(state.candidate_mask, active, active, cfg)
+    # Retrieval and evaluation coincide: a one-shot candidate whose evaluator is
+    # absent shows its source slot but none of that source's measurements.
+    return complete_snapshot_state(state.candidate_mask, state.evaluator_mask, state.evaluator_mask, cfg)
 
 
 @lru_cache(maxsize=4)
-def structural_catalog(zero_shots, k):
-    """Every nonempty structure with an active evaluator for each one-shot source."""
-    rows = []
-    for zero_mask in range(1 << zero_shots):
-        for code in range(3 ** k):
-            candidates, retrieved, evaluators, rest = zero_mask, 0, 0, code
-            for i in range(k):
-                choice, rest = rest % 3, rest // 3
-                if choice:
-                    retrieved |= 1 << i
-                    evaluators |= 1 << i
-                if choice == 2:
-                    candidates |= 1 << (zero_shots + i)
-            if candidates:
-                rows.append((candidates, retrieved, evaluators))
-    return tuple(rows)
+def presence_states(zero_shots, k):
+    """Every nonempty candidate subset with every evaluator subset.
 
-
-@lru_cache(maxsize=8)
-def structural_states(zero_shots, k):
-    """All valid presence states, including states without ZS1."""
+    A one-shot candidate does not need its own evaluator, so these are all the
+    states that acquisition, and hiding candidates or evaluators, can produce:
+    (2**8 - 1) * 2**5 = 8,160 by default, including states without ZS1.
+    """
     return tuple(State(candidates, evaluators)
-                 for candidates, _, evaluators in structural_catalog(zero_shots, k))
+                 for candidates in range(1, 1 << (zero_shots + k))
+                 for evaluators in range(1 << k))
 
 
 @lru_cache(maxsize=8)
-def structural_graph(zero_shots, k):
+def state_graph(zero_shots, k):
     """Budget-independent, monotone transitions shared by every question."""
     cfg = Config(zero_shots=zero_shots, k=k)
-    states = structural_states(zero_shots, k)
+    states = presence_states(zero_shots, k)
     index = {state: j for j, state in enumerate(states)}
     transitions = tuple({action: index[nxt]
                          for action in range(cfg.action_count)
@@ -761,7 +755,7 @@ def structural_graph(zero_shots, k):
 def decision_structure(zero_shots, k, repeats, cost_unit, max_cost):
     """Budget-filtered action/cost tables shared across questions and orders."""
     cfg = Config(zero_shots=zero_shots, k=k, repeats=repeats, cost_unit=cost_unit, max_cost=max_cost)
-    states, graph = structural_graph(zero_shots, k)
+    states, graph = state_graph(zero_shots, k)
     costs = {state: state_cost(state, cfg) for state in states}
     transitions, valid = {}, {}
     for state, edges in zip(states, graph):
@@ -820,8 +814,10 @@ def raw_next_state(state, action, cfg):
         if not len(missing):
             return None
         return State(state.candidate_mask | (1 << int(missing[0])), state.evaluator_mask)
+    # Generating source j's one-shot candidate needs neither R(j+1) nor any other
+    # evaluator: its measurements cover whichever evaluators are active, now or later.
     source = action - 2
-    if not 0 <= source < cfg.k or not state.evaluator_mask & (1 << source):
+    if not 0 <= source < cfg.k:
         return None
     slot = cfg.zero_shots + source
     if mask[slot]:
@@ -846,10 +842,10 @@ def advance(state, action, cfg):
     return raw_next_state(state, action, cfg)
 
 
-def observation(record, state, cfg, allow_hidden_source=False):
+def observation(record, state, cfg):
     """Only observed entries are indexed; no labels/teacher scores enter x."""
-    state = as_snapshot_state(state, cfg, allow_hidden_source)
-    validate_snapshot_state(state, cfg, allow_hidden_source=allow_hidden_source)
+    state = as_snapshot_state(state, cfg)
+    validate_snapshot_state(state, cfg)
     cm = present_mask(state, cfg)
     rm = bit_array(state.retrieved, cfg.k)
     em = bit_array(state.evaluators, cfg.k)
@@ -878,21 +874,20 @@ def observation(record, state, cfg, allow_hidden_source=False):
 
 
 @lru_cache(maxsize=8)
-def structural_observation_template(states, zero_shots, k, repeats, cost_unit,
-                                    max_cost, allow_hidden_source):
+def state_observation_template(states, zero_shots, k, repeats, cost_unit, max_cost):
     """Cache state-only bytes/masks; records supply only observed measurements.
 
     Build through the scalar contract once, retaining its validation, float32
-    rounding and budget features. A default catalog needs about 1.8 MiB, rather
-    than repeating this Python work for every question and historical order.
+    rounding and budget features. The default 8,160-state catalog needs about
+    7 MiB, rather than repeating this Python work for every question and
+    historical order.
     """
     cfg = Config(zero_shots=zero_shots, k=k, repeats=repeats,
                  cost_unit=cost_unit, max_cost=max_cost)
     empty = Record("", "", "", [], [], np.zeros(k, np.float32),
                    np.zeros(k, np.float32), np.zeros((cfg.n, k), np.float32),
                    np.zeros(cfg.n, np.float32))
-    template = np.stack([observation(empty, state, cfg, allow_hidden_source)
-                         for state in states])
+    template = np.stack([observation(empty, state, cfg) for state in states])
     similarity_start = cfg.n * (k + 3) + 2*k
     baseline_start = similarity_start + 2*k
     ccs_start = baseline_start + 3*k
@@ -905,15 +900,13 @@ def structural_observation_template(states, zero_shots, k, repeats, cost_unit,
     return template, masks, (similarity_start, baseline_start, ccs_start)
 
 
-def observation_many(record, states, cfg, allow_hidden_source=False):
-    """Batch complete structural states; augmented snapshots keep scalar logic."""
+def observation_many(record, states, cfg):
+    """Batch fully measured presence states; augmented snapshots keep scalar logic."""
     states = tuple(states)
     if not states or not all(isinstance(state, State) for state in states):
-        return np.stack([observation(record, state, cfg, allow_hidden_source)
-                         for state in states])
-    template, masks, offsets = structural_observation_template(
-        states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit,
-        cfg.max_cost, allow_hidden_source)
+        return np.stack([observation(record, state, cfg) for state in states])
+    template, masks, offsets = state_observation_template(
+        states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     xs = template.copy()
     for source, mask, start in zip((record.similarity, record.baseline, record.ccs.ravel()),
                                    masks, offsets):
@@ -932,19 +925,6 @@ def snapshot_target(record, safe, maximum, state, cfg):
                  float(np.any(safe * cm)), float(np.any(maximum * cm)), cm].astype(np.float32)
 
 
-@lru_cache(maxsize=4)
-def presence_states(zero_shots, k):
-    """Every nonempty candidate subset with every evaluator subset.
-
-    These are all states that hiding candidates or evaluators can produce,
-    including one-shots whose evaluator is hidden: (2**8 - 1) * 2**5 = 8,160 by
-    default, a superset of the 1,912 structural_states.
-    """
-    return tuple(State(candidates, evaluators)
-                 for candidates in range(1, 1 << (zero_shots + k))
-                 for evaluators in range(1 << k))
-
-
 SNAPSHOT_EVAL_BATCH = 16384
 
 
@@ -954,16 +934,16 @@ class SnapshotViews:
     Nothing is materialized or written. A shared state table (about 7 MiB for the
     default 8,160 states) holds the state-only observation bytes and masks; each
     question adds its measurements, labels, and SAFE/MAX under each zero-shot order
-    (under 1 KiB). Rows equal observation(..., allow_hidden_source=True) and
-    snapshot_target of the permuted record bit for bit. Views are indexed
-    question-major, then zero-shot order, then state.
+    (under 1 KiB). Rows equal observation(...) and snapshot_target of the
+    permuted record bit for bit. Views are indexed question-major, then
+    zero-shot order, then state.
     """
     def __init__(self, records, ids, cfg, device, teacher=None, states=None, complete_share=0.):
         self.cfg, self.device, self.ids = cfg, torch.device(device), list(ids)
         states = presence_states(cfg.zero_shots, cfg.k) if states is None else tuple(states)
         full = State((1 << cfg.n) - 1, (1 << cfg.k) - 1)
-        template, masks, (sim, base, ccs) = structural_observation_template(
-            states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, True)
+        template, masks, (sim, base, ccs) = state_observation_template(
+            states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
         orders = list(permutations(range(cfg.zero_shots)))
         slots = np.asarray([list(order) + list(range(cfg.zero_shots, cfg.n)) for order in orders])
 
@@ -1055,7 +1035,8 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
     """Every epoch visits every view once, plus the views' complete-state repeats;
     development checks are spread through it.
 
-    `evaluate(model)` returns a comparable score and its description. Patience counts
+    `evaluate(model)` returns the development loss (lower is better) and its description;
+    `better(new, old)` says whether a loss improves on the best so far. Patience counts
     checks without improvement, so training can stop inside a long epoch.
     """
     if views.rows < 2:
@@ -1089,7 +1070,7 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
             check, position = due, epoch + done / views.epoch_rows
             score, text = evaluate(model)
             model.train()
-            history.append({"epoch": position, "train_loss": float(total) / seen, "score": score})
+            history.append({"epoch": position, "train_loss": float(total) / seen, "dev_loss": score})
             epoch_total += total
             total.zero_()
             seen = 0
@@ -1110,18 +1091,23 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
             "epochs": position, "history": history}
 
 
-def snapshot_loss(logits, targets, cfg):
+def snapshot_row_losses(logits, targets, cfg):
+    """The training loss of each view: correctness plus auxiliary SAFE/MAX terms (absent candidates masked)."""
     n = cfg.n
     mask = targets[:, 3*n + 2:]
     raw = nn.functional.binary_cross_entropy_with_logits(logits, targets[:, :3*n+2], reduction="none")
-    losses = [((raw[:, b*n:(b+1)*n] * mask).sum(1) / mask.sum(1).clamp_min(1)).mean()
-              for b in range(3)]
-    return losses[0] + cfg.auxiliary_weight * (losses[1] + losses[2] + raw[:, 3*n:].mean(0).sum())
+    losses = [(raw[:, b*n:(b+1)*n] * mask).sum(1) / mask.sum(1).clamp_min(1) for b in range(3)]
+    return losses[0] + cfg.auxiliary_weight * (losses[1] + losses[2] + raw[:, 3*n:].sum(1))
 
 
+def snapshot_loss(logits, targets, cfg):
+    return snapshot_row_losses(logits, targets, cfg).mean()
+
+
+# `loss` is the sum of snapshot_row_losses, which Stage 2 minimizes and selects its checkpoint on.
 SNAPSHOT_SUM_FIELDS = ("views", "top1", "brier", "brier_cells",
                        "safe_predicted", "safe_true_positive", "safe_true",
-                       "max_predicted", "max_true_positive", "max_true")
+                       "max_predicted", "max_true_positive", "max_true", "loss")
 
 
 def snapshot_sums(model, views, temperatures, cfg):
@@ -1143,6 +1129,7 @@ def snapshot_sums(model, views, temperatures, cfg):
             for col in (3*n, 3*n+1):
                 predicted, true = p[:, col] >= cfg.recognition_threshold, y[:, col] > .5
                 columns += [predicted, predicted & true, true]
+            columns.append(snapshot_row_losses(logits, y, cfg))
             sums.index_add_(0, q, torch.stack([c.double() for c in columns], 1))
     return sums.cpu().numpy()
 
@@ -1151,7 +1138,8 @@ def summarize_snapshot_sums(sums):
     total = np.asarray(sums, np.float64).reshape(-1, len(SNAPSHOT_SUM_FIELDS)).sum(0)
     value = dict(zip(SNAPSHOT_SUM_FIELDS, total))
     ratio = lambda a, b: float(a / b) if b else None
-    return {"snapshots": int(value["views"]), "top1": ratio(value["top1"], value["views"]),
+    return {"snapshots": int(value["views"]), "loss": ratio(value["loss"], value["views"]),
+            "top1": ratio(value["top1"], value["views"]),
             "brier": ratio(value["brier"], value["brier_cells"]),
             **{f"{name}_{metric}": ratio(value[f"{name}_true_positive"], value[f"{name}_{base}"])
                for name in ("safe", "max")
@@ -1202,23 +1190,26 @@ def fit_snapshot(records, splits, teacher, cfg, device):
     uncalibrated = temperature_vector(np.ones(5, np.float32), cfg)
 
     def evaluate(model):
+        # The training loss over all 3n+2 outputs, on the reachable development states. Top-1 and
+        # Brier are shown for information; they do not choose the checkpoint.
         metrics = summarize_snapshot_sums(snapshot_sums(model, dev, uncalibrated, cfg))
-        return ((metrics["top1"], -metrics["brier"]),
-                f"development Top-1 {metrics['top1']:.1%} | Brier {metrics['brier']:.4f}")
+        return (metrics["loss"],
+                f"development loss {metrics['loss']:.4f} (Top-1 {metrics['top1']:.1%}, "
+                f"Brier {metrics['brier']:.4f})")
 
     fit = train_on_views(model, views, cfg.snapshot_epochs, cfg.seed + 201,
                          lambda logits, y: snapshot_loss(logits, y, cfg), evaluate,
-                         lambda new, old: new > old, cfg, "Snapshot")
+                         lower_loss, cfg, "Snapshot")
     model.load_state_dict(fit["weights"])
     temps = fit_temperatures(model, dev, cfg)
-    print(f"Snapshot selected at epoch {fit['best_epoch']:.2f}; development Top-1 {fit['best'][0]:.1%}.")
+    dev_summary = summarize_snapshot_sums(snapshot_sums(model, dev, temperature_vector(temps, cfg), cfg))
+    print(f"Snapshot selected at epoch {fit['best_epoch']:.2f}; development loss {fit['best']:.4f} "
+          f"({dev_summary['loss']:.4f} calibrated), Top-1 {dev_summary['top1']:.1%}.")
     return {"weights": fit["weights"], "temperatures": temps, "history": fit["history"],
             "best_epoch": fit["best_epoch"], "input_dim": cfg.input_dim,
             "presence_states": views.state_count, "zero_shot_orders": views.order_count,
             "views_per_epoch": views.rows, "rows_per_epoch": views.epoch_rows,
-            "complete_copies": views.complete_copies,
-            "dev_summary": summarize_snapshot_sums(
-                snapshot_sums(model, dev, temperature_vector(temps, cfg), cfg))}
+            "complete_copies": views.complete_copies, "dev_summary": dev_summary}
 
 
 class FrozenPredictor:
@@ -1242,13 +1233,11 @@ class FrozenPredictor:
             parts = [self.model.encode(xs[start:start+8192]) for start in range(0, len(xs), 8192)]
         return torch.cat(parts) if parts else torch.empty((0, self.cfg.hidden_dim), device=self.device)
 
-    def predict_many(self, record, states, cfg_override=None, allow_hidden_source=False,
-                     observations=None):
+    def predict_many(self, record, states, cfg_override=None, observations=None):
         """Batch frozen inference; only visible measurements enter the network."""
         cfg = cfg_override or self.cfg
         states = tuple(states)
-        xs = observations if observations is not None else observation_many(
-            record, states, cfg, allow_hidden_source)
+        xs = observations if observations is not None else observation_many(record, states, cfg)
         hs, ps = [], []
         self.model.eval()
         with torch.no_grad():
@@ -1348,17 +1337,14 @@ def states_from(start, cfg):
                 pending.append(nxt)
     return pending
 
-def decision_scenario(record, scores, safe, maximum, predictor, cfg, states,
-                      allow_hidden_source=False, reference_order=None):
+def decision_scenario(record, scores, safe, maximum, predictor, cfg, states, reference_order=None):
     """Cache frozen evidence and goals without optimizing a clairvoyant path."""
     # Reuse exactly the same observation bytes for inference and visible grouping.
-    observations = observation_many(record, states, cfg, allow_hidden_source)
+    observations = observation_many(record, states, cfg)
     if isinstance(predictor, FrozenPredictor):
-        hidden, probabilities = predictor.predict_many(
-            record, states, allow_hidden_source=allow_hidden_source, observations=observations)
+        hidden, probabilities = predictor.predict_many(record, states, observations=observations)
     else:
-        hidden, probabilities = predictor.predict_many(
-            record, states, allow_hidden_source=allow_hidden_source)
+        hidden, probabilities = predictor.predict_many(record, states)
     full_cfg = copy.deepcopy(cfg)
     full_cfg.max_cost = None
     _, full_probability = predictor.predict(record, State((1 << cfg.n)-1, (1 << cfg.k)-1), full_cfg)
@@ -1391,9 +1377,9 @@ def decision_goals(order, safe, maximum, probabilities, full_probabilities, stat
     return goal
 
 
-def visible_state_key(record, state, cfg, allow_hidden_source=False):
+def visible_state_key(record, state, cfg):
     # Candidate IDs and hidden order are audit information, not model features.
-    observed = observation(record, state, cfg, allow_hidden_source)
+    observed = observation(record, state, cfg)
     return (state.candidate_mask, state.evaluator_mask, hashlib.sha256(observed.tobytes()).hexdigest())
 
 
@@ -1410,6 +1396,11 @@ def plan_decision_rows(scenarios, cfg, transition_table=None):
     prioritizes its first unfinished rank, including an earlier lost goal.
     Values follow that recovery policy rather than an unrestricted fixed-goal
     shortest path.
+
+    A case whose reference goals all hold (COMPLETE) has no unfinished rank, so
+    it plans nothing; it needs every candidate, not every evaluator, and only
+    the evaluator action can remain for it. It keeps a row only when an
+    unfinished case shares its visible observation.
 
     The plan is held in arrays rather than per-case dictionaries: for every
     case (scenario-major), a status code, goal rank, and training row; for
@@ -1428,11 +1419,15 @@ def plan_decision_rows(scenarios, cfg, transition_table=None):
     actions_by_state = {state: np.flatnonzero(valid) for state, valid in valid_by_state.items()}
     costs = {state: cached_costs[state] if state in cached_costs else state_cost(state, cfg)
              for state in unique_states}
+    fallback_actions = {}
     def fill_pool_action(state):
         """Prefer the next valid retrieval, otherwise the cheapest candidate."""
-        return min(actions_by_state[state], key=lambda action: (
-            0 if action == 0 else 1,
-            costs[advance(state, int(action), cfg)] - costs[state], int(action)))
+        # Depends only on the state, which many visible groups share; its actions are valid.
+        if state not in fallback_actions:
+            fallback_actions[state] = min(actions_by_state[state], key=lambda action: (
+                0 if action == 0 else 1,
+                costs[raw_next_state(state, int(action), cfg)] - costs[state], int(action)))
+        return fallback_actions[state]
     prefixes = [np.logical_and.accumulate(scenario["goal"], axis=1) for scenario in scenarios]
     goal_ranks = [prefix.sum(axis=1) for prefix in prefixes]
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
@@ -1571,6 +1566,7 @@ def plan_decision_rows(scenarios, cfg, transition_table=None):
         for s, index, _ in group:
             if status[starts[s] + index] == pending:
                 status[starts[s] + index] = action_status if reached else unreachable
+            # A finished member of a mixed group shares its identical visible observation's row.
             case_row[starts[s] + index] = row
     if pending in status:
         raise AssertionError("A decision case was left without a disposition.")
@@ -1658,7 +1654,7 @@ def build_decision_labels(record, scores, safe, maximum, predictor, cfg):
     """One question's stored labels and coverage, planned without audit dictionaries.
 
     The same plan as build_decision_rows; only its arrays are kept, so a
-    default-geometry question peaks near 20 MiB instead of 60 MiB.
+    default-geometry question peaks near 70 MiB instead of 120 MiB.
     """
     all_states, transitions, _, _ = decision_structure(
         cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
@@ -1843,7 +1839,7 @@ def upgrade_decision_fingerprints(records, splits, teacher, predictor, cfg, out)
 def label_coverage(rows, cases, cfg):
     """One question's state/order dispositions; the rows and cases are not stored."""
     statuses = Counter(case["status"] for case in cases)
-    structures = structural_states(cfg.zero_shots, cfg.k)
+    structures = presence_states(cfg.zero_shots, cfg.k)
     expected = {(sid, state.candidate_mask, state.evaluator_mask)
                 for sid in range(math.factorial(cfg.zero_shots)) for state in structures}
     actual = {(case["scenario"], case["candidate_mask"], case["evaluator_mask"])
@@ -1859,7 +1855,11 @@ def label_coverage(rows, cases, cfg):
         index = case["training_row"]
         state = State(case["candidate_mask"], case["evaluator_mask"])
         valid = cached_valid[state] if state in cached_valid else valid_actions(state, cfg)
-        if bool(valid.any()) != (index is not None):
+        # A row needs an affordable action, and a case with one has a row unless every
+        # reference goal already holds (COMPLETE keeps a row only when it shares its visible
+        # observation with an unfinished case).
+        if (index is not None and not valid.any()) or (
+                index is None and valid.any() and case["status"] != "COMPLETE"):
             raise ValueError("Decision label action mapping is incomplete.")
         if index is not None and not 0 <= index < len(rows):
             raise ValueError("Decision labels have an invalid training-row reference.")
@@ -1871,7 +1871,7 @@ def label_coverage(rows, cases, cfg):
                 not np.isclose(row["target"].sum(), 1) or
                 np.any(row["target"][~row["valid"]])):
             raise ValueError("Decision labels have an invalid masked action target.")
-    return {"questions": 1, "structural_states": len(structures),
+    return {"questions": 1, "presence_states": len(structures),
             "state_order_cases": len(cases), "action_rows": len(rows),
             "status_counts": dict(statuses), "trained_status_counts": dict(trained_statuses),
             "actionable_by_target_rank": dict(Counter(str(case["goal_rank"] + 1)
@@ -1885,7 +1885,7 @@ def plan_coverage(plan, cfg, out_of_budget):
     over-budget cases, which never have a row, are only counted.
     """
     states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
-    structures = structural_states(cfg.zero_shots, cfg.k)
+    structures = presence_states(cfg.zero_shots, cfg.k)
     orders = math.factorial(cfg.zero_shots)
     status, case_row = plan["status"], plan["case_row"]
     if (len(status) != orders * len(states) or
@@ -1893,7 +1893,12 @@ def plan_coverage(plan, cfg, out_of_budget):
             not np.array_equal(plan["starts"], np.arange(orders + 1) * len(states))):
         raise ValueError("Decision labels have incomplete state/order coverage.")
     valid = decision_valid_table(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
-    if not np.array_equal(case_row >= 0, np.tile(valid.any(1), orders)):
+    has_action, has_row = np.tile(valid.any(1), orders), case_row >= 0
+    # A row needs an affordable action, and a case with one has a row unless every reference
+    # goal already holds (COMPLETE keeps a row only when it shares its visible observation
+    # with an unfinished case).
+    if (has_row & ~has_action).any() or (
+            has_action & ~has_row & (status != DECISION_STATUSES.index("COMPLETE"))).any():
         raise ValueError("Decision label action mapping is incomplete.")
     if case_row.max(initial=-1) >= len(plan["row_case"]):
         raise ValueError("Decision labels have an invalid training-row reference.")
@@ -1901,7 +1906,7 @@ def plan_coverage(plan, cfg, out_of_budget):
     statuses = Counter(names)
     if out_of_budget:
         statuses["OUT_OF_BUDGET"] += out_of_budget
-    return {"questions": 1, "structural_states": len(structures),
+    return {"questions": 1, "presence_states": len(structures),
             "state_order_cases": len(status) + out_of_budget, "action_rows": len(plan["row_case"]),
             "status_counts": dict(statuses),
             "trained_status_counts": dict(Counter(name for name, row in zip(names, case_row.tolist())
@@ -1918,7 +1923,7 @@ def combine_coverage(parts):
         trained_statuses.update(part["trained_status_counts"])
         ranks.update(part["actionable_by_target_rank"])
     return {"questions": len(parts),
-            "structural_states_per_question": parts[0]["structural_states"] if parts else 0,
+            "presence_states_per_question": parts[0]["presence_states"] if parts else 0,
             "state_order_cases": sum(p["state_order_cases"] for p in parts),
             "action_rows": sum(p["action_rows"] for p in parts),
             "status_counts": dict(statuses), "trained_status_counts": dict(trained_statuses),
@@ -1960,8 +1965,8 @@ def decision_targets(preferred, cfg):
 def decision_row_observations(record, source, cfg):
     """Rebuild each row's label-time observation from its scenario * states + state source."""
     states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
-    template, masks, offsets = structural_observation_template(
-        states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, False)
+    template, masks, offsets = state_observation_template(
+        states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     scenario, position = np.divmod(np.asarray(source, dtype=np.int64), len(states))
     blank = np.zeros(cfg.n, np.float32)
     orders = [permute_zero_shots(record, blank, blank, blank, order, cfg)[0]
@@ -2158,7 +2163,7 @@ def decision_role_labels(role, records, ids, teacher, predictor, cfg, out, finge
     role_path = decision_role_path(out, role)
     paths = question_paths(records, ids, out / "decision_labels" / role)
     legacy_paths = question_paths(records, ids, out / "decision_shards" / role)
-    expected_cases = len(structural_states(cfg.zero_shots, cfg.k)) * math.factorial(cfg.zero_shots)
+    expected_cases = len(presence_states(cfg.zero_shots, cfg.k)) * math.factorial(cfg.zero_shots)
     store = load_label_file(role_path) if role_path.exists() else None
     upgraded = False
     if store is not None:
@@ -2591,7 +2596,7 @@ def fixed_order_actions(cfg, order="interleaved"):
         if (nxt is None or
                 kind == "ZS" and (nxt.candidate_mask ^ state.candidate_mask) != 1 << (number-1) or
                 kind == "R" and (nxt.evaluator_mask ^ state.evaluator_mask) != 1 << (number-1)):
-            raise ValueError(f"Invalid fixed acquisition order at {item}: duplicates, missing evaluator, or out-of-order zero-shot.")
+            raise ValueError(f"Invalid fixed acquisition order at {item}: duplicates, out-of-order evaluator, or out-of-order zero-shot.")
         actions.append(action)
         state = nxt
     return actions
@@ -3369,7 +3374,8 @@ class Workflow:
               f"compact outcomes to {ROLLOUT_FILE}, not trajectories. Stages 1-2 train on every "
               f"presence state under every zero-shot order ({len(presence_states(self.cfg.zero_shots, self.cfg.k)):,} "
               f"x {math.factorial(self.cfg.zero_shots)} views per question), assembled on the "
-              "device and never stored.", flush=True)
+              "device and never stored; each keeps the checkpoint with the lowest development "
+              "loss (AP is only a reported metric).", flush=True)
         cache_path = self.out / "compact_records.pt"
         if self.cfg.resume and cache_path.exists():
             cache = load_checkpoint(cache_path)
@@ -3428,7 +3434,8 @@ class Workflow:
         print("Reference rankings and SAFE/MAX labels come from complete-state predictions; "
               "partial states only train the models.")
         teacher_report(self.records, self.splits["dev"], self.cfg, self.teacher["scores"],
-                       self.heuristics, "TEACHER DEVELOPMENT REPORT (used for model selection)")
+                       self.heuristics, "TEACHER DEVELOPMENT REPORT (metrics only; checkpoints are selected "
+                       "on development loss)")
         self.push("Stage 1 complete: teacher folds and out-of-fold labels")
         return self
 

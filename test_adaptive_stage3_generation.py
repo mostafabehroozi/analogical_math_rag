@@ -17,19 +17,19 @@ def make_record(cfg, seed=7):
 @pytest.mark.parametrize("cost_unit,max_cost", [("solver_calls", None),
                                                ("solver_calls", 9.),
                                                ("total_calls", 9.)])
-def test_batched_structural_observations_preserve_every_scalar_byte(geometry, cost_unit, max_cost):
+def test_batched_observations_preserve_every_scalar_byte(geometry, cost_unit, max_cost):
     zero_shots, k = geometry
     cfg = a.Config(zero_shots=zero_shots, k=k, cost_unit=cost_unit, max_cost=max_cost)
     record = make_record(cfg)
     # Include exhausted and out-of-budget states, and a noncatalog order.
-    states = tuple(reversed(a.structural_states(zero_shots, k)))
+    states = tuple(reversed(a.presence_states(zero_shots, k)))
     expected = np.stack([a.observation(record, state, cfg) for state in states])
     actual = a.observation_many(record, states, cfg)
     assert actual.dtype == np.float32
     assert actual.tobytes() == expected.tobytes()
 
 
-def test_batched_observations_index_only_visible_values_and_validate_hidden_sources():
+def test_batched_observations_index_only_visible_values_and_accept_a_one_shot_without_its_evaluator():
     cfg = a.Config(k=2, zero_shots=2)
     record = make_record(cfg)
     record.similarity[:] = np.nan
@@ -40,10 +40,11 @@ def test_batched_observations_index_only_visible_values_and_validate_hidden_sour
     assert a.observation_many(record, states, cfg).tobytes() == expected.tobytes()
     with pytest.raises(ValueError, match="Invalid snapshot observation"):
         a.observation_many(record, [a.State(1, 1)], cfg)
-    hidden = a.State(1 << cfg.zero_shots, 0)
-    with pytest.raises(ValueError, match="one-shot"):
-        a.observation_many(record, [hidden], cfg)
-    assert a.observation_many(record, [hidden], cfg, True).tobytes() == a.observation(record, hidden, cfg, True).tobytes()
+    # OS1 without R1 is an ordinary state: it shows the candidate's source slot and no measurement
+    # of that source, so even NaN measurements stay invisible.
+    lone = a.State(1 << cfg.zero_shots, 0)
+    assert a.observation_many(record, [lone], cfg).tobytes() == a.observation(record, lone, cfg).tobytes()
+    assert np.isfinite(a.observation(record, lone, cfg)).all()
 
 
 def test_augmented_snapshot_batches_keep_the_scalar_observation_contract():
@@ -55,14 +56,14 @@ def test_augmented_snapshot_batches_keep_the_scalar_observation_contract():
                               full.baseline_attempted, full.baseline_observed & ~1,
                               full.ccs_attempted & ~0b101, full.ccs_observed & ~0b101)
     states = [a.State(), missing, full]
-    expected = np.stack([a.observation(record, state, cfg, True) for state in states])
-    assert a.observation_many(record, states, cfg, True).tobytes() == expected.tobytes()
+    expected = np.stack([a.observation(record, state, cfg) for state in states])
+    assert a.observation_many(record, states, cfg).tobytes() == expected.tobytes()
 
 
-def test_structural_templates_are_reused_across_questions_without_mutating_inputs(monkeypatch):
+def test_state_templates_are_reused_across_questions_without_mutating_inputs(monkeypatch):
     cfg = a.Config(k=2, zero_shots=2)
-    states = a.structural_states(cfg.zero_shots, cfg.k)
-    a.structural_observation_template.cache_clear()
+    states = a.presence_states(cfg.zero_shots, cfg.k)
+    a.state_observation_template.cache_clear()
     original = a.observation
     calls = []
     def counted(*args, **kwargs):
@@ -90,7 +91,7 @@ def test_frozen_batch_probabilities_preserve_scalar_masking_exactly(device):
     model = a.ResNet(cfg.input_dim, 3*cfg.n+2, cfg)
     predictor = a.FrozenPredictor({"weights": a.cpu_state(model),
                                    "temperatures": np.array([.5, 1., 2., .75, 1.5])}, cfg, device)
-    states = a.structural_states(cfg.zero_shots, cfg.k)
+    states = a.presence_states(cfg.zero_shots, cfg.k)
     xs = np.stack([a.observation(record, state, cfg) for state in states])
     hidden_parts, logits_parts = [], []
     with torch.no_grad():

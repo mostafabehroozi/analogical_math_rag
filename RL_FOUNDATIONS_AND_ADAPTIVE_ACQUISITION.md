@@ -173,7 +173,7 @@ Before RL begins, the snapshot model is switched to evaluation mode and its para
 | Environment | `CachedEnvironment` for one complete historical question record |
 | Hidden world state | Full cached candidates, CCS outcomes, and correctness labels |
 | Agent observation | Current acquired snapshot encoded as frozen vector `h`; action validity supplied as a mask |
-| Action | Add the next evaluator, next zero-shot candidate, or a one-shot candidate from an active source |
+| Action | Add the next evaluator, next zero-shot candidate, or the one-shot candidate of any source not yet generated |
 | Reward | Negative incremental acquisition cost; on termination add correctness of returned candidate |
 | Episode | One question from initial `ZS1 + R1` until confidence, budget, or pool exhaustion stops it |
 | Policy | Greedy valid-action Q selection at evaluation; epsilon-greedy valid selection during training |
@@ -191,7 +191,7 @@ The full cached record is used by the environment to reveal outcomes and grade t
 
 These are **bundled** actions. Activating an evaluator reveals its baseline probes and CCS measurements against all currently acquired candidates. Adding a candidate reveals its generation result and CCS measurements against all active evaluators. Activating an evaluator does not automatically create that evaluator's one-shot candidate.
 
-The one-shot action for a source is valid only after its evaluator is active and if that candidate has not already been acquired. Actions are also invalid if the relevant pool is exhausted or if the resulting total cost would exceed the budget. Invalid outputs can still have numeric network values, but they are excluded from random exploration, greedy choice, and the Bellman future maximum. On the initial `ZS1 + R1` snapshot, actions 0, 1, and 2 are structurally possible, subject to budget; actions 3–6 require more activated evaluators.
+The one-shot action for a source is valid whenever that candidate has not already been acquired; it does not need that source's evaluator. Actions are also invalid if the relevant pool is exhausted or if the resulting total cost would exceed the budget. Invalid outputs can still have numeric network values, but they are excluded from random exploration, greedy choice, and the Bellman future maximum. On the initial `ZS1 + R1` snapshot, all seven actions are structurally possible, subject to budget.
 
 ### 14. Cost and reward with actual numbers
 
@@ -234,9 +234,9 @@ This illustrates mechanics; the candidate outcomes and predictions are invented.
 
 1. Start with zero-shot candidate `ZS1` and evaluator `R1`. Cost is 11 calls. The predictor ranks `ZS1` but the configured SAFE stop condition is not met.
 2. The DQN compares valid Q-values and chooses action 0, “add next evaluator.” The environment reveals `R2` baseline and `ZS1`-with-`R2` probes. Cost rises by 10 to 21. The new evidence lowers confidence in `ZS1`.
-3. The application still does not stop. The DQN now chooses action 3, “generate/reveal one-shot candidate from source 2.” This is valid because `R2` is active. With two evaluators active, its incremental cost is `1 + 5 * 2 = 11`; total cost becomes 32.
+3. The application still does not stop. The DQN now chooses action 3, “generate/reveal one-shot candidate from source 2.” This is valid because that candidate has not been generated yet; it would be valid without `R2`, which only decides what the new candidate is measured against. With two evaluators active, its incremental cost is `1 + 5 * 2 = 11`; total cost becomes 32.
 4. The predictor now ranks the new candidate first. Suppose the fixed SAFE rule fires. The application returns that candidate. If the offline correctness label says it is correct, the terminal step receives `+1` in addition to its cost penalty.
-5. DQN backups can assign positive value to the earlier `R2` acquisition because it enabled the useful later action, despite its immediate negative reward.
+5. DQN backups can assign positive value to the earlier `R2` acquisition because the evidence it revealed led to the useful later action, despite its immediate negative reward.
 
 If the stop rule never fires, acquisition continues until no budget-valid action remains or the pool is complete. The application then returns its highest-ranked available candidate. The DQN is not allowed to choose a “stop” action.
 

@@ -78,7 +78,7 @@ There are two complementary activities:
   Improving the available answer pool: generate another candidate.
   Improving our ability to judge the pool: evaluate through another exemplar.
 
-An exemplar acquisition can also enable a future one-shot generation. Its value may therefore appear several decisions later. Conversely, a new candidate and its probe outcomes can help interpret other candidates if the predictor jointly observes the pool.
+An exemplar acquisition can also change what a future one-shot generation is measured against. Its value may therefore appear several decisions later. Conversely, a new candidate and its probe outcomes can help interpret other candidates if the predictor jointly observes the pool.
 
 The system should allocate less computation when its configured stopping condition is met early and more when continued investigation is useful. This is an empirical goal, not a guaranteed consequence of adding RL.
 
@@ -471,14 +471,15 @@ Action 0: ADD_NEXT_EVALUATOR.
   Activate the next unactivated exemplar in retrieval order.
   Measure its baseline and its CCS against every existing candidate.
   Generate no candidate automatically.
-  This source now becomes eligible for a one-shot generation.
+  This source's one-shot generation does not depend on this action: the
+  evaluator only adds the measurements of every existing candidate against it.
 
 Action 1: ADD_ZERO_SHOT.
   Generate/reveal the next zero-shot candidate in fixed sample order.
   Measure its CCS against all active evaluators.
 
 Actions 2..6: ADD_ONE_SHOT_FROM_SOURCE_1..5.
-  Require that source to be active.
+  The source need not be active.
   Generate/reveal its one recorded one-shot candidate.
   Measure that candidate against all active evaluators.
 
@@ -502,8 +503,8 @@ After the initial state, there are at most 11 acquisitions in the stated
 setup: four evaluators, two zero-shot candidates, and five one-shot candidates.
 There are no cycles or unbounded re-acquisitions in V1.
 
-Mask actions when they have no recorded remaining result, require an
-inactive source, would duplicate an acquired result, or cannot fit the
+Mask actions when they have no recorded remaining result,
+would duplicate an acquired result, or cannot fit the
 remaining budget under the declared admission rule.
 
 For simulation, exact call counts are straightforward. Monetary costs and
@@ -986,7 +987,7 @@ Hypothetical trajectory, not an experimental result:
   stopping gate is met. The application returns OS2 and records why it stopped.
 
 Whether OS2 is actually correct is known only in historical evaluation.
-The example shows how an evaluator can both inform a decision and enable a
+The example shows how an evaluator can both inform a decision and guide a
 new source-conditioned generation. It does not assume R2 was identifiable
 as the best source at the first step.
 
@@ -1189,7 +1190,7 @@ Losses/freezing:
   frozen hidden output is deterministic under identical observations.
 
 Simulator/cost:
-  each source dependency is enforced;
+  a one-shot action never requires its source's evaluator;
   no duplicate acquisition or unrecorded generation is possible;
   all routes to the same full pool have the same solver-call total;
   initialization is charged in reporting;
