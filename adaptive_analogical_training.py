@@ -945,9 +945,6 @@ def presence_states(zero_shots, k):
                  for evaluators in range(1 << k))
 
 
-# Views of this many questions are shuffled together: the permutation stays near
-# 16 MiB while each minibatch still mixes dozens of questions.
-SNAPSHOT_GROUP_VIEWS = 1 << 21
 SNAPSHOT_EVAL_BATCH = 16384
 
 
@@ -1021,25 +1018,31 @@ class SnapshotViews:
                              (maximum * cm).amax(1, keepdim=True).gt(0).float(), cm], 1)
 
     def batches(self, batch_size, rng):
-        """One epoch: every view once plus the complete-view repeats, shuffled within
-        groups of questions taken in random order."""
-        per = self.epoch_per_question
-        group = max(1, SNAPSHOT_GROUP_VIEWS // per)
-        order = rng.permutation(len(self.ids)).astype(np.int64)
-        for start in range(0, len(order), group):
-            members = order[start:start+group]
-            slot = rng.permutation(len(members) * per).astype(np.int64)
-            local = slot % per
+        """One epoch: every view once plus the complete-view repeats.
+
+        Every minibatch takes an even slice of every question's rows. Batches drawn
+        from a few questions at a time would train many consecutive steps on the same
+        questions, which the model memorizes, raising its loss on the next ones. Each
+        question walks one shared random order of its rows from its own random start,
+        so the epoch holds a single permutation of one question's rows, not of all rows.
+        """
+        per, count = self.epoch_per_question, len(self.ids)
+        # Rows per question per batch: about batch_size rows in all, at least one per
+        # question (so more questions than batch_size rows give larger batches).
+        steps = max(1, -(-per // max(1, batch_size // max(1, count))))
+        if count == 1:
+            steps = max(1, min(steps, per // 2))  # BatchNorm cannot train on a single row.
+        order = torch.as_tensor(rng.permutation(per), device=self.device)
+        start = torch.as_tensor(rng.randint(0, per, count), device=self.device)
+        base = torch.arange(count, device=self.device) * self.per_question
+        cuts = [step * per // steps for step in range(steps + 1)]
+        for lo, hi in zip(cuts, cuts[1:]):
+            local = order[(torch.arange(lo, hi, device=self.device)[None] + start[:, None]) % per]
             if per > self.per_question:  # Slots past the views repeat a complete view per order.
                 repeat = local >= self.per_question
-                local[repeat] = ((local[repeat] - self.per_question) % self.order_count
-                                 * self.state_count + self.complete_state)
-            flat = torch.from_numpy(members[slot // per] * self.per_question + local).to(self.device)
-            bounds = list(range(0, len(flat), batch_size)) + [len(flat)]
-            if len(bounds) > 2 and bounds[-1] - bounds[-2] == 1:
-                del bounds[-2]  # BatchNorm cannot train on a single row.
-            for lo, hi in zip(bounds, bounds[1:]):
-                yield self.batch(flat[lo:hi])
+                local = torch.where(repeat, (local - self.per_question) % self.order_count
+                                    * self.state_count + self.complete_state, local)
+            yield self.batch((base[:, None] + local).reshape(-1))
 
     def ordered(self, batch_size=SNAPSHOT_EVAL_BATCH):
         """Every view in index order, with each row's question position."""
@@ -1060,17 +1063,18 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
     # One fused update kernel on CUDA: small-model steps are otherwise launch-bound.
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
                            fused=views.device.type == "cuda")
-    best, weights, best_epoch, stale, history = None, None, 0., 0, []
+    best, best_text, weights, best_epoch, stale, history = None, "", None, 0., 0, []
     checks, position, started = cfg.dev_checks_per_epoch, 0., time.monotonic()
     complete = len(views.ids) * views.order_count * views.complete_copies
     print(f"{name}: {len(views.ids)} questions x {views.order_count} zero-shot orders x "
           f"{views.state_count} presence states = {views.rows:,} views; each complete view "
           f"{views.complete_copies:,}x, so {views.epoch_rows:,} rows per epoch, "
-          f"{complete / views.epoch_rows:.1%} complete; {checks} development checks per epoch.",
-          flush=True)
+          f"{complete / views.epoch_rows:.1%} complete; {checks} development checks per epoch; "
+          f"patience counts checks.", flush=True)
     for epoch in range(epochs):
         done = seen = check = 0
         total = torch.zeros((), device=views.device)
+        epoch_total = torch.zeros((), device=views.device)
         model.train()
         for bx, by in views.batches(cfg.batch_size, np.random.RandomState(seed + epoch)):
             opt.zero_grad(set_to_none=True)
@@ -1086,16 +1090,19 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
             score, text = evaluate(model)
             model.train()
             history.append({"epoch": position, "train_loss": float(total) / seen, "score": score})
+            epoch_total += total
             total.zero_()
             seen = 0
             if best is None or better(score, best):
-                best, weights, best_epoch, stale = score, cpu_state(model), position, 0
+                best, best_text, weights, best_epoch, stale = score, text, cpu_state(model), position, 0
             else:
                 stale += 1
             if stale >= cfg.patience:
                 break
-        print(f"{name} | epoch {position:6.2f} | train loss {history[-1]['train_loss']:.4f} | {text} | "
-              f"best at epoch {best_epoch:.2f} | patience {stale}/{cfg.patience} | "
+        # Training loss averages this epoch's rows up to its last check.
+        print(f"{name} | epoch {position:6.3f} | train loss {float(epoch_total) / max(1, done - seen):.4f} | "
+              f"latest {text} | best {best_text} at epoch {best_epoch:.3f} | "
+              f"checks without improvement {stale}/{cfg.patience} | "
               f"elapsed {(time.monotonic() - started) / 60:.1f} min", flush=True)
         if stale >= cfg.patience:
             break
@@ -2306,9 +2313,10 @@ def masked_action_loss(model, rows, order, cfg, device, optimizer=None, *, batch
     return float(total), count
 
 
-def decision_progress(label, completed, total, started, last_print, cfg, detail=""):
+def decision_progress(label, completed, total, started, last_print, cfg, detail="", every=None, seconds=30):
     now = time.monotonic()
-    if completed == 1 or completed == total or completed % cfg.print_every == 0 or now - last_print >= 30:
+    every = cfg.print_every if every is None else every
+    if completed == 1 or completed == total or completed % every == 0 or now - last_print >= seconds:
         elapsed = now - started
         eta = elapsed * (total - completed) / completed
         print(f"{label}: {completed}/{total} questions | elapsed {elapsed/60:.1f} min | "
@@ -2696,6 +2704,7 @@ def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, tra
                                      state.evaluator_mask == (1 << cfg.k)-1),
             "final_max_recognized": max_recognized(probabilities, state, cfg),
             "correct": int(record.labels[selected]), "has_max": has_max,
+            "any_correct": bool(record.labels.any()),
             "exact_max": exact_max, "cost": state_cost(state, cfg),
             "full_cost": cfg.full_cost,
             "call_counts": acquisition_call_counts(bin(state.candidate_mask).count("1"),
@@ -2725,20 +2734,31 @@ def evaluate_policy(records, ids, teacher, predictor, cfg, head=None,
             for row in question_rollouts(records[idx], teacher["scores"][idx], teacher["safe"][idx],
                                          teacher["maximum"][idx], predictor, cfg, head, policy, trace)]
 
+# Question cohorts by the teacher's historical ranking. no_max: the teacher's top-ranked
+# candidate is wrong, so no stop can return a MAX candidate and every predicted-MAX stop
+# there is false. It splits into teacher_miss (a correct candidate exists below that top)
+# and all_wrong (no candidate is correct, so no stop can lower top-1).
+SAVINGS_COHORTS = {"all": lambda m: True,
+                   "max_present": lambda m: m["has_max"],
+                   "no_max": lambda m: not m["has_max"],
+                   "teacher_miss": lambda m: not m["has_max"] and m["any_correct"],
+                   "all_wrong": lambda m: not m["any_correct"]}
+
+
 def call_savings_summary(question_means):
-    groups = {"all": question_means,
-              "max_present": [row for row in question_means if row["has_max"]]}
+    groups = {name: [row for row in question_means if keep(row)] for name, keep in SAVINGS_COHORTS.items()}
     result = {}
     for name, group in groups.items():
         with_max = [row for row in group if row["has_max"]]
         metrics = {"n": len(group),
+                   "top1_correct": float(np.mean([row["correct"] for row in group])) if group else None,
                    "exact_max_recovery": float(np.mean([row["exact_max"] for row in with_max])) if with_max else None,
                    "predicted_max_stop_rate": float(np.mean([row["predicted_max"] for row in group])) if group else None,
                    "wrong_predicted_max_stop_rate": float(np.mean([row["wrong_predicted_max"] for row in group])) if group else None}
         stop_weight = sum(row["predicted_max"] for row in group)
         metrics["predicted_max_stop_precision"] = (
             float(sum(row["predicted_max"] - row["wrong_predicted_max"] for row in group) / stop_weight)
-            if stop_weight else None)
+            if stop_weight and with_max else None)
         for unit in ("solver_calls", "total_calls"):
             used = np.asarray([row["call_counts"][unit] for row in group])
             full = np.asarray([row["full_call_counts"][unit] for row in group])
@@ -2746,6 +2766,9 @@ def call_savings_summary(question_means):
                              "mean_used": float(used.mean()) if group else None,
                              "mean_saved": float((full-used).mean()) if group else None,
                              "total_saved": float((full-used).sum()) if group else None,
+                             # Over every benchmark question, so max_present + no_max = all.
+                             "saved_per_benchmark_question": (float((full-used).sum() / len(question_means))
+                                                              if group else None),
                              "saved_fraction": float((full-used).sum()/full.sum()) if group else None}
             for stop in ("correct_max", "wrong_max", "other"):
                 metrics[unit][f"mean_saved_by_{stop}_stop"] = (
@@ -2779,7 +2802,7 @@ def question_summary(group):
                 if savings_stop_category(r) == stop else 0. for r in group])
                 for stop in ("correct_max", "wrong_max", "other")}
                 for unit in ("solver_calls", "total_calls")},
-            "has_max": group[0]["has_max"],
+            "has_max": group[0]["has_max"], "any_correct": group[0]["any_correct"],
             "exact_max": np.mean([r["exact_max"] for r in group]) if group[0]["has_max"] else None,
             "predicted_max": np.mean([r["reason"] == "predicted_max" for r in group]),
             "max_recognized": np.mean([r.get("first_max_recognition") is not None or
@@ -2933,8 +2956,9 @@ def question_report(record, scores, safe, maximum, predictor, cfg, head, sink=No
     """Roll out one question once per method and zero-shot order; keep only report inputs.
 
     Each rollout's outcome streams to `sink` as it is produced. The question keeps its
-    per-method means (question_summary), stop reasons and per-order correctness for
-    paired intervals, and its continuation diagnostic; untraced rows are discarded.
+    per-method means (question_summary), and per zero-shot order its stop reason,
+    correctness, MAX recovery, and saved calls for paired comparisons, plus its
+    continuation diagnostic; untraced rows are discarded.
     """
     methods = {}
     for method in evaluation_methods(cfg):
@@ -2944,9 +2968,78 @@ def question_report(record, scores, safe, maximum, predictor, cfg, head, sink=No
                             for row in rows)
         methods[method] = {"means": question_summary(rows),
                            "reasons": tuple(row["reason"] for row in rows),
-                           "correct": tuple(row["correct"] for row in rows)}
+                           "correct": tuple(row["correct"] for row in rows),
+                           "exact_max": tuple(row["exact_max"] for row in rows),
+                           "saved_calls": tuple(row["full_call_counts"]["total_calls"] -
+                                                row["call_counts"]["total_calls"] for row in rows)}
     return {"methods": methods,
             "continuation": question_continuation(record, scores, safe, maximum, predictor, cfg, head)}
+
+
+# Each evaluation rollout's MAX-recognition outcome, in report order with its label.
+RECOGNITION_OUTCOMES = {"correct_max_stop": "MAX stop: correct MAX",
+                        "kept_stop": "MAX stop: other, top-1 kept",
+                        "lost_stop": "MAX stop: other, top-1 lost",
+                        "missed_max": "No MAX stop: MAX missed",
+                        "no_max_no_stop": "No MAX stop: no MAX"}
+
+
+def recognition_outcome(reason, exact_max, has_max, correct, full_correct):
+    """A predicted-MAX stop returns the teacher's MAX or another candidate, whose top-1 is
+    kept or lost against the full pool in the same zero-shot order."""
+    if reason == "predicted_max":
+        if exact_max:
+            return "correct_max_stop"
+        return "lost_stop" if correct < full_correct else "kept_stop"
+    return "missed_max" if has_max else "no_max_no_stop"
+
+
+def recognition_outcomes(questions, method):
+    """Per outcome: share of rollouts, calls saved, and top-1 lost/gained versus the full pool.
+
+    Each is a mean over zero-shot orders within a question, then over questions, so the
+    outcomes add up to all rollouts, the mean saved calls, and the paired top-1 change.
+    """
+    result = {key: {"rollouts": 0., "saved_calls": 0., "top1_lost": 0., "top1_gained": 0.}
+              for key in RECOGNITION_OUTCOMES}
+    for question in questions:
+        own, full = question["methods"][method], question["methods"]["full"]
+        weight = 1 / (len(questions) * len(own["reasons"]))
+        for reason, exact, correct, saved, reference in zip(
+                own["reasons"], own["exact_max"], own["correct"], own["saved_calls"], full["correct"]):
+            cell = result[recognition_outcome(reason, exact, own["means"]["has_max"], correct, reference)]
+            cell["rollouts"] += weight
+            cell["saved_calls"] += saved * weight
+            cell["top1_lost"] += (reference > correct) * weight
+            cell["top1_gained"] += (correct > reference) * weight
+    return result
+
+
+def method_comparisons(questions, cfg):
+    """Paired differences, first method minus second, with bootstrap intervals over questions.
+
+    Each method is compared with the full pool, then the learned head with each fixed order,
+    on saved calls and top-1 over all questions and on exact MAX over MAX-present questions.
+    """
+    pairs = [(name, "full") for name in evaluation_methods(cfg) if name != "full"]
+    pairs += [("supervised", name) for name in cfg.fixed_acquisition_orders]
+    result = {}
+    for first, second in pairs:
+        def difference(key, keep=lambda question: True):
+            values = [np.mean(question["methods"][first][key]) - np.mean(question["methods"][second][key])
+                      for question in questions if keep(question)]
+            return bootstrap_difference(values, cfg.bootstrap_samples, cfg.seed) if values else None
+        result[f"{first} vs {second}"] = {
+            "saved_calls": difference("saved_calls"), "top1": difference("correct"),
+            "exact_max": difference("exact_max", lambda question: question["methods"][first]["means"]["has_max"])}
+    return result
+
+
+def interval_text(item, scale=1., unit=""):
+    if item is None:
+        return "--"
+    low, high = (scale * value for value in item["ci95"])
+    return f"{scale * item['delta']:+.1f}{unit} [{low:+.1f}, {high:+.1f}]"
 
 
 def paired_top1(questions, cfg):
@@ -2980,7 +3073,8 @@ def policy_report(records, ids, teacher, predictor, cfg, head, title, evaluated=
     for position, idx in enumerate(missing, 1):
         evaluated[idx] = question_report(records[idx], teacher["scores"][idx], teacher["safe"][idx],
                                          teacher["maximum"][idx], predictor, cfg, head, sink)
-        last_print = decision_progress("Stage 4 rollouts", position, len(missing), started, last_print, cfg)
+        last_print = decision_progress("Stage 4 rollouts", position, len(missing), started, last_print, cfg,
+                                       every=max(cfg.print_every, -(-len(missing) // 10)), seconds=300)
     questions = [evaluated[idx] for idx in ids]
     summary = {}
     for name in evaluation_methods(cfg):
@@ -2989,40 +3083,70 @@ def policy_report(records, ids, teacher, predictor, cfg, head, title, evaluated=
             reasons.update(question["methods"][name]["reasons"])
         summary[name] = summarize_questions([question["methods"][name]["means"] for question in questions],
                                             reasons)
-    print(f"{'Method':<26} | {'Top-1 correct':>13} | {'Exact MAX':>9} | {'Mean cost':>10} | {'Saved':>7}")
+    comparisons = method_comparisons(questions, cfg)
+    outcomes = {name: recognition_outcomes(questions, name) for name in summary if name != "full"}
+    sizes = {group: item["n"] for group, item in summary["full"]["call_savings"].items()}
+    full_calls = acquisition_call_counts(cfg.n, cfg.k, cfg)["total_calls"]
+    print(f"Questions: {sizes['all']} | MAX present {sizes['max_present']} | no MAX {sizes['no_max']} "
+          f"(teacher miss {sizes['teacher_miss']}, all wrong {sizes['all_wrong']})")
+
+    print(f"\n1) API calls versus accuracy (per question; full pool = {full_calls} calls)")
+    print(f"{'Method':<26} | {'API calls':>9} | {'Saved':>6} | {'Top-1':>6} | {'Exact MAX':>9} | "
+          f"{'MAX stops':>9} | {'Stop precision':>14}")
     for name, item in summary.items():
+        calls, stops = item["call_savings"]["all"]["total_calls"], item["call_savings"]["all"]
         exact = "--" if item["exact_max_recovery"] is None else f"{item['exact_max_recovery']:.1%}"
-        print(f"{name:<26} | {item['top1_correct']:>12.1%} | {exact:>9} | "
-              f"{item['mean_cost']:>10.1f} | {item['mean_saved_fraction']:>6.1%}")
-    print("MAX recognized during acquisition: " +
-          ", ".join(f"{name}={item['max_recognition_rate']:.1%}" for name, item in summary.items()))
-    print(f"Cost unit: {cfg.cost_unit}. MAX recognition uses predicted signals, not historical MAX labels.")
-    print("Evaluation stops each learned and fixed rollout at predicted MAX; "
-          "the application wrapper may choose a different stopping point.")
-    print("API-call savings versus the complete pool (generation + measurement solves + their graders):")
-    print(f"{'Method':<26} | {'Questions':<12} | {'N':>5} | {'Mean API':>9} | {'Saved/q':>9} | {'True MAX/q':>10} | {'Wrong MAX/q':>11} | {'Other/q':>9} | {'Saved':>7} | {'Exact MAX':>9}")
+        precision = ("--" if stops["predicted_max_stop_precision"] is None else
+                     f"{stops['predicted_max_stop_precision']:.1%}")
+        print(f"{name:<26} | {calls['mean_used']:>9.1f} | {calls['saved_fraction']:>6.1%} | "
+              f"{item['top1_correct']:>6.1%} | {exact:>9} | {stops['predicted_max_stop_rate']:>9.1%} | "
+              f"{precision:>14}")
+
+    print("\n2) Paired differences, first minus second (95% CI over questions)")
+    print(f"{'Comparison':<40} | {'Saved calls/q':>22} | {'Top-1':>22} | {'Exact MAX':>22}")
+    for pair, item in comparisons.items():
+        print(f"{pair:<40} | {interval_text(item['saved_calls']):>22} | "
+              f"{interval_text(item['top1'], 100, 'pp'):>22} | {interval_text(item['exact_max'], 100, 'pp'):>22}")
+
+    groups = {"all": "All", "max_present": "MAX present", "no_max": "No MAX",
+              "teacher_miss": "Teacher miss", "all_wrong": "All wrong"}
+    print("\n3) API calls saved by question group (% of the group's full-pool calls)")
+    print(f"{'Method':<26} | " + " | ".join(f"{label:>12}" for label in groups.values()) +
+          f" | {'From no MAX':>11}")
     for name, item in summary.items():
-        for cohort, metrics in item["call_savings"].items():
-            calls = metrics["total_calls"]
-            values = ["--" if calls[key] is None else f"{calls[key]:.1f}"
-                      for key in ("mean_used", "mean_saved", "mean_saved_by_correct_max_stop",
-                                  "mean_saved_by_wrong_max_stop", "mean_saved_by_other_stop")]
-            saved = "--" if calls["saved_fraction"] is None else f"{calls['saved_fraction']:.1%}"
-            exact = "--" if metrics["exact_max_recovery"] is None else f"{metrics['exact_max_recovery']:.1%}"
-            print(f"{name:<26} | {cohort:<12} | {metrics['n']:>5} | {values[0]:>9} | {values[1]:>9} | {values[2]:>10} | {values[3]:>11} | {values[4]:>9} | {saved:>7} | {exact:>9}")
-    print("Saved/q = True MAX/q + Wrong MAX/q + Other/q; each uses all questions in that row as the denominator.")
-    print("Other/q includes budget limits and ended custom sequences; only True MAX/q reflects a correct MAX-triggered stop.")
-    print("On predicted-MAX stops only (including incorrect stops):")
-    print(f"{'Method':<26} | {'Questions':<12} | {'MAX stop %':>10} | {'API/stop':>9} | {'Saved/stop':>10} | {'Correct MAX':>11}")
-    for name, item in summary.items():
-        for cohort, metrics in item["call_savings"].items():
-            calls = metrics["total_calls"]
-            values = ["--" if calls[key] is None else f"{calls[key]:.1f}"
-                      for key in ("mean_used_on_predicted_max_stop", "mean_saved_on_predicted_max_stop")]
-            rate = "--" if metrics["predicted_max_stop_rate"] is None else f"{metrics['predicted_max_stop_rate']:.1%}"
-            precision = "--" if metrics["predicted_max_stop_precision"] is None else f"{metrics['predicted_max_stop_precision']:.1%}"
-            print(f"{name:<26} | {cohort:<12} | {rate:>10} | {values[0]:>9} | {values[1]:>10} | {precision:>11}")
-    return {"policies": summary, "cost_unit": cfg.cost_unit,
+        if name == "full":
+            continue
+        savings = item["call_savings"]
+        cells = ["--" if savings[group]["total_calls"]["saved_fraction"] is None else
+                 f"{savings[group]['total_calls']['saved_fraction']:.1%}" for group in groups]
+        total = savings["all"]["total_calls"]["total_saved"]
+        share = f"{(savings['no_max']['total_calls']['total_saved'] or 0.) / total:.1%}" if total else "--"
+        print(f"{name:<26} | " + " | ".join(f"{cell:>12}" for cell in cells) + f" | {share:>11}")
+
+    print("\n4) MAX recognition outcomes (share of rollouts; per question: calls saved, top-1 change vs full)")
+    print(f"{'Method':<26} | {'Outcome':<27} | {'Rollouts':>8} | {'Saved/q':>7} | {'Top-1 lost':>10} | "
+          f"{'Top-1 gained':>12}")
+    columns = ("rollouts", "saved_calls", "top1_lost", "top1_gained")
+    for name, table in outcomes.items():
+        rows = [(RECOGNITION_OUTCOMES[key], table[key]) for key in RECOGNITION_OUTCOMES]
+        rows.append(("Total", {column: sum(cell[column] for cell in table.values()) for column in columns}))
+        for position, (label, cell) in enumerate(rows):
+            print(f"{name if position == 0 else '':<26} | {label:<27} | {cell['rollouts']:>8.1%} | "
+                  f"{cell['saved_calls']:>7.1f} | {cell['top1_lost']:>10.1%} | {cell['top1_gained']:>12.1%}")
+
+    first_state = full_calls - acquisition_call_counts(1, 0, cfg)["total_calls"]
+    print(f"\nNotes: API calls = candidate generations + measurement solves + their graders; retrieval is "
+          f"excluded. Each question counts once: its {math.factorial(cfg.zero_shots)} zero-shot orders are averaged.")
+    print("Rollouts stop at the first predicted MAX (the deployed wrapper may continue). MAX = the teacher's "
+          "top-ranked candidate when it is correct; every MAX stop on a no-MAX question is false.")
+    print("Teacher miss: a correct candidate ranks below a wrong top. All wrong: no candidate is correct, so a "
+          f"stop costs no accuracy (stopping at the first state would save {first_state} calls).")
+    print("Exact MAX = share of MAX-present questions whose returned candidate is the MAX. MAX stops = share "
+          "of rollouts stopped at a predicted MAX; stop precision = share of those stops returning the MAX.")
+    print("Top-1 lost/gained pair each rollout with the full pool in the same zero-shot order; "
+          f"95% CI from a {cfg.bootstrap_samples}-sample bootstrap over questions.")
+    return {"policies": summary, "comparisons": comparisons, "recognition_outcomes": outcomes,
+            "cost_unit": cfg.cost_unit,
             "fixed_acquisition_sequences": fixed_acquisition_sequences(cfg),
             "learned_continues_after_max": False,
             "inference_continues_after_max_default": cfg.continue_after_max,

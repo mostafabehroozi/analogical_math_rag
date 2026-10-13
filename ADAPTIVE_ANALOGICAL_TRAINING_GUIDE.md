@@ -85,17 +85,33 @@ for 2,000 training questions. The defaults are therefore `batch_size=16384`,
 `teacher_epochs=snapshot_epochs=10`, and `dev_checks_per_epoch=8`. Development
 checks are spread evenly through each epoch, `patience` counts checks without
 improvement in Stages 1-2 (epochs in Stage 3), and the selected checkpoint's
-position is a fractional epoch such as `1.375`. The training loop prints one
-line per epoch with the latest check, the best position, and patience.
+position is a fractional epoch such as `1.375`. Patience is therefore not reset
+at an epoch boundary: with 8 checks per epoch, `15` is just under two epochs
+without a better check. The training loop prints one line per epoch: the mean
+training loss over the epoch, the latest check's score, the best score and the
+epoch of its check, and the checks without improvement, for example
+`epoch  4.000 | train loss 0.2846 | latest development AP 0.7195 | best
+development AP 0.7447 at epoch 3.625 | checks without improvement 3/15`.
 
 **Memory and disk.** No view is stored, on disk or in RAM. A shared state
 table (about 7 MiB) holds the state-only observation bytes and masks; each
 question adds its measurements, labels, and SAFE/MAX under each order (under
 1 KiB). `SnapshotViews` assembles each minibatch on the selected device from
 those tensors, bit-identical to `observation(..., allow_hidden_source=True)`.
-Each epoch shuffles question order, then shuffles the views of about 40
-questions at a time (a 16 MiB permutation), so every minibatch mixes dozens of
-questions without a 98-million-entry permutation. Development metrics,
+Every minibatch takes an even slice of **every** question's rows: with 1,280
+fold questions and `batch_size=16384`, 12 rows of each. Each question walks one
+shared random order of its rows from its own random start, so an epoch holds a
+single permutation of one question's rows (under 0.5 MiB), not of all 98
+million. An earlier revision-6 build (`c003b05`) instead shuffled the views of
+about 36 questions at a time, so about 126 consecutive optimizer steps saw the
+same few questions. On real logs (640 GSM8K training questions, 500 MATH-500
+development questions, 4 checks per epoch, local GPU), its epoch-mean training
+loss went 0.298, 0.282, 0.277 over three epochs, with the best development AP
+0.5606 at epoch 1.25. All-question batches went 0.364, 0.221, 0.175, with the
+best AP 0.5552 at epoch 0.25 and lower AP afterward: each question appears tens
+of thousands of times per epoch, so the model fits its training questions
+within the first epoch, and the best checkpoint comes early. Development
+metrics,
 temperature calibration, and the Stage 4 snapshot diagnostic stream per-batch
 sums; no logits are kept. Adam uses its fused CUDA kernel.
 
@@ -613,37 +629,50 @@ completion in `acquisition_complete_rate`. These are averaged over zero-shot
 orders within each question, then equally across questions. An earlier
 recognition peak does not establish that those goals still hold at the end.
 
-The additional API-savings table has two rows per method: **all questions**
-and **MAX-present questions** (nonempty historical teacher MAX labels).
-It shows question counts, mean API calls used, mean calls saved per question
-versus the full pool, savings percentage, and exact MAX recovery. Savings
-include failed/incorrect stops; they are not conditional on successful MAX
-recovery. `first_max_recognition` and `max_recognition_rate` also record when
-recognition occurs. JSON `policies[method].call_savings` stores both
-`solver_calls` and `total_calls`, expected total savings across questions,
-predicted-MAX stopping rates, and wrong predicted-MAX stopping rates.
+Each ACQUISITION section opens with its question counts: MAX present,
+no MAX, and the two kinds of no-MAX question. A question has a MAX only when
+the teacher's top-ranked candidate is correct. Otherwise it is a **teacher
+miss** (a correct candidate ranks below a wrong top) or **all wrong** (no
+candidate in the pool is correct). Every question is rolled out, and its
+saving is the full pool's calls minus the calls used when its rollout
+stopped, so savings are never limited to questions with a MAX. Four tables
+follow, then one notes block.
 
-The visible table also divides saved calls into **True MAX/q**, **Wrong
-MAX/q**, and **Other/q**. True MAX savings require a predicted-MAX stop
-that returns the historical MAX candidate. Wrong MAX savings come from an
-incorrect predicted-MAX stop, including questions with no historical MAX.
-Other savings come from budget limits or an ended custom sequence. These
-three contributions add up to total saved calls per question; each uses the
-whole row's question group as its denominator. Thus even a budget-limited
-run that happens to return MAX is counted under Other, not True MAX.
+1. **API calls versus accuracy.** One row per method, the full pool
+   included: mean API calls per question, the share saved, top-1, exact MAX
+   (the share of MAX-present questions whose returned candidate is the MAX),
+   the share of rollouts stopped at a predicted MAX, and the stop precision
+   (the share of those stops that returned the MAX; `--` when a method never
+   stops).
+2. **Paired differences**, first method minus second, each with a 95%
+   bootstrap interval over questions: every method against the full pool,
+   then the learned head against each fixed order. Columns are saved calls
+   per question, top-1, and exact MAX (over MAX-present questions). Read
+   savings and exact MAX side by side to weigh calls saved against MAX
+   found; an interval that contains zero is no evidence of a difference.
+3. **API calls saved by question group**, as a share of each group's
+   full-pool calls: all, MAX present, no MAX, teacher miss, and all wrong,
+   plus the share of the method's saved calls that came from no-MAX
+   questions. Empty groups show `--`.
+4. **MAX recognition outcomes.** Each rollout falls in one row: a MAX stop
+   that returned the MAX; a MAX stop on another candidate whose top-1 was
+   kept or lost against the full pool in the same zero-shot order; no MAX
+   stop although a MAX exists (missed); or no MAX stop and no MAX. Each row
+   gives its share of rollouts, its calls saved per question, and its top-1
+   lost and gained. The **Total** row adds up to all rollouts, table 1's
+   saved calls, and table 2's top-1 change. Every MAX stop on a no-MAX
+   question is false; on an all-wrong question it cannot cost accuracy.
 
-A compact **predicted-MAX stops only** table makes the other meaning of
-"MAX enabled" explicit: the prediction gates actually triggered the stop.
-For both all questions and reference-MAX-present questions, it shows the
-MAX-stop rate, mean calls used/saved per such stop, and the fraction of those
-stops that returned the correct reference MAX. Incorrect stops are included.
-Question weights are equal before conditioning on the stop event, and all
-zero-shot orders are averaged within each question. When no MAX stop occurs,
-conditional savings and precision are unavailable (`null`/`--`). This differs
-from overall savings, which also include runs ending at a budget or sequence
-limit. The JSON keys are `predicted_max_stop_precision` and each cost unit's
-`mean_used_on_predicted_max_stop`, `mean_saved_on_predicted_max_stop`, and
-`saved_fraction_on_predicted_max_stop`.
+The JSON keeps the printed values and more. `policies[method].call_savings`
+has five question groups (`all`, `max_present`, `no_max`, `teacher_miss`,
+`all_wrong`), each with `top1_correct`, stop rates, and, per cost unit
+(`solver_calls` and `total_calls`), calls used and saved, the saved share,
+`saved_per_benchmark_question` (groups add up to `all`), savings divided into
+correct-MAX, wrong-MAX, and other stops (`mean_saved_by_*_stop`), and the
+savings conditional on predicted-MAX stops. `predicted_max_stop_precision` is
+`null` for a group without any MAX. `comparisons["A vs B"]` holds table 2's
+`saved_calls`, `top1`, and `exact_max` intervals, and
+`recognition_outcomes[method]` holds table 4.
 
 Total API calls include candidate generations, repeated baseline/cross
 measurement solves, and their grading calls. With default settings the

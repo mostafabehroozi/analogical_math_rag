@@ -3,6 +3,7 @@ import ast
 import copy
 import itertools
 import json
+import re
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
@@ -185,24 +186,29 @@ def test_snapshot_views_equal_scalar_observations_and_targets_for_every_order_an
     assert torch.equal(y1, torch.cat([y2[:, :cfg.n], y2[:, 3*cfg.n+2:]], 1))
 
 
-@pytest.mark.parametrize("group,batch", [(1 << 21, 4), (130, 64), (100, 7)])
-def test_snapshot_batches_visit_every_view_once_without_singletons(group, batch, monkeypatch):
+@pytest.mark.parametrize("questions,batch", [(5, 4), (5, 64), (5, 7), (1, 16), (1, 1000), (9, 5)])
+def test_snapshot_batches_mix_every_question_and_visit_every_view_once(questions, batch, monkeypatch):
     cfg = a.Config(k=2, zero_shots=2)
-    monkeypatch.setattr(a, "SNAPSHOT_GROUP_VIEWS", group)
-    views = a.SnapshotViews([record(cfg, i) for i in range(5)], list(range(5)), cfg, "cpu")
+    views = a.SnapshotViews([record(cfg, i) for i in range(questions)], list(range(questions)), cfg, "cpu")
     monkeypatch.setattr(views, "batch", lambda index: (index, index))
-    sizes = [len(index) for index, _ in views.batches(batch, np.random.RandomState(1))]
-    seen = torch.cat([index for index, _ in views.batches(batch, np.random.RandomState(1))])
-    assert min(sizes) >= 2
+    batches = [index for index, _ in views.batches(batch, np.random.RandomState(1))]
+    seen = torch.cat(batches)
+    assert min(map(len, batches)) >= 2  # BatchNorm cannot train on a single row.
     assert sorted(seen.tolist()) == list(range(views.rows))
+    # No batch is drawn from a few questions: every question has an even share of each.
+    for index in batches:
+        counts = torch.bincount(index // views.per_question, minlength=questions)
+        assert counts.min() >= 1 and counts.max() - counts.min() <= 1
+        assert len(index) <= max(batch, questions)
     again = torch.cat([index for index, _ in views.batches(batch, np.random.RandomState(1))])
     assert torch.equal(seen, again) and not torch.equal(seen, torch.arange(views.rows))
+    other = torch.cat([index for index, _ in views.batches(batch, np.random.RandomState(2))])
+    assert not torch.equal(seen, other)
 
 
-@pytest.mark.parametrize("share,group", [(.5, 1 << 21), (.1, 200), (.9, 1000)])
-def test_complete_views_fill_their_share_of_every_epoch(share, group, monkeypatch):
+@pytest.mark.parametrize("share", [.5, .1, .9])
+def test_complete_views_fill_their_share_of_every_epoch(share, monkeypatch):
     cfg = a.Config(k=2, zero_shots=2)
-    monkeypatch.setattr(a, "SNAPSHOT_GROUP_VIEWS", group)
     views = a.SnapshotViews([record(cfg, i) for i in range(5)], list(range(5)), cfg, "cpu",
                             complete_share=share)
     full = a.presence_states(cfg.zero_shots, cfg.k).index(a.State((1 << cfg.n)-1, (1 << cfg.k)-1))
@@ -520,11 +526,11 @@ def test_fixed_policy_does_not_skip_an_unaffordable_step():
 
 
 def test_no_max_evaluation_keeps_false_predicted_max_and_separate_stratum():
-    rows = [dict(uid="a", correct=0, exact_max=None, has_max=False, cost=1,
+    rows = [dict(uid="a", correct=0, exact_max=None, has_max=False, any_correct=False, cost=1,
                  saved_fraction=.9, reason="predicted_max",
                  call_counts={"solver_calls": 1, "total_calls": 1},
                  full_call_counts={"solver_calls": 10, "total_calls": 19}),
-            dict(uid="b", correct=1, exact_max=True, has_max=True, cost=10,
+            dict(uid="b", correct=1, exact_max=True, has_max=True, any_correct=True, cost=10,
                  saved_fraction=0, reason="predicted_max",
                  call_counts={"solver_calls": 10, "total_calls": 19},
                  full_call_counts={"solver_calls": 10, "total_calls": 19})]
@@ -617,7 +623,8 @@ def test_call_savings_average_orders_per_question_and_keep_max_cohort_separate()
                                  ("no_max", False, [(2, 0), (3, 1)])):
         for i, (n, k) in enumerate(states):
             counts = a.acquisition_call_counts(n, k, cfg)
-            rows.append(dict(uid=uid, has_max=has_max, exact_max=bool(i) if has_max else None,
+            rows.append(dict(uid=uid, has_max=has_max, any_correct=has_max,
+                             exact_max=bool(i) if has_max else None,
                              correct=int(has_max and i), cost=counts[cfg.cost_unit],
                              saved_fraction=1-counts[cfg.cost_unit]/cfg.full_cost,
                              reason="predicted_max", call_counts=counts, full_call_counts=full))
@@ -625,6 +632,7 @@ def test_call_savings_average_orders_per_question_and_keep_max_cohort_separate()
     assert savings["all"]["n"] == 2 and savings["max_present"]["n"] == 1
     assert savings["all"]["total_calls"] == dict(mean_full=43., mean_used=19.5,
                                                 mean_saved=23.5, total_saved=47., saved_fraction=47/86,
+                                                saved_per_benchmark_question=23.5,
                                                 mean_saved_by_correct_max_stop=2.75,
                                                 mean_saved_by_wrong_max_stop=20.75,
                                                 mean_saved_by_other_stop=0.,
@@ -633,6 +641,7 @@ def test_call_savings_average_orders_per_question_and_keep_max_cohort_separate()
                                                 saved_fraction_on_predicted_max_stop=47/86)
     assert savings["max_present"]["total_calls"] == dict(mean_full=43., mean_used=16.5,
                                                         mean_saved=26.5, total_saved=26.5, saved_fraction=26.5/43,
+                                                        saved_per_benchmark_question=13.25,
                                                         mean_saved_by_correct_max_stop=5.5,
                                                         mean_saved_by_wrong_max_stop=21.,
                                                         mean_saved_by_other_stop=0.,
@@ -645,6 +654,77 @@ def test_call_savings_average_orders_per_question_and_keep_max_cohort_separate()
     no_max = a.policy_summary([row for row in rows if not row["has_max"]])["call_savings"]["max_present"]
     assert no_max["n"] == 0 and no_max["total_calls"]["mean_saved"] is None
     assert no_max["exact_max_recovery"] is None
+
+
+def test_no_max_cohorts_split_false_stops_and_pair_top1_with_the_full_pool():
+    cfg = a.Config(k=1, zero_shots=2)
+    full = a.acquisition_call_counts(cfg.n, cfg.k, cfg)
+    def row(uid, has_max, any_correct, correct, reason, n=cfg.n, k=cfg.k):
+        counts = a.acquisition_call_counts(n, k, cfg)
+        return dict(uid=uid, has_max=has_max, any_correct=any_correct, correct=correct,
+                    exact_max=bool(correct) if has_max else None, reason=reason,
+                    cost=counts[cfg.cost_unit], saved_fraction=1-counts[cfg.cost_unit]/cfg.full_cost,
+                    call_counts=counts, full_call_counts=full)
+    rows = [row("max", True, True, 1, "predicted_max", 1, 0),
+            row("miss", False, True, 0, "predicted_max", 1, 0),
+            row("wrong", False, False, 0, "predicted_max", 2, 1)]
+    savings = a.policy_summary(rows)["call_savings"]
+    assert {name: savings[name]["n"] for name in a.SAVINGS_COHORTS} == dict(
+        all=3, max_present=1, no_max=2, teacher_miss=1, all_wrong=1)
+    saved = full["total_calls"] - a.acquisition_call_counts(2, 1, cfg)["total_calls"]
+    assert savings["all_wrong"]["total_calls"]["mean_saved_by_wrong_max_stop"] == saved
+    assert savings["no_max"]["predicted_max_stop_rate"] == 1
+    # No stop in a no-MAX cohort can return MAX, so its stop precision is undefined.
+    assert savings["no_max"]["predicted_max_stop_precision"] is None
+    assert savings["all"]["predicted_max_stop_precision"] == pytest.approx(1/3)
+    assert savings["teacher_miss"]["top1_correct"] == savings["all_wrong"]["top1_correct"] == 0
+    # Savings cover every question: cohort contributions per benchmark question add up.
+    per = {name: savings[name]["total_calls"]["saved_per_benchmark_question"] for name in a.SAVINGS_COHORTS}
+    assert per["all"] == savings["all"]["total_calls"]["mean_saved"]
+    assert per["max_present"] + per["no_max"] == pytest.approx(per["all"])
+    assert per["teacher_miss"] + per["all_wrong"] == pytest.approx(per["no_max"])
+    assert per["all_wrong"] == pytest.approx(saved / 3)
+
+
+def test_recognition_outcomes_add_up_and_pair_each_order_with_the_full_pool():
+    def question(has_max, full_correct, reasons, exact, correct, saved):
+        means = dict(has_max=has_max)
+        return {"methods": {
+            "full": {"means": means, "correct": full_correct, "reasons": ("full_budget_reference",) * 2,
+                     "exact_max": (True,) * 2 if has_max else (None,) * 2, "saved_calls": (0., 0.)},
+            "supervised": {"means": means, "correct": correct, "reasons": reasons,
+                           "exact_max": exact, "saved_calls": saved}}}
+    stop, run = "predicted_max", "pool_exhaustion"
+    questions = [
+        # MAX present: one correct MAX stop, one missed MAX.
+        question(True, (1, 1), (stop, run), (True, False), (1, 1), (40., 0.)),
+        # MAX present: a stop on another, still correct candidate; a stop that loses top-1.
+        question(True, (1, 1), (stop, stop), (False, False), (1, 0), (20., 60.)),
+        # No MAX: a false stop that happens to gain; no stop.
+        question(False, (0, 0), (stop, run), (None, None), (1, 0), (80., 0.))]
+    table = a.recognition_outcomes(questions, "supervised")
+    expect = {"correct_max_stop": (1/6, 40/6, 0, 0), "kept_stop": (2/6, 100/6, 0, 1/6),
+              "lost_stop": (1/6, 60/6, 1/6, 0), "missed_max": (1/6, 0, 0, 0),
+              "no_max_no_stop": (1/6, 0, 0, 0)}
+    assert list(table) == list(a.RECOGNITION_OUTCOMES)
+    for key, values in expect.items():
+        assert [table[key][column] for column in ("rollouts", "saved_calls", "top1_lost", "top1_gained")
+                ] == pytest.approx(values)
+    assert sum(cell["rollouts"] for cell in table.values()) == pytest.approx(1)
+    assert sum(cell["saved_calls"] for cell in table.values()) == pytest.approx(200/6)
+    cfg = a.Config(fixed_acquisition_orders={"fixed": "interleaved"}, bootstrap_samples=50)
+    for question_ in questions:
+        question_["methods"]["fixed"] = question_["methods"]["full"]
+    comparisons = a.method_comparisons(questions, cfg)
+    assert list(comparisons) == ["fixed vs full", "supervised vs full", "supervised vs fixed"]
+    learned = comparisons["supervised vs full"]
+    assert learned["saved_calls"]["delta"] == pytest.approx(200/6)
+    assert learned["top1"]["delta"] == pytest.approx(0)  # One lost and one gained order.
+    # Exact MAX is compared on MAX-present questions only: (1/2 + 0) / 2 - 1.
+    assert learned["exact_max"]["delta"] == pytest.approx(-.75)
+    assert comparisons["supervised vs fixed"] == learned
+    assert a.interval_text(learned["top1"], 100, "pp").startswith("+0.0pp [")
+    assert a.interval_text(None) == "--"
 
 
 def test_call_counts_include_grading_and_are_independent_of_selected_cost_unit():
@@ -803,7 +883,7 @@ def test_budget_and_short_sequence_savings_are_not_counted_as_max_stopping():
             ("predicted_max", True, True), ("predicted_max", False, True),
             ("budget", True, True), ("fixed_sequence_exhaustion", None, False)]):
         counts = a.acquisition_call_counts(1, 0, cfg)
-        rows.append(dict(uid=str(i), reason=reason, exact_max=exact, has_max=has_max,
+        rows.append(dict(uid=str(i), reason=reason, exact_max=exact, has_max=has_max, any_correct=has_max,
                          correct=int(bool(exact)), cost=1, saved_fraction=1-1/cfg.full_cost,
                          call_counts=counts, full_call_counts=full))
     savings = a.policy_summary(rows)["call_savings"]
@@ -818,6 +898,8 @@ def test_budget_and_short_sequence_savings_are_not_counted_as_max_stopping():
     assert savings["all"]["predicted_max_stop_precision"] == .5
     assert savings["max_present"]["total_calls"]["mean_saved_by_other_stop"] == 14
     for cohort in savings.values():
+        if not cohort["n"]:  # An empty cohort has no means.
+            continue
         for unit in ("solver_calls", "total_calls"):
             values = cohort[unit]
             assert values["mean_saved"] == pytest.approx(sum(values[f"mean_saved_by_{stop}_stop"]
@@ -860,7 +942,7 @@ def test_predicted_max_stop_savings_condition_on_stops_with_equal_question_weigh
     full = a.acquisition_call_counts(cfg.n, cfg.k, cfg)
     def row(uid, n, k, reason):
         counts = a.acquisition_call_counts(n, k, cfg)
-        return dict(uid=uid, reason=reason, exact_max=True, has_max=True, correct=1,
+        return dict(uid=uid, reason=reason, exact_max=True, has_max=True, any_correct=True, correct=1,
                     cost=counts[cfg.cost_unit], saved_fraction=1-counts[cfg.cost_unit]/cfg.full_cost,
                     call_counts=counts, full_call_counts=full)
     # First question stops in half of its orders; second stops in all its orders.
@@ -982,9 +1064,29 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
             savings = summary["call_savings"]
             assert savings["all"]["n"] == summary["n"]
             assert savings["max_present"]["n"] == summary["max_present_n"]
+            assert savings["no_max"]["n"] == summary["no_max_n"]
+            assert savings["teacher_miss"]["n"] + savings["all_wrong"]["n"] == savings["no_max"]["n"]
             assert savings["all"]["total_calls"]["mean_full"] == a.acquisition_call_counts(cfg.n, cfg.k, cfg)["total_calls"]
             if method == "full":
                 assert savings["all"]["total_calls"]["mean_saved"] == 0
+        # Recognition outcomes add up to every rollout, the mean saved calls, and the top-1 change.
+        for method, table in report["recognition_outcomes"].items():
+            calls = report["policies"][method]["call_savings"]["all"]["total_calls"]
+            change = report["comparisons"][f"{method} vs full"]["top1"]["delta"]
+            assert sum(cell["rollouts"] for cell in table.values()) == pytest.approx(1)
+            assert sum(cell["saved_calls"] for cell in table.values()) == pytest.approx(calls["mean_saved"])
+            assert sum(cell["top1_gained"] - cell["top1_lost"] for cell in table.values()) == pytest.approx(change)
+        assert set(report["comparisons"]) == {
+            *(f"{method} vs full" for method in a.evaluation_methods(cfg) if method != "full"),
+            *(f"supervised vs {method}" for method in cfg.fixed_acquisition_orders)}
+    # The external file's all-wrong question has its own savings group.
+    assert all(summary["call_savings"]["all_wrong"]["n"] >= 1
+               for summary in work.results["external"]["adaptive"]["policies"].values())
+    for title in ("1) API calls versus accuracy", "2) Paired differences", "3) API calls saved by question group",
+                  "4) MAX recognition outcomes"):
+        assert log.count(title) == 3  # audit, external, second
+    assert re.search(r"^supervised vs fixed +\| +[+-]\d", log, re.M)
+    assert re.search(r"^ +\| Total +\| +100\.0% \|", log, re.M)
     assert set(work.results["external_macro"]["methods"]) == set(a.evaluation_methods(cfg))
     assert work.audit["second"]["duplicate_or_cross_file_overlap"] == 2
     assert (tmp_path/"run"/"decision_head_completed.pt").exists()
@@ -1058,6 +1160,11 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
                 for method in a.evaluation_methods(cfg)}
         assert work.results[name]["adaptive"]["policies"] == {
             method: a.policy_summary(method_rows) for method, method_rows in rows.items()}
+        for method in rows:
+            if method != "full":
+                assert work.results[name]["adaptive"]["comparisons"][f"{method} vs full"]["top1"]["delta"] == (
+                    pytest.approx(a.paired_interval(rows[method], rows["full"], cfg.bootstrap_samples,
+                                                    cfg.seed)["delta"]))
         assert work.results[name]["paired_top1"] == {
             baseline: a.paired_interval(rows["supervised"], rows[baseline], cfg.bootstrap_samples, cfg.seed)
             for baseline in rows if baseline != "supervised"}
