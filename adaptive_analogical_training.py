@@ -67,7 +67,7 @@ class Config:
     teacher_complete_share: float = .15
     snapshot_complete_share: float = 0.   # 0: complete views appear once per order, like any other.
     dev_checks_per_epoch: int = 8   # Stages 1-2 development checks, evenly spaced in each epoch.
-    patience: int = 15              # Checks without improvement (Stages 1-2) or epochs (Stage 3).
+    patience: int = 15              # Epochs without a better development loss before training stops.
     auxiliary_weight: float = .25
     calibrate: bool = True          # Development-only temperature selection.
     recognition_threshold: float = .50
@@ -1055,22 +1055,23 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
     development checks are spread through it.
 
     `evaluate(model)` returns the development loss (lower is better) and its description;
-    `better(new, old)` says whether a loss improves on the best so far. Patience counts
-    checks without improvement, so training can stop inside a long epoch.
+    `better(new, old)` says whether a loss improves on the best so far. The checks only
+    choose the checkpoint: training stops at the end of the first epoch that finishes
+    `patience` or more whole epochs after the best check.
     """
     if views.rows < 2:
         raise ValueError(f"{name}: too few training views.")
     # One fused update kernel on CUDA: small-model steps are otherwise launch-bound.
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
                            fused=views.device.type == "cuda")
-    best, best_text, weights, best_epoch, stale, history = None, "", None, 0., 0, []
+    best, best_text, weights, best_epoch, history = None, "", None, 0., []
     checks, position, started = cfg.dev_checks_per_epoch, 0., time.monotonic()
     complete = len(views.ids) * views.order_count * views.complete_copies
     print(f"{name}: {len(views.ids)} questions x {views.order_count} zero-shot orders x "
           f"{views.state_count} presence states = {views.rows:,} views; each complete view "
           f"{views.complete_copies:,}x, so {views.epoch_rows:,} rows per epoch, "
           f"{complete / views.epoch_rows:.1%} complete; {checks} development checks per epoch; "
-          f"patience counts checks.", flush=True)
+          f"patience counts epochs.", flush=True)
     for epoch in range(epochs):
         done = seen = check = 0
         total = torch.zeros((), device=views.device)
@@ -1094,17 +1095,14 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
             total.zero_()
             seen = 0
             if best is None or better(score, best):
-                best, best_text, weights, best_epoch, stale = score, text, cpu_state(model), position, 0
-            else:
-                stale += 1
-            if stale >= cfg.patience:
-                break
+                best, best_text, weights, best_epoch = score, text, cpu_state(model), position
         # Training loss averages this epoch's rows up to its last check.
+        waited = position - best_epoch
         print(f"{name} | epoch {position:6.3f} | train loss {float(epoch_total) / max(1, done - seen):.4f} | "
               f"latest {text} | best {best_text} at epoch {best_epoch:.3f} | "
-              f"checks without improvement {stale}/{cfg.patience} | "
+              f"epochs without improvement {waited:.2f}/{cfg.patience} | "
               f"elapsed {(time.monotonic() - started) / 60:.1f} min", flush=True)
-        if stale >= cfg.patience:
+        if waited >= cfg.patience:
             break
     return {"weights": weights, "best": best, "best_epoch": best_epoch,
             "epochs": position, "history": history}

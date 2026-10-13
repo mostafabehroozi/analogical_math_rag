@@ -90,16 +90,16 @@ complete-state development loss, Stage 2 on its loss over every reachable state.
 One epoch visits every view once (plus those repeats): about 98 million views
 for 2,000 training questions. The defaults are therefore `batch_size=16384`,
 `teacher_epochs=snapshot_epochs=10`, and `dev_checks_per_epoch=8`. Development
-checks are spread evenly through each epoch, `patience` counts checks without
-improvement in Stages 1-2 (epochs in Stage 3), and the selected checkpoint's
-position is a fractional epoch such as `1.375`. Patience is therefore not reset
-at an epoch boundary: with 8 checks per epoch, `15` is just under two epochs
-without a better check. The training loop prints one line per epoch: the mean
-training loss over the epoch, the latest check's development loss, the best
-development loss and the epoch of its check, and the checks without
-improvement, for example
+checks are spread evenly through each epoch and only choose the checkpoint, whose
+position is a fractional epoch such as `1.375`. `patience` counts whole epochs in
+every stage: training stops at the end of the first epoch that finishes
+`patience` or more epochs after the best check (the best check at epoch `3.625`
+with `patience=15` stops at the end of epoch 19, never inside an epoch). The
+training loop prints one line per epoch: the mean training loss over the epoch,
+the latest check's development loss, the best development loss and the epoch of
+its check, and the epochs without improvement, for example
 `epoch  4.000 | train loss 0.2846 | latest development loss 0.2951 | best
-development loss 0.2874 at epoch 3.625 | checks without improvement 3/15`.
+development loss 0.2874 at epoch 3.625 | epochs without improvement 0.38/15`.
 Stage 2 also shows Top-1 and Brier in parentheses after each loss; they are
 information, not selection criteria.
 
