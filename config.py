@@ -76,6 +76,19 @@ CONFIG = {
     # API-task chains.
     "QUESTION_PARALLEL_API_ENABLED": False,  # Master switch: Set to True to enable parallel API calls inside a question's steps
     "QUESTION_PARALLEL_MAX_WORKERS": 3,      # Max number of concurrent API calls allowed per step (e.g., batches of 3)
+    # Provider batch API (OpenRouter and Kaggle Benchmarks; other providers
+    # ignore it). Off sends every call directly. On, the calls that question
+    # workers and in-question pools make at the same time are collected and
+    # submitted together; each caller still gets its own response and retries.
+    # At most BATCH_MAX_WORKERS * QUESTION_PARALLEL_MAX_WORKERS calls are
+    # outstanding at once, so raise those settings to fill larger batches.
+    "API_BATCHING_ENABLED": False,
+    "API_BATCH_MAX_SIZE": 20,               # Requests per submitted batch
+    "API_BATCH_COLLECT_SECONDS": 2.0,       # How long the first queued request waits for others
+    "API_BATCH_MAX_CONCURRENT_BATCHES": 2,  # Batches in flight per provider (fixed when the first batch starts)
+    "API_BATCH_POLL_SECONDS": 10.0,         # OpenRouter batch status polling interval
+    "API_BATCH_TIMEOUT_SECONDS": 1800.0,    # A batch still unfinished after this fails its requests (they retry)
+    "API_BATCH_KAGGLE_N_JOBS": 5,           # Concurrent workers inside one Kaggle Benchmarks batch
     "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
     "API_REQUEST_TIMEOUT_SECONDS": 60.0,
     "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 1,            # N: Number of consecutive errors to trigger a pause (0 to disable)
@@ -108,7 +121,7 @@ CONFIG = {
         "models/gemma-3-27b-it": [{"api_key": None, "rpm": 30, "rpd": 1000}],
     },
     # Minimum time between outgoing calls to each provider (0 disables this delay).
-    "GLOBAL_API_CALL_DELAY_SECONDS": {"gemini": 5.0, "avalai": 5.0, "openrouter": 5.0, "ollama": 0.0},
+    "GLOBAL_API_CALL_DELAY_SECONDS": {"gemini": 5.0, "avalai": 5.0, "openrouter": 5.0, "kaggle": 0.0, "ollama": 0.0},
 
     "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-3-27b-it",
     "GEMINI_MODEL_NAME_FINAL_SOLVER": "models/gemma-3-27b-it",
@@ -156,6 +169,22 @@ CONFIG = {
     "OPENROUTER_PROVIDER_ROUTING": {},
     "OPENROUTER_MODEL_ROUTING": {},
     "OPENROUTER_MODEL_FALLBACKS": {},
+
+    # Kaggle Benchmarks model proxy ("kaggle" provider). Runs only inside a
+    # Kaggle notebook with the kaggle-benchmarks package; calls are billed to
+    # the notebook's free benchmarking budget. Model names are kbench.llms
+    # keys such as "google/gemini-2.5-flash".
+    "KAGGLE_MODEL_NAME_ADAPTATION": None,
+    "KAGGLE_MODEL_NAME_FINAL_SOLVER": None,
+    "KAGGLE_MODEL_NAME_EVALUATOR": None,
+    "KAGGLE_MODEL_NAME_SIMPLIFICATION": None,
+    "KAGGLE_MODEL_QUOTAS": {"default": {"rpm": 60}},
+    # Options: None (model default), "none", "low", "medium", "high". Note: the
+    # kaggle-benchmarks library currently drops temperature for proxy models.
+    "KAGGLE_REASONING_EFFORT": None,
+    "KAGGLE_REASONING_EFFORT_ADAPTATION": None,
+    "KAGGLE_REASONING_EFFORT_FINAL_SOLVER": None,
+    "KAGGLE_REASONING_EFFORT_EVALUATOR": None,
 
     # Ollama (Local LLM) Settings
     "OLLAMA_BASE_URL": "http://127.0.0.1:11434",

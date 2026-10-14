@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
 
-from src.api_manager import model_name_for
+from src.api_manager import SUPPORTED_API_PROVIDERS, model_name_for
 from src.benchmark_data import benchmark_name_for_target_index
 from src.batching import BatchCoordinator, QuestionResult, QuestionWorkItem
 from src.distributed_execution import (
@@ -46,7 +46,7 @@ def _result_completed(result: Dict[str, Any]) -> bool:
 
 def _model_name(manager: Any, config: Dict[str, Any], role: str) -> str:
     """Resolve a model name while retaining support for lightweight test managers."""
-    if getattr(manager, "provider_name", None) in {"gemini", "avalai", "openrouter", "ollama"}:
+    if getattr(manager, "provider_name", None) in SUPPORTED_API_PROVIDERS:
         return model_name_for(manager, config, role)
     # Lightweight test managers do not always expose provider_name.
     provider = config.get(f"API_PROVIDER_{'SOLVER' if role == 'solver' else role.upper()}", "gemini")

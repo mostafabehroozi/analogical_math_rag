@@ -78,6 +78,66 @@ changing another experiment's requests. Optional global and per-role
 supports it. OpenRouter uses the existing request retry, quota, and provider
 delay settings.
 
+## Kaggle Benchmarks models
+
+Inside a Kaggle notebook, the `kaggle` provider sends calls through the
+`kaggle_benchmarks` model proxy and uses the notebook's free benchmarking
+budget; no API key is needed. Set the role model names to keys of
+`kaggle_benchmarks.llms` (`list(kbench.llms)` shows them) and select
+`"kaggle"` for any role:
+
+```python
+CONFIG["KAGGLE_MODEL_NAME_FINAL_SOLVER"] = "google/gemini-2.5-flash"
+CONFIG["KAGGLE_MODEL_NAME_EVALUATOR"] = "google/gemini-2.5-flash"
+experiment_configurations[0]["API_PROVIDER_SOLVER"] = "kaggle"
+experiment_configurations[0]["API_PROVIDER_EVALUATOR"] = "kaggle"
+```
+
+`KAGGLE_REASONING_EFFORT` (and its per-role overrides) accepts `"none"`,
+`"low"`, `"medium"` or `"high"`. The library currently drops `temperature`
+for proxy models, so sampled attempts (Pass@N) use the model default.
+`KAGGLE_MODEL_QUOTAS` paces requests (default 60 per minute).
+
+## Provider batch API
+
+`API_BATCHING_ENABLED` (globally or per experiment) makes OpenRouter and
+Kaggle send concurrent calls as one batch; other providers ignore it. It is a
+transport switch and works alongside the two existing parallel levels:
+
+- `BATCH_PROCESSING_ENABLED` / `BATCH_MAX_WORKERS`: questions run in parallel.
+- `QUESTION_PARALLEL_API_ENABLED` / `QUESTION_PARALLEL_MAX_WORKERS`: calls run
+  in parallel inside a question.
+
+Every call those workers make at the same time waits up to
+`API_BATCH_COLLECT_SECONDS` for others, and up to `API_BATCH_MAX_SIZE` of them
+are submitted together. Each call still receives its own response, and a failed
+call is retried on its own in a later batch. At most
+`API_BATCH_MAX_CONCURRENT_BATCHES` batches are in flight per provider; calls
+that arrive meanwhile form the next, larger batch. Because at most
+`BATCH_MAX_WORKERS × QUESTION_PARALLEL_MAX_WORKERS` calls are outstanding,
+those settings bound the batch size.
+
+- **Kaggle**: a batch is one `task.evaluate` over the prompts with
+  `API_BATCH_KAGGLE_N_JOBS` concurrent workers.
+- **OpenRouter**: a batch is one
+  [Batch API](https://openrouter.ai/docs/batch-quickstart) job, billed at a
+  discount. The job is polled every `API_BATCH_POLL_SECONDS`. Only models with
+  a batch endpoint are accepted. Provider routing may use only `only` and
+  `allow_fallbacks`, and `OPENROUTER_MODEL_FALLBACKS` cannot be used; other
+  settings fail the call immediately. OpenRouter allows up to 24 hours per job,
+  so a job still running after `API_BATCH_TIMEOUT_SECONDS` is abandoned and its
+  calls retried, and OpenRouter may still bill it.
+
+```python
+{
+    "experiment_name": "Layer1_Grouping_K5_Sizes_2",
+    # ...
+    "BATCH_PROCESSING_ENABLED": True, "BATCH_SIZE": 5, "BATCH_MAX_WORKERS": 5,
+    "QUESTION_PARALLEL_API_ENABLED": True, "QUESTION_PARALLEL_MAX_WORKERS": 2,
+    "API_BATCHING_ENABLED": True, "API_BATCH_MAX_SIZE": 10,
+}
+```
+
 ## Layer-1 grouping companion run
 
 Run grouping as its own experiment so its JSON can later be paired with the

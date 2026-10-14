@@ -12,12 +12,14 @@ import logging
 import threading
 import time
 import inspect
+import json
 import os
 import copy
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, TypedDict, Union
+from src.api_batching import APIBatchDispatcher, BatchItem, BatchSettings, batching_enabled
 from src.context_logger import ctx_query_idx, ctx_batch_id, tprint
 from src.distributed_execution import api_deadline_due, remaining_api_seconds
 
@@ -41,7 +43,7 @@ except ImportError:  # The legacy ``google`` namespace may exist without google-
 RETRYABLE_ERROR_TYPES = {
     "APITimeoutError", "APIConnectionError", "ResourceExhausted",
     "OllamaConnectionError", "UnknownError", "APIStatusError",
-    "RateLimitError", 
+    "RateLimitError", "BatchError", "BatchItemError", "BatchTimeout",
 }
 NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "PermissionDeniedError", "PaymentRequired", "InvalidArgument", "InvalidModel", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit", "SessionDeadline"}
 
@@ -423,7 +425,15 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
     return final_resp
 
 
-class _KeyedAPIManager:
+class _ConfigBindable:
+    def for_config(self, config: Dict[str, Any]):
+        """Use experiment options while sharing clients, quota and batch state."""
+        bound = copy.copy(self)
+        bound.config = config
+        return bound
+
+
+class _KeyedAPIManager(_ConfigBindable):
     provider_name = "remote"
 
     def __init__(self, api_keys: List[str], model_quotas: Dict[str, Any], config: Optional[Dict[str, Any]]) -> None:
@@ -477,10 +487,13 @@ _MODEL_ROLE_SUFFIX = {
 }
 
 
+SUPPORTED_API_PROVIDERS = frozenset({"gemini", "avalai", "openrouter", "kaggle", "ollama"})
+
+
 def model_name_for(manager: Any, config: Dict[str, Any], role: str) -> str:
     """Resolve a role's model for any configured API provider."""
     provider = getattr(manager, "provider_name", None)
-    if provider not in {"gemini", "avalai", "openrouter", "ollama"}:
+    if provider not in SUPPORTED_API_PROVIDERS:
         raise TypeError(f"Unsupported API manager: {type(manager)}")
     suffix = _MODEL_ROLE_SUFFIX[role]
     prefix = provider.upper()
@@ -695,6 +708,10 @@ class OpenRouterAPIManager(_KeyedAPIManager):
             headers["HTTP-Referer"] = self.config["OPENROUTER_HTTP_REFERER"]
         if self.config.get("OPENROUTER_APP_TITLE"):
             headers["X-OpenRouter-Title"] = self.config["OPENROUTER_APP_TITLE"]
+        self.base_url = base_url.rstrip("/")
+        self.headers = headers
+        self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0))
+        self.batcher = APIBatchDispatcher(self.provider_name, self._submit_batch)
         self.clients = {
             key: openai.OpenAI(
                 api_key=key,
@@ -704,12 +721,6 @@ class OpenRouterAPIManager(_KeyedAPIManager):
                 max_retries=0,
             ) for key in self.api_keys_list
         }
-
-    def for_config(self, config: Dict[str, Any]) -> "OpenRouterAPIManager":
-        """Use experiment options while sharing clients and quota state."""
-        bound = copy.copy(self)
-        bound.config = config
-        return bound
 
     def _extra_body(self, model_name: str, role: Optional[str]) -> Dict[str, Any]:
         config = self.config
@@ -745,6 +756,8 @@ class OpenRouterAPIManager(_KeyedAPIManager):
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
         self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
         extra_body = self._extra_body(model_name, avalai_role)
+        if batching_enabled(self.config):
+            return self._generate_batched(prompt, model_name, temperature, extra_body)
 
         def attempt() -> APIResponse:
             lease = self.scheduler.acquire(model_name)
@@ -797,18 +810,345 @@ class OpenRouterAPIManager(_KeyedAPIManager):
 
         return execute_with_retry(self.config, self.provider_name, model_name, prompt, attempt)
 
+    # --- Batch API (https://openrouter.ai/docs/batch-quickstart) ---
+    # One batch has one model and one provider object; only provider.only and
+    # provider.allow_fallbacks are accepted, and results come back inline once
+    # the batch reaches a terminal status.
+
+    _BATCH_PROVIDER_KEYS = frozenset({"only", "allow_fallbacks"})
+    _BATCH_TERMINAL = frozenset({"completed", "failed", "expired", "cancelled"})
+
+    def _generate_batched(self, prompt: str, model_name: str, temperature: Optional[float], extra_body: Dict[str, Any]) -> APIResponse:
+        provider = extra_body.get("provider") or {}
+        unsupported = sorted(set(provider) - self._BATCH_PROVIDER_KEYS)
+        if unsupported or extra_body.get("models"):
+            reason = (
+                f"provider routing keys {unsupported}" if unsupported
+                else f"OPENROUTER_MODEL_FALLBACKS for {model_name!r}"
+            )
+            return {
+                "status": "ERROR", "text": None, "error_type": "InvalidArgument",
+                "error_message": (
+                    f"The OpenRouter Batch API does not accept {reason}; only provider "
+                    "'only'/'allow_fallbacks' are allowed. Change the routing or set "
+                    "API_BATCHING_ENABLED=False."
+                ),
+            }
+        body: Dict[str, Any] = {"messages": [{"role": "user", "content": prompt}]}
+        if temperature is not None:
+            body["temperature"] = temperature
+        if "reasoning" in extra_body:
+            body["reasoning"] = extra_body["reasoning"]
+        payload = {"model": model_name, "provider": provider, "body": body}
+        group = (model_name, json.dumps(provider, sort_keys=True))
+        settings = BatchSettings.from_config(self.config)
+        return execute_with_retry(
+            self.config, self.provider_name, model_name, prompt,
+            lambda: self.batcher.call(payload, group, settings),
+        )
+
+    def _batch_http(self, method: str, path: str, api_key: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+        import httpx  # Installed with the openai SDK.
+
+        response = httpx.request(
+            method, f"{self.base_url}{path}", json=payload, timeout=self.timeout_seconds,
+            headers={**self.headers, "Authorization": f"Bearer {api_key}"},
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"error": {"message": response.text[:500]}}
+        return response.status_code, data
+
+    def _http_error_type(self, code: int, api_key: str, model_name: str) -> str:
+        if code in (401, 402, 403):
+            self.scheduler.disable(api_key, f"HTTP {code}")
+        elif code == 429 or code >= 500:
+            self.scheduler.cooldown(api_key, model_name)
+        return {400: "InvalidArgument", 401: "AuthenticationError", 402: "PaymentRequired",
+                403: "PermissionDeniedError", 404: "InvalidModel", 422: "InvalidArgument",
+                429: "RateLimitError"}.get(code, "APIStatusError")
+
+    def _submit_batch(self, items: List[BatchItem], settings: BatchSettings) -> List[APIResponse]:
+        model_name = items[0].payload["model"]
+        provider = items[0].payload["provider"]
+
+        def fail_all(error_type: str, message: str, meta: Optional[Dict[str, Any]] = None) -> List[APIResponse]:
+            status = "RATE_LIMITED" if error_type in ("RateLimitError", "ProactiveRateLimit") else "ERROR"
+            return [{"status": status, "text": None, "error_type": error_type, "error_message": message,
+                     "request_meta": dict(meta or {})} for _ in items]
+
+        lease = self.scheduler.acquire(model_name)
+        if lease is None:
+            return fail_all("ProactiveRateLimit", f"No eligible OpenRouter key for {model_name}.")
+        meta = self._request_meta(lease)
+        meta["requested_model"] = model_name
+        request: Dict[str, Any] = {"endpoint": "/v1/chat/completions", "model": model_name}
+        if provider:
+            request["provider"] = provider
+        request["completion_window"] = "24h"
+        # The API requires "requests" to be serialized last.
+        request["requests"] = [
+            {"custom_id": f"req-{position}", "body": item.payload["body"]}
+            for position, item in enumerate(items)
+        ]
+        _pace_provider_call(self.config, self.provider_name)
+        code, batch = self._batch_http("POST", "/batches", lease.api_key, request)
+        if code >= 400 or not isinstance(batch, dict) or not batch.get("id"):
+            message = (batch.get("error") or {}).get("message") if isinstance(batch, dict) else None
+            error_type = self._http_error_type(code, lease.api_key, model_name) if code >= 400 else "BatchError"
+            return fail_all(error_type, f"Batch create failed (HTTP {code}): {message or batch}", meta)
+        batch_id = batch["id"]
+        meta["openrouter_batch_id"] = batch_id
+        tprint(f"[API BATCH openrouter] {batch_id}: {len(items)} request(s) for {model_name} submitted.", level="INFO")
+
+        deadline = time.monotonic() + settings.timeout_seconds
+        while batch.get("status") not in self._BATCH_TERMINAL:
+            if api_deadline_due(self.config):
+                return fail_all("SessionDeadline", f"Session API deadline reached while waiting for batch {batch_id}.", meta)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return fail_all(
+                    "BatchTimeout",
+                    f"Batch {batch_id} was not finished after {settings.timeout_seconds:.0f}s "
+                    f"(last status {batch.get('status')!r}); OpenRouter may still complete and bill it.",
+                    meta,
+                )
+            time.sleep(min(settings.poll_seconds, remaining))
+            try:
+                code, polled = self._batch_http("GET", f"/batches/{batch_id}", lease.api_key)
+            except Exception as error:  # A failed poll is retried on the next tick.
+                tprint(f"[API BATCH openrouter] {batch_id}: poll failed ({error!r}).", level="DEBUG")
+                continue
+            if code < 400 and isinstance(polled, dict):
+                batch = polled
+                tprint(f"[API BATCH openrouter] {batch_id}: {batch.get('status')} {batch.get('request_counts')}", level="DEBUG")
+
+        if batch.get("status") != "completed":
+            return fail_all("BatchError", f"Batch {batch_id} ended {batch.get('status')!r}: {batch.get('errors') or batch.get('error')}", meta)
+
+        by_id = {result.get("custom_id"): result for result in batch.get("results") or []}
+        responses: List[APIResponse] = []
+        for position in range(len(items)):
+            item_meta = dict(meta)
+            result = by_id.get(f"req-{position}")
+            response = (result or {}).get("response") or {}
+            body = response.get("body") or {}
+            if result is None or result.get("error") or response.get("status_code") != 200:
+                code = response.get("status_code")
+                error = (result or {}).get("error") or body.get("error") or {}
+                error_type = (
+                    self._http_error_type(code, lease.api_key, model_name)
+                    if isinstance(code, int) and code >= 400 else "BatchItemError"
+                )
+                message = error.get("message") if isinstance(error, dict) else error
+                responses.append({"status": "ERROR", "text": None, "error_type": error_type,
+                                  "error_message": str(message or "Missing batch result."), "request_meta": item_meta})
+                continue
+            item_meta["returned_model"] = body.get("model")
+            choices = body.get("choices") or []
+            content = ((choices[0] if choices else {}).get("message") or {}).get("content")
+            if not content:
+                responses.append({"status": "BLOCKED", "text": None, "error_type": "NoChoices",
+                                  "error_message": "OpenRouter returned no completion text.", "request_meta": item_meta})
+            else:
+                responses.append({"status": "SUCCESS", "text": content, "error_type": None,
+                                  "error_message": None, "request_meta": item_meta})
+        return responses
+
 
 def bind_api_managers(api_managers: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
-    """Bind OpenRouter request settings to one experiment without shared mutation."""
-    manager = api_managers.get("openrouter")
-    if not isinstance(manager, OpenRouterAPIManager):
-        return api_managers
-    bound = dict(api_managers)
-    bound["openrouter"] = manager.for_config(config)
-    return bound
+    """Bind request settings (reasoning, routing, batching) to one experiment.
+
+    Bound copies share clients, key schedulers and batch dispatchers with the
+    original manager, so no shared state is mutated.
+    """
+    return {
+        name: manager.for_config(config) if isinstance(manager, _ConfigBindable) else manager
+        for name, manager in api_managers.items()
+    }
 
 
-class OllamaAPIManager:
+def _kaggle_error_type(message: str) -> str:
+    """Classify a Kaggle model-proxy failure from its exception name or traceback."""
+    for marker, error_type in (
+        ("RateLimitError", "RateLimitError"),
+        ("AuthenticationError", "AuthenticationError"),
+        ("PermissionDeniedError", "PermissionDeniedError"),
+        ("NotFoundError", "InvalidModel"),
+        ("BadRequestError", "InvalidArgument"),
+        ("UnprocessableEntityError", "InvalidArgument"),
+    ):
+        if marker in message:
+            return error_type
+    return "UnknownError"
+
+
+class KaggleBenchmarksAPIManager(_KeyedAPIManager):
+    """Kaggle Benchmarks model proxy (``kaggle_benchmarks``), free within the notebook quota.
+
+    Direct calls use ``llm.prompt`` inside an isolated chat: outside a task the
+    library shares one global chat, so concurrent prompts would overwrite each
+    other.  Batched calls run one ``task.evaluate`` over a DataFrame of
+    prompts; every row is its own task run with its own chat.
+    The proxy has no per-user keys, so one pseudo-key carries the RPM quota.
+    """
+
+    provider_name = "kaggle"
+    _PROXY_KEY = "model-proxy"
+
+    def __init__(self, model_quotas: Dict[str, Any], config: Optional[Dict[str, Any]] = None):
+        try:
+            import kaggle_benchmarks as kbench
+        except ImportError as error:
+            raise ImportError(
+                "KaggleBenchmarksAPIManager requires the 'kaggle-benchmarks' package "
+                "(preinstalled in Kaggle notebooks; otherwise: pip install kaggle-benchmarks)."
+            ) from error
+        if not kbench.kaggle.is_configured():
+            raise RuntimeError(
+                "The Kaggle model proxy is not configured (MODEL_PROXY_URL and "
+                "MODEL_PROXY_API_KEY are missing). Run inside a Kaggle notebook with "
+                "benchmark models available, or authenticate with 'kaggle benchmarks auth'."
+            )
+        super().__init__([self._PROXY_KEY], model_quotas, config)
+        self.kbench = kbench
+        self._llms: Dict[str, Any] = {}
+        self._llm_lock = threading.Lock()
+        self._row_task = None
+        self.batcher = APIBatchDispatcher(self.provider_name, self._submit_batch)
+
+    def _llm(self, model_name: str) -> Any:
+        with self._llm_lock:
+            if model_name not in self._llms:
+                llm = self.kbench.llms.get(model_name)
+                self._llms[model_name] = llm if llm is not None else self.kbench.kaggle.load_model(model_name)
+            return self._llms[model_name]
+
+    def _prompt_options(self, temperature: Optional[float], role: Optional[str]) -> Dict[str, Any]:
+        # The library currently drops temperature for proxy models; it is sent
+        # anyway so it takes effect as soon as the proxy supports it.
+        options: Dict[str, Any] = {}
+        if temperature is not None:
+            options["temperature"] = temperature
+        role_key = {
+            "adaptation": "KAGGLE_REASONING_EFFORT_ADAPTATION",
+            "final_solver": "KAGGLE_REASONING_EFFORT_FINAL_SOLVER",
+            "evaluator": "KAGGLE_REASONING_EFFORT_EVALUATOR",
+        }.get(role)
+        effort = self.config.get(role_key) if role_key else None
+        if effort is None:
+            effort = self.config.get("KAGGLE_REASONING_EFFORT")
+        if effort is not None:
+            options["reasoning"] = effort
+        return options
+
+    def _failure(self, message: str, meta: Dict[str, Any], model_name: str) -> APIResponse:
+        error_type = _kaggle_error_type(message)
+        if error_type in ("AuthenticationError", "PermissionDeniedError"):
+            self.scheduler.disable(self._PROXY_KEY, error_type)
+        elif error_type in ("RateLimitError", "UnknownError"):
+            self.scheduler.cooldown(self._PROXY_KEY, model_name)
+        status = "RATE_LIMITED" if error_type == "RateLimitError" else "ERROR"
+        return {"status": status, "text": None, "error_type": error_type,
+                "error_message": message[-2000:], "request_meta": meta}
+
+    def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
+        self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
+        options = self._prompt_options(temperature, avalai_role)
+        if batching_enabled(self.config):
+            payload = {
+                "model": model_name, "prompt": prompt, "options": options,
+                "n_jobs": max(1, int(self.config.get("API_BATCH_KAGGLE_N_JOBS", 5))),
+            }
+            settings = BatchSettings.from_config(self.config)
+            return execute_with_retry(
+                self.config, self.provider_name, model_name, prompt,
+                lambda: self.batcher.call(payload, model_name, settings),
+            )
+
+        def attempt() -> APIResponse:
+            lease = self.scheduler.acquire(model_name)
+            if lease is None:
+                return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": f"No eligible Kaggle proxy quota for {model_name}.", "error_details": self.scheduler.snapshot()}
+            meta = self._request_meta(lease)
+            try:
+                llm = self._llm(model_name)
+                _pace_provider_call(self.config, self.provider_name)
+                with self.kbench.chats.new("analogical-math-rag", orphan=True):
+                    text = llm.prompt(prompt, **options)
+            except Exception as error:
+                return self._failure(f"{type(error).__name__}: {error}", meta, model_name)
+            if not text:
+                return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": "Kaggle model proxy returned no text.", "request_meta": meta}
+            return {"status": "SUCCESS", "text": text, "error_type": None, "error_message": None, "request_meta": meta}
+
+        return execute_with_retry(self.config, self.provider_name, model_name, prompt, attempt)
+
+    def _get_row_task(self) -> Any:
+        with self._llm_lock:
+            if self._row_task is None:
+                def prompt_row(llm, prompt, options):
+                    return {"text": llm.prompt(prompt, **json.loads(options))}
+
+                # kbench infers the result type from the real annotation object;
+                # this module's postponed annotations would only give a string.
+                prompt_row.__annotations__ = {"return": dict}
+                self._row_task = self.kbench.task(
+                    name="analogical_math_rag_prompt", store_task=False, store_run=False
+                )(prompt_row)
+            return self._row_task
+
+    def _submit_batch(self, items: List[BatchItem], settings: BatchSettings) -> List[APIResponse]:
+        import pandas as pd
+
+        model_name = items[0].payload["model"]
+        responses: List[Optional[APIResponse]] = [None] * len(items)
+        metas: List[Dict[str, Any]] = [{} for _ in items]
+        runnable: List[int] = []
+        for position in range(len(items)):
+            # Every row is a real model call, so each one takes quota.
+            lease = self.scheduler.acquire(model_name)
+            if lease is None:
+                responses[position] = {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit",
+                                       "error_message": f"No eligible Kaggle proxy quota for {model_name}."}
+                continue
+            metas[position] = self._request_meta(lease)
+            runnable.append(position)
+        if runnable:
+            frame = pd.DataFrame({
+                "prompt": [items[position].payload["prompt"] for position in runnable],
+                # JSON keeps None and per-row options intact through pandas.
+                "options": [json.dumps(items[position].payload["options"]) for position in runnable],
+            })
+            _pace_provider_call(self.config, self.provider_name)
+            runs = self._get_row_task().evaluate(
+                llm=[self._llm(model_name)],
+                evaluation_data=frame,
+                n_jobs=min(items[0].payload["n_jobs"], len(runnable)),
+                timeout=settings.timeout_seconds,
+                on_failure="continue",
+                remove_run_files=True,
+            )
+            # evaluate() passes each row's DataFrame index as the run's param_id.
+            by_row = {int(run.param_id): run for run in runs if run.param_id is not None}
+            for row, position in enumerate(runnable):
+                run = by_row.get(row)
+                meta = metas[position]
+                result = getattr(run, "result", None)
+                if run is None or str(run.status) != "success" or not isinstance(result, dict):
+                    message = getattr(run, "error_message", None) or "Kaggle task run produced no result."
+                    responses[position] = self._failure(str(message), meta, model_name)
+                elif not result.get("text"):
+                    responses[position] = {"status": "BLOCKED", "text": None, "error_type": "NoChoices",
+                                           "error_message": "Kaggle model proxy returned no text.", "request_meta": meta}
+                else:
+                    responses[position] = {"status": "SUCCESS", "text": result["text"], "error_type": None,
+                                           "error_message": None, "request_meta": meta}
+        return responses
+
+
+class OllamaAPIManager(_ConfigBindable):
     """Local manager retaining the same response contract (no API-key scheduler)."""
 
     provider_name = "ollama"

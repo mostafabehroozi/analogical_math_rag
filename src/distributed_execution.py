@@ -47,6 +47,9 @@ INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS = frozenset({
     "OPENROUTER_REASONING_EFFORT_ADAPTATION",
     "OPENROUTER_REASONING_EFFORT_FINAL_SOLVER",
     "OPENROUTER_REASONING_EFFORT_EVALUATOR",
+    "KAGGLE_REASONING_EFFORT_ADAPTATION",
+    "KAGGLE_REASONING_EFFORT_FINAL_SOLVER",
+    "KAGGLE_REASONING_EFFORT_EVALUATOR",
 })
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -257,6 +260,8 @@ _SECRET_PARTS = (
 )
 _RUNTIME_PREFIXES = (
     "DISTRIBUTED_", "HF_SYNC_", "BATCH_", "QUESTION_PARALLEL_",
+    # Provider batch submission changes transport only, never request content.
+    "API_BATCH",
 )
 _RUNTIME_EXACT = {
     "BASE_OUTPUT_DIR", "DATA_DIR", "LOGS_DIR", "OUTPUTS_DIR", "RESULTS_DIR",
@@ -300,11 +305,16 @@ def sanitize_scientific_config(value: Any) -> Any:
             str(key).startswith("API_PROVIDER_") and provider == "openrouter"
             for key, provider in value.items()
         )
+        uses_kaggle = any(
+            str(key).startswith("API_PROVIDER_") and provider == "kaggle"
+            for key, provider in value.items()
+        )
         return {
             str(key): sanitize_scientific_config(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
             if not _is_runtime_or_secret_key(str(key))
             and not (is_experiment_config and not uses_openrouter and str(key).startswith("OPENROUTER_"))
+            and not (is_experiment_config and not uses_kaggle and str(key).startswith("KAGGLE_"))
             and not (
                 str(key) in INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS
                 and item is None
