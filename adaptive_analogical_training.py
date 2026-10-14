@@ -3097,8 +3097,15 @@ def dataset_construction(contract_cfg, sources):
 
     `sources` lists name, size, and SHA-256 of each log in order, or is None while the logs are unknown.
     """
-    return json.loads(json.dumps({"schema_version": DATASET_SCHEMA, "implementation_revision": PIPELINE_REVISION,
-                                  "config": contract_cfg, "sources": sources}))
+    def canonical(value):  # 0 and 0. are one setting; they must be one version.
+        if isinstance(value, dict):
+            return {key: canonical(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else value
+    return json.loads(json.dumps(canonical({"schema_version": DATASET_SCHEMA,
+                                            "implementation_revision": PIPELINE_REVISION,
+                                            "config": contract_cfg, "sources": sources})))
 
 
 def dataset_version(construction):
@@ -3134,7 +3141,7 @@ class DatasetStore:
         self.interval, self.resume = interval_minutes, resume
         self.api = hub_api() if api is None else api
         self.version = self.construction = self.remote = self.channel = None
-        self.others, self.state = {}, None
+        self.others, self.state, self.pulled = {}, None, False
 
     @property
     def prefix(self):
@@ -3160,16 +3167,26 @@ class DatasetStore:
                         lambda: self.api.repo_exists(self.repo, repo_type="dataset")):
             return {}
         staging = self.out / DATASET_STAGING
-        shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(parents=True)
+        listed = [name for name in self.hub("list the dataset versions", lambda: self.api.list_repo_files(
+            self.repo, repo_type="dataset")) if re.fullmatch(rf"{re.escape(self.id)}/{DATASET_VERSION}/{DATASET_MANIFEST}", name)]
+        if not listed:
+            return {}
+
+        def fetch():
+            # A fresh folder per attempt: a half-finished attempt must not pass for a download.
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True, exist_ok=True)
+            return self.api.snapshot_download(repo_id=self.repo, repo_type="dataset", local_dir=str(staging),
+                                              allow_patterns=listed)
         try:
-            self.hub("list the dataset versions", lambda: self.api.snapshot_download(
-                repo_id=self.repo, repo_type="dataset", local_dir=str(staging),
-                allow_patterns=[f"{self.id}/*/{DATASET_MANIFEST}"]))
+            self.hub("download the dataset manifests", fetch)
             found = {}
-            for path in sorted((staging / self.id).glob(f"*/{DATASET_MANIFEST}")):
-                if re.fullmatch(DATASET_VERSION, path.parent.name):
-                    found[path.parent.name] = json.loads(path.read_text(encoding="utf-8"))
+            for name in listed:
+                path = staging / name
+                if not path.is_file():
+                    raise RuntimeError(f"{name} is listed in {self.repo} but did not download; nothing is "
+                                       "rebuilt while the Hub's state is unknown. Run again.")
+                found[path.parent.name] = json.loads(path.read_text(encoding="utf-8"))
             return found
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -3249,11 +3266,14 @@ class DatasetStore:
         if not missing:
             return 0
         staging = self.out / DATASET_STAGING
-        shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(parents=True)
+
+        def fetch():
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True, exist_ok=True)
+            return self.api.snapshot_download(repo_id=self.repo, repo_type="dataset", local_dir=str(staging),
+                                              allow_patterns=[prefix + "*"])
         try:
-            self.hub("download the dataset", lambda: self.api.snapshot_download(
-                repo_id=self.repo, repo_type="dataset", local_dir=str(staging), allow_patterns=[prefix + "*"]))
+            self.hub("download the dataset", fetch)
             moved = 0
             for relative in missing:
                 source, target = staging / self.id / self.version / relative, self.out / relative
@@ -3293,6 +3313,7 @@ class DatasetStore:
                 self.verify(self.remote)
                 atomic_json(self.out / DATASET_MANIFEST, self.remote)
                 self.state = "complete"
+                self.pulled = True
                 size = sum((self.out / rel).stat().st_size for rel in self.remote["artifacts"])
                 print(f"{name}: complete in {self.repo}; {moved} files downloaded, {len(self.remote['artifacts'])} "
                       f"artifacts ({size / 1024**2:.1f} MiB) verified. Nothing is rebuilt.", flush=True)
@@ -3310,6 +3331,8 @@ class DatasetStore:
 
     def finish(self, info=None):
         """Seal the dataset: hash its artifacts, mark the manifest complete, and upload it."""
+        if self.state == "complete":
+            return  # Pulled complete and verified: the stored version is read-only here.
         local = self.local_manifest()
         if not (local or {}).get("complete"):
             lacking = [rel for rel in (*dataset_artifacts(), *DATASET_SUPPORT_FILES) if not (self.out / rel).is_file()]
@@ -3326,7 +3349,7 @@ class DatasetStore:
         self.state = "complete"
 
     def describe(self):
-        return self.channel.describe()
+        return "Dataset store: read-only (complete version downloaded)." if self.state == "complete" and self.pulled             else self.channel.describe()
 
 
 class OutputSync:
@@ -3386,7 +3409,7 @@ class OutputSync:
             try:
                 self.api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
                 self.api.upload_folder(folder_path=str(self.out), repo_id=self.repo, repo_type="dataset",
-                                       commit_message=message, ignore_patterns=self.ignore_patterns,
+                                       commit_message=message, ignore_patterns=list(self.ignore_patterns),
                                        delete_patterns=["decision_labels/*/*.pt", LEGACY_TRAJECTORY_FILE],
                                        **scope)
             except Exception as exc:  # Network, rate limit, or credentials; local files stay complete.
@@ -3484,15 +3507,18 @@ class Workflow:
             if reclaimed:
                 print(f"Reclaimed {reclaimed / 1024**2:.2f} MiB of incomplete writes in {self.out} "
                       "before resuming.", flush=True)
+        # Files that no contract explains are never adopted, dataset files included.
+        if not existing and any(self.out.iterdir()):
+            raise ValueError("Use an empty output folder; existing unrecognized files will not be overwritten.")
         if self.datasets is not None:
             self.datasets.pull()
         if not existing:
-            if any(self.out.iterdir()) if self.datasets is None else self.datasets.foreign_files():
-                raise ValueError("Use an empty output folder; existing unrecognized files will not be overwritten.")
             atomic_json(path, contract)
         # The dataset's mirror comes first: a legacy run mirror's per-question label files leave it
         # only after the dataset store has uploaded them.
-        mirrors = [mirror for mirror in (None if self.datasets is None else self.datasets.channel, run_sync)
+        # A complete version pulled from the Hub is read-only: no channel may rewrite it.
+        stored = None if self.datasets is None or self.datasets.pulled else self.datasets.channel
+        mirrors = [mirror for mirror in (stored, run_sync)
                    if mirror is not None]
         self.sync = None if not mirrors else mirrors[0] if len(mirrors) == 1 else SyncGroup(*mirrors)
         self.records, self.splits = None, None

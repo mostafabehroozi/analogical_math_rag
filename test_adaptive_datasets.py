@@ -283,3 +283,21 @@ def test_without_the_logs_the_one_complete_version_with_these_log_names_is_used(
     renamed.test_files = [str(Path(renamed.test_files[0]).with_name("elsewhere.json"))]
     with pytest.raises(ValueError, match="not available"):
         a.Workflow(renamed)
+
+
+def test_equal_settings_share_a_version_and_a_complete_dataset_is_read_only_here(tmp_path, hub):
+    torch.set_num_threads(1)
+    cfg = dataset_config(tmp_path)
+    built = a.Workflow(cfg).prepare().build_datasets()
+    same = copy.deepcopy(cfg)
+    same.output_dir, same.snapshot_complete_share = str(tmp_path / "same"), 0
+    assert a.Workflow(same).datasets.version == built.datasets.version
+    # A complete version is never written to by a session that only loaded it, even by a differing local file.
+    before = dict(hub.repos["user/datasets"])
+    session = copy.deepcopy(cfg)
+    session.output_dir = str(tmp_path / "reader")
+    reader = a.Workflow(session)
+    (tmp_path / "reader" / "teacher_fold_1.pt").write_bytes(b"legacy copy")
+    reader.prepare()
+    reader.push("anything")
+    assert hub.repos["user/datasets"] == before and "read-only" in reader.datasets.describe()
