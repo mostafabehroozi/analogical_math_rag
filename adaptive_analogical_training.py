@@ -6,6 +6,7 @@ No provider calls are made. Acquisition is simulated from recorded Layer-1 data.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import hashlib
 import json
 import math
@@ -94,6 +95,11 @@ class Config:
     # working disk only while a session lives, so uploads make a run resumable.
     hf_repo: Optional[str] = None      # Private dataset repo id such as "user/run"; None disables.
     hf_sync_minutes: float = 15.       # Upload cadence inside long loops; stage ends always upload.
+    # Runtime-only versioned dataset store: what the three training phases build (compact records,
+    # teacher labels, frozen predictor, Stage 3 labels) is uploaded once under dataset_id and
+    # downloaded, never rebuilt, whenever the Hub already holds it for this configuration.
+    dataset_id: Optional[str] = None   # Name of the dataset family, e.g. "adaptive-v9"; None disables.
+    dataset_repo: Optional[str] = None # Private dataset repo that holds every dataset_id, e.g. "user/datasets".
 
     @property
     def n(self):
@@ -147,15 +153,26 @@ class Config:
         assert self.hf_sync_minutes > 0
         if self.hf_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", str(self.hf_repo)):
             raise ValueError("hf_repo must be a Hugging Face dataset repository id such as 'user/name'.")
+        if self.dataset_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", str(self.dataset_id)):
+            raise ValueError("dataset_id must be 1-64 letters, digits, '.', '_' or '-' and start with a "
+                             "letter or digit, for example 'adaptive-v9'.")
+        if self.dataset_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", str(self.dataset_repo)):
+            raise ValueError("dataset_repo must be a Hugging Face dataset repository id such as 'user/name'.")
+        if (self.dataset_id is None) != (self.dataset_repo is None):
+            raise ValueError("dataset_id and dataset_repo go together: the id names a dataset inside the repository.")
+        if self.dataset_repo is not None and self.dataset_repo == self.hf_repo:
+            raise ValueError("dataset_repo must differ from hf_repo: the run mirror would download the "
+                             "datasets stored beside it.")
         fixed_acquisition_sequences(self)
 
 
 # Outside the run contract and the Stage 3 fingerprint: runtime controls, the Hub
-# mirror, and the input log paths. A log is identified by its content, and its
+# mirror, the dataset store, and the input log paths. A log is identified by its content, and its
 # filename stem is the benchmark named in each record uid.
 NON_CONTRACT_SETTINGS = ("resume", "output_dir", "device", "cpu_threads", "print_every",
                          "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size",
-                         "hf_repo", "hf_sync_minutes", "train_file", "test_files")
+                         "hf_repo", "hf_sync_minutes", "train_file", "test_files",
+                         "dataset_id", "dataset_repo")
 
 
 @dataclass
@@ -2237,14 +2254,17 @@ def train_pretrained_head(records, splits, teacher, predictor, cfg, device, out=
     return {**checkpoint, "coverage": coverage}
 
 
-def train_finetuned_head(records, splits, teacher, predictor, pretrained, cfg, device, out, sync=None):
-    """Stage 3b: fine-tune the pretrained head on one action per row, chosen by its own continuations."""
+def finetune_labels(records, splits, teacher, predictor, pretrained, cfg, device, out, sync=None):
+    """Stage 3b labels, built or validated: one action per row, chosen by the pretrained head's continuations.
+
+    This is the dataset half of Stage 3b: it needs the pretrained head, but no fine-tuning.
+    Returns the labels in RAM, their coverage, and the fingerprint they are bound to.
+    """
     out = Path(out)
     dataset = decision_dataset_fingerprint(records, splits, teacher, predictor, cfg)
     if pretrained.get("dataset_fingerprint") != dataset:
         raise ValueError("The pretrained decision head belongs to a different dataset or action contract.")
     fingerprint = finetune_fingerprint(dataset, pretrained["weights"])
-    frozen_before = predictor_fingerprint(predictor)
     decision_manifest(out, dataset)
     head = SupervisedActionHead(cfg).to(device)
     head.load_state_dict(pretrained["weights"])
@@ -2269,6 +2289,14 @@ def train_finetuned_head(records, splits, teacher, predictor, pretrained, cfg, d
     checkers = {role: checker(role) for role in ("policy", "dev")}
     labels, coverage = phase_labels("finetune", records, splits, cfg, out, fingerprint, builders, checkers, sync)
     references.clear()  # Only the row check needs the Stage 3a labels, which are large.
+    return labels, coverage, fingerprint
+
+
+def train_finetuned_head(records, splits, teacher, predictor, pretrained, cfg, device, out, sync=None):
+    """Stage 3b: fine-tune the pretrained head on one action per row, chosen by its own continuations."""
+    frozen_before = predictor_fingerprint(predictor)
+    labels, coverage, fingerprint = finetune_labels(records, splits, teacher, predictor, pretrained, cfg,
+                                                    device, out, sync)
     checkpoint = fit_action_head("finetune", records, splits, labels, predictor, cfg, device, out,
                                  fingerprint, sync, initial_weights=pretrained["weights"])
     if predictor_fingerprint(predictor) != frozen_before:
@@ -3030,6 +3058,277 @@ def folder_size(path):
     return sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file())
 
 
+# What the three training phases build, relative to output_dir: the compact records, the teacher
+# (folds and out-of-fold labels), the frozen snapshot predictor, and Stage 3's labels together with the
+# pretrained head that the fine-tuning labels were rolled out from. The rest (the splits and data audit
+# that Stage 0 rewrites each session, head training progress, the fine-tuned head, the inference
+# bundle, reports) is run output for the run mirror.
+DATASET_SCHEMA = 1
+DATASET_MANIFEST = "dataset_manifest.json"
+DATASET_STAGING = ".dataset_download"    # Downloads land here first; never uploaded.
+DATASET_VERSION = r"[0-9a-f]{12}"
+DATASET_PATTERNS = ("compact_records.pt", "teacher_fold_*.pt", "teacher_final.pt", "teacher_completed.pt",
+                    "snapshot_completed.pt", "decision_head_pretrained.pt",
+                    "decision_dataset_manifest.json", "decision_label_coverage.json",
+                    "decision_labels/*", DATASET_MANIFEST)
+# Reports that Stage 3 writes beside the labels; present in a complete dataset, not hashed.
+DATASET_SUPPORT_FILES = ("decision_dataset_manifest.json", "decision_label_coverage.json")
+
+
+def in_dataset(relative):
+    """Whether a path inside output_dir (posix, relative) belongs to the dataset store."""
+    return any(fnmatch.fnmatch(relative, pattern) for pattern in DATASET_PATTERNS)
+
+
+def dataset_artifacts():
+    """The files a complete dataset must hold. Each is written once, so the manifest hashes it."""
+    return ["compact_records.pt", "teacher_completed.pt", "snapshot_completed.pt", "decision_head_pretrained.pt",
+            *[f"decision_labels/{phase}_{role}.pt" for phase in HEAD_PHASES for role in ("policy", "dev")]]
+
+
+def input_sources(paths):
+    """Each input log by name, size, and content: its directory and mtime change between sessions."""
+    return [{"path": str(Path(p).resolve()), "name": Path(p).name, "bytes": Path(p).stat().st_size,
+             "sha256": file_digest(p)} for p in paths]
+
+
+def dataset_construction(contract_cfg, sources):
+    """What a dataset version is hashed from: the contract's settings, the revision, and the logs' content.
+
+    `sources` lists name, size, and SHA-256 of each log in order, or is None while the logs are unknown.
+    """
+    return json.loads(json.dumps({"schema_version": DATASET_SCHEMA, "implementation_revision": PIPELINE_REVISION,
+                                  "config": contract_cfg, "sources": sources}))
+
+
+def dataset_version(construction):
+    payload = json.dumps(construction, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def dataset_differences(old, new):
+    """Names of the settings that make two dataset constructions different versions."""
+    names = [key for key in ("schema_version", "implementation_revision") if old.get(key) != new.get(key)]
+    old_cfg, new_cfg = old.get("config", {}), new.get("config", {})
+    names += [f"config.{key}" for key in sorted(set(old_cfg) | set(new_cfg)) if old_cfg.get(key) != new_cfg.get(key)]
+    if old.get("sources") != new.get("sources"):
+        names.append("the input logs")
+    return names
+
+
+class DatasetStore:
+    """The datasets that the three training phases build, versioned on the Hub under a dataset id.
+
+    A dataset is the output of the phases that precede head training: compact records and splits,
+    the teacher's out-of-fold labels, the frozen snapshot predictor, and Stage 3's labels
+    (`DATASET_PATTERNS`). It is uploaded to `<repo>/<dataset_id>/<version>/`, where the version is a
+    hash of everything that decides its content (the contract's settings, the implementation
+    revision, and the input logs' content). The same id with another construction is therefore
+    another version beside the first, and a notebook that selects the id finds the version its
+    configuration needs: a complete one is downloaded and verified, never rebuilt; a partial one
+    resumes; only an absent one is built. Uploads go out as the build progresses, so a session
+    killed mid-build loses little. Run one session per dataset id and version.
+    """
+    def __init__(self, out, repo, dataset_id, interval_minutes, resume=True, api=None):
+        self.out, self.repo, self.id = Path(out), repo, dataset_id
+        self.interval, self.resume = interval_minutes, resume
+        self.api = hub_api() if api is None else api
+        self.version = self.construction = self.remote = self.channel = None
+        self.others, self.state = {}, None
+
+    @property
+    def prefix(self):
+        return f"{self.id}/{self.version}"
+
+    def hub(self, action, call):
+        """A Hub read with retries. An outage is never mistaken for an absent dataset."""
+        error = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(5 * 2 ** (attempt - 1))
+            try:
+                return call()
+            except Exception as exc:  # Network, rate limit, or credentials.
+                error = exc
+        raise RuntimeError(f"Could not {action} in {self.repo}: {error}. Nothing is rebuilt while it is unknown "
+                           "whether the Hub already holds the dataset; check the token (HF_SYNC_TOKEN or "
+                           "HF_TOKEN), the repository id, and Kaggle Internet, then run again.") from error
+
+    def catalog(self):
+        """Every uploaded version of this dataset id, as {version: manifest}."""
+        if not self.hub("check whether the repository exists",
+                        lambda: self.api.repo_exists(self.repo, repo_type="dataset")):
+            return {}
+        staging = self.out / DATASET_STAGING
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+        try:
+            self.hub("list the dataset versions", lambda: self.api.snapshot_download(
+                repo_id=self.repo, repo_type="dataset", local_dir=str(staging),
+                allow_patterns=[f"{self.id}/*/{DATASET_MANIFEST}"]))
+            found = {}
+            for path in sorted((staging / self.id).glob(f"*/{DATASET_MANIFEST}")):
+                if re.fullmatch(DATASET_VERSION, path.parent.name):
+                    found[path.parent.name] = json.loads(path.read_text(encoding="utf-8"))
+            return found
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def resolve(self, construction, names):
+        """Pick this configuration's version and return its construction, input logs included.
+
+        With the logs at hand the version is a hash of their content. Without them (a new session
+        that did not attach the logs), the one complete version of this id built with this
+        configuration and these log names is used, and its recorded logs stand in for them.
+        """
+        catalog = self.catalog()
+        if construction["sources"] is not None:
+            self.version = dataset_version(construction)
+        else:
+            def same(manifest):
+                recorded = manifest.get("construction", {})
+                return bool(manifest.get("complete")) and [s["name"] for s in recorded.get("sources") or []] == names \
+                    and not dataset_differences(recorded, {**construction, "sources": recorded.get("sources")})
+            matches = [version for version, manifest in catalog.items() if same(manifest)]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"The input logs {names} are not available, and {self.repo} holds "
+                    f"{len(matches)} complete versions of dataset {self.id!r} for this configuration "
+                    f"({sorted(matches) or 'none'}), not exactly one. Attach the logs so the version is identified "
+                    "by their content, or keep the settings the dataset was built with.")
+            self.version = matches[0]
+            construction = {**construction, "sources": catalog[self.version]["construction"]["sources"]}
+        if catalog.get(self.version) and dataset_differences(catalog[self.version].get("construction", {}), construction):
+            raise ValueError(f"The manifest of dataset {self.id!r} version {self.version} does not describe the "
+                             "construction it is stored under; the upload is corrupt.")
+        self.construction, self.remote = construction, catalog.get(self.version)
+        self.others = {version: dataset_differences(manifest.get("construction", {}), construction)
+                       for version, manifest in catalog.items() if version != self.version}
+        self.channel = OutputSync(self.out, self.repo, self.interval, self.api, path_in_repo=self.prefix,
+                                  allow_patterns=list(DATASET_PATTERNS),
+                                  name=f"Dataset {self.id} version {self.version} in {self.repo}")
+        return construction
+
+    def local_manifest(self):
+        path = self.out / DATASET_MANIFEST
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+    def local_files(self):
+        found = (path.relative_to(self.out).as_posix() for path in self.out.rglob("*") if path.is_file())
+        return sorted(rel for rel in found if in_dataset(rel) and not rel.endswith(".tmp"))
+
+    def foreign_files(self):
+        """Files in the output folder that are neither dataset files nor a download in progress."""
+        found = (path.relative_to(self.out).as_posix() for path in self.out.rglob("*") if path.is_file())
+        return sorted(rel for rel in found if not in_dataset(rel) and not rel.startswith(f"{DATASET_STAGING}/"))
+
+    def manifest(self, complete=False, artifacts=None, info=None):
+        return {"schema_version": DATASET_SCHEMA, "dataset_id": self.id, "version": self.version,
+                "implementation_revision": PIPELINE_REVISION, "construction": self.construction,
+                "complete": complete, "artifacts": artifacts or {}, "info": info or {}}
+
+    def verify(self, manifest):
+        """Every hashed artifact of a complete dataset must be here and byte-identical."""
+        for relative, meta in manifest["artifacts"].items():
+            path = self.out / relative
+            if not path.is_file():
+                raise ValueError(f"Dataset {self.id!r} version {self.version} is missing {relative} in {self.out}.")
+            if path.stat().st_size != meta["bytes"] or file_digest(path) != meta["sha256"]:
+                raise ValueError(
+                    f"{path} differs from dataset {self.id!r} version {self.version} on {self.repo}: it was "
+                    "rebuilt or changed here, or the download is damaged. Use an empty output_dir to download "
+                    "the dataset, or another dataset_id to keep this build as a new dataset.")
+
+    def download(self):
+        """Fetch the version's files that the output folder lacks; existing files are kept."""
+        prefix = self.prefix + "/"
+        remote = [name[len(prefix):] for name in self.hub("list the dataset files", lambda: self.api.list_repo_files(
+            self.repo, repo_type="dataset")) if name.startswith(prefix)]
+        wanted = [rel for rel in remote if in_dataset(rel) and not rel.endswith(".tmp")]
+        missing = [rel for rel in wanted if not (self.out / rel).exists()]
+        if not missing:
+            return 0
+        staging = self.out / DATASET_STAGING
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+        try:
+            self.hub("download the dataset", lambda: self.api.snapshot_download(
+                repo_id=self.repo, repo_type="dataset", local_dir=str(staging), allow_patterns=[prefix + "*"]))
+            moved = 0
+            for relative in missing:
+                source, target = staging / self.id / self.version / relative, self.out / relative
+                if not source.is_file():
+                    raise RuntimeError(f"{relative} is listed in dataset {self.id!r} version {self.version} on "
+                                       f"{self.repo} but did not download.")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)  # The staging folder is on the same filesystem.
+                moved += 1
+            return moved
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def pull(self):
+        """Bring the output folder in line with the Hub: download what exists, verify what is complete."""
+        local = self.local_manifest()
+        if local is not None and (local.get("dataset_id"), local.get("version")) != (self.id, self.version):
+            raise ValueError(f"The output folder holds dataset {local.get('dataset_id')!r} version "
+                             f"{local.get('version')}, not {self.id!r} version {self.version}. Choose a new "
+                             "output_dir or the matching dataset_id.")
+        held = [rel for rel in self.local_files() if rel != DATASET_MANIFEST]
+        name = f"Dataset {self.id!r} version {self.version}"
+        if self.remote is None:
+            self.state = "adopted" if held else "new"
+            print(f"{name}: not in {self.repo} yet. "
+                  + (f"The {len(held)} dataset files already in {self.out} are uploaded under it, not rebuilt; "
+                     "missing parts are built and uploaded as they finish." if held else
+                     "It is built and uploaded as it progresses."), flush=True)
+            if local is None:
+                atomic_json(self.out / DATASET_MANIFEST, self.manifest())
+        else:
+            if not self.resume:
+                raise ValueError(f"{name} is already in {self.repo}. Set resume=True to reuse it, or choose "
+                                 "another dataset_id.")
+            moved = self.download()
+            if self.remote.get("complete"):
+                self.verify(self.remote)
+                atomic_json(self.out / DATASET_MANIFEST, self.remote)
+                self.state = "complete"
+                size = sum((self.out / rel).stat().st_size for rel in self.remote["artifacts"])
+                print(f"{name}: complete in {self.repo}; {moved} files downloaded, {len(self.remote['artifacts'])} "
+                      f"artifacts ({size / 1024**2:.1f} MiB) verified. Nothing is rebuilt.", flush=True)
+            else:
+                self.state = "partial"
+                if self.local_manifest() is None:
+                    atomic_json(self.out / DATASET_MANIFEST, self.manifest())
+                print(f"{name}: partly built in {self.repo}; {moved} files downloaded. The build resumes from "
+                      "them.", flush=True)
+        if self.others:
+            print("Other versions under this id stay untouched: " + "; ".join(
+                f"{version} differs in {', '.join(changed) or 'nothing recorded'}"
+                for version, changed in sorted(self.others.items())) + ".", flush=True)
+        return self.state
+
+    def finish(self, info=None):
+        """Seal the dataset: hash its artifacts, mark the manifest complete, and upload it."""
+        local = self.local_manifest()
+        if not (local or {}).get("complete"):
+            lacking = [rel for rel in (*dataset_artifacts(), *DATASET_SUPPORT_FILES) if not (self.out / rel).is_file()]
+            if lacking:
+                raise RuntimeError(f"Dataset {self.id!r} version {self.version} is not complete: {lacking} "
+                                   f"missing from {self.out}.")
+            artifacts = {rel: {"bytes": (self.out / rel).stat().st_size, "sha256": file_digest(self.out / rel)}
+                         for rel in dataset_artifacts()}
+            atomic_json(self.out / DATASET_MANIFEST,
+                        {**self.manifest(True, artifacts, info),
+                         "completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        # One commit carries the sealed manifest with any file the Hub still lacks.
+        self.channel.push(f"Dataset {self.id} version {self.version}: complete", force=True, required=True)
+        self.state = "complete"
+
+    def describe(self):
+        return self.channel.describe()
+
+
 class OutputSync:
     """Mirror output_dir to a private Hugging Face dataset repository.
 
@@ -3042,10 +3341,18 @@ class OutputSync:
     files from the mirror once a role is merged. The traced Stage 4 rows of
     earlier code (final_trajectories.jsonl, derived and superseded) are never
     downloaded and leave the mirror at the next upload. Run one session per repo.
+
+    The dataset store reuses this class for one folder of a shared repository: `path_in_repo`
+    puts its files under `<dataset_id>/<version>/`, and `allow_patterns` limits it to the
+    files that make up the dataset. `ignore_patterns` keeps those files out of the run mirror.
     """
-    def __init__(self, out, repo, interval_minutes, api=None):
+    def __init__(self, out, repo, interval_minutes, api=None, *, path_in_repo=None, allow_patterns=None,
+                 ignore_patterns=(), name=None):
         self.out, self.repo, self.interval = Path(out), repo, interval_minutes * 60
         self.api = hub_api() if api is None else api
+        self.path_in_repo, self.allow_patterns = path_in_repo, allow_patterns
+        self.ignore_patterns = ["*.tmp", f"{DATASET_STAGING}/*", *ignore_patterns]
+        self.name = name or f"Mirror {repo}"
         self.last = time.monotonic()
         self.uploads, self.last_message, self.last_error = 0, None, None
 
@@ -3070,14 +3377,18 @@ class OutputSync:
         if not force and time.monotonic() - self.last < self.interval:
             return False
         error = None
+        # Only a shared-repository channel needs these arguments; the run mirror's call is unchanged.
+        scope = {key: value for key, value in (("path_in_repo", self.path_in_repo),
+                                               ("allow_patterns", self.allow_patterns)) if value}
         for attempt in range(3):
             if attempt:
                 time.sleep(5 * 2 ** (attempt - 1))
             try:
                 self.api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
                 self.api.upload_folder(folder_path=str(self.out), repo_id=self.repo, repo_type="dataset",
-                                       commit_message=message, ignore_patterns=["*.tmp"],
-                                       delete_patterns=["decision_labels/*/*.pt", LEGACY_TRAJECTORY_FILE])
+                                       commit_message=message, ignore_patterns=self.ignore_patterns,
+                                       delete_patterns=["decision_labels/*/*.pt", LEGACY_TRAJECTORY_FILE],
+                                       **scope)
             except Exception as exc:  # Network, rate limit, or credentials; local files stay complete.
                 error = exc
                 continue
@@ -3094,8 +3405,21 @@ class OutputSync:
         return False
 
     def describe(self):
-        return (f"Mirror {self.repo}: {self.uploads} uploads; last upload: {self.last_message or 'none'}; "
+        return (f"{self.name}: {self.uploads} uploads; last upload: {self.last_message or 'none'}; "
                 f"last error: {self.last_error or 'none'}.")
+
+
+class SyncGroup:
+    """Several mirrors of one output folder, each with its own files, repository, and timing."""
+    def __init__(self, *syncs):
+        self.syncs = [sync for sync in syncs if sync is not None]
+
+    def push(self, message, *, force=False, required=False):
+        # Every mirror is attempted in turn; a required upload raises at the first one that fails.
+        return any([sync.push(message, force=force, required=required) for sync in self.syncs])
+
+    def describe(self):
+        return " ".join(sync.describe() for sync in self.syncs)
 
 
 def contract_identity(contract):
@@ -3116,22 +3440,38 @@ class Workflow:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else torch.device(cfg.device)
         self.out = Path(cfg.output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
-        self.sync = OutputSync(self.out, cfg.hf_repo, cfg.hf_sync_minutes) if cfg.hf_repo else None
-        if self.sync is not None:
-            state = self.sync.pull()
+        # With a dataset store its files live there; the run mirror carries the training output.
+        run_sync = (OutputSync(self.out, cfg.hf_repo, cfg.hf_sync_minutes,
+                               ignore_patterns=DATASET_PATTERNS if cfg.dataset_id else ())
+                    if cfg.hf_repo else None)
+        if run_sync is not None:
+            state = run_sync.pull()
             print({"local": f"Mirror {cfg.hf_repo}: {self.out} already holds files; they are used as is.",
                    "new": f"Mirror {cfg.hf_repo}: no uploaded run yet; this run is uploaded as it progresses.",
                    "pulled": f"Mirror {cfg.hf_repo}: downloaded {folder_size(self.out) / 1024**2:.1f} MiB "
                              f"into {self.out}; completed stages resume."}[state], flush=True)
         # Logs are identified by the sources below, not by the configured paths.
         contract_cfg = {key: value for key, value in asdict(cfg).items() if key not in NON_CONTRACT_SETTINGS}
-        # A log's filename is its benchmark identity; its directory and mtime are not.
-        sources = [{"path": str(Path(p).resolve()), "name": Path(p).name, "bytes": Path(p).stat().st_size,
-                    "sha256": file_digest(p)} for p in [cfg.train_file] + cfg.test_files]
+        paths = [cfg.train_file] + cfg.test_files
+        self.datasets = None
+        if cfg.dataset_id:
+            self.datasets = DatasetStore(self.out, cfg.dataset_repo, cfg.dataset_id, cfg.hf_sync_minutes, cfg.resume)
+            # A log's filename is its benchmark identity; its directory and mtime are not.
+            sources = input_sources(paths) if all(Path(p).is_file() for p in paths) else None
+            construction = self.datasets.resolve(
+                dataset_construction(contract_cfg, None if sources is None else
+                                     [{key: source[key] for key in ("name", "bytes", "sha256")} for source in sources]),
+                [Path(p).name for p in paths])
+            if sources is None:
+                print("Input logs are not attached; the dataset's recorded logs identify this run.", flush=True)
+                sources = [{"path": str(Path(p)), **source} for p, source in zip(paths, construction["sources"])]
+        else:
+            sources = input_sources(paths)
         contract = {"schema_version": 4, "implementation_revision": PIPELINE_REVISION,
                     "config": contract_cfg, "sources": sources}
         path = self.out / "contract.json"
-        if path.exists():
+        existing = path.exists()
+        if existing:
             old = json.loads(path.read_text(encoding="utf-8"))
             # Round-trip converts tuples to JSON lists consistently.
             if contract_identity(old) != contract_identity(contract):
@@ -3144,10 +3484,17 @@ class Workflow:
             if reclaimed:
                 print(f"Reclaimed {reclaimed / 1024**2:.2f} MiB of incomplete writes in {self.out} "
                       "before resuming.", flush=True)
-        else:
-            if any(self.out.iterdir()):
+        if self.datasets is not None:
+            self.datasets.pull()
+        if not existing:
+            if any(self.out.iterdir()) if self.datasets is None else self.datasets.foreign_files():
                 raise ValueError("Use an empty output folder; existing unrecognized files will not be overwritten.")
             atomic_json(path, contract)
+        # The dataset's mirror comes first: a legacy run mirror's per-question label files leave it
+        # only after the dataset store has uploaded them.
+        mirrors = [mirror for mirror in (None if self.datasets is None else self.datasets.channel, run_sync)
+                   if mirror is not None]
+        self.sync = None if not mirrors else mirrors[0] if len(mirrors) == 1 else SyncGroup(*mirrors)
         self.records, self.splits = None, None
 
     def prepare(self):
@@ -3202,6 +3549,39 @@ class Workflow:
     def push(self, message="manual upload", *, force=True, required=False):
         """Upload the output folder to hf_repo now; a no-op without a mirror."""
         return False if self.sync is None else self.sync.push(message, force=force, required=required)
+
+    def build_datasets(self):
+        """Make every dataset the training phases consume, once: records, teacher labels, predictor, Stage 3 labels.
+
+        Each dataset comes from the phase before it: the teacher's out-of-fold labels define the
+        SAFE/MAX targets, the frozen snapshot predictor defines every Stage 3 goal, and Stage 3b's
+        labels are rolled out with the pretrained head. So this builds Stages 1, 2 and 3a and then
+        labels 3b; it stops short of fine-tuning, which only reads the labels. With `dataset_id`, a
+        complete version on the Hub was downloaded and verified when the workflow was created and
+        the calls below only load it; a partial version resumes; the finished dataset is sealed
+        and uploaded.
+        """
+        if self.records is None:
+            self.prepare()
+        store = self.datasets
+        section("DATASETS | " + (f"{self.cfg.dataset_id!r} version {store.version} ({store.state})" if store is not None
+                                 else "no dataset_id: the datasets stay in this run's output folder"))
+        self.train_teacher()
+        self.train_snapshot()
+        self.train_pretrained_head()
+        section("DATASETS | Stage 3b labels, rolled out with the pretrained head")
+        labels, coverage, _ = finetune_labels(self.records, self.splits, self.teacher, self.predictor,
+                                              self.pretrained_checkpoint, self.cfg, self.device, self.out,
+                                              self.sync)
+        del labels
+        if store is not None:
+            store.finish({"records": len(self.records),
+                          "questions": {role: len(self.splits[role]) for role in ("supervised", "dev", "audit")},
+                          "label_coverage": coverage})
+            print(f"Dataset {self.cfg.dataset_id!r} version {store.version} is complete in {store.repo}. A later "
+                  "session with the same dataset_id and configuration downloads it instead of building it.",
+                  flush=True)
+        return self
 
     def train_teacher(self):
         if self.records is None:
@@ -3421,7 +3801,7 @@ def load_inference_bundle(path, device="cpu", variant="supervised"):
 
 def run_pipeline(cfg=None):
     work = Workflow(cfg or Config())
-    work.prepare().train_teacher().train_snapshot().train_decision_head()
+    work.prepare().build_datasets().train_decision_head()
     work.report()
     return work
 

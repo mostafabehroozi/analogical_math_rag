@@ -20,19 +20,33 @@ from test_adaptive_analogical_training import raw_record
 class FakeHub:
     """In-memory stand-in for HfApi with the Hub's pattern semantics."""
     def __init__(self):
-        self.repos, self.messages, self.fail_uploads = {}, [], 0
+        self.repos, self.messages, self.fail_uploads, self.fail_reads = {}, [], 0, 0
+
+    def outage(self):
+        if self.fail_reads:
+            self.fail_reads -= 1
+            raise ConnectionError("simulated outage")
 
     def repo_exists(self, repo_id, *, repo_type=None, token=None):
+        self.outage()
         return repo_id in self.repos
+
+    def list_repo_files(self, repo_id, *, repo_type=None, **kwargs):
+        self.outage()
+        return sorted(self.repos[repo_id])
 
     def create_repo(self, repo_id, *, repo_type=None, private=None, exist_ok=False, **kwargs):
         assert repo_type == "dataset" and private and exist_ok
         self.repos.setdefault(repo_id, {})
 
-    def snapshot_download(self, repo_id, *, repo_type=None, local_dir=None, ignore_patterns=None, **kwargs):
+    def snapshot_download(self, repo_id, *, repo_type=None, local_dir=None, ignore_patterns=None,
+                          allow_patterns=None, **kwargs):
+        self.outage()
         local = Path(local_dir)
         for relative, data in self.repos[repo_id].items():
             if any(fnmatch.fnmatch(relative, pattern) for pattern in ignore_patterns or ()):
+                continue
+            if allow_patterns and not any(fnmatch.fnmatch(relative, pattern) for pattern in allow_patterns):
                 continue
             target = local / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -44,11 +58,13 @@ class FakeHub:
         return str(local)
 
     def upload_folder(self, *, repo_id, folder_path, repo_type=None, commit_message=None,
-                      ignore_patterns=None, delete_patterns=None, **kwargs):
+                      ignore_patterns=None, delete_patterns=None, path_in_repo=None, allow_patterns=None,
+                      **kwargs):
         if self.fail_uploads:
             self.fail_uploads -= 1
             raise ConnectionError("simulated upload failure")
         folder, remote = Path(folder_path), self.repos.setdefault(repo_id, {})
+        prefix = f"{path_in_repo}/" if path_in_repo else ""
         local = {}
         for path in folder.rglob("*"):
             relative = path.relative_to(folder).as_posix()
@@ -56,13 +72,16 @@ class FakeHub:
                 continue
             if any(fnmatch.fnmatch(relative, pattern) for pattern in ignore_patterns or ()):
                 continue
+            if allow_patterns and not any(fnmatch.fnmatch(relative, pattern) for pattern in allow_patterns):
+                continue
             local[relative] = path.read_bytes()
-        # Remote files matching delete_patterns go unless this upload re-adds them.
-        for relative in list(remote):
-            if relative not in local and any(fnmatch.fnmatch(relative, pattern)
-                                             for pattern in delete_patterns or ()):
-                del remote[relative]
-        remote.update(local)
+        # Remote files (relative to path_in_repo) matching delete_patterns go unless this upload re-adds them.
+        for name in list(remote):
+            relative = name[len(prefix):]
+            if name.startswith(prefix) and relative not in local and any(
+                    fnmatch.fnmatch(relative, pattern) for pattern in delete_patterns or ()):
+                del remote[name]
+        remote.update({prefix + relative: data for relative, data in local.items()})
         self.messages.append(commit_message)
         return f"https://hub/{repo_id}/commit/{len(self.messages)}"
 

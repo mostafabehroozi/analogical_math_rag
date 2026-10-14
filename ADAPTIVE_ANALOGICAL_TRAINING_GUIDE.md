@@ -473,6 +473,94 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
 - **One session per repository.** Two sessions writing the same mirror would
   overwrite each other; use a different `hf_repo` for a different run
   (`QUICK_PILOT` appends `_pilot` to both the output folder and the mirror).
+- **Datasets.** With `dataset_id` set, the files that the three training phases
+  build are stored separately, under a version, and never rebuilt once uploaded;
+  the run mirror then carries only the rest (see the next section).
+
+### Datasets and dataset IDs
+
+The datasets that the heads train on are built by the phases before them, and
+they are the expensive part of a run. Set `dataset_id` (a name such as
+`adaptive-v9`) and `dataset_repo` (a private Hub dataset repository id that can
+hold many ids, and must differ from `hf_repo`; the token is the one it uses) to keep them apart from the
+run mirror, version them, and never rebuild one that the Hub already holds. Both
+are runtime-only, outside the run contract and every fingerprint, so adding them
+to a run in progress changes nothing it has built. The notebook's datasets cell
+(`WORK.build_datasets()`, right after Stage 0) makes the whole dataset first;
+Stages 1-3 afterwards only load it, and fine-tuning and the report read it.
+
+Each dataset comes from the phase before it, so "all of them first" means
+running those phases, not building the data ahead of them: the teacher's
+out-of-fold labels define the SAFE/MAX targets, the frozen snapshot predictor
+defines every Stage 3 goal, and Stage 3b's labels are rolled out with the
+pretrained head. `build_datasets()` therefore runs Stages 1, 2 and 3a and then
+labels 3b; only the 3b fine-tuning, Stage 4 and the inference bundle are outside
+it. What it stores, relative to the output folder:
+
+| Part | Files | Why it belongs to the dataset |
+| --- | --- | --- |
+| Records | `compact_records.pt` | The parsed logs: with this file the logs themselves are not needed again |
+| Teacher | `teacher_fold_*.pt`, `teacher_final.pt`, `teacher_completed.pt` | Out-of-fold scores and the SAFE/MAX labels every later phase reads |
+| Snapshot predictor | `snapshot_completed.pt` | The frozen encoder that Stage 3 goals and head inputs come from |
+| Stage 3 labels | `decision_labels/*`, `decision_dataset_manifest.json`, `decision_label_coverage.json` | The 3a and 3b labels (about 590 MB for the full run) |
+| Pretrained head | `decision_head_pretrained.pt` | The 3b labels are bound to its exact weights |
+
+The run mirror keeps everything else: `contract.json`, the `data_audit.json` and
+`split_manifest.json` that Stage 0 rewrites each session (they name the logs'
+paths), head training progress, `decision_head_completed.pt`,
+`inference_bundle.pt`, `final_rollouts.jsonl`, `results.json`. With `dataset_id` set the run mirror
+skips the dataset files; a run mirror from before the dataset store may still
+hold copies, which are used as they are.
+
+**Version.** A dataset lives at `<dataset_repo>/<dataset_id>/<version>/`. The
+version is the first 12 hex digits of a SHA-256 over what decides the dataset's
+content: the contract's settings (every setting except the runtime-only ones),
+the implementation revision, and each input log's filename, size and content
+hash. The id names the dataset; the version tells the builds apart. The same
+id with another setting (a different `teacher_epochs`, say), another revision,
+or other log content is another version beside the first, which stays untouched;
+the workflow prints which settings differ (`config.teacher_epochs`, the input
+logs, ...). Tuning a setting outside the contract, such as `device`,
+`hf_sync_minutes` or `decision_eval_batch_size`, keeps the version. Note that
+`decision_finetune_epochs` and `decision_finetune_lr` are inside the contract
+and the Stage 3 fingerprints, so changing them makes a new version, as they
+always made a new output folder.
+
+**What a session does** (when `Workflow(CFG)` is created, then
+`build_datasets()`):
+
+| The Hub holds, for this id and version | Result |
+| --- | --- |
+| Nothing | The dataset is built and uploaded as it progresses: every stage end, and every `hf_sync_minutes` inside the long loops. Dataset files already in the output folder (a run built before the dataset store, pulled from its run mirror) are uploaded under the version, not rebuilt |
+| A partial dataset (`complete: false`) | The files the folder lacks are downloaded and the build resumes from them, at most about `hf_sync_minutes` of work behind |
+| A complete dataset | The files the folder lacks are downloaded and every hashed artifact's size and SHA-256 is verified; the stage calls only load it. Nothing trains or relabels, and nothing is uploaded |
+
+Finishing a build writes `dataset_manifest.json` with `complete: true`, each
+artifact's size and SHA-256, and the question counts, and uploads it together
+with any file the Hub still lacks in one commit, so the Hub never shows a
+complete dataset with a file missing.
+
+**Safeguards.** A dataset is never overwritten or silently replaced:
+`resume=False` against an uploaded version, an output folder that holds another
+dataset id or version, and an artifact that differs from the uploaded hash all
+stop with an explanation (use an empty output folder to download, or another
+`dataset_id` to keep a rebuild as its own dataset). Hub reads retry three times;
+if the Hub still cannot be read, the run stops with an error rather than
+treating an outage as "not generated yet" and rebuilding hours of work. A bad
+token or repository fails at Stage 0's required upload, like the run mirror.
+
+**Without the logs.** A session may attach no input logs. The version cannot be
+hashed from content then, so the Hub must hold exactly one complete version of
+the id built with this configuration and these log filenames; its recorded logs
+(name, size, hash) stand in for them in the run contract. Zero or several
+matches stop with an error asking for the logs. The compact records in the
+dataset are all Stages 1-4 read.
+
+**Cost and housekeeping.** Every version keeps its own copy of the labels and
+checkpoints in the repository; delete a `<dataset_id>/<version>` folder there to
+drop one. Run one session per dataset id and version, as with the run mirror,
+and use a new `dataset_id` for experiments (`QUICK_PILOT` appends `-pilot`).
+The Hub's repository history keeps earlier commits.
 
 ### Stage 3 label storage
 
@@ -816,7 +904,9 @@ trajectories`; a notebook copy without it still writes the traced file.
 
 This implementation uses **revision 9**, **contract schema 4**,
 **inference-bundle schema 5**, **decision-dataset schema 5** (the label
-fingerprint, without input log paths), and **label-file schema 6**. Revision 9
+fingerprint, without input log paths), **label-file schema 6**, and
+**dataset-store schema 1** (the versioned dataset manifest; it does not change
+any label, checkpoint or contract, so adding it needed no new revision). Revision 9
 replaces the single planned label per state with two phases. An evaluator and a
 one-shot candidate are separate acquisitions per source (eleven actions instead
 of seven), offered for a source in use or the nearest unused one, so 1,092
