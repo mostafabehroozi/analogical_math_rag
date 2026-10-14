@@ -281,7 +281,13 @@ class JudgmentCheckpointTests(TestCase):
 class NotebookCheckpointIdentityTests(TestCase):
     def test_actual_identity_builder_tracks_judge_settings_and_excludes_credentials(self):
         notebook = json.loads(Path("merging_finetuning.ipynb").read_text(encoding="utf-8"))
-        source = "".join(notebook["cells"][14]["source"])
+
+        def only_cell(marker):
+            matches = [c for c in notebook["cells"] if c["cell_type"] == "code" and marker in "".join(c["source"])]
+            self.assertEqual(len(matches), 1, f"{marker!r} must identify exactly one code cell")
+            return matches[0]
+
+        source = "".join(only_cell("evaluation_identity = {")["source"])
         source = "def file_sha256" + source.split("def file_sha256", 1)[1]
         with TemporaryDirectory() as directory, redirect_stdout(StringIO()):
             adapter = Path(directory) / "adapter"
@@ -312,7 +318,7 @@ class NotebookCheckpointIdentityTests(TestCase):
             self.assertNotIn("secret-test-value", json.dumps(namespace["evaluation_identity"]))
             self.assertIn("api_manager.py", namespace["evaluation_identity"]["code_sha256"])
             self.assertEqual(namespace["evaluation_identity"]["notebook_evaluation_sha256"],
-                             canonical_fingerprint(notebook["cells"][18]["source"]))
+                             canonical_fingerprint(only_cell("def evaluate_population(")["source"]))
             for setting in ("AVALAI_REASONING_EFFORT_EVALUATOR", "AVALAI_REASONING_EFFORT",
                             "AVALAI_ENABLE_THINKING", "AVALAI_CHAT_TEMPLATE_KWARGS_ENABLE_THINKING"):
                 with self.subTest(setting=setting):

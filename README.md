@@ -136,6 +136,71 @@ metrics and raw results remain available. The simplification report compares
 direct solving, base simplification, and adapted simplification using a fixed
 base solver, with separate copy/change behavior and matched-question contrasts.
 
+### Runs longer than one Kaggle session
+
+A Kaggle session ends after 12 hours and takes `/kaggle/working` with it. Both
+fine-tuning notebooks therefore recover every long stage from Hugging Face:
+running the notebook again from the top in a new session continues each stage
+where it stopped. A read-only "Check Hugging Face for progress" cell prints what
+the Hub already holds for training, the finished adapter, and each benchmark
+before any GPU work starts.
+
+| Stage | Saved to | Resumes from |
+|---|---|---|
+| Training | private dataset repo `<user>/<workflow>-qwen3-4b-training-state` (`HF_TRAIN_*`) | the newest Trainer checkpoint: adapter, optimizer, scheduler, RNG and data position |
+| Finished adapter | model repo `<user>/<workflow>-qwen3-4b-qlora` (`HF_MODEL_REPO_ID`) | the adapter; training is skipped |
+| Evaluation | private dataset repo `<user>/<workflow>-qwen3-4b-evaluation` (`HF_EVAL_*`) | every saved generation and judgment, per question |
+
+Everything is matched by an **identity**, never by name alone, so changed inputs
+cannot resume stale work:
+
+- A training checkpoint resumes only when the base model, QLoRA settings (epochs,
+  learning rate, LoRA rank, seed, maximum length, ...) and the exact tokenized
+  training rows match. Output paths, GPU index and `checkpoint_steps` do not
+  count, so saving more often never discards progress.
+- A trained adapter carries `training_source.json` (data hashes and QLoRA
+  settings). An uploaded adapter from other data or settings stops the notebook;
+  the merging notebook accepts adapters uploaded before this file existed with a
+  warning because their data cannot be verified.
+- An evaluation checkpoint is identified by the adapter, base-model revision,
+  data, source files, prompts, generation budgets and judge settings. When
+  nothing matches but the Hub holds progress for that benchmark under another
+  identity, the notebook prints that identity and the keys that differ (for
+  example `code_sha256.merging_finetuning.py`) instead of silently starting over.
+  The identity hashes the raw bytes of the listed source files, so keep the
+  project files byte-identical across the sessions of one run (a CRLF upload
+  and an LF git clone are different bytes), and finish a partly evaluated run
+  with the code that started it.
+
+How training recovery works (`src/training_checkpoints.py`):
+
+- After every Trainer save, the new `checkpoint-N` and the best-validation
+  checkpoint are published in a single Hub commit that also deletes superseded
+  checkpoints, so the repository never holds a half-written checkpoint. At most
+  two checkpoint folders are kept online (estimated at roughly 0.2 GB each for
+  the default LoRA: adapter plus 8-bit optimizer state; not yet measured on a
+  real run).
+- A new session restores the newest matching checkpoint at a pinned repository
+  revision, verifies every file's size, rewrites Trainer's absolute
+  `best_model_checkpoint` path for the new machine, and continues with
+  `resume_from_checkpoint`. A local checkpoint wins when it is newer; local
+  checkpoints from another configuration are moved to `_untrusted_checkpoints/`
+  rather than resumed or deleted.
+- An upload failure is reported and retried at the next save instead of ending
+  training. Transient Hub errors (rate limits, 5xx, dropped connections) are
+  retried with a 5 s / 20 s / 60 s backoff for training and evaluation
+  checkpoints and for adapter upload and restore; authentication and permission
+  errors still stop immediately.
+- Every uploaded checkpoint is a new Hub object, so the training-state repository
+  grows with each save. Delete it once the adapter is uploaded.
+- `RESUME_CHECKPOINT` remains a manual override: when set, the Hub is not
+  consulted for training.
+
+`test_training_checkpoints_trainer.py` runs a real Trainer on a tiny PEFT model and
+checks that a session lost mid-training, restored from the (fake) Hub into an empty
+directory, finishes with the same weights and best checkpoint as an uninterrupted
+run. It needs `torch`, `transformers` and `peft` and is skipped otherwise.
+
 ## Simplification-model fine-tuning
 
 `simplification_finetuning.ipynb` trains a Kaggle QLoRA adapter from an
@@ -154,7 +219,10 @@ The best adapter is uploaded to its own model repository,
 and QLoRA settings. With `HF_REUSE_ADAPTER_IF_AVAILABLE=True` a later session
 restores the adapter and skips training, and a mismatched
 `training_source.json` stops the notebook. Use a new `HF_MODEL_REPO_ID` and
-`WORK_DIR` for each training configuration.
+`WORK_DIR` for each training configuration. Training itself also survives a lost
+session: every Trainer checkpoint is mirrored to
+`<user>/simplification-qwen3-4b-training-state` and a rerun resumes from it (see
+"Runs longer than one Kaggle session" above).
 
 Evaluation compares direct solving with base and adapted simplification using a
 fixed local base solver. With `EVAL_HELDOUT=True` it first evaluates the

@@ -5,9 +5,11 @@ import hashlib
 import json
 import re
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from src.hub_resilience import DEFAULT_RETRY_DELAYS, call_with_retries
 from src.utils import save_json_atomic
 
 
@@ -22,6 +24,18 @@ def canonical_fingerprint(value: Any) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def differing_identity_keys(first: Any, second: Any, _path: str = "") -> List[str]:
+    """Name the dotted identity keys whose values differ, e.g. ``code_sha256.utils.py``."""
+    if isinstance(first, Mapping) and isinstance(second, Mapping):
+        found: List[str] = []
+        for key in sorted(set(first) | set(second), key=str):
+            found.extend(differing_identity_keys(
+                first.get(key), second.get(key), f"{_path}.{key}" if _path else str(key),
+            ))
+        return found
+    return [] if first == second else [_path or "<identity>"]
 
 
 def fingerprint_merging_adapter(adapter_dir) -> str:
@@ -74,6 +88,8 @@ class MergingEvaluationCheckpoint:
         upload_enabled: bool = False, restore_enabled: bool = False,
         private: bool = True, upload_every: int = 10,
         api: Optional[Any] = None, download_fn: Optional[Callable[..., str]] = None,
+        retry_delays: Sequence[float] = DEFAULT_RETRY_DELAYS,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         if not isinstance(identity, Mapping):
             raise ValueError("Evaluation checkpoint identity must be a mapping.")
@@ -97,6 +113,8 @@ class MergingEvaluationCheckpoint:
         self._explicit_repo_id = bool(repo_id)
         self.api = api
         self.download_fn = download_fn
+        self.retry_delays = tuple(retry_delays)
+        self.sleep = sleep
         self.cache_hits = 0
         self._pending_operations = 0
         self._dirty_files = {"manifest.json"}
@@ -117,15 +135,19 @@ class MergingEvaluationCheckpoint:
             self._restore()
         if self.upload_enabled:
             # Authenticate and validate repository permissions before paid work.
-            self.api.create_repo(
+            self._hub_call("Creating the evaluation checkpoint repository", lambda: self.api.create_repo(
                 repo_id=self.repo_id, repo_type="dataset", private=private, exist_ok=True,
-            )
+            ))
             # A first small checkpoint also verifies actual write access.
             self.sync()
         print(
             f"Evaluation checkpoint: {benchmark}, identity {self.fingerprint[:12]}, "
             f"{sum(state['completed'] for state in self._states.values())} completed questions restored."
         )
+
+    def _hub_call(self, what: str, operation: Callable[[], Any]) -> Any:
+        """Repeat transient Hub failures; authentication and other errors still stop the run."""
+        return call_with_retries(operation, what, delays=self.retry_delays, sleep=self.sleep)
 
     def _configure_hub(self) -> None:
         if self.api is None:
@@ -255,7 +277,10 @@ class MergingEvaluationCheckpoint:
 
     def _restore(self) -> None:
         try:
-            info = self.api.repo_info(repo_id=self.repo_id, repo_type="dataset")
+            info = self._hub_call(
+                "Reading the evaluation checkpoint repository",
+                lambda: self.api.repo_info(repo_id=self.repo_id, repo_type="dataset"),
+            )
         except Exception as exc:
             # A genuinely absent dataset repository is a new run. Authentication,
             # connection and other Hub errors must not restart costly inference.
@@ -272,22 +297,25 @@ class MergingEvaluationCheckpoint:
             raise RuntimeError("Could not resolve the evaluation dataset checkpoint revision.")
         siblings = getattr(info, "siblings", None)
         if siblings is None:
-            names = self.api.list_repo_files(repo_id=self.repo_id, repo_type="dataset", revision=revision)
+            names = self._hub_call("Listing the evaluation checkpoint repository", lambda: self.api.list_repo_files(
+                repo_id=self.repo_id, repo_type="dataset", revision=revision,
+            ))
         else:
             names = [item.rfilename for item in siblings]
         prefix = self.remote_prefix + "/"
         matching = [name for name in names if name.startswith(prefix)]
         if not matching:
             print("No matching Hugging Face evaluation checkpoint exists; starting this benchmark identity.")
+            self._report_other_identities(names, revision)
             return
         if prefix + "manifest.json" not in matching:
             raise ValueError("Remote evaluation checkpoint has files but no identity manifest.")
         with tempfile.TemporaryDirectory(prefix="merging-evaluation-restore-") as staging_dir:
-            self.download_fn(
+            self._hub_call("Downloading the evaluation checkpoint", lambda: self.download_fn(
                 repo_id=self.repo_id, repo_type="dataset", revision=revision,
                 token=self.token, local_dir=staging_dir,
                 allow_patterns=[prefix + "*.json"], max_workers=1,
-            )
+            ))
             folder = Path(staging_dir).joinpath(*PurePosixPath(self.remote_prefix).parts)
             for name in matching:
                 relative = PurePosixPath(name).relative_to(PurePosixPath(self.remote_prefix))
@@ -304,6 +332,50 @@ class MergingEvaluationCheckpoint:
                 self._save_file(self._question_path(index), state)
                 self._dirty_files.add(self._question_path(index).name)
         print(f"Restored evaluation checkpoints from Hugging Face dataset {self.repo_id}@{revision[:12]}.")
+
+    def _report_other_identities(self, names: Sequence[str], revision: str) -> None:
+        """Explain a fresh start: say which saved runs of this benchmark have other identities.
+
+        A changed adapter, source file, or evaluation cell gives a new identity, and the
+        old progress then stays on the Hub unused. This only prints; it never raises.
+        """
+        try:
+            root = PurePosixPath(self.remote_prefix).parent
+            others: Dict[str, List[str]] = {}
+            for name in names:
+                try:
+                    relative = PurePosixPath(name).relative_to(root).parts
+                except ValueError:
+                    continue
+                if len(relative) == 2 and relative[0] != self.fingerprint:
+                    others.setdefault(relative[0], []).append(relative[1])
+            if not others:
+                return
+            print(
+                f"The Hub already holds {self.identity['benchmark']} checkpoints saved under "
+                f"{len(others)} other identit{'y' if len(others) == 1 else 'ies'}; they are not reused:"
+            )
+            for fingerprint, files in sorted(others.items())[:5]:
+                questions = sum(1 for file in files if _QUESTION_PATTERN.fullmatch(file))
+                differing = "manifest unavailable"
+                if "manifest.json" in files:
+                    with tempfile.TemporaryDirectory(prefix="merging-evaluation-identity-") as staging_dir:
+                        manifest_name = f"{root}/{fingerprint}/manifest.json"
+                        self._hub_call("Reading an older evaluation manifest", lambda: self.download_fn(
+                            repo_id=self.repo_id, repo_type="dataset", revision=revision,
+                            token=self.token, local_dir=staging_dir,
+                            allow_patterns=[manifest_name], max_workers=1,
+                        ))
+                        saved = json.loads(Path(staging_dir, *PurePosixPath(manifest_name).parts).read_text(encoding="utf-8"))
+                        keys = differing_identity_keys(self.identity, saved.get("identity", {}))
+                        differing = ", ".join(keys[:6]) + (", ..." if len(keys) > 6 else "") if keys else "no differences found"
+                print(f"  {fingerprint[:12]}: {questions} question files; differs in: {differing}")
+            print(
+                "To continue one of them, run the notebook with the same adapter, source files, and "
+                "evaluation cell that produced it."
+            )
+        except Exception as exc:
+            print(f"Could not inspect other saved identities ({type(exc).__name__}: {str(exc)[:120]}).")
 
     def _question_path(self, index: int) -> Path:
         return self.checkpoint_dir / f"question-{index:08d}.json"
@@ -361,12 +433,12 @@ class MergingEvaluationCheckpoint:
             return None
         if not self._dirty_files:
             return None
-        result = self.api.upload_folder(
+        result = self._hub_call("Uploading the evaluation checkpoint", lambda: self.api.upload_folder(
             repo_id=self.repo_id, repo_type="dataset", folder_path=str(self.checkpoint_dir),
             path_in_repo=self.remote_prefix,
             allow_patterns=sorted(self._dirty_files | {"manifest.json"}),
             commit_message=f"Checkpoint {self.label} evaluation {self.identity['benchmark']}",
-        )
+        ))
         self._pending_operations = 0
         self._dirty_files.clear()
         print(f"Evaluation checkpoint uploaded to Hugging Face dataset {self.repo_id}.")

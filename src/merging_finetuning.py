@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from src.evaluation import evaluate_single_answer_with_llm
+from src.hub_resilience import call_with_retries
 from src.prompts import (
     EXEMPLAR_FORMAT,
     create_final_reasoning_prompt,
@@ -456,8 +457,13 @@ def train_qlora(
     tokenized_splits: Mapping[str, Sequence[Mapping[str, Any]]],
     config: QLoRAConfig,
     resume_from_checkpoint: Optional[str] = None,
+    callbacks: Optional[Sequence[Any]] = None,
 ) -> Any:
-    """Train and save the best validation-loss adapter and reproducibility data."""
+    """Train and save the best validation-loss adapter and reproducibility data.
+
+    ``callbacks`` are extra ``TrainerCallback`` objects, such as the one that
+    uploads every checkpoint to the Hub (``src.training_checkpoints``).
+    """
     import torch
     from datasets import Dataset
     from transformers import Trainer, TrainingArguments
@@ -498,6 +504,7 @@ def train_qlora(
         eval_dataset=Dataset.from_list(list(tokenized_splits["validation"])),
         data_collator=CompletionOnlyCollator(tokenizer),
         processing_class=tokenizer,
+        callbacks=list(callbacks) if callbacks else None,
     )
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     best_dir = output_dir / "best_adapter"
@@ -557,18 +564,18 @@ def upload_adapter_to_hub(
     if "/" not in resolved_repo_id:
         raise ValueError("repo_id must use the 'owner/repository' format.")
 
-    api.create_repo(
+    call_with_retries(lambda: api.create_repo(
         repo_id=resolved_repo_id,
         repo_type="model",
         private=private,
         exist_ok=True,
-    )
-    api.upload_folder(
+    ), "Creating the adapter repository")
+    call_with_retries(lambda: api.upload_folder(
         folder_path=str(adapter_dir),
         repo_id=resolved_repo_id,
         repo_type="model",
         commit_message=commit_message,
-    )
+    ), "Uploading the adapter")
     return {
         "repo_id": resolved_repo_id,
         "url": f"https://huggingface.co/{resolved_repo_id}",
@@ -608,7 +615,9 @@ def download_adapter_from_hub(
         raise ValueError("repo_id must use the 'owner/repository' format.")
 
     try:
-        info = api.model_info(repo_id=resolved_repo_id)
+        info = call_with_retries(
+            lambda: api.model_info(repo_id=resolved_repo_id), "Reading the adapter repository",
+        )
     except RepositoryNotFoundError:
         if repo_id:
             raise RuntimeError(
@@ -626,10 +635,10 @@ def download_adapter_from_hub(
 
     adapter_dir = Path(adapter_path).expanduser().resolve() / info.sha
     adapter_dir.mkdir(parents=True, exist_ok=True)
-    download_fn(
+    call_with_retries(lambda: download_fn(
         repo_id=resolved_repo_id, repo_type="model", revision=info.sha,
         local_dir=str(adapter_dir), token=token,
-    )
+    ), "Downloading the adapter")
     if not (adapter_dir / "adapter_config.json").is_file() or not any(
         (adapter_dir / name).is_file()
         for name in ("adapter_model.safetensors", "adapter_model.bin")

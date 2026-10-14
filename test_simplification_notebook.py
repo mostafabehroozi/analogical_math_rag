@@ -15,11 +15,14 @@ from src.merging_evaluation_checkpoints import canonical_fingerprint, fingerprin
 from src.merging_finetuning import QLoRAConfig, normalize_question
 from src.simplification_finetuning import (
     HELDOUT_POPULATION, SIMPLIFICATION_INSTRUCTION, SimplificationEvaluationCheckpoint,
-    evaluate_question, evaluation_prompts, load_heldout_population, retryable_failures,
-    solver_prompt, summarize_evaluation, training_identity, verify_adapter_training_source,
+    SimplificationTrainingCheckpoints, evaluate_question, evaluation_prompts, load_heldout_population,
+    retryable_failures, solver_prompt, summarize_evaluation, training_identity,
+    verify_adapter_training_source,
 )
+from src.training_checkpoints import describe_hub_progress, training_checkpoint_identity
 from src.utils import save_json_atomic
 from test_merging_evaluation_checkpoints import FakeDatasetHub
+from test_training_checkpoints import FakeTrainingHub, make_checkpoint
 
 NOTEBOOK = Path(__file__).resolve().parent / "simplification_finetuning.ipynb"
 QUESTION = "Find x if 2x = 6."
@@ -233,7 +236,8 @@ class AdapterCellTests(TestCase):
 
             namespace = {
                 "TRAIN": True, "hub_adapter": None, "train_qlora": train, "model": None,
-                "tokenizer": None, "tokenized": {}, "qlora_config": None, "RESUME_CHECKPOINT": None,
+                "tokenizer": None, "tokenized": {}, "qlora_config": None, "resume_checkpoint": None,
+                "training_state": SimpleNamespace(trainer_callback=lambda: "hub-checkpoint-callback"),
                 "training_source": source, "save_json_atomic": save_json_atomic, "WORK_DIR": work_dir,
                 "HF_UPLOAD_ENABLED": True, "HF_TOKEN": "test-token", "HF_MODEL_REPO_ID": None,
                 "HF_MODEL_REPO_PRIVATE": True,
@@ -243,6 +247,127 @@ class AdapterCellTests(TestCase):
                 exec(cell("trainer = train_qlora("), namespace)
             verify_adapter_training_source(work_dir / "best_adapter", source)
             self.assertEqual(uploads[0]["default_repo_name"], "simplification-qwen3-4b-qlora")
+
+
+TOKENS = {"train": [{"input_ids": [1, 2, 3], "labels": [-100, 2, 3], "attention_mask": [1, 1, 1]}],
+          "validation": [{"input_ids": [4, 5], "labels": [-100, 5], "attention_mask": [1, 1]}]}
+
+
+class TrainingRecoveryCellTests(TestCase):
+    """The notebook's training stage survives a lost Kaggle session."""
+
+    def status(self, work_dir, hub, **overrides):
+        lines = []
+        namespace = {
+            "WORK_DIR": Path(work_dir), "TRAIN": True, "RUN_EVALUATION": True,
+            "qlora_config": QLoRAConfig(output_dir=str(work_dir)), "prepared": {"tokenized": TOKENS},
+            "SimplificationTrainingCheckpoints": functools.partial(
+                SimplificationTrainingCheckpoints, api=hub, download_fn=hub.download, log=lines.append),
+            "describe_hub_progress": functools.partial(describe_hub_progress, api=hub, log=lines.append),
+            "training_checkpoint_identity": training_checkpoint_identity,
+            "HF_TOKEN": "test-token", "hub_features": ["HF_TRAIN_UPLOAD_ENABLED"],
+            "HF_TRAIN_UPLOAD_ENABLED": True, "HF_TRAIN_RESTORE_ENABLED": True,
+            "HF_TRAIN_STATE_REPO_ID": None, "HF_TRAIN_STATE_PRIVATE": True,
+            "HF_TRAIN_STATE_REMOTE_PREFIX": "simplification_training", "HF_TRAIN_UPLOAD_EVERY_SAVES": 1,
+            "HF_MODEL_REPO_ID": None, "HF_REUSE_ADAPTER_IF_AVAILABLE": True,
+            "HF_EVAL_DATASET_REPO_ID": None, "HF_EVAL_REMOTE_PREFIX": "simplification_evaluations",
+            "EVAL_POPULATIONS": [HELDOUT_POPULATION, "math500"],
+        }
+        namespace.update(overrides)
+        exec(cell("training_state = SimplificationTrainingCheckpoints("), namespace)
+        return namespace, "\n".join(lines)
+
+    def test_status_cell_uses_the_simplification_repositories_and_finds_earlier_progress(self):
+        hub = FakeTrainingHub()
+        with TemporaryDirectory() as first, TemporaryDirectory() as second:
+            namespace, text = self.status(first, hub)
+            self.assertIn("researcher/simplification-qwen3-4b-training-state", text)
+            self.assertIn("researcher/simplification-qwen3-4b-evaluation", text)
+            self.assertEqual(namespace["training_state"].identity["workflow"], "simplification")
+            store = namespace["training_state"]
+            store.restore()
+            store.on_checkpoint_saved(make_checkpoint(first, 60), "checkpoint-60")
+            self.assertEqual(hub.creates[0]["repo_id"], "researcher/simplification-qwen3-4b-training-state")
+            _, text = self.status(second, hub)
+            self.assertIn("checkpoint-60 (step 60 of 100) matches this configuration -> training resumes", text)
+            self.assertIn("heldout: nothing saved yet", text)
+
+    def test_changed_settings_never_resume_the_old_checkpoint(self):
+        hub = FakeTrainingHub()
+        with TemporaryDirectory() as first, TemporaryDirectory() as second:
+            namespace, _ = self.status(first, hub)
+            namespace["training_state"].restore()
+            namespace["training_state"].on_checkpoint_saved(make_checkpoint(first, 60), "checkpoint-60")
+            namespace, text = self.status(second, hub, qlora_config=QLoRAConfig(output_dir=str(second), lora_rank=8))
+            self.assertIn("differs in: qlora.lora_rank", text)
+            self.assertIsNone(namespace["training_state"].restore())
+
+    def restore_cell(self, work_dir, **overrides):
+        calls = []
+        identity = training_checkpoint_identity(QLoRAConfig(), TOKENS, workflow="simplification")
+
+        def load_qlora_model(config):
+            calls.append("load_model")
+            return SimpleNamespace(get_nb_trainable_parameters=lambda: (1, 2)), SimpleNamespace()
+
+        namespace = {
+            "HF_REUSE_ADAPTER_IF_AVAILABLE": False, "TRAIN": True, "RESUME_CHECKPOINT": None,
+            "WORK_DIR": Path(work_dir), "HF_TOKEN": "t", "HF_MODEL_REPO_ID": None,
+            "training_state": SimpleNamespace(identity=identity,
+                                              restore=lambda: calls.append("restore") or "hub/checkpoint-60"),
+            "load_qlora_model": load_qlora_model, "qlora_config": QLoRAConfig(),
+            "tokenize_splits": lambda splits, tokenizer, length: (TOKENS, {}),
+            "prepared": {"splits": {}}, "MAX_LENGTH": 4096,
+            "training_checkpoint_identity": training_checkpoint_identity,
+            "CompletionOnlyCollator": lambda tokenizer: "collator",
+            "smoke_test_training_step": lambda *a: calls.append("smoke") or 1.5,
+            "download_adapter_from_hub": lambda *a, **k: None,
+            "verify_adapter_training_source": verify_adapter_training_source,
+            "training_source": {},
+        }
+        namespace.update(overrides)
+        with redirect_stdout(StringIO()):
+            exec(cell("hub_adapter = None"), namespace)
+        return namespace, calls
+
+    def test_training_resumes_from_the_hub_before_the_model_loads(self):
+        with TemporaryDirectory() as directory:
+            namespace, calls = self.restore_cell(directory)
+            self.assertEqual(namespace["resume_checkpoint"], "hub/checkpoint-60")
+            self.assertEqual(calls, ["restore", "load_model", "smoke"])
+
+    def test_manual_resume_checkpoint_overrides_the_hub(self):
+        with TemporaryDirectory() as directory:
+            namespace, calls = self.restore_cell(directory, RESUME_CHECKPOINT="/local/checkpoint-3")
+            self.assertEqual(namespace["resume_checkpoint"], "/local/checkpoint-3")
+            self.assertNotIn("restore", calls)
+
+    def test_tokens_that_differ_from_the_fingerprinted_ones_stop_before_training(self):
+        changed = {**TOKENS, "train": [{"input_ids": [9], "labels": [9], "attention_mask": [1]}]}
+        with TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, "differ from those fingerprinted"):
+            self.restore_cell(directory, tokenize_splits=lambda *a: (changed, {}))
+
+    def test_train_cell_resumes_and_uploads_every_checkpoint(self):
+        captured = {}
+        with TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+
+            def train(model, tokenizer, tokenized, config, **kwargs):
+                captured.update(kwargs)
+                (work_dir / "best_adapter").mkdir()
+                return SimpleNamespace(state=SimpleNamespace(best_model_checkpoint="checkpoint-60"))
+
+            namespace = {
+                "TRAIN": True, "hub_adapter": None, "train_qlora": train, "model": None, "tokenizer": None,
+                "tokenized": {}, "qlora_config": None, "resume_checkpoint": "hub/checkpoint-60",
+                "training_state": SimpleNamespace(trainer_callback=lambda: "hub-callback"),
+                "training_source": {}, "save_json_atomic": save_json_atomic, "WORK_DIR": work_dir,
+                "HF_UPLOAD_ENABLED": False,
+            }
+            with redirect_stdout(StringIO()):
+                exec(cell("trainer = train_qlora("), namespace)
+            self.assertEqual(captured, {"resume_from_checkpoint": "hub/checkpoint-60",
+                                        "callbacks": ["hub-callback"]})
 
 
 class EvaluationIdentityTests(TestCase):

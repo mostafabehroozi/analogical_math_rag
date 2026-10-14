@@ -16,6 +16,7 @@ from src.prompts import (
     create_core_simp_augmented_solver_prompt,
     create_final_reasoning_prompt_simple,
 )
+from src.training_checkpoints import HubTrainingCheckpoints
 from src.utils import save_json_atomic
 
 
@@ -285,6 +286,13 @@ class SimplificationEvaluationCheckpoint(MergingEvaluationCheckpoint):
     """
 
     default_repo_name = "simplification-qwen3-4b-evaluation"
+    label = "simplification"
+
+
+class SimplificationTrainingCheckpoints(HubTrainingCheckpoints):
+    """Training checkpoints for the simplifier, kept in their own Hub repo."""
+
+    default_repo_name = "simplification-qwen3-4b-training-state"
     label = "simplification"
 
 
