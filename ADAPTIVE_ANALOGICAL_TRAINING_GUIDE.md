@@ -90,16 +90,28 @@ complete-state development loss, Stage 2 on its loss over every reachable state.
 One epoch visits every view once (plus those repeats): about 98 million views
 for 2,000 training questions. The defaults are therefore `batch_size=16384`,
 `teacher_epochs=snapshot_epochs=10`, and `dev_checks_per_epoch=8`. Development
-checks are spread evenly through each epoch and only choose the checkpoint, whose
-position is a fractional epoch such as `1.375`. `patience` counts whole epochs in
-every stage: training stops at the end of the first epoch that finishes
-`patience` or more epochs after the best check (the best check at epoch `3.625`
-with `patience=15` stops at the end of epoch 19, never inside an epoch). The
-training loop prints one line per epoch: the mean training loss over the epoch,
-the latest check's development loss, the best development loss and the epoch of
-its check, and the epochs without improvement, for example
-`epoch  4.000 | train loss 0.2846 | latest development loss 0.2951 | best
-development loss 0.2874 at epoch 3.625 | epochs without improvement 0.38/15`.
+checks are spread evenly through each epoch, and the checkpoint's position is a
+fractional epoch such as `1.375`. Every minibatch holds rows of every training
+question (see below), so an epoch is thousands of passes over the questions'
+labels and the best check comes early in the first epoch. Stages 1-2 therefore
+stop at the first check `view_patience` (default `0.25`) or more epochs after the
+best one, inside an epoch if need be; `teacher_epochs` and `snapshot_epochs` only
+cap a run that keeps improving. `patience` counts whole epochs in Stage 3 alone,
+where an epoch is one pass over the questions. On real logs (fold-sized splits of
+the AIME, GSM8K and MATH-500 logs: 1,280 training and 320 development questions,
+`dev_checks_per_epoch=64`, local GPU), fold teachers were best at epochs
+0.016-0.045 with a development loss of about 0.58, passed the constant-prior loss
+near epoch 0.1 and reached about 1.2 by the end of the first epoch, while their
+complete-state training loss fell to 0.07 and the reported AP fell too. The
+snapshot model was best at epoch 0.17. Revision 9 counted whole epochs in these
+stages too, checked only at epoch ends, so `patience=15` with `teacher_epochs=10`
+never stopped a teacher: each fold trained ten epochs to keep its epoch-0.031
+weights. The training loop prints one line per epoch, and one where it stops:
+the mean training loss over the epoch, the latest check's development loss, the
+best development loss and the epoch of its check, and the epochs without
+improvement, for example `epoch  0.625 | train loss 0.4846 | latest development
+loss 0.6120 | best development loss 0.5874 at epoch 0.375 | epochs without
+improvement 0.25/0.25`.
 Stage 2 also shows Top-1 and Brier in parentheses after each loss; they are
 information, not selection criteria.
 
@@ -133,7 +145,10 @@ initialization), and 180 MiB peak CUDA memory. At that rate one epoch takes
 about 1 minute for Stage 2 and, with the teacher's complete-view repeats
 adding 18% to its rows, about 5 minutes for Stage 1's five folds plus final
 teacher, so the 10-epoch maximum is about an hour for both stages before
-early stopping. Kaggle hardware will differ. This was measured when each
+early stopping. Kaggle hardware will differ, but a 1,280-question fold epoch
+with 64 checks takes about 70 seconds on this GPU; one that takes many minutes
+is probably running on the CPU, which Stage 0's `DATA AUDIT | device=` line
+shows. This was measured when each
 Stage 2 development check covered 189 reachable states; it now covers 1,092, so
 a check costs about six times as much. Lower `dev_checks_per_epoch` to spend
 less time on checks.
@@ -445,10 +460,11 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
 - **Push.** Stage 0 ends with a required upload, so a bad token, repository
   id, or disabled Internet fails in the first minute. Each later stage uploads
   when it completes. Inside long loops the run uploads every `hf_sync_minutes`
-  (default 15): after Stage 1 folds, during the Stage 3 label build, and after
-  Stage 3 epochs; each merged role uploads immediately. Uploads skip unchanged
+  (default 15): during Stage 1-2 training (with the model's training state),
+  after Stage 1 folds, during the Stage 3 label build, and after Stage 3 epochs;
+  each merged role uploads immediately. Uploads skip unchanged
   files by content hash, never include `.tmp` files, and remove per-question
-  label files and an earlier revision's
+  label files, a completed model's Stage 1-2 training state, and an earlier revision's
   `final_trajectories.jsonl` from the mirror once they are gone locally (the
   dataset repository's history keeps earlier versions).
   A failed periodic upload prints a warning and retries at the next sync
@@ -464,12 +480,25 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
   which name each log's filename stem, identify the logs. Stages 0-2 load
   their completed checkpoints; Stage 1 also reuses completed
   `teacher_fold_<n>.pt` and `teacher_final.pt` files whose question roles
-  match exactly, so an interrupted Stage 1 repeats at most one fold. Stage 3
+  match exactly, and a teacher or the snapshot model that was training
+  continues from its saved training state (next item), so an interrupted
+  Stage 1 or 2 repeats at most about `hf_sync_minutes` of training. Stage 3
   reuses completed questions and continues from the last completed epoch of
   the phase it was in; fine-tuning labels are bound to the exact pretrained head
-  they were rolled out from.
-  Stage 2 and Stage 4 restart if interrupted; neither takes long compared with
-  Stage 3.
+  they were rolled out from. Stage 4 restarts if interrupted.
+- **Training state.** A teacher or the snapshot model trains for hours (a
+  teacher epoch over 1,280 questions took about 17 minutes on Kaggle), longer
+  than a session may have left. At the first development check after every
+  `hf_sync_minutes`, its current and best weights, Adam state, random states,
+  position in the epoch, and history are saved atomically to
+  `training_progress/<model>.pt` (`teacher_fold_<n>.pt`, `teacher_final.pt`,
+  `snapshot.pt`) and uploaded. A session that finds the file restores it and
+  continues with the epoch's next batch; the epoch's batch order is rebuilt from
+  its seed, so on the same device the model ends exactly as an uninterrupted
+  run would. The file is bound to a hash of the questions and targets the
+  model trains on; one saved for other training is reported and replaced. It
+  is removed, locally and on the Hub, once the model's completed checkpoint is
+  saved.
 - **One session per repository.** Two sessions writing the same mirror would
   overwrite each other; use a different `hf_repo` for a different run
   (`QUICK_PILOT` appends `_pilot` to both the output folder and the mirror).
@@ -481,7 +510,7 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
 
 The datasets that the heads train on are built by the phases before them, and
 they are the expensive part of a run. Set `dataset_id` (a name such as
-`adaptive-v9`) and `dataset_repo` (a private Hub dataset repository id that can
+`adaptive-v10`) and `dataset_repo` (a private Hub dataset repository id that can
 hold many ids, and must differ from `hf_repo`; the token is the one it uses) to keep them apart from the
 run mirror, version them, and never rebuild one that the Hub already holds. Both
 are runtime-only, outside the run contract and every fingerprint, so adding them
@@ -495,7 +524,10 @@ out-of-fold labels define the SAFE/MAX targets, the frozen snapshot predictor
 defines every Stage 3 goal, and Stage 3b's labels are rolled out with the
 pretrained head. `build_datasets()` therefore runs Stages 1, 2 and 3a and then
 labels 3b; only the 3b fine-tuning, Stage 4 and the inference bundle are outside
-it. What it stores, relative to the output folder:
+it. The model training that the datasets cell prints (teacher folds, the
+snapshot predictor, the Stage 3a head) is this construction, not a separate
+experiment, and it saves its progress as it goes, so it resumes in a new session
+(see "Training state" above). What it stores, relative to the output folder:
 
 | Part | Files | Why it belongs to the dataset |
 | --- | --- | --- |
@@ -504,10 +536,11 @@ it. What it stores, relative to the output folder:
 | Snapshot predictor | `snapshot_completed.pt` | The frozen encoder that Stage 3 goals and head inputs come from |
 | Stage 3 labels | `decision_labels/*`, `decision_dataset_manifest.json`, `decision_label_coverage.json` | The 3a and 3b labels (about 590 MB for the full run) |
 | Pretrained head | `decision_head_pretrained.pt` | The 3b labels are bound to its exact weights |
+| Build progress | `training_progress/*`, `decision_head_pretrain_progress.pt` | The training state of the models a build in progress trains (not hashed); a new session downloads it and continues the build. The Stage 1-2 files leave once their model completes |
 
 The run mirror keeps everything else: `contract.json`, the `data_audit.json` and
 `split_manifest.json` that Stage 0 rewrites each session (they name the logs'
-paths), head training progress, `decision_head_completed.pt`,
+paths), fine-tuning progress, `decision_head_completed.pt`,
 `inference_bundle.pt`, `final_rollouts.jsonl`, `results.json`. With `dataset_id` set the run mirror
 skips the dataset files; a run mirror from before the dataset store may still
 hold copies, which are used as they are.
@@ -532,7 +565,7 @@ always made a new output folder.
 | The Hub holds, for this id and version | Result |
 | --- | --- |
 | Nothing | The dataset is built and uploaded as it progresses: every stage end, and every `hf_sync_minutes` inside the long loops. Dataset files already in the output folder (a run built before the dataset store, pulled from its run mirror) are uploaded under the version, not rebuilt |
-| A partial dataset (`complete: false`) | The files the folder lacks are downloaded and the build resumes from them, at most about `hf_sync_minutes` of work behind |
+| A partial dataset (`complete: false`) | The files the folder lacks are downloaded and the build resumes from them, at most about `hf_sync_minutes` of work behind, also inside the teacher or snapshot model it was training |
 | A complete dataset | The files the folder lacks are downloaded and every hashed artifact's size and SHA-256 is verified; the stage calls only load it. Nothing trains or relabels, and nothing is uploaded |
 
 Finishing a build writes `dataset_manifest.json` with `complete: true`, each
@@ -626,7 +659,7 @@ warns if the bound does not fit.
 **Recognizing the earlier code.** The notebook embeds its implementation, so a
 Kaggle copy uploaded before these changes keeps its old behavior. Stage 0 of
 the current workflow prints the implementation revision and the label schema
-(`Implementation revision 9; Stage 3 labels every presence state with its
+(`Implementation revision 10; Stage 3 labels every presence state with its
 cheapest routes to the next goal and pretrains on them (Stage 3a), then
 fine-tunes on the route its own continuations make cheapest (Stage 3b). Compact
 labels (schema 6: a bit mask per state/order case for 3a, one byte for 3b)`)
@@ -634,9 +667,10 @@ before any stage trains, so the running code can be checked in the first minute
 rather than hours later. The same line ends with `Stages 1-2 train on every
 presence state under every zero-shot order (8,160 x 6 views per question),
 assembled on the device and never stored; each keeps the checkpoint with the
-lowest development loss (AP is only a reported metric)`. A copy that prints a
-lower revision plans a single label per state with its own tie rules, or still
-requires a one-shot candidate's evaluator, and cannot continue a revision-9 run.
+lowest development loss (AP is only a reported metric), stops 0.25 epochs after
+it`. A copy that prints revision 9 stops Stages 1-2 only at epoch ends; a lower
+revision plans a single label per state with its own tie rules, or still
+requires a one-shot candidate's evaluator. None can continue a revision-10 run.
 
 A `torch.save` iostream error followed by `unexpected pos` is a checkpoint
 write failure, commonly caused by exhausted disk space or a storage quota.
@@ -902,11 +936,14 @@ trajectories`; a notebook copy without it still writes the traced file.
 
 ### Versions
 
-This implementation uses **revision 9**, **contract schema 4**,
+This implementation uses **revision 10**, **contract schema 4**,
 **inference-bundle schema 5**, **decision-dataset schema 5** (the label
 fingerprint, without input log paths), **label-file schema 6**, and
 **dataset-store schema 1** (the versioned dataset manifest; it does not change
-any label, checkpoint or contract, so adding it needed no new revision). Revision 9
+any label, checkpoint or contract, so adding it needed no new revision). Revision 10
+stops Stages 1-2 at the first development check `view_patience` epochs after the
+best one, inside an epoch if need be; revision 9 counted whole epochs there,
+checked at epoch ends, so its teachers trained every epoch. Revision 9
 replaces the single planned label per state with two phases. An evaluator and a
 one-shot candidate are separate acquisitions per source (eleven actions instead
 of seven), offered for a source in use or the nearest unused one, so 1,092
@@ -921,7 +958,7 @@ of development AP (Stage 1) and Top-1 then Brier (Stage 2); AP stays a reported
 metric. Revision 6 trains Stages 1-2 on exhaustive views instead of random
 snapshots. Every earlier output folder is rejected as a different contract, and
 older action/state bundles and checkpoints are rejected. Use the new default
-output directory `/kaggle/working/adaptive_analogical_shared_training_v9_run` and
+output directory `/kaggle/working/adaptive_analogical_shared_training_v10_run` and
 a new `hf_repo` mirror for a fresh run; old runs are not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
 quality. Recorded outcomes cannot establish live provider behavior or the
 results of newly generated candidates.

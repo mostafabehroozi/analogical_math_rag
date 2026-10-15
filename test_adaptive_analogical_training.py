@@ -231,6 +231,9 @@ def test_snapshot_batches_mix_every_question_and_visit_every_view_once(questions
     assert torch.equal(seen, again) and not torch.equal(seen, torch.arange(views.rows))
     other = torch.cat([index for index, _ in views.batches(batch, np.random.RandomState(2))])
     assert not torch.equal(seen, other)
+    # A resumed epoch skips the batches it already trained on and draws the rest unchanged.
+    rest = [index for index, _ in views.batches(batch, np.random.RandomState(1), 1)]
+    assert len(rest) == len(batches) - 1 and all(map(torch.equal, rest, batches[1:]))
 
 
 @pytest.mark.parametrize("share", [.5, .1, .9])
@@ -305,7 +308,8 @@ def test_streamed_snapshot_metrics_and_temperatures_match_materialized_arrays():
 
 def small_stage_cfg():
     return a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1, batch_size=64, device="cpu",
-                    cpu_threads=1, teacher_epochs=3, snapshot_epochs=3, dev_checks_per_epoch=3, patience=100)
+                    cpu_threads=1, teacher_epochs=3, snapshot_epochs=3, dev_checks_per_epoch=3,
+                    view_patience=100)
 
 
 def refuse_ap(*args, **kwargs):
@@ -333,6 +337,35 @@ def test_teacher_checkpoint_is_the_lowest_development_correctness_loss_and_never
     with torch.no_grad():
         expected = torch.nn.functional.binary_cross_entropy_with_logits(model(x), y).item()
     assert expected == pytest.approx(min(losses), rel=1e-4)
+
+
+def test_stages_1_2_stop_view_patience_epochs_after_the_best_check_even_inside_an_epoch(capsys):
+    # Every step sees every question, so a Stage 1-2 epoch is thousands of passes over the data and
+    # the best check comes early in the first one: patience is a fraction of an epoch, checked at
+    # every development check. Stage 3's whole-epoch `patience` plays no part.
+    cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1, batch_size=64, device="cpu",
+                   cpu_threads=1, dev_checks_per_epoch=4, view_patience=.5, patience=1)
+    views = a.SnapshotViews([record(cfg, i) for i in range(4)], list(range(4)), cfg, "cpu")
+    losses = iter([.9, .8, .5, .6, .7, .1])
+
+    def evaluate(model):
+        score = next(losses)
+        return score, f"development loss {score:.4f}"
+
+    fit = a.train_on_views(a.ResNet(cfg.input_dim, cfg.n, cfg), views, 5, 3,
+                           lambda logits, y: a.teacher_loss(logits, y, cfg), evaluate, a.lower_loss, cfg, "Teacher")
+    # The best check is at epoch 0.75. The check at 1.25, inside the second epoch, is the first one
+    # half an epoch later, so training stops there and never draws the next loss.
+    assert [entry["epoch"] for entry in fit["history"]] == [.25, .5, .75, 1., 1.25]
+    assert (fit["best"], fit["best_epoch"], fit["epochs"]) == (.5, .75, 1.25)
+    assert next(losses) == .1
+    log = capsys.readouterr().out
+    assert "training stops 0.5 epochs after the best check" in log
+    assert "epochs without improvement 0.25/0.5" in log and "epochs without improvement 0.50/0.5" in log
+    assert log.count("Teacher | epoch") == 2
+    a.Config(view_patience=.25).validate()
+    with pytest.raises(AssertionError):
+        a.Config(view_patience=0).validate()
 
 
 def test_snapshot_checkpoint_is_the_lowest_development_loss_over_all_outputs_and_never_uses_ap(monkeypatch):
@@ -976,11 +1009,11 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     second.write_text(json.dumps([raw_record(i,cfg,prefix="second") for i in range(2)] + duplicates))
     snapshot_training_ids = []
     train_on_views = a.train_on_views
-    def track_snapshot_training(model, views, *args):
+    def track_snapshot_training(model, views, *args, **kwargs):
         if args[-1] == "Snapshot":
             snapshot_training_ids.append(views.ids)
             assert views.safe is not None and views.state_count == len(a.presence_states(cfg.zero_shots, cfg.k))
-        return train_on_views(model, views, *args)
+        return train_on_views(model, views, *args, **kwargs)
     monkeypatch.setattr(a, "train_on_views", track_snapshot_training)
     rolled_out, rollout = [], a.rollout
     monkeypatch.setattr(a, "rollout", lambda record, *args, **kwargs: rolled_out.append(record.uid) or
@@ -995,6 +1028,7 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
             f"(schema {a.DECISION_LABEL_SCHEMA}: a bit mask per state/order case for 3a, one byte for 3b)"
             ) in log
     assert f"Stage 4 rolls out each question once and saves compact outcomes to {a.ROLLOUT_FILE}" in log
+    assert f"(AP is only a reported metric), stops {cfg.view_patience:g} epochs after it" in log
     # Stages 1-2 report and select on development loss; AP appears only in the report tables.
     assert "development loss" in log and "development AP" not in log
     assert "Mean AP" in log

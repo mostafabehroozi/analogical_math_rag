@@ -93,7 +93,7 @@ def small_config(root, **overrides):
                    output_dir=str(root / "run"), device="cpu", cpu_threads=1,
                    k=2, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
                    batch_size=16, teacher_epochs=2, snapshot_epochs=2, decision_epochs=2,
-                   decision_finetune_epochs=2, patience=2, dev_checks_per_epoch=2,
+                   decision_finetune_epochs=2, patience=2, dev_checks_per_epoch=2, view_patience=2,
                    decision_batch_size=16, recognition_threshold=.1,
                    bootstrap_samples=20, **overrides)
     if not train.exists():
@@ -264,11 +264,11 @@ def test_interrupted_teacher_stage_resumes_completed_folds_exactly(tmp_path, mon
     original = a.train_teacher
     names = []
 
-    def interrupt_second_fold(records, train_ids, val_ids, config, device, seed, name):
+    def interrupt_second_fold(records, train_ids, val_ids, config, device, seed, name, **kwargs):
         names.append(name)
         if len(names) == 2:
             raise KeyboardInterrupt("simulated session end")
-        return original(records, train_ids, val_ids, config, device, seed, name)
+        return original(records, train_ids, val_ids, config, device, seed, name, **kwargs)
 
     monkeypatch.setattr(a, "train_teacher", interrupt_second_fold)
     with pytest.raises(KeyboardInterrupt, match="simulated session end"):
@@ -296,6 +296,74 @@ def test_interrupted_teacher_stage_resumes_completed_folds_exactly(tmp_path, mon
     names.clear()
     a.Workflow(cfg).prepare().train_teacher()
     assert names == ["Teacher fold 1/2"]
+
+
+def interrupt_after_save(monkeypatch, saves, batches):
+    """Save the training state at every development check, and end the session `batches` training
+    batches after the `saves`-th save."""
+    save, batch, due = a.TrainingProgress.save, a.SnapshotViews.batch, a.TrainingProgress.due
+    count = {"saves": 0, "batches": 0}
+
+    def counted_save(self, state, message):
+        save(self, state, message)
+        count["saves"] += 1
+
+    def interrupted_batch(self, index):
+        if count["saves"] >= saves:
+            count["batches"] += 1
+            if count["batches"] > batches:
+                raise KeyboardInterrupt("simulated session end")
+        return batch(self, index)
+
+    monkeypatch.setattr(a.TrainingProgress, "save", counted_save)
+    monkeypatch.setattr(a.TrainingProgress, "due", lambda self: True)
+    monkeypatch.setattr(a.SnapshotViews, "batch", interrupted_batch)
+    return lambda: (monkeypatch.setattr(a.TrainingProgress, "save", save),
+                    monkeypatch.setattr(a.TrainingProgress, "due", due),
+                    monkeypatch.setattr(a.SnapshotViews, "batch", batch))
+
+
+def test_an_interrupted_teacher_continues_inside_its_epoch_and_ends_as_an_uninterrupted_run(
+        tmp_path, monkeypatch, capsys):
+    torch.set_num_threads(1)
+    cfg = small_config(tmp_path)
+    reference_cfg = copy.deepcopy(cfg)
+    reference_cfg.output_dir = str(tmp_path / "reference")
+    reference = a.Workflow(reference_cfg).prepare().train_teacher().teacher
+    run = tmp_path / "run"
+    progress = run / a.PROGRESS_DIR / "teacher_fold_1.pt"
+    # The session ends five batches after the third saved check, in the first fold's second epoch.
+    restore = interrupt_after_save(monkeypatch, 3, 5)
+    with pytest.raises(KeyboardInterrupt, match="simulated session end"):
+        a.Workflow(cfg).prepare().train_teacher()
+    restore()
+    saved = a.load_checkpoint(progress)
+    assert saved["epoch"] == 1 and 0 < saved["step"] and saved["position"] == pytest.approx(1.5)
+    assert not (run / "teacher_fold_1.pt").exists()
+    capsys.readouterr()
+    resumed = a.Workflow(cfg).prepare().train_teacher().teacher
+    log = capsys.readouterr().out
+    assert "Teacher fold 1/2: resumed at epoch 1.500 from teacher_fold_1.pt" in log
+    # The same batches, dropout draws, and checks: identical to the uninterrupted run.
+    for key in ("scores", "safe", "maximum"):
+        np.testing.assert_array_equal(resumed[key], reference[key])
+    folds = [a.load_checkpoint(path / "teacher_fold_1.pt") for path in (run, tmp_path / "reference")]
+    assert folds[0]["history"] == folds[1]["history"] and folds[0]["best_epoch"] == folds[1]["best_epoch"]
+    assert all(torch.equal(value, folds[0]["weights"][key]) for key, value in folds[1]["weights"].items())
+    # Completed models leave no training state behind.
+    assert not (run / a.PROGRESS_DIR).exists()
+    # A state saved for other questions or targets is never resumed: the model trains from its start.
+    (run / "teacher_completed.pt").unlink()
+    (run / "teacher_fold_2.pt").unlink()
+    progress.parent.mkdir()
+    a.atomic_torch(run / a.PROGRESS_DIR / "teacher_fold_2.pt", {**saved, "identity": "another training"})
+    capsys.readouterr()
+    again = a.Workflow(cfg).prepare().train_teacher().teacher
+    log = capsys.readouterr().out
+    assert "teacher_fold_2.pt holds the training of other questions or targets" in log
+    assert "resumed at epoch" not in log
+    np.testing.assert_array_equal(again["scores"], reference["scores"])
+    assert not (run / a.PROGRESS_DIR).exists()
 
 
 def test_pipeline_resumes_from_the_mirror_in_a_fresh_session(tmp_path, monkeypatch, capsys):

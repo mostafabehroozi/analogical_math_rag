@@ -26,11 +26,12 @@ import numpy as np
 import torch
 from torch import nn
 
-# Stages 1-2 train on every presence state and zero-shot order and select checkpoints by development
-# loss. A one-shot candidate does not need its own evaluator. Stage 3 labels every presence state
-# with its cheapest routes to the next goal (pretraining), then fine-tunes on the route that the
-# pretrained head's own continuations make cheapest.
-PIPELINE_REVISION = 9
+# Stages 1-2 train on every presence state and zero-shot order, select checkpoints by development
+# loss, and stop a fraction of an epoch after the best check. A one-shot candidate does not need its
+# own evaluator. Stage 3 labels every presence state with its cheapest routes to the next goal
+# (pretraining), then fine-tunes on the route that the pretrained head's own continuations make
+# cheapest.
+PIPELINE_REVISION = 10
 
 
 # %% Configuration and compact data
@@ -43,7 +44,7 @@ class Config:
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ])
-    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v9_run"
+    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v10_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
     device: str = "auto"
@@ -68,7 +69,11 @@ class Config:
     teacher_complete_share: float = .15
     snapshot_complete_share: float = 0.   # 0: complete views appear once per order, like any other.
     dev_checks_per_epoch: int = 8   # Stages 1-2 development checks, evenly spaced in each epoch.
-    patience: int = 15              # Epochs without a better development loss before training stops.
+    # Stages 1-2 stop at the first development check this many epochs (fractions allowed) after the
+    # best one. Each of their steps sees every question, so an epoch is thousands of passes over the
+    # data and the best check comes early in the first epoch.
+    view_patience: float = .25
+    patience: int = 15              # Stage 3: epochs without a better development loss before a phase stops.
     auxiliary_weight: float = .25
     calibrate: bool = True          # Development-only temperature selection.
     recognition_threshold: float = .50
@@ -94,11 +99,11 @@ class Config:
     # Runtime-only mirror of output_dir on the Hugging Face Hub: Kaggle keeps its
     # working disk only while a session lives, so uploads make a run resumable.
     hf_repo: Optional[str] = None      # Private dataset repo id such as "user/run"; None disables.
-    hf_sync_minutes: float = 15.       # Upload cadence inside long loops; stage ends always upload.
+    hf_sync_minutes: float = 15.       # Uploads and Stage 1-2 progress saves inside long loops; stage ends always upload.
     # Runtime-only versioned dataset store: what the three training phases build (compact records,
     # teacher labels, frozen predictor, Stage 3 labels) is uploaded once under dataset_id and
     # downloaded, never rebuilt, whenever the Hub already holds it for this configuration.
-    dataset_id: Optional[str] = None   # Name of the dataset family, e.g. "adaptive-v9"; None disables.
+    dataset_id: Optional[str] = None   # Name of the dataset family, e.g. "adaptive-v10"; None disables.
     dataset_repo: Optional[str] = None # Private dataset repo that holds every dataset_id, e.g. "user/datasets".
 
     @property
@@ -147,7 +152,7 @@ class Config:
         assert self.decision_epochs > 0 and self.decision_batch_size >= 2 and self.decision_lr > 0
         assert self.decision_finetune_epochs > 0 and self.decision_finetune_lr > 0
         assert self.decision_eval_batch_size >= 2
-        assert self.dev_checks_per_epoch >= 1
+        assert self.dev_checks_per_epoch >= 1 and self.view_patience > 0
         assert 0 <= self.teacher_complete_share < 1 and 0 <= self.snapshot_complete_share < 1
         assert self.print_every > 0
         assert self.hf_sync_minutes > 0
@@ -155,7 +160,7 @@ class Config:
             raise ValueError("hf_repo must be a Hugging Face dataset repository id such as 'user/name'.")
         if self.dataset_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", str(self.dataset_id)):
             raise ValueError("dataset_id must be 1-64 letters, digits, '.', '_' or '-' and start with a "
-                             "letter or digit, for example 'adaptive-v9'.")
+                             "letter or digit, for example 'adaptive-v10'.")
         if self.dataset_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", str(self.dataset_repo)):
             raise ValueError("dataset_repo must be a Hugging Face dataset repository id such as 'user/name'.")
         if (self.dataset_id is None) != (self.dataset_repo is None):
@@ -560,9 +565,10 @@ def lower_loss(new, old):
     return new < old - 1e-8
 
 
-def train_teacher(records, train_ids, val_ids, cfg, device, seed, name):
+def train_teacher(records, train_ids, val_ids, cfg, device, seed, name, progress=None):
     """Train on every presence state and zero-shot order; keep the checkpoint with the lowest
-    development correctness loss on complete states. AP is a report metric, never a training signal."""
+    development correctness loss on complete states. AP is a report metric, never a training signal.
+    With a `TrainingProgress`, an interrupted training continues from its last saved check."""
     seed_everything(seed)
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
     # The ranking passed to later stages is read from complete states, so selection is too.
@@ -580,7 +586,7 @@ def train_teacher(records, train_ids, val_ids, cfg, device, seed, name):
         return score, f"development loss {score:.4f}"
 
     fit = train_on_views(model, views, cfg.teacher_epochs, seed, lambda logits, y: teacher_loss(logits, y, cfg),
-                         evaluate, lower_loss, cfg, name)
+                         evaluate, lower_loss, cfg, name, progress=progress)
     print(f"{name:<24} | epochs {fit['epochs']:6.2f} | best {fit['best_epoch']:6.2f} | "
           f"development loss {fit['best']:.4f}")
     return {"weights": fit["weights"], "best_epoch": fit["best_epoch"], "history": fit["history"],
@@ -621,6 +627,7 @@ def completed_teacher(path, expected, cfg, name):
 
 
 def fit_teachers(records, splits, cfg, device, out, sync=None):
+    out = Path(out)
     sup = np.array(splits["supervised"])
     rng = np.random.RandomState(cfg.seed + 1)
     rng.shuffle(sup)
@@ -637,12 +644,15 @@ def fit_teachers(records, splits, cfg, device, out, sync=None):
         expected = {"train_ids": [records[i].uid for i in train_ids],
                     "validation_ids": [records[i].uid for i in val_ids],
                     "heldout_ids": [records[i].uid for i in heldout]}
-        # Each fold completes as an atomic file, so an interrupted Stage 1 resumes per fold.
+        # Each fold completes as an atomic file, and the fold in training saves its state, so an
+        # interrupted Stage 1 resumes inside that fold.
+        progress = TrainingProgress(out, "Stage 1", fold_path.name, expected, cfg, sync)
         ckpt = completed_teacher(fold_path, expected, cfg, name)
         if ckpt is None:
-            ckpt = train_teacher(records, train_ids, val_ids, cfg, device, cfg.seed + f, name)
+            ckpt = train_teacher(records, train_ids, val_ids, cfg, device, cfg.seed + f, name, progress=progress)
             ckpt["heldout_ids"] = expected["heldout_ids"]
             atomic_torch(fold_path, ckpt)
+        progress.clear()  # The completed fold supersedes it.
         predictions = teacher_predict(ckpt, records, heldout.tolist(), cfg, device)
         oof.update({int(i): p for i, p in zip(heldout, predictions)})
         provenance.append({k: ckpt[k] for k in ("train_ids", "validation_ids", "heldout_ids")})
@@ -651,11 +661,13 @@ def fit_teachers(records, splits, cfg, device, out, sync=None):
     final_path = out / "teacher_final.pt"
     expected = {"train_ids": [records[i].uid for i in splits["supervised"]],
                 "validation_ids": [records[i].uid for i in splits["dev"]]}
+    progress = TrainingProgress(out, "Stage 1", final_path.name, expected, cfg, sync)
     final = completed_teacher(final_path, expected, cfg, "Final teacher")
     if final is None:
         final = train_teacher(records, splits["supervised"], splits["dev"], cfg, device,
-                              cfg.seed + 100, "Final teacher")
+                              cfg.seed + 100, "Final teacher", progress=progress)
         atomic_torch(final_path, final)
+    progress.clear()
     scores = teacher_predict(final, records, list(range(len(records))), cfg, device)
     for idx, pred in oof.items():
         scores[idx] = pred
@@ -1033,7 +1045,7 @@ class SnapshotViews:
                              (safe * cm).amax(1, keepdim=True).gt(0).float(),
                              (maximum * cm).amax(1, keepdim=True).gt(0).float(), cm], 1)
 
-    def batches(self, batch_size, rng):
+    def batches(self, batch_size, rng, skip=0):
         """One epoch: every view once plus the complete-view repeats.
 
         Every minibatch takes an even slice of every question's rows. Batches drawn
@@ -1041,6 +1053,8 @@ class SnapshotViews:
         questions, which the model memorizes, raising its loss on the next ones. Each
         question walks one shared random order of its rows from its own random start,
         so the epoch holds a single permutation of one question's rows, not of all rows.
+        `skip` leaves out the epoch's first batches without building them, so a resumed epoch
+        continues with the batches an uninterrupted one draws.
         """
         per, count = self.epoch_per_question, len(self.ids)
         # Rows per question per batch: about batch_size rows in all, at least one per
@@ -1052,7 +1066,7 @@ class SnapshotViews:
         start = torch.as_tensor(rng.randint(0, per, count), device=self.device)
         base = torch.arange(count, device=self.device) * self.per_question
         cuts = [step * per // steps for step in range(steps + 1)]
-        for lo, hi in zip(cuts, cuts[1:]):
+        for lo, hi in zip(cuts[skip:], cuts[skip + 1:]):
             local = order[(torch.arange(lo, hi, device=self.device)[None] + start[:, None]) % per]
             if per > self.per_question:  # Slots past the views repeat a complete view per order.
                 repeat = local >= self.per_question
@@ -1066,15 +1080,84 @@ class SnapshotViews:
             index = torch.arange(lo, min(self.rows, lo + batch_size), device=self.device)
             yield (index // self.per_question, *self.batch(index))
 
+    def digest(self):
+        """SHA-256 of what the views hold: their geometry, states, and every question's values and targets."""
+        digest = hashlib.sha256(json.dumps([len(self.ids), self.state_count, self.order_count,
+                                            self.complete_state, self.complete_copies]).encode())
+        for tensor in (self.template, *self.values, self.labels, self.safe, self.maximum):
+            if tensor is not None:
+                digest.update(tensor.cpu().numpy().tobytes())
+        return digest.hexdigest()
 
-def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, name):
+
+PROGRESS_DIR = "training_progress"  # Stage 1-2 training state; each model's file goes once it completes.
+
+
+def clear_progress(out, pattern):
+    """Remove the training state of completed models; their checkpoints supersede it."""
+    folder = Path(out) / PROGRESS_DIR
+    for path in folder.glob(pattern):
+        path.unlink()
+    try:
+        folder.rmdir()
+    except OSError:
+        pass  # Missing, or another model's state is still there.
+
+
+class TrainingProgress:
+    """The training state of one Stage 1 or Stage 2 model, saved so another session continues it.
+
+    A teacher or the snapshot model can train for hours, longer than a Kaggle session has left.
+    At the first development check after every `hf_sync_minutes`, the current and best weights,
+    Adam's state, the random states, and the position in the epoch are written to
+    `<out>/training_progress/<name>` and uploaded. A session that finds the file restores it and
+    continues with the epoch's next batch, so an interruption repeats at most that much training
+    and, on the same device, ends as an uninterrupted run would. The file is bound to the
+    questions and targets it trains on; the caller removes it once the completed model is saved.
+    """
+    def __init__(self, out, stage, name, identity, cfg, sync=None):
+        self.out, self.name, self.path = Path(out), name, Path(out) / PROGRESS_DIR / name
+        self.identity, self.sync = {"stage": stage, **identity}, sync
+        self.resume, self.interval = cfg.resume, cfg.hf_sync_minutes * 60
+        self.key, self.last = None, time.monotonic()
+
+    def start(self, **details):
+        """Bind the file to this training; return the saved state to resume, or None."""
+        self.key = hashlib.sha256(json.dumps({**self.identity, **details}, sort_keys=True).encode()).hexdigest()
+        self.last = time.monotonic()
+        if not (self.resume and self.path.exists()):
+            return None
+        state = load_checkpoint(self.path)
+        if state.get("schema_version") == 1 and state.get("identity") == self.key:
+            return state
+        print(f"WARNING: {self.path} holds the training of other questions or targets; this model trains "
+              "from its start and replaces it.", flush=True)
+        return None
+
+    def due(self):
+        return time.monotonic() - self.last >= self.interval
+
+    def save(self, state, message):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_torch(self.path, {"schema_version": 1, "identity": self.key, **state})
+        self.last = time.monotonic()
+        if self.sync is not None:
+            self.sync.push(f"{self.identity['stage']}: {message}", force=True)
+
+    def clear(self):
+        clear_progress(self.out, self.name)
+
+
+def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, name, progress=None):
     """Every epoch visits every view once, plus the views' complete-state repeats;
     development checks are spread through it.
 
     `evaluate(model)` returns the development loss (lower is better) and its description;
-    `better(new, old)` says whether a loss improves on the best so far. The checks only
-    choose the checkpoint: training stops at the end of the first epoch that finishes
-    `patience` or more whole epochs after the best check.
+    `better(new, old)` says whether a loss improves on the best so far. The checks choose the
+    checkpoint, and training stops at the first check `view_patience` or more epochs after the
+    best one, inside an epoch if need be: every step sees every question, so the best check
+    comes early in the first epoch. With a `TrainingProgress`, the training state is saved at
+    a check every `hf_sync_minutes`, and a saved state resumes.
     """
     if views.rows < 2:
         raise ValueError(f"{name}: too few training views.")
@@ -1088,13 +1171,35 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
           f"{views.state_count} presence states = {views.rows:,} views; each complete view "
           f"{views.complete_copies:,}x, so {views.epoch_rows:,} rows per epoch, "
           f"{complete / views.epoch_rows:.1%} complete; {checks} development checks per epoch; "
-          f"patience counts epochs.", flush=True)
-    for epoch in range(epochs):
-        done = seen = check = 0
+          f"training stops {cfg.view_patience:g} epochs after the best check.", flush=True)
+    saved = None if progress is None else progress.start(views=views.digest(), seed=seed, epochs=epochs,
+                                                          batch_size=cfg.batch_size, checks=checks,
+                                                          patience=cfg.view_patience)
+    start_epoch, text, stopped = 0, "", False
+    if saved is not None:
+        model.load_state_dict(saved["model"])
+        opt.load_state_dict(saved["optimizer"])
+        best, best_text, weights = saved["best"], saved["best_text"], saved["best_weights"]
+        best_epoch, history, position = saved["best_epoch"], saved["history"], saved["position"]
+        text, start_epoch = saved["text"], saved["epoch"]
+        # Dropout draws continue where they stopped; the epoch's batch order is rebuilt from its seed.
+        torch.set_rng_state(saved["rng"])
+        if views.device.type == "cuda" and saved["cuda_rng"] is not None:
+            torch.cuda.set_rng_state(saved["cuda_rng"], views.device)
+        started -= saved["elapsed"]
+        print(f"{name}: resumed at epoch {position:.3f} from {progress.path.name}, with the optimizer, the "
+              f"random state, and the best development check (epoch {best_epoch:.3f}) restored.", flush=True)
+    for epoch in range(start_epoch, epochs):
+        done = seen = check = skip = 0
         total = torch.zeros((), device=views.device)
         epoch_total = torch.zeros((), device=views.device)
+        if saved is not None:  # The resumed epoch continues after its last saved check.
+            done, check, skip = saved["done"], saved["check"], saved["step"]
+            epoch_total += saved["epoch_total"]
+            saved = None
         model.train()
-        for bx, by in views.batches(cfg.batch_size, np.random.RandomState(seed + epoch)):
+        batches = views.batches(cfg.batch_size, np.random.RandomState(seed + epoch), skip)
+        for step, (bx, by) in enumerate(batches, skip + 1):
             opt.zero_grad(set_to_none=True)
             loss = loss_of(model(bx), by)
             loss.backward()
@@ -1113,13 +1218,26 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
             seen = 0
             if best is None or better(score, best):
                 best, best_text, weights, best_epoch = score, text, cpu_state(model), position
+            if position - best_epoch >= cfg.view_patience:
+                stopped = True  # The completed model supersedes any saved state.
+                break
+            if progress is not None and progress.due():
+                # A check is a clean resume point: the running sums start again after it.
+                progress.save({"epoch": epoch, "step": step, "done": done, "check": check,
+                               "epoch_total": float(epoch_total), "position": position, "text": text,
+                               "model": cpu_state(model), "optimizer": opt.state_dict(), "best": best,
+                               "best_text": best_text, "best_weights": weights, "best_epoch": best_epoch,
+                               "history": history, "rng": torch.get_rng_state(),
+                               "cuda_rng": (torch.cuda.get_rng_state(views.device)
+                                            if views.device.type == "cuda" else None),
+                               "elapsed": time.monotonic() - started},
+                              f"{name} training progress at epoch {position:.3f}")
         # Training loss averages this epoch's rows up to its last check.
-        waited = position - best_epoch
         print(f"{name} | epoch {position:6.3f} | train loss {float(epoch_total) / max(1, done - seen):.4f} | "
               f"latest {text} | best {best_text} at epoch {best_epoch:.3f} | "
-              f"epochs without improvement {waited:.2f}/{cfg.patience} | "
+              f"epochs without improvement {position - best_epoch:.2f}/{cfg.view_patience:g} | "
               f"elapsed {(time.monotonic() - started) / 60:.1f} min", flush=True)
-        if waited >= cfg.patience:
+        if stopped:
             break
     return {"weights": weights, "best": best, "best_epoch": best_epoch,
             "epochs": position, "history": history}
@@ -1212,7 +1330,7 @@ def fit_temperatures(model, views, cfg):
     return TEMPERATURE_GRID[(nll / count[:, None]).argmin(1).cpu().numpy()].astype(np.float32)
 
 
-def fit_snapshot(records, splits, teacher, cfg, device):
+def fit_snapshot(records, splits, teacher, cfg, device, out=None, sync=None):
     seed_everything(cfg.seed + 200)
     views = SnapshotViews(records, splits["supervised"], cfg, device, teacher,
                           complete_share=cfg.snapshot_complete_share)
@@ -1231,9 +1349,11 @@ def fit_snapshot(records, splits, teacher, cfg, device):
                 f"development loss {metrics['loss']:.4f} (Top-1 {metrics['top1']:.1%}, "
                 f"Brier {metrics['brier']:.4f})")
 
+    progress = None if out is None else TrainingProgress(
+        out, "Stage 2", "snapshot.pt", {"development": dev.digest()}, cfg, sync)
     fit = train_on_views(model, views, cfg.snapshot_epochs, cfg.seed + 201,
                          lambda logits, y: snapshot_loss(logits, y, cfg), evaluate,
-                         lower_loss, cfg, "Snapshot")
+                         lower_loss, cfg, "Snapshot", progress=progress)
     model.load_state_dict(fit["weights"])
     temps = fit_temperatures(model, dev, cfg)
     dev_summary = summarize_snapshot_sums(snapshot_sums(model, dev, temperature_vector(temps, cfg), cfg))
@@ -1780,7 +1900,7 @@ def reclaim_derived_stage3_files(out):
     it before a resumed run writes anything lets a run that filled its disk continue.
     """
     out, reclaimed = Path(out), 0
-    for pattern in ("*.tmp", "decision_labels/*.tmp", "decision_labels/*/*.tmp"):
+    for pattern in ("*.tmp", "decision_labels/*.tmp", "decision_labels/*/*.tmp", f"{PROGRESS_DIR}/*.tmp"):
         for path in out.glob(pattern):
             if path.is_file():
                 reclaimed += path.stat().st_size
@@ -3060,9 +3180,11 @@ def folder_size(path):
 
 # What the three training phases build, relative to output_dir: the compact records, the teacher
 # (folds and out-of-fold labels), the frozen snapshot predictor, and Stage 3's labels together with the
-# pretrained head that the fine-tuning labels were rolled out from. The rest (the splits and data audit
-# that Stage 0 rewrites each session, head training progress, the fine-tuned head, the inference
-# bundle, reports) is run output for the run mirror.
+# pretrained head that the fine-tuning labels were rolled out from. A build in progress also keeps the
+# training state of the models it trains there (Stages 1-2 and the Stage 3a head), so a new session
+# downloads it and continues the build. The rest (the splits and data audit that Stage 0 rewrites each
+# session, fine-tuning progress, the fine-tuned head, the inference bundle, reports) is run output for
+# the run mirror.
 DATASET_SCHEMA = 1
 DATASET_MANIFEST = "dataset_manifest.json"
 DATASET_STAGING = ".dataset_download"    # Downloads land here first; never uploaded.
@@ -3070,7 +3192,8 @@ DATASET_VERSION = r"[0-9a-f]{12}"
 DATASET_PATTERNS = ("compact_records.pt", "teacher_fold_*.pt", "teacher_final.pt", "teacher_completed.pt",
                     "snapshot_completed.pt", "decision_head_pretrained.pt",
                     "decision_dataset_manifest.json", "decision_label_coverage.json",
-                    "decision_labels/*", DATASET_MANIFEST)
+                    "decision_labels/*", DATASET_MANIFEST,
+                    f"{PROGRESS_DIR}/*", HEAD_PHASES["pretrain"]["progress"])
 # Reports that Stage 3 writes beside the labels; present in a complete dataset, not hashed.
 DATASET_SUPPORT_FILES = ("decision_dataset_manifest.json", "decision_label_coverage.json")
 
@@ -3361,7 +3484,8 @@ class OutputSync:
     folder, Stages 0-2 load their completed checkpoints, and Stage 3 continues
     from its completed questions and epochs. Uploads skip unchanged files by
     content hash, never include `.tmp` files, and remove per-question label
-    files from the mirror once a role is merged. The traced Stage 4 rows of
+    files from the mirror once a role is merged, and a Stage 1-2 model's training
+    state once the model completes. The traced Stage 4 rows of
     earlier code (final_trajectories.jsonl, derived and superseded) are never
     downloaded and leave the mirror at the next upload. Run one session per repo.
 
@@ -3410,7 +3534,8 @@ class OutputSync:
                 self.api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
                 self.api.upload_folder(folder_path=str(self.out), repo_id=self.repo, repo_type="dataset",
                                        commit_message=message, ignore_patterns=list(self.ignore_patterns),
-                                       delete_patterns=["decision_labels/*/*.pt", LEGACY_TRAJECTORY_FILE],
+                                       delete_patterns=["decision_labels/*/*.pt", f"{PROGRESS_DIR}/*",
+                                                        LEGACY_TRAJECTORY_FILE],
                                        **scope)
             except Exception as exc:  # Network, rate limit, or credentials; local files stay complete.
                 error = exc
@@ -3536,7 +3661,9 @@ class Workflow:
               f"presence state under every zero-shot order ({len(presence_states(self.cfg.zero_shots, self.cfg.k)):,} "
               f"x {math.factorial(self.cfg.zero_shots)} views per question), assembled on the "
               "device and never stored; each keeps the checkpoint with the lowest development "
-              "loss (AP is only a reported metric).", flush=True)
+              f"loss (AP is only a reported metric), stops {self.cfg.view_patience:g} epochs after it, "
+              f"and saves its training state every {self.cfg.hf_sync_minutes:g} minutes, so a new session "
+              "continues inside an epoch.", flush=True)
         cache_path = self.out / "compact_records.pt"
         if self.cfg.resume and cache_path.exists():
             cache = load_checkpoint(cache_path)
@@ -3584,14 +3711,30 @@ class Workflow:
         labels are rolled out with the pretrained head. So this builds Stages 1, 2 and 3a and then
         labels 3b; it stops short of fine-tuning, which only reads the labels. With `dataset_id`, a
         complete version on the Hub was downloaded and verified when the workflow was created and
-        the calls below only load it; a partial version resumes; the finished dataset is sealed
-        and uploaded.
+        the calls below only load it; a partial version resumes from the saved training state and
+        labels it holds; the finished dataset is sealed and uploaded.
         """
         if self.records is None:
             self.prepare()
         store = self.datasets
         section("DATASETS | " + (f"{self.cfg.dataset_id!r} version {store.version} ({store.state})" if store is not None
                                  else "no dataset_id: the datasets stay in this run's output folder"))
+        if store is not None and store.state == "complete":
+            print("Every part is downloaded and verified; the stages below only load it, and nothing trains.",
+                  flush=True)
+        else:
+            kept = (f"uploaded to {store.repo} under this version, and a new session that runs the notebook from "
+                    "the start downloads it and continues" if store is not None else
+                    f"mirrored to {self.cfg.hf_repo}, and a new session that runs the notebook from the start "
+                    "downloads it and continues" if self.cfg.hf_repo else
+                    f"kept in {self.out}, so a restarted kernel continues (set dataset_id and dataset_repo to "
+                    "continue in a new Kaggle session)")
+            print(f"The labels come from trained models, so the build trains them: {self.cfg.teacher_folds} fold "
+                  "teachers and a final teacher (out-of-fold SAFE/MAX labels), the snapshot predictor (every "
+                  "Stage 3 goal), and the Stage 3a head (the Stage 3b labels are rolled out with it). Fine-tuning "
+                  "and the report are not part of it. Progress is saved as it goes (Stages 1-2 every "
+                  f"{self.cfg.hf_sync_minutes:g} minutes, Stage 3 labels per question, the Stage 3a head per "
+                  f"epoch) and {kept}.", flush=True)
         self.train_teacher()
         self.train_snapshot()
         self.train_pretrained_head()
@@ -3620,6 +3763,7 @@ class Workflow:
         else:
             self.teacher = fit_teachers(self.records, self.splits, self.cfg, self.device, self.out, self.sync)
             atomic_torch(path, self.teacher)
+        clear_progress(self.out, "teacher_*.pt")  # Leftovers of an interrupted session; the stage is complete.
         self.heuristics = select_heuristics(self.records, self.splits["dev"], self.cfg)
         atomic_json(self.out / "heuristics_selected_on_dev.json", self.heuristics)
         ids = self.splits["supervised"]
@@ -3642,8 +3786,10 @@ class Workflow:
             checkpoint = load_checkpoint(path)
             print("Loaded completed snapshot stage.")
         else:
-            checkpoint = fit_snapshot(self.records, self.splits, self.teacher, self.cfg, self.device)
+            checkpoint = fit_snapshot(self.records, self.splits, self.teacher, self.cfg, self.device, self.out,
+                                      self.sync)
             atomic_torch(path, checkpoint)
+        clear_progress(self.out, "snapshot.pt")
         self.predictor = FrozenPredictor(checkpoint, self.cfg, self.device)
         print("Encoder and prediction heads frozen. Development temperature calibration: "
               + ("enabled." if self.cfg.calibrate else "disabled."))

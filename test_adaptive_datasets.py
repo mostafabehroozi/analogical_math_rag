@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import adaptive_analogical_training as a
-from test_adaptive_session_resume import FakeHub, assert_same_head, forbid, small_config
+from test_adaptive_session_resume import FakeHub, assert_same_head, forbid, interrupt_after_save, small_config
 
 DATASET_FILES = {
     "compact_records.pt",
@@ -18,7 +18,7 @@ DATASET_FILES = {
     "decision_dataset_manifest.json", "decision_label_coverage.json",
     "decision_labels/pretrain_policy.pt", "decision_labels/pretrain_dev.pt",
     "decision_labels/finetune_policy.pt", "decision_labels/finetune_dev.pt",
-    "dataset_manifest.json"}
+    "decision_head_pretrain_progress.pt", "dataset_manifest.json"}
 BUILDERS = ("fit_teachers", "fit_snapshot", "fit_action_head", "build_route_labels", "build_finetune_labels")
 
 
@@ -95,14 +95,14 @@ def test_build_uploads_the_dataset_under_its_id_and_version_and_keeps_training_o
     assert manifest["info"]["questions"]["dev"] == len(work.splits["dev"])
     # The run mirror carries only what the dataset does not: the contract and training output.
     assert set(hub.repos["user/run"]) == {"contract.json", "data_audit.json", "split_manifest.json",
-                                          "heuristics_selected_on_dev.json", "decision_head_pretrain_progress.pt"}
-    assert "complete in user/datasets" in capsys.readouterr().out
+                                          "heuristics_selected_on_dev.json"}
+    log = capsys.readouterr().out
+    assert "complete in user/datasets" in log and "The labels come from trained models" in log
     work.train_decision_head().report()
     assert set(hub.repos["user/run"]) == {
         "contract.json", "data_audit.json", "split_manifest.json",
-        "heuristics_selected_on_dev.json", "decision_head_pretrain_progress.pt",
-        "decision_head_finetune_progress.pt", "decision_head_completed.pt", "inference_bundle.pt",
-        "final_rollouts.jsonl", "results.json"}
+        "heuristics_selected_on_dev.json", "decision_head_finetune_progress.pt", "decision_head_completed.pt",
+        "inference_bundle.pt", "final_rollouts.jsonl", "results.json"}
     assert stored(hub, version) == remote
     assert "Dataset adaptive-v9 version" in work.sync.describe() and "Mirror user/run" in work.sync.describe()
 
@@ -125,7 +125,7 @@ def test_a_fresh_session_downloads_the_dataset_without_the_logs_and_never_rebuil
     assert resumed.datasets.version == version and resumed.datasets.state == "complete"
     resumed.prepare().build_datasets()
     log = capsys.readouterr().out
-    assert "complete in user/datasets" in log and "Nothing is rebuilt" in log
+    assert "complete in user/datasets" in log and "Nothing is rebuilt" in log and "nothing trains" in log
     assert "Using compact cached records" in log and "Loaded completed teacher stage." in log
     assert "Loaded completed snapshot stage." in log and "Loaded completed pretrained decision head." in log
     resumed.train_decision_head()
@@ -198,6 +198,42 @@ def test_an_interrupted_build_resumes_from_the_partial_dataset_on_the_hub(tmp_pa
     assert "partly built in user/datasets" in log and "Loaded completed teacher stage." in log
     complete = stored(hub, version)
     assert set(complete) == DATASET_FILES and json.loads(complete["dataset_manifest.json"])["complete"] is True
+
+
+def test_a_session_ended_inside_model_training_continues_from_the_state_on_the_hub(
+        tmp_path, hub, monkeypatch, capsys):
+    torch.set_num_threads(1)
+    cfg = dataset_config(tmp_path)
+    reference_cfg = copy.deepcopy(cfg)
+    reference_cfg.output_dir, reference_cfg.dataset_id = str(tmp_path / "reference"), "reference"
+    reference = a.Workflow(reference_cfg).prepare().build_datasets()
+    # The session ends inside Stage 2, a few batches after its first saved check.
+    teacher_saves = (cfg.teacher_folds + 1) * cfg.teacher_epochs * cfg.dev_checks_per_epoch
+    restore = interrupt_after_save(monkeypatch, teacher_saves + 1, 3)
+    with pytest.raises(KeyboardInterrupt, match="simulated session end"):
+        a.Workflow(cfg).prepare().build_datasets()
+    restore()
+    (version,) = {name.split("/")[1] for name in hub.repos["user/datasets"] if name.startswith("adaptive-v9/")}
+    partial = stored(hub, version)
+    assert "teacher_completed.pt" in partial and "snapshot_completed.pt" not in partial
+    assert "training_progress/snapshot.pt" in partial
+    assert not any(name.startswith("training_progress/teacher") for name in partial)
+    # Kaggle restarted: an empty working folder, and the notebook runs from its first cell.
+    shutil.rmtree(tmp_path / "run")
+    forbid(monkeypatch, "fit_teachers")
+    capsys.readouterr()
+    resumed = a.Workflow(cfg)
+    assert resumed.datasets.state == "partial"
+    resumed.prepare().build_datasets()
+    log = capsys.readouterr().out
+    assert "Loaded completed teacher stage." in log and "Snapshot: resumed at epoch 0.500 from snapshot.pt" in log
+    complete = stored(hub, version)
+    assert set(complete) == DATASET_FILES and json.loads(complete["dataset_manifest.json"])["complete"] is True
+    assert not (tmp_path / "run" / a.PROGRESS_DIR).exists()
+    built, expected = (a.load_checkpoint(root / "snapshot_completed.pt") for root in (tmp_path / "run",
+                                                                                      tmp_path / "reference"))
+    assert built["history"] == expected["history"]
+    assert all(torch.equal(value, built["weights"][key]) for key, value in expected["weights"].items())
 
 
 def test_a_run_built_before_the_dataset_store_is_uploaded_as_a_dataset_not_rebuilt(tmp_path, hub, monkeypatch, capsys):
