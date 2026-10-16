@@ -69,7 +69,7 @@ precision (AP) is a reported metric only (see "Checkpoint selection").
 **Complete-view share.** Each question has only 6 complete views among its
 48,960, so an unweighted epoch would spend 0.012% of its training on the one
 state whose predictions later stages use. A larger loss weight would not fix
-this: a 16,384-row batch holds about two complete rows, and weighting them by
+this: a 16,384-row batch held about two complete rows, and weighting them by
 thousands makes the gradient follow those two rows. Instead, each epoch
 repeats every complete view until complete views form a configured share of
 its rows, and shuffles the repeats in with the partial views; every partial
@@ -88,7 +88,7 @@ recognition, so by default its complete views count like any other view
 complete-state development loss, Stage 2 on its loss over every reachable state.
 
 One epoch visits every view once (plus those repeats): about 98 million views
-for 2,000 training questions. The defaults are therefore `batch_size=16384`,
+for 2,000 training questions. The defaults are therefore `batch_size=262144`,
 `teacher_epochs=snapshot_epochs=10`, and `dev_checks_per_epoch=8`. Development
 checks are spread evenly through each epoch, and the checkpoint's position is a
 fractional epoch such as `1.375`. Every minibatch holds rows of every training
@@ -115,13 +115,37 @@ improvement 0.25/0.25`.
 Stage 2 also shows Top-1 and Brier in parentheses after each loss; they are
 information, not selection criteria.
 
+**Batch size.** A batch holds `batch_size // questions` rows of every training
+question, so the batch size sets how many views of each question one step
+averages and how many steps make an epoch. The default `262144` gives 204 rows
+of each of 1,280 fold questions (131 of each of 1,999 for the final teacher and
+Stage 2), about 2.2 GB of GPU memory (about 8.5 KB per row; up to about
+1,500,000 rows fit a 16 GB GPU), and 283 steps per fold epoch instead of 4,800
+at the earlier `16384`. On the same real-log split as above (local GPU, 64
+checks per epoch), the best development loss did not depend on it, because the
+best check always came after about 50 to 150 optimizer steps:
+
+| `batch_size` | Learning rate | Best development loss | Best at epoch | Best at step |
+| --- | --- | --- | --- | --- |
+| 16,384 | 3e-4 | 0.5689 | 0.031 | 151 |
+| 131,072 | 3e-4 | 0.5641 | 0.173 | 98 |
+| 262,144 | 3e-4 | 0.5665 | 0.283 | 80 |
+| 262,144 | 1e-3 | 0.5673 | 0.173 | 49 |
+
+(The constant per-slot prior scores 0.606 there.) A larger batch therefore
+moves the best check to a later epoch without improving it; what it buys is
+fewer, larger steps, which is much faster where many small steps are slow. It
+does not stop memorization, which comes from the weak signal in the
+measurements. `batch_size` is in the run contract, so changing it needs a new
+`output_dir` and `hf_repo`; the records dataset is unaffected and is reused.
+
 **Memory and disk.** No view is stored, on disk or in RAM. A shared state
 table (about 7 MiB) holds the state-only observation bytes and masks; each
 question adds its measurements, labels, and SAFE/MAX under each order (under
 1 KiB). `SnapshotViews` assembles each minibatch on the selected device from
 those tensors, bit-identical to `observation(...)`.
 Every minibatch takes an even slice of **every** question's rows: with 1,280
-fold questions and `batch_size=16384`, 12 rows of each. Each question walks one
+fold questions and `batch_size=262144`, 204 rows of each. Each question walks one
 shared random order of its rows from its own random start, so an epoch holds a
 single permutation of one question's rows (under 0.5 MiB), not of all 98
 million. An earlier revision-6 build (`c003b05`) instead shuffled the views of
@@ -985,7 +1009,7 @@ of development AP (Stage 1) and Top-1 then Brier (Stage 2); AP stays a reported
 metric. Revision 6 trains Stages 1-2 on exhaustive views instead of random
 snapshots. Every earlier output folder is rejected as a different contract, and
 older action/state bundles and checkpoints are rejected. Use the new default
-output directory `/kaggle/working/adaptive_analogical_shared_training_v10_run` and
+output directory `/kaggle/working/adaptive_analogical_shared_training_v10_bs262k_run` and
 a new `hf_repo` mirror for a fresh run; old runs are not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
 quality. Recorded outcomes cannot establish live provider behavior or the
 results of newly generated candidates.

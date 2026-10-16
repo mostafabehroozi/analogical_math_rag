@@ -44,7 +44,7 @@ class Config:
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ])
-    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v10_run"
+    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v10_bs262k_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
     device: str = "auto"
@@ -60,7 +60,9 @@ class Config:
     dropout: float = .10
     # Stages 1-2: one epoch visits every presence state of every question under
     # every zero-shot order once (48,960 views per default question).
-    batch_size: int = 16384
+    # Each batch holds batch_size // questions rows of every question (204 of each of 1,280 fold
+    # questions), about 2.2 GB of GPU memory; one epoch is then a few hundred steps.
+    batch_size: int = 262144
     learning_rate: float = .0003
     weight_decay: float = 1e-4
     teacher_epochs: int = 10
