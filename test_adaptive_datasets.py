@@ -338,6 +338,35 @@ def test_model_checkpoints_that_a_schema_1_dataset_kept_continue_in_the_run(tmp_
     assert "schema 1" not in capsys.readouterr().out and (tmp_path / "run" / "teacher_fold_1.pt").exists()
 
 
+def test_a_folder_left_by_a_schema_1_build_continues_in_the_same_session_under_this_code(
+        tmp_path, hub, monkeypatch, capsys):
+    torch.set_num_threads(1)
+    cfg = dataset_config(tmp_path)
+    # What a schema 1 build left in the working folder: its records, the teachers it trained, its manifest.
+    plain = copy.deepcopy(cfg)
+    plain.dataset_id = plain.dataset_repo = None
+    a.Workflow(plain).build_datasets().prepare().train_teacher()
+    run = tmp_path / "run"
+    contract = json.loads((run / "contract.json").read_text(encoding="utf-8"))
+    identity = [{key: source[key] for key in ("name", "bytes", "sha256")} for source in contract["sources"]]
+    legacy = a.legacy_dataset_version(contract["config"], identity)
+    a.atomic_json(run / "dataset_manifest.json", {"schema_version": 1, "dataset_id": "adaptive-v9", "version": legacy,
+                                                  "complete": False, "artifacts": {}, "info": {}})
+    forbid(monkeypatch, "read_log", "fit_teachers")
+    capsys.readouterr()
+    work = a.Workflow(cfg)
+    assert work.datasets.state == "adopted" and "from dataset-store schema 1" in capsys.readouterr().out
+    work.build_datasets().train_teacher()
+    assert "Loaded completed teacher stage." in capsys.readouterr().out
+    remote = stored(hub, work.datasets.version)
+    assert set(remote) == DATASET_FILES and json.loads(remote["dataset_manifest.json"])["complete"] is True
+    # A manifest of any other dataset is still refused rather than mixed in.
+    a.atomic_json(run / "dataset_manifest.json", {"schema_version": 1, "dataset_id": "adaptive-v9",
+                                                  "version": "abcdefabcdef"})
+    with pytest.raises(ValueError, match="holds dataset 'adaptive-v9' version abcdefabcdef"):
+        a.Workflow(cfg)
+
+
 def test_records_built_before_the_dataset_store_are_uploaded_as_the_dataset_not_read_again(
         tmp_path, hub, monkeypatch, capsys):
     torch.set_num_threads(1)

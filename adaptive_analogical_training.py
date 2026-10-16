@@ -3348,6 +3348,7 @@ class DatasetStore:
         self.api = hub_api() if api is None else api
         self.version = self.construction = self.remote = self.channel = None
         self.versions, self.others, self.state, self.pulled = {}, {}, None, False
+        self.legacy = None  # The version dataset-store schema 1 gave this run; the workflow sets it.
 
     @property
     def prefix(self):
@@ -3499,6 +3500,15 @@ class DatasetStore:
     def pull(self):
         """Bring the output folder in line with the Hub: download what exists, verify what is complete."""
         local = self.local_manifest()
+        if (local is not None and self.legacy is not None and local.get("schema_version") == 1
+                and (local.get("dataset_id"), local.get("version")) == (self.id, self.legacy)):
+            # The folder holds this run's schema 1 build (a session that switched to this code): its
+            # model files are training output now, and its records belong to the version below.
+            (self.out / DATASET_MANIFEST).unlink()
+            local = None
+            print(f"{self.out} holds this run's build of dataset {self.id!r} version {self.legacy} from "
+                  "dataset-store schema 1, which also kept model checkpoints there. They stay as training "
+                  f"output; the records go to version {self.version}.", flush=True)
         if local is not None and (local.get("dataset_id"), local.get("version")) != (self.id, self.version):
             raise ValueError(f"The output folder holds dataset {local.get('dataset_id')!r} version "
                              f"{local.get('version')}, not {self.id!r} version {self.version}. Choose a new "
@@ -3538,8 +3548,8 @@ class DatasetStore:
                 for version, changed in sorted(self.others.items())) + ".", flush=True)
         return self.state
 
-    def adopt_training(self, version):
-        """Download this run's training checkpoints from a schema 1 version of the id; returns how many.
+    def adopt_training(self):
+        """Download this run's training checkpoints from its schema 1 version of the id; returns how many.
 
         Schema 1 kept the output of Stages 1-3a, and the training state of a build in progress, in the
         dataset, under a version hashed from the run's whole contract, so that version belongs to
@@ -3548,13 +3558,13 @@ class DatasetStore:
         they would their own, and the run mirror keeps them from here on. The schema 1 version itself
         stays untouched.
         """
-        manifest = self.versions.get(version)
-        if version == self.version or not manifest or manifest.get("schema_version") != 1:
+        manifest = self.versions.get(self.legacy)
+        if self.legacy in (None, self.version) or not manifest or manifest.get("schema_version") != 1:
             return 0
         held = (path.relative_to(self.out).as_posix() for path in self.out.rglob("*") if path.is_file())
         if any(fnmatch.fnmatch(rel, pattern) for rel in held for pattern in LEGACY_TRAINING_PATTERNS):
             return 0
-        return self.download(version, LEGACY_TRAINING_PATTERNS)
+        return self.download(self.legacy, LEGACY_TRAINING_PATTERNS)
 
     def finish(self, info=None):
         """Seal the dataset: hash its artifacts, mark the manifest complete, and upload it."""
@@ -3740,15 +3750,15 @@ class Workflow:
         # Files that no contract explains are never adopted, dataset files included.
         if not existing and any(self.out.iterdir()):
             raise ValueError("Use an empty output folder; existing unrecognized files will not be overwritten.")
-        if self.datasets is not None:
-            self.datasets.pull()
-        if not existing:
-            atomic_json(path, contract)
         self.sources = sources
         if self.datasets is not None:
             identity = [{key: source[key] for key in ("name", "bytes", "sha256")} for source in sources]
-            legacy = legacy_dataset_version(contract_cfg, identity)
-            adopted = self.datasets.adopt_training(legacy)
+            self.datasets.legacy = legacy = legacy_dataset_version(contract_cfg, identity)
+            self.datasets.pull()
+        if not existing:
+            atomic_json(path, contract)
+        if self.datasets is not None:
+            adopted = self.datasets.adopt_training()
             if adopted:
                 print(f"Dataset {cfg.dataset_id!r} version {legacy} was built by dataset-store schema 1, which kept "
                       f"this run's model checkpoints in the dataset: {adopted} of them were downloaded into "

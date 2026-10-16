@@ -602,9 +602,13 @@ those models. Such a version belongs to exactly one run. When a run that holds
 no training output of its own yet finds the schema 1 version of its contract
 under its id, it downloads those model files into the output folder once; the
 stages validate them as their own and continue, and the run mirror keeps them
-from then on. The schema 1 version stays untouched, and the records are stored
-again under a schema 2 version. Delete the old folder on the Hub once the run
-mirror holds the checkpoints.
+from then on. A session that switched to this code with the schema 1 build
+still in its working folder keeps those files the same way: its old
+`dataset_manifest.json` is recognized as this run's and replaced, and its
+records go to the schema 2 version without reading the logs again. The schema 1
+version stays untouched, and the records are stored again under a schema 2
+version. Delete the old folder on the Hub once the run mirror holds the
+checkpoints.
 
 **Housekeeping.** Delete a `<dataset_id>/<version>` folder in the repository to
 drop a version. Run one session per dataset id and version, as with the run
