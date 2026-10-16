@@ -271,6 +271,63 @@ def _reject_removed_feature_flags(config: Dict[str, Any]) -> None:
             )
 
 
+def _require_target_questions(hard_questions: List[str]) -> None:
+    """Refuse an empty run instead of saving empty logs and reporting success."""
+    if not hard_questions:
+        raise ValueError(
+            "run_experiments received no target questions, so nothing would run and "
+            "every run log would be saved as []. Loading the target benchmarks or the "
+            "exemplar corpus failed earlier; fix the error printed by the asset-loading "
+            "cell (TARGET_BENCHMARKS, HARD_QUESTIONS_INDICES_PATH, embeddings) and rerun."
+        )
+
+
+# Experiments with one of these flags run a dedicated builder instead of the
+# per-query pipeline.
+_DEDICATED_WORKFLOW_FLAGS = (
+    "APPLY_TRANSFORMATION_DATASET_CONSTRUCTION",
+    "APPLY_CORE_SIMP_PHASE1",
+    "APPLY_CORE_SIMP_PHASE2",
+    "APPLY_MERGING_DATASET_CONSTRUCTION",
+)
+
+
+def _require_standard_pipeline_managers(
+    experiment_configs: List[Dict[str, Any]],
+    global_config: Dict[str, Any],
+    api_managers: Dict[str, Any],
+) -> None:
+    """Fail before any work when a per-query experiment's provider has no manager.
+
+    ``run_pipeline_for_single_query`` looks up all four role managers for every
+    query. Without this check each query fails, its FAILURE log is saved, and
+    the single-notebook resume then treats those queries as done.
+    """
+    missing = []
+    for exp_overrides in experiment_configs:
+        config = _merge_experiment_config(global_config, exp_overrides)
+        if any(config.get(flag) for flag in _DEDICATED_WORKFLOW_FLAGS):
+            continue
+        adaptation = config.get("API_PROVIDER_ADAPTATION", "gemini")
+        roles = {
+            "API_PROVIDER_ADAPTATION": adaptation,
+            "API_PROVIDER_SOLVER": config.get("API_PROVIDER_SOLVER", "gemini"),
+            "API_PROVIDER_EVALUATOR": config.get("API_PROVIDER_EVALUATOR", "gemini"),
+            "API_PROVIDER_SIMPLIFICATION": config.get("API_PROVIDER_SIMPLIFICATION", adaptation),
+        }
+        for role, provider in roles.items():
+            if not api_managers.get(provider):
+                missing.append(
+                    f"{config.get('experiment_name', 'unnamed_experiment')}: {role}={provider!r}"
+                )
+    if missing:
+        raise ValueError(
+            "No API manager is initialized for " + "; ".join(missing)
+            + f". Initialized managers: {sorted(api_managers)}. Create a manager for "
+            "every provider the experiments select before calling run_experiments."
+        )
+
+
 _DISTRIBUTED_UNSUPPORTED_FLAGS = {
     "DEFER_SOLVE_STEP": "deferred solve mode",
 }
@@ -1773,6 +1830,8 @@ def run_experiments(
     for exp_overrides in experiment_configs:
         effective_config = _merge_experiment_config(global_config, exp_overrides)
         _reject_removed_feature_flags(effective_config)
+    _require_target_questions(hard_questions)
+    _require_standard_pipeline_managers(experiment_configs, global_config, api_managers)
 
     if distributed_enabled(global_config):
         if global_config.get("DISTRIBUTED_FINALIZER_MODE", False):

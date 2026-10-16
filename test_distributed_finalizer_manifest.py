@@ -307,7 +307,7 @@ class FinalizerManifestTests(unittest.TestCase):
                     with self.assertRaisesRegex(DistributedManifestMismatchError, "remote worker source changed"):
                         orchestration.run_experiments(
                             [self.experiment], config, ["question one", "question two"],
-                            None, {}, {"avalai": object()}, ["answer one", "answer two"],
+                            None, {}, {"gemini": object()}, ["answer one", "answer two"],
                         )
                     for blocked_call in (restore, start, status, sync, bind):
                         blocked_call.assert_not_called()
