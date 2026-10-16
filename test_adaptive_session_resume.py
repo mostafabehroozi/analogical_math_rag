@@ -385,8 +385,12 @@ def test_pipeline_resumes_from_the_mirror_in_a_fresh_session(tmp_path, monkeypat
         "final_rollouts.jsonl", "results.json"}
     for relative, data in remote.items():
         assert (tmp_path / "run" / relative).read_bytes() == data
-    assert hub.messages[0].startswith("Stage 0") and hub.messages[-1].startswith("Stage 4")
-    stages = [int(re.match(r"Stage (\d)", message).group(1)) for message in hub.messages]
+    # The dataset phase uploads first: once before reading, after each log, and the finished records.
+    built = [message for message in hub.messages if message.startswith("Dataset")]
+    assert hub.messages[:len(built)] == ["Dataset: build started", "Dataset: records of log 1/2",
+                                         "Dataset: records of log 2/2", "Dataset: compact records"]
+    assert hub.messages[len(built)].startswith("Stage 0") and hub.messages[-1].startswith("Stage 4")
+    stages = [int(re.match(r"Stage (\d)", message).group(1)) for message in hub.messages[len(built):]]
     assert stages == sorted(stages) and set(stages) == {0, 1, 2, 3, 4}
     assert any("teacher fold" in message for message in hub.messages)
     assert any("labels" in message and "questions" in message for message in hub.messages)
