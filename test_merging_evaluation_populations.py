@@ -75,3 +75,11 @@ class EvaluationPopulationTests(TestCase):
         self.prepared["splits"]["test"] = [record("Missing?", "missing")]
         with self.assertRaisesRegex(ValueError, "absent from benchmark"):
             build_evaluation_populations(self.prepared, ["Q?"], ["answer"])
+
+    def test_missing_numina_index_file_names_the_path(self):
+        with self.assertRaisesRegex(FileNotFoundError, "missing-indices.json"):
+            load_target_benchmarks(
+                {"TARGET_BENCHMARK": "numina_hard", "HARD_QUESTIONS_INDICES_PATH": "missing-indices.json"},
+                {"questions": ["Find x."], "solutions": ["x=1"]},
+                load_json_fn=lambda path: None,
+            )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
@@ -136,7 +137,19 @@ def load_target_benchmarks(
         if name in HUGGINGFACE_BENCHMARK_SPECS:
             questions, ground_truths = load_huggingface_benchmark(name, load_dataset_fn)
         else:  # ``selected_benchmark_names`` restricts this to numina_hard.
-            hard_indices = load_json_fn(config.get("HARD_QUESTIONS_INDICES_PATH"))
+            indices_path = config.get("HARD_QUESTIONS_INDICES_PATH")
+            if not indices_path:
+                raise ValueError("HARD_QUESTIONS_INDICES_PATH is not set; numina_hard needs it.")
+            hard_indices = load_json_fn(indices_path)
+            # load_json returns None for a missing file; say so instead of
+            # reporting the absent file as an empty list.
+            if hard_indices is None and not os.path.exists(indices_path):
+                raise FileNotFoundError(
+                    f"HARD_QUESTIONS_INDICES_PATH points to a missing file: {indices_path}. "
+                    "Upload hard_question_indices.json there (or restore it with the "
+                    "Hugging Face workspace), point HARD_QUESTIONS_INDICES_PATH at a "
+                    "generated hard-question set, or select other TARGET_BENCHMARKS."
+                )
             if not isinstance(hard_indices, list) or not hard_indices:
                 raise ValueError("HARD_QUESTIONS_INDICES_PATH must contain a non-empty JSON list.")
             corpus_questions = exemplar_data.get("questions", [])
