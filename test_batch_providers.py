@@ -225,6 +225,19 @@ class SwitchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             enabled({"API_BATCHING_ENABLED": {"openrouter": 3}}, "openrouter", "a/one")
 
+    def test_each_route_is_logged_once_while_the_switch_is_set(self):
+        config = {"API_BATCHING_ENABLED": {"kaggle": True, "openrouter": False}}
+        with patch.object(api_batching, "_announced_routes", set()), \
+                patch.object(api_batching, "tprint") as log:
+            for _ in range(3):
+                api_batching.batching_enabled(config, "openrouter", "meta-llama/llama-3.1-8b-instruct")
+                api_batching.batching_enabled(config, "kaggle", "google/x")
+            api_batching.batching_enabled({}, "openrouter", "other/model")
+        messages = [call.args[0] for call in log.call_args_list]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("meta-llama/llama-3.1-8b-instruct: sent directly", messages[0])
+        self.assertIn("google/x: batched", messages[1])
+
 
 class OpenRouterFallbackTests(_Quiet):
     """A model OpenRouter refuses to batch goes direct only when allowed."""

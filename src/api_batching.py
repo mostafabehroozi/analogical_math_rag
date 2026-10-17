@@ -55,6 +55,8 @@ class BatchSettings:
 
 
 _COLLECTIONS = (list, tuple, set, frozenset)
+_announced_routes: set = set()
+_announced_lock = threading.Lock()
 
 
 def batching_enabled(config: Dict[str, Any], provider_name: str, model_name: Optional[str] = None) -> bool:
@@ -66,9 +68,26 @@ def batching_enabled(config: Dict[str, Any], provider_name: str, model_name: Opt
       * a dict mapping a provider to a bool (all its models) or to a model ID /
         list of model IDs (only those), e.g.
         ``{"kaggle": True, "openrouter": ["openai/gpt-4o-mini"]}``.
-    Anything not selected is sent directly.
+    Anything not selected is sent directly.  While the switch is set, each
+    (provider, model) route is logged once, so a run shows what it batches.
     """
     value = config.get("API_BATCHING_ENABLED", False)
+    enabled = _batching_rule(value, provider_name, model_name)
+    if value is not False and value is not None:
+        route = (provider_name, model_name, enabled)
+        with _announced_lock:
+            first_time = route not in _announced_routes
+            _announced_routes.add(route)
+        if first_time:
+            tprint(
+                f"[API BATCH {provider_name}] {model_name}: "
+                f"{'batched' if enabled else 'sent directly'} (API_BATCHING_ENABLED={value!r}).",
+                level="INFO",
+            )
+    return enabled
+
+
+def _batching_rule(value: Any, provider_name: str, model_name: Optional[str]) -> bool:
     if isinstance(value, Mapping):
         rules = {str(key).strip().lower(): rule for key, rule in value.items()}
         rule = rules.get(provider_name)
