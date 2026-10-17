@@ -273,10 +273,17 @@ class OpenRouterFallbackTests(_Quiet):
         self.manager = api_manager.OpenRouterAPIManager("test-key", {"default": {"rpm": 1000}}, self.config)
 
     def test_without_fallback_the_refusal_is_a_final_error(self):
-        result = self.manager.generate_content("p", "meta-llama/llama-3.1-8b-instruct")
-        self.assertEqual(result["error_type"], "InvalidArgument")
-        self.assertIn("API_BATCH_FALLBACK_TO_DIRECT", result["error_message"])
+        for prompt in ("p", "q"):
+            result = self.manager.generate_content(prompt, "meta-llama/llama-3.1-8b-instruct")
+            self.assertEqual(result["error_type"], "InvalidArgument")
+            self.assertIn("API_BATCH_FALLBACK_TO_DIRECT", result["error_message"])
         self.assertEqual(self.direct_calls, [])
+        # The call log truncates the message, so the full hint is printed once.
+        warnings = [call.args[0] for call in api_manager.tprint.call_args_list
+                    if call.args[0].startswith("[API BATCH openrouter]")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("has no batch endpoint", warnings[0])
+        self.assertIn("API_BATCHING_ENABLED", warnings[0])
 
     def test_fallback_sends_the_model_directly_and_remembers_it(self):
         bound = self.manager.for_config({**self.config, "API_BATCH_FALLBACK_TO_DIRECT": True})

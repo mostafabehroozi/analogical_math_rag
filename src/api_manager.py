@@ -715,6 +715,8 @@ class OpenRouterAPIManager(_KeyedAPIManager):
         # (model, routing) pairs OpenRouter refused to batch; with
         # API_BATCH_FALLBACK_TO_DIRECT they are sent directly from then on.
         self.batch_unsupported: set = set()
+        # Pairs whose refusal was already printed in full (the call log truncates it).
+        self.batch_refused: set = set()
         self._batch_unsupported_lock = threading.Lock()
         self.clients = {
             key: openai.OpenAI(
@@ -837,6 +839,13 @@ class OpenRouterAPIManager(_KeyedAPIManager):
                 level="WARNING",
             )
 
+    def _warn_batch_refused(self, group: Tuple[str, str], message: str) -> None:
+        with self._batch_unsupported_lock:
+            first_time = group not in self.batch_refused
+            self.batch_refused.add(group)
+        if first_time:
+            tprint(f"[API BATCH openrouter] {message}", level="WARNING")
+
     def _batched_attempt(
         self, prompt: str, model_name: str, temperature: Optional[float],
         extra_body: Dict[str, Any], direct_attempt: Callable[[], APIResponse],
@@ -905,6 +914,7 @@ class OpenRouterAPIManager(_KeyedAPIManager):
     def _submit_batch(self, items: List[BatchItem], settings: BatchSettings) -> List[APIResponse]:
         model_name = items[0].payload["model"]
         provider = items[0].payload["provider"]
+        group = (model_name, json.dumps(provider, sort_keys=True))
 
         def fail_all(error_type: str, message: str, meta: Optional[Dict[str, Any]] = None) -> List[APIResponse]:
             status = "RATE_LIMITED" if error_type in ("RateLimitError", "ProactiveRateLimit") else "ERROR"
@@ -932,8 +942,7 @@ class OpenRouterAPIManager(_KeyedAPIManager):
             if code in (400, 404) and items[0].payload.get("fallback"):
                 # Each caller now retries the same request directly; a real
                 # request error therefore still surfaces from that call.
-                self._mark_batch_unsupported((model_name, json.dumps(provider, sort_keys=True)),
-                                             f"HTTP {code}: {message or batch}")
+                self._mark_batch_unsupported(group, f"HTTP {code}: {message or batch}")
                 return fail_all("BatchUnsupported", f"Batch create failed (HTTP {code}): {message or batch}", meta)
             error_type = self._http_error_type(code, lease.api_key, model_name) if code >= 400 else "BatchError"
             hint = (
@@ -942,7 +951,10 @@ class OpenRouterAPIManager(_KeyedAPIManager):
                 "API_BATCH_FALLBACK_TO_DIRECT=True."
                 if code in (400, 404) else ""
             )
-            return fail_all(error_type, f"Batch create failed (HTTP {code}): {message or batch}.{hint}", meta)
+            failure = f"Batch create failed (HTTP {code}): {message or batch}.{hint}"
+            if hint:
+                self._warn_batch_refused(group, f"{model_name}: {failure}")
+            return fail_all(error_type, failure, meta)
         batch_id = batch["id"]
         meta["openrouter_batch_id"] = batch_id
         tprint(f"[API BATCH openrouter] {batch_id}: {len(items)} request(s) for {model_name} submitted.", level="INFO")
