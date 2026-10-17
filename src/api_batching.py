@@ -22,7 +22,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Hashable, List, Optional
+from typing import Any, Callable, Dict, Hashable, List, Mapping, Optional
 
 from src.context_logger import tprint
 
@@ -54,8 +54,43 @@ class BatchSettings:
         return settings
 
 
-def batching_enabled(config: Dict[str, Any]) -> bool:
-    return bool(config.get("API_BATCHING_ENABLED", False))
+_COLLECTIONS = (list, tuple, set, frozenset)
+
+
+def batching_enabled(config: Dict[str, Any], provider_name: str, model_name: Optional[str] = None) -> bool:
+    """Whether this provider batches calls for this model.
+
+    ``API_BATCHING_ENABLED`` may be:
+      * a bool, for every model of every batch-capable provider;
+      * a provider name or list of names, e.g. ``["kaggle"]``, for all their models;
+      * a dict mapping a provider to a bool (all its models) or to a model ID /
+        list of model IDs (only those), e.g.
+        ``{"kaggle": True, "openrouter": ["openai/gpt-4o-mini"]}``.
+    Anything not selected is sent directly.
+    """
+    value = config.get("API_BATCHING_ENABLED", False)
+    if isinstance(value, Mapping):
+        rules = {str(key).strip().lower(): rule for key, rule in value.items()}
+        rule = rules.get(provider_name)
+        if rule is None or isinstance(rule, bool):
+            return bool(rule)
+        if isinstance(rule, str):
+            rule = [rule]
+        if isinstance(rule, _COLLECTIONS):
+            return model_name in {str(item).strip() for item in rule}
+        raise ValueError(
+            f"API_BATCHING_ENABLED[{provider_name!r}] must be a bool, a model ID or a list of model IDs."
+        )
+    if isinstance(value, str):
+        return value.strip().lower() == provider_name
+    if isinstance(value, _COLLECTIONS):
+        return provider_name in {str(item).strip().lower() for item in value}
+    return bool(value)
+
+
+def fallback_to_direct(config: Dict[str, Any]) -> bool:
+    """Send a model directly once its provider refuses to batch it (full price)."""
+    return bool(config.get("API_BATCH_FALLBACK_TO_DIRECT", False))
 
 
 @dataclass
@@ -172,4 +207,4 @@ class APIBatchDispatcher:
             item.done.set()
 
 
-__all__ = ["APIBatchDispatcher", "BatchItem", "BatchSettings", "batching_enabled"]
+__all__ = ["APIBatchDispatcher", "BatchItem", "BatchSettings", "batching_enabled", "fallback_to_direct"]

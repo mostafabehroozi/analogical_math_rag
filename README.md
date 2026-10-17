@@ -101,8 +101,21 @@ for proxy models, so sampled attempts (Pass@N) use the model default.
 ## Provider batch API
 
 `API_BATCHING_ENABLED` (globally or per experiment) makes OpenRouter and
-Kaggle send concurrent calls as one batch; other providers ignore it. It is a
-transport switch and works alongside the two existing parallel levels:
+Kaggle send concurrent calls as one batch; other providers ignore it. It can be
+switched per provider and per model:
+
+```python
+CONFIG["API_BATCHING_ENABLED"] = True        # every model of both providers
+CONFIG["API_BATCHING_ENABLED"] = False       # off
+CONFIG["API_BATCHING_ENABLED"] = ["kaggle"]  # every Kaggle model, OpenRouter direct
+CONFIG["API_BATCHING_ENABLED"] = {
+    "kaggle": True,                          # every Kaggle model
+    "openrouter": ["openai/gpt-4o-mini"],    # only these OpenRouter models
+}
+```
+
+Anything not selected is sent directly with the usual retries and parallelism.
+It is a transport switch and works alongside the two existing parallel levels:
 
 - `BATCH_PROCESSING_ENABLED` / `BATCH_MAX_WORKERS`: questions run in parallel.
 - `QUESTION_PARALLEL_API_ENABLED` / `QUESTION_PARALLEL_MAX_WORKERS`: calls run
@@ -122,9 +135,12 @@ those settings bound the batch size.
 - **OpenRouter**: a batch is one
   [Batch API](https://openrouter.ai/docs/batch-quickstart) job, billed at a
   discount. The job is polled every `API_BATCH_POLL_SECONDS`. Only models with
-  a batch endpoint are accepted. Provider routing may use only `only` and
+  a batch endpoint are accepted; others fail with HTTP 400, so leave such a
+  model out of `API_BATCHING_ENABLED`. Provider routing may use only `only` and
   `allow_fallbacks`, and `OPENROUTER_MODEL_FALLBACKS` cannot be used; other
-  settings fail the call immediately. OpenRouter allows up to 24 hours per job,
+  settings fail the call immediately. With `API_BATCH_FALLBACK_TO_DIRECT = True`
+  these cases instead send that model directly for the rest of the session,
+  with one warning, at the standard price. OpenRouter allows up to 24 hours per job,
   so a job still running after `API_BATCH_TIMEOUT_SECONDS` is abandoned and its
   calls retried, and OpenRouter may still bill it.
 

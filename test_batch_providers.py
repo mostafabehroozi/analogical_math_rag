@@ -205,6 +205,92 @@ class KaggleBenchmarksTests(_Quiet):
             api_manager.KaggleBenchmarksAPIManager({}, {})
 
 
+class SwitchTests(unittest.TestCase):
+    def test_switch_accepts_bool_or_provider_names(self):
+        enabled = api_batching.batching_enabled
+        self.assertTrue(enabled({"API_BATCHING_ENABLED": True}, "openrouter"))
+        self.assertFalse(enabled({}, "kaggle"))
+        self.assertTrue(enabled({"API_BATCHING_ENABLED": ["kaggle"]}, "kaggle"))
+        self.assertFalse(enabled({"API_BATCHING_ENABLED": ["kaggle"]}, "openrouter"))
+        self.assertTrue(enabled({"API_BATCHING_ENABLED": "Kaggle"}, "kaggle"))
+
+    def test_switch_accepts_per_provider_model_rules(self):
+        enabled = api_batching.batching_enabled
+        config = {"API_BATCHING_ENABLED": {"Kaggle": True, "openrouter": ["a/batchable"]}}
+        self.assertTrue(enabled(config, "kaggle", "any/model"))
+        self.assertTrue(enabled(config, "openrouter", "a/batchable"))
+        self.assertFalse(enabled(config, "openrouter", "meta-llama/llama-3.1-8b-instruct"))
+        self.assertTrue(enabled({"API_BATCHING_ENABLED": {"openrouter": "a/one"}}, "openrouter", "a/one"))
+        self.assertFalse(enabled({"API_BATCHING_ENABLED": {"kaggle": True}}, "openrouter", "a/one"))
+        with self.assertRaises(ValueError):
+            enabled({"API_BATCHING_ENABLED": {"openrouter": 3}}, "openrouter", "a/one")
+
+
+class OpenRouterFallbackTests(_Quiet):
+    """A model OpenRouter refuses to batch goes direct only when allowed."""
+
+    def setUp(self):
+        super().setUp()
+        self.direct_calls = []
+
+        def create(**kwargs):
+            self.direct_calls.append(kwargs["model"])
+            return types.SimpleNamespace(
+                model=kwargs["model"], model_extra={},
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="direct answer"))],
+            )
+
+        client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create)))
+        fake_openai = types.SimpleNamespace(OpenAI=lambda **kwargs: client,
+                                            RateLimitError=FakeError, APIStatusError=FakeError)
+        patcher = patch.object(api_manager, "openai", fake_openai)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.creates = 0
+
+        def fake_http(manager, method, path, api_key, payload=None):
+            self.creates += 1
+            return 400, {"error": {"message": "Model 'meta-llama/llama-3.1-8b-instruct' has no batch endpoint"}}
+
+        patcher = patch.object(api_manager.OpenRouterAPIManager, "_batch_http", fake_http)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config = {**BATCH_CONFIG, "API_BATCH_COLLECT_SECONDS": 0.0,
+                       "OPENROUTER_MODEL_ROUTING": {"meta-llama/llama-3.1-8b-instruct": {"only": ["novita/fp8"]}}}
+        self.manager = api_manager.OpenRouterAPIManager("test-key", {"default": {"rpm": 1000}}, self.config)
+
+    def test_without_fallback_the_refusal_is_a_final_error(self):
+        result = self.manager.generate_content("p", "meta-llama/llama-3.1-8b-instruct")
+        self.assertEqual(result["error_type"], "InvalidArgument")
+        self.assertIn("API_BATCH_FALLBACK_TO_DIRECT", result["error_message"])
+        self.assertEqual(self.direct_calls, [])
+
+    def test_fallback_sends_the_model_directly_and_remembers_it(self):
+        bound = self.manager.for_config({**self.config, "API_BATCH_FALLBACK_TO_DIRECT": True})
+        first = bound.generate_content("p", "meta-llama/llama-3.1-8b-instruct")
+        second = bound.generate_content("q", "meta-llama/llama-3.1-8b-instruct")
+        self.assertEqual((first["text"], second["text"]), ("direct answer", "direct answer"))
+        self.assertEqual(self.creates, 1)  # The second call never tried a batch.
+        self.assertEqual(len(self.direct_calls), 2)
+
+    def test_model_left_out_of_the_switch_goes_direct(self):
+        config = {**self.config, "API_BATCHING_ENABLED": {"kaggle": True, "openrouter": ["other/model"]}}
+        result = self.manager.for_config(config).generate_content("p", "meta-llama/llama-3.1-8b-instruct")
+        self.assertEqual(result["text"], "direct answer")
+        self.assertEqual(self.creates, 0)
+
+    def test_fallback_also_covers_routing_the_batch_api_rejects(self):
+        config = {**self.config, "API_BATCH_FALLBACK_TO_DIRECT": True,
+                  "OPENROUTER_MODEL_ROUTING": {"meta-llama/llama-3.1-8b-instruct": {"order": ["novita/fp8"]}}}
+        result = self.manager.for_config(config).generate_content("p", "meta-llama/llama-3.1-8b-instruct")
+        self.assertEqual(result["text"], "direct answer")
+        self.assertEqual(self.creates, 0)
+
+
+class FakeError(Exception):
+    status_code = 500
+
+
 class BindingTests(unittest.TestCase):
     def test_every_manager_is_bound_to_experiment_options(self):
         class Manager(api_manager._ConfigBindable):

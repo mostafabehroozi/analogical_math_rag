@@ -82,7 +82,16 @@ CONFIG = {
     # submitted together; each caller still gets its own response and retries.
     # At most BATCH_MAX_WORKERS * QUESTION_PARALLEL_MAX_WORKERS calls are
     # outstanding at once, so raise those settings to fill larger batches.
+    # True/False for every model of both providers; a list such as ["kaggle"]
+    # for those providers only; or per provider and model, e.g.
+    # {"kaggle": True, "openrouter": ["openai/gpt-4o-mini"]}. Anything not
+    # selected is sent directly.
     "API_BATCHING_ENABLED": False,
+    # When OpenRouter refuses to batch a model (HTTP 400/404 on batch create,
+    # or routing the Batch API rejects), send that model's calls directly for
+    # the rest of the session instead of failing them. Direct calls are billed
+    # at the standard price, not the batch discount.
+    "API_BATCH_FALLBACK_TO_DIRECT": False,
     "API_BATCH_MAX_SIZE": 20,               # Requests per submitted batch
     "API_BATCH_COLLECT_SECONDS": 2.0,       # How long the first queued request waits for others
     "API_BATCH_MAX_CONCURRENT_BATCHES": 2,  # Batches in flight per provider (fixed when the first batch starts)
