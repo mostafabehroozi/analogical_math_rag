@@ -350,9 +350,10 @@ def explicit_choices(plan, head):
         return weights / weights.sum()
 
     chosen = np.full((orders, states), a.NO_CHOICE)
+    deciding = plan["informative"] & plan["rows"]  # Routed cases that have a row.
     for state in range(states):
         for lead in range(orders):
-            members = [o for o in range(orders) if plan["leader"][o, state] == lead and plan["informative"][o, state]]
+            members = [o for o in range(orders) if plan["leader"][o, state] == lead and deciding[o, state]]
             if not members:
                 continue
             union = sorted(set().union(*(set(np.flatnonzero(plan["options"][o, state]).tolist()) for o in members)))
@@ -378,11 +379,12 @@ def explicit_choices(plan, head):
     return chosen
 
 
-@pytest.mark.parametrize("threshold,seed", [(.5, 5), (.45, 1), (.45, 8)])
-def test_finetune_choices_match_explicit_continuations_of_the_pretrained_head(threshold, seed):
+@pytest.mark.parametrize("threshold,seed,reachable_only", [(.5, 5, False), (.45, 1, False), (.45, 8, False),
+                                                            (.35, 5, True), (.4, 5, True)])
+def test_finetune_choices_match_explicit_continuations_of_the_pretrained_head(threshold, seed, reachable_only):
     torch.set_num_threads(1)
     cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1, decision_hidden=8,
-                   recognition_threshold=threshold)
+                   recognition_threshold=threshold, reachable_only=reachable_only)
     rng = np.random.RandomState(40)
     record = a.Record("q", "q", "synthetic", [f"zs_{i}" for i in range(2)] + ["os_0", "os_1"], ["e0", "e1"],
                       np.array([.9, .8], np.float32), (rng.randint(6, size=2) / 5).astype(np.float32),
@@ -398,9 +400,12 @@ def test_finetune_choices_match_explicit_continuations_of_the_pretrained_head(th
     expected = explicit_choices(plan, head)
     np.testing.assert_array_equal(chosen, expected)
     # The comparison is not vacuous: tied options, merged groups, and moved labels all occur.
-    informative = plan["informative"]
+    informative = plan["informative"] & plan["rows"]
     assert informative.sum() > 5 and (plan["options"][informative].sum(1) > 1).sum() > 0
     assert ((plan["leader"] != np.arange(2)[:, None]) & informative).sum() > 0 or threshold != .5
+    if reachable_only:
+        # Routed cases whose first goal holds, where the rollout has stopped, take no part.
+        assert (plan["informative"] & ~plan["rows"]).any()
     # A merged group shares one decision.
     for state in range(informative.shape[1]):
         for lead in range(2):
@@ -531,3 +536,99 @@ def test_label_identity_includes_the_acquisition_rules(monkeypatch):
     assert a.decision_dataset_fingerprint(records, splits, teacher, predictor, cfg) == identity
     # Costs are part of the rules too.
     assert a.rules_fingerprint(a.Config(k=2, zero_shots=2, repeats=3)) != before
+
+
+def test_reachable_only_is_off_by_default_and_enters_the_identity_only_when_on():
+    off, on = a.Config(k=2, zero_shots=2, hidden_dim=4), a.Config(k=2, zero_shots=2, hidden_dim=4, reachable_only=True)
+    assert off.reachable_only is False
+    # Off, the contract and the Stage 3 identity hold exactly what they held before the setting existed,
+    # so runs started earlier still resume.
+    assert a.contract_settings(off) == {key: value for key, value in a.asdict(off).items()
+                                        if key not in a.NON_CONTRACT_SETTINGS and key != "reachable_only"}
+    assert a.contract_settings(on) == {**a.contract_settings(off), "reachable_only": True}
+    records = [a.Record(str(i), str(i), "synthetic", list(range(off.n)), list(range(off.k)),
+                        np.ones(off.k, np.float32), np.ones(off.k, np.float32),
+                        np.ones((off.n, off.k), np.float32), np.ones(off.n, np.float32)) for i in range(2)]
+    teacher = {name: np.ones((2, off.n), np.float32) for name in ("scores", "safe", "maximum")}
+    predictor = SimpleNamespace(model=torch.nn.Linear(4, 4), temperatures=np.ones(5))
+    splits = {"policy": [0], "dev": [1]}
+    assert (a.decision_dataset_fingerprint(records, splits, teacher, predictor, off) !=
+            a.decision_dataset_fingerprint(records, splits, teacher, predictor, on))
+    assert a.rules_fingerprint(off) != a.rules_fingerprint(on)
+    with pytest.raises(AssertionError):
+        a.Config(reachable_only=1).validate()
+
+
+@pytest.mark.parametrize("max_cost", [None, 70.])
+def test_reachable_only_graph_is_the_runtime_part_of_the_full_graph(max_cost):
+    cfg = a.Config(k=3, zero_shots=2, repeats=2, max_cost=max_cost, reachable_only=True)
+    full = a.decision_graph(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    graph = a.decision_graph(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, True)
+    assert set(graph.states) == set(a.reachable_states(cfg)) and len(graph.states) < len(full.states)
+    index = {state: i for i, state in enumerate(full.states)}
+    assert [index[state] for state in graph.states] == sorted(index[state] for state in graph.states)  # Catalog order.
+    for i, state in enumerate(graph.states):
+        j = index[state]
+        assert graph.legal[i].tolist() == full.legal[j].tolist() and np.array_equal(graph.delta[i], full.delta[j])
+        assert [graph.states[s] if s >= 0 else None for s in graph.succ[i]] == [
+            full.states[s] if s >= 0 else None for s in full.succ[j]]
+    assert a.decision_case_count(cfg) == 2 * len(graph.states)
+    assert a.decision_valid(np.arange(a.decision_case_count(cfg)), cfg).shape == (2 * len(graph.states), cfg.action_count)
+    if max_cost is None:
+        assert len(graph.states) == 80 and graph.states[graph.full] == a.State((1 << cfg.n) - 1, (1 << cfg.k) - 1)
+
+
+def prefix_lights(cfg, record, state):
+    """Rank one (OS1) needs an evaluator; ZS1 and ZS2 then hold ranks two and three once present.
+
+    Under the swapped zero-shot order nothing lights, so no goal can be reached there.
+    """
+    if record.candidate_ids[0] != "zs_0":
+        return np.zeros(3 * cfg.n + 2, np.float32)
+    p = recognizes(cfg, state, 2, needs_evaluator=True)
+    if state.candidate_mask & 1:
+        p[0] = .5
+    return p
+
+
+@pytest.mark.parametrize("has_max", [True, False])
+def test_reachable_only_rows_are_the_routed_cases_the_runtime_asks_about(has_max):
+    plans = {}
+    for reachable_only in (False, True):
+        cfg, record, scores, safe, maximum, predictor = tiny_problem(prefix_lights, reachable_only=reachable_only)
+        if not has_max:
+            safe = maximum = np.zeros(cfg.n, np.float32)
+        plans[reachable_only] = (cfg, a.question_plan(record, scores, safe, maximum, predictor, cfg))
+    (_, every), (cfg, plan) = plans[False], plans[True]
+    states = plan["graph"].states
+    assert set(states) == set(a.reachable_states(cfg)) and len(states) == 8 < len(every["graph"].states) == 14
+    # On the reachable states, goals, routes, and statuses are those of the full catalog.
+    index = [{s: j for j, s in enumerate(every["graph"].states)}[s] for s in states]
+    for key in ("achieved", "status", "informative", "options", "leader"):
+        assert np.array_equal(plan[key], every[key][:, index]), key
+    # Rows: routed cases only, and with a MAX candidate only before its first goal, the runtime's stop test.
+    expected = plan["informative"] & ~((plan["achieved"] >= 1) & has_max)
+    assert np.array_equal(plan["rows"], expected) and plan["rows"].any()
+    assert (plan["targets"][plan["rows"]] == plan["options"][plan["rows"]]).all() and not plan["targets"][~plan["rows"]].any()
+    # The comparison is not vacuous: the full catalog labels cases this drops.
+    assert (every["rows"][:, index] & ~every["informative"][:, index]).any()  # No preference.
+    assert (plan["informative"] & (plan["achieved"] >= 1)).any()              # Past the first goal.
+    coverage = a.plan_coverage(plan, cfg)
+    assert coverage["state_order_cases"] == 28 and coverage["status_counts"]["UNVISITED"] == 12
+    assert coverage["action_rows"] == coverage["informative_rows"] == plan["rows"].sum()
+    assert set(coverage["trained_status_counts"]) == {"ACTION"}
+
+
+def test_reachable_only_question_without_rows_round_trips_its_labels():
+    cfg, record, scores, safe, maximum, predictor = tiny_problem(
+        lambda c, r, s: np.zeros(3 * c.n + 2, np.float32), reachable_only=True)
+    labels = a.build_route_labels(record, scores, safe, maximum, predictor, cfg)
+    assert labels["options"].shape == (a.decision_case_count(cfg), 1) == (16, 1) and not labels["options"].any()
+    assert labels["coverage"]["action_rows"] == 0
+    assert labels["coverage"]["status_counts"] == {"UNREACHABLE": 14, "EXHAUSTED": 2, "UNVISITED": 12}
+    assert len(a.check_route_labels(record, labels, cfg)) == 0
+    rows = a.decision_training_rows(record, np.zeros(0, np.int64), np.zeros((0, 1), np.uint8), "pretrain",
+                                    a.FrozenPredictor({"weights": a.cpu_state(a.ResNet(cfg.input_dim, 3 * cfg.n + 2, cfg)),
+                                                       "temperatures": np.ones(5)}, cfg, torch.device("cpu")), cfg)
+    assert rows["h"].shape == (0, cfg.head_input_dim) and rows["valid"].shape == (0, cfg.action_count)
+    assert a.masked_action_loss(a.SupervisedActionHead(cfg), rows, [], cfg, "cpu") == (0., 0)

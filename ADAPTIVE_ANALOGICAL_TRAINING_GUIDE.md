@@ -368,6 +368,60 @@ minutes for 2,000 + 1,900 questions: about 320 optimizer steps of 128 rows per
 question dominate it, and `decision_batch_size=1024` takes about one seventh of
 the step time. Question count alone is not a training-set size.
 
+## Reachable-only training (`reachable_only`)
+
+Everything above is `reachable_only=False`, the default. With `True`, Stages 2
+and 3 use only the **1,092** presence states the runtime can reach from ZS1
+(13.4% of 8,160). The other 7,068 are never visited at run time:
+
+- **5,088** have a zero-shot set other than ZS1, ZS1-ZS2 or ZS1-ZS3. The run
+  starts with ZS1, and the zero-shot action fills the first empty slot. The six
+  zero-shot orders already put every recorded zero-shot in every slot.
+- **1,980** use a source before a nearer unused one.
+
+| Stage | With `reachable_only=True` |
+| --- | --- |
+| 1 | Unchanged: every presence state. The teacher's ranking and SAFE/MAX labels are the same in both settings, so the switch compares Stages 2-3 alone. |
+| 2 | Trains on the reachable states under every zero-shot order: 6,552 views per question instead of 48,960. Selection and calibration used these states already. |
+| 3 | Labels only the reachable states: 6,552 cases per question. Only the cases the runtime asks the head about become rows (see below). |
+
+**Stage 2 schedule.** An epoch of the reachable views is about 7.5 times
+shorter: one all-state epoch spans 48,960 / 6,552 = 7.47 of them. So
+`snapshot_epochs`, `dev_checks_per_epoch` and `view_patience` still count
+all-state epochs. The checks, the patience and the cap keep their spacing in
+optimizer steps, which is where memorization happens. With the notebook's 64
+checks and 0.25 patience, Stage 2 checks 9 times per reachable epoch and stops
+1.87 reachable epochs after its best check. Stage 3's `patience` counts passes
+over the questions in both settings.
+
+**Stage 3 rows.** Only ACTION cases (with a route to their next goal) before
+the rollout stops become rows:
+
+- **No-preference cases are dropped** (COMPLETE, and UNREACHABLE with no
+  routed group mate). Their target spreads over every move. When the goal
+  cannot be reached, the rollout acquires the whole pool whatever the head
+  picks, so these rows only flatten the head.
+- **For a question with a MAX candidate, cases whose first goal holds are
+  dropped.** That goal is the runtime's own stop test: the selected candidate
+  is the MAX and passes all four lights. An evaluation rollout has stopped
+  there and never asks the head.
+- **What is kept:**
+  - for a question without a MAX candidate, the later goals, since its rollout
+    continues;
+  - a state where the runtime would stop on another candidate (a false MAX),
+    which keeps its row as before.
+
+Stage 3b decides each group of identical-looking cases from the cases that
+have a row. A question can have no row at all. Its labels are still saved and
+checked, and it adds nothing to an epoch. Coverage counts the in-budget states
+the runtime never reaches as `UNVISITED`, so `state_order_cases` still covers
+every presence state.
+
+**Contract.** At `False` the setting is left out of the run contract and the
+Stage 3 identity. Runs started before it existed keep their contract and labels
+and still resume. `True` is a new run: use a new `output_dir` and `hf_repo`.
+`dataset_id` can stay, because the records do not change.
+
 ## Training, artifacts, and evaluation
 
 All three stages train on exactly the same question group: `supervised`.
@@ -991,7 +1045,8 @@ fingerprint, without input log paths), **label-file schema 6**, and
 version hashes only the record settings and the logs; schema 1 also held the
 model output of Stages 1-3a, which a run adopts as described in "Datasets and
 dataset IDs"; neither changes any label, checkpoint or contract, so neither
-needed a new revision). Revision 10
+needed a new revision). The `reachable_only` switch is not a revision either:
+off, it changes no label, checkpoint or contract. Revision 10
 stops Stages 1-2 at the first development check `view_patience` epochs after the
 best one, inside an epoch if need be; revision 9 counted whole epochs there,
 checked at epoch ends, so its teachers trained every epoch. Revision 9

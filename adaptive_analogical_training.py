@@ -70,6 +70,10 @@ class Config:
     # Complete views (6 of 48,960 per question) are repeated to this share of each epoch.
     teacher_complete_share: float = .15
     snapshot_complete_share: float = 0.   # 0: complete views appear once per order, like any other.
+    # Only the states the runtime can reach (1,092 of 8,160 by default): Stage 2 trains on them, keeping
+    # the all-state schedule in optimizer steps, and Stage 3 labels them, keeping only the rows the
+    # runtime asks the head about. Stage 1 is unchanged. False reproduces the earlier runs exactly.
+    reachable_only: bool = False
     dev_checks_per_epoch: int = 8   # Stages 1-2 development checks, evenly spaced in each epoch.
     # Stages 1-2 stop at the first development check this many epochs (fractions allowed) after the
     # best one. Each of their steps sees every question, so an epoch is thousands of passes over the
@@ -143,6 +147,7 @@ class Config:
         assert 0 < self.recognition_threshold < 1
         assert type(self.continue_after_max) is bool
         assert type(self.use_test_files_for_dev_and_audit) is bool
+        assert type(self.reachable_only) is bool
         if self.use_test_files_for_dev_and_audit:
             if not self.test_files:
                 raise ValueError("test_files must be provided when using them for dev and audit.")
@@ -180,6 +185,15 @@ NON_CONTRACT_SETTINGS = ("resume", "output_dir", "device", "cpu_threads", "print
                          "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size",
                          "hf_repo", "hf_sync_minutes", "train_file", "test_files",
                          "dataset_id", "dataset_repo")
+# Contract settings added after revision 10's runs began, with the value that reproduces those runs. At
+# that value a setting stays out of the run contract and the Stage 3 identity, so those runs still resume.
+LATER_CONTRACT_DEFAULTS = {"reachable_only": False}
+
+
+def contract_settings(cfg):
+    """The settings a run contract and the Stage 3 identity hold."""
+    return {key: value for key, value in asdict(cfg).items() if key not in NON_CONTRACT_SETTINGS
+            and not (key in LATER_CONTRACT_DEFAULTS and value == LATER_CONTRACT_DEFAULTS[key])}
 
 
 @dataclass
@@ -821,11 +835,17 @@ def decision_structure(zero_shots, k, repeats, cost_unit, max_cost):
 
 
 @lru_cache(maxsize=8)
-def budget_state_index(zero_shots, k, repeats, cost_unit, max_cost):
-    """In-budget states in the order every labeling scenario enumerates them."""
+def budget_state_index(zero_shots, k, repeats, cost_unit, max_cost, reachable_only=False):
+    """In-budget states in the order every labeling scenario enumerates them.
+
+    With `reachable_only`, only those the runtime can reach from ZS1, in the same order.
+    """
     cfg = Config(zero_shots=zero_shots, k=k, repeats=repeats, cost_unit=cost_unit, max_cost=max_cost)
     all_states, _, _, costs = decision_structure(zero_shots, k, repeats, cost_unit, max_cost)
     states = tuple(state for state in all_states if costs[state] <= cfg.budget + 1e-6)
+    if reachable_only:
+        reachable = set(reachable_states(cfg))
+        states = tuple(state for state in states if state in reachable)
     return states, {state: position for position, state in enumerate(states)}
 
 
@@ -998,6 +1018,11 @@ def snapshot_target(record, safe, maximum, state, cfg):
 SNAPSHOT_EVAL_BATCH = 16384
 
 
+def complete_copies(state_count, share):
+    """Copies of each complete view that make complete views `share` of an epoch's rows."""
+    return max(1, round(share * (state_count - 1) / (1 - share))) if share else 1
+
+
 class SnapshotViews:
     """Every (question, zero-shot order, presence state) view, assembled per batch.
 
@@ -1041,12 +1066,9 @@ class SnapshotViews:
         # of an epoch; every partial view is still visited exactly once.
         self.complete_state = states.index(full) if full in states else None
         self.complete_share = complete_share
-        self.complete_copies = 1
-        if complete_share:
-            if self.complete_state is None:
-                raise ValueError("complete_share needs the complete state among the views.")
-            self.complete_copies = max(1, round(complete_share * (self.state_count - 1)
-                                                / (1 - complete_share)))
+        if complete_share and self.complete_state is None:
+            raise ValueError("complete_share needs the complete state among the views.")
+        self.complete_copies = complete_copies(self.state_count, complete_share)
         self.epoch_per_question = self.per_question + (self.complete_copies - 1) * self.order_count
         self.epoch_rows = len(self.ids) * self.epoch_per_question
 
@@ -1170,7 +1192,8 @@ class TrainingProgress:
         clear_progress(self.out, self.name)
 
 
-def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, name, progress=None):
+def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, name, progress=None,
+                   schedule_scale=1.):
     """Every epoch visits every view once, plus the views' complete-state repeats;
     development checks are spread through it.
 
@@ -1180,6 +1203,10 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
     best one, inside an epoch if need be: every step sees every question, so the best check
     comes early in the first epoch. With a `TrainingProgress`, the training state is saved at
     a check every `hf_sync_minutes`, and a saved state resumes.
+
+    One all-state epoch spans `schedule_scale` epochs of these views (more than one when only the
+    reachable states are trained), so `epochs`, `dev_checks_per_epoch`, and `view_patience` count
+    all-state epochs and keep their spacing in optimizer steps.
     """
     if views.rows < 2:
         raise ValueError(f"{name}: too few training views.")
@@ -1187,16 +1214,23 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
                            fused=views.device.type == "cuda")
     best, best_text, weights, best_epoch, history = None, "", None, 0., []
-    checks, position, started = cfg.dev_checks_per_epoch, 0., time.monotonic()
+    checks, patience = cfg.dev_checks_per_epoch, cfg.view_patience
+    if schedule_scale != 1:
+        checks = max(1, round(checks / schedule_scale))
+        patience, epochs = patience * schedule_scale, math.ceil(epochs * schedule_scale - 1e-9)
+    position, started = 0., time.monotonic()
     complete = len(views.ids) * views.order_count * views.complete_copies
     print(f"{name}: {len(views.ids)} questions x {views.order_count} zero-shot orders x "
           f"{views.state_count} presence states = {views.rows:,} views; each complete view "
           f"{views.complete_copies:,}x, so {views.epoch_rows:,} rows per epoch, "
           f"{complete / views.epoch_rows:.1%} complete; {checks} development checks per epoch; "
-          f"training stops {cfg.view_patience:g} epochs after the best check.", flush=True)
+          f"training stops {patience:g} epochs after the best check"
+          + ("." if schedule_scale == 1 else
+             f" (one all-state epoch is {schedule_scale:.2f} of these epochs, so the checks, the patience "
+             f"and the {epochs}-epoch cap keep the all-state schedule in optimizer steps)."), flush=True)
     saved = None if progress is None else progress.start(views=views.digest(), seed=seed, epochs=epochs,
                                                           batch_size=cfg.batch_size, checks=checks,
-                                                          patience=cfg.view_patience)
+                                                          patience=patience)
     start_epoch, text, stopped = 0, "", False
     if saved is not None:
         model.load_state_dict(saved["model"])
@@ -1240,7 +1274,7 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
             seen = 0
             if best is None or better(score, best):
                 best, best_text, weights, best_epoch = score, text, cpu_state(model), position
-            if position - best_epoch >= cfg.view_patience:
+            if position - best_epoch >= patience:
                 stopped = True  # The completed model supersedes any saved state.
                 break
             if progress is not None and progress.due():
@@ -1257,7 +1291,7 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
         # Training loss averages this epoch's rows up to its last check.
         print(f"{name} | epoch {position:6.3f} | train loss {float(epoch_total) / max(1, done - seen):.4f} | "
               f"latest {text} | best {best_text} at epoch {best_epoch:.3f} | "
-              f"epochs without improvement {position - best_epoch:.2f}/{cfg.view_patience:g} | "
+              f"epochs without improvement {position - best_epoch:.2f}/{patience:g} | "
               f"elapsed {(time.monotonic() - started) / 60:.1f} min", flush=True)
         if stopped:
             break
@@ -1354,8 +1388,14 @@ def fit_temperatures(model, views, cfg):
 
 def fit_snapshot(records, splits, teacher, cfg, device, out=None, sync=None):
     seed_everything(cfg.seed + 200)
+    # Training uses every presence state, or with `reachable_only` only the reachable ones.
     views = SnapshotViews(records, splits["supervised"], cfg, device, teacher,
+                          reachable_states(cfg) if cfg.reachable_only else None,
                           complete_share=cfg.snapshot_complete_share)
+    # How many epochs of these views one all-state epoch spans (1 when every state is trained).
+    every = len(presence_states(cfg.zero_shots, cfg.k))
+    scale = ((every + complete_copies(every, cfg.snapshot_complete_share) - 1) * views.order_count
+             / views.epoch_per_question)
     # Selection and calibration use what the runtime visits: every reachable state.
     dev = SnapshotViews(records, splits["dev"], cfg, device, teacher, reachable_states(cfg))
     model = ResNet(cfg.input_dim, 3*cfg.n+2, cfg).to(device)
@@ -1375,7 +1415,7 @@ def fit_snapshot(records, splits, teacher, cfg, device, out=None, sync=None):
         out, "Stage 2", "snapshot.pt", {"development": dev.digest()}, cfg, sync)
     fit = train_on_views(model, views, cfg.snapshot_epochs, cfg.seed + 201,
                          lambda logits, y: snapshot_loss(logits, y, cfg), evaluate,
-                         lower_loss, cfg, "Snapshot", progress=progress)
+                         lower_loss, cfg, "Snapshot", progress=progress, schedule_scale=scale)
     model.load_state_dict(fit["weights"])
     temps = fit_temperatures(model, dev, cfg)
     dev_summary = summarize_snapshot_sums(snapshot_sums(model, dev, temperature_vector(temps, cfg), cfg))
@@ -1569,13 +1609,14 @@ class DecisionGraph(NamedTuple):
 
 
 @lru_cache(maxsize=8)
-def decision_graph(zero_shots, k, repeats, cost_unit, max_cost):
+def decision_graph(zero_shots, k, repeats, cost_unit, max_cost, reachable_only=False):
     """The in-budget transitions as arrays, shared by every question and zero-shot order.
 
     Every action adds exactly one item, so a backward pass over `levels` sees all of a
-    state's successors before the state itself.
+    state's successors before the state itself. With `reachable_only` the graph holds only the
+    reachable states; every move from one of them leads to another, so no route is lost.
     """
-    states, index = budget_state_index(zero_shots, k, repeats, cost_unit, max_cost)
+    states, index = budget_state_index(zero_shots, k, repeats, cost_unit, max_cost, reachable_only)
     _, transitions, _, costs = decision_structure(zero_shots, k, repeats, cost_unit, max_cost)
     succ = np.full((len(states), 2 * k + 1), -1, np.int64)
     delta = np.zeros(succ.shape)
@@ -1601,7 +1642,7 @@ def decision_scenarios(record, scores, safe, maximum, predictor, cfg):
     [orders, states, goals], and a digest of each visible observation
     [orders, states, 4] (byte-identical observations are the same head input).
     """
-    graph = decision_graph(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    graph = decision_graph(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, cfg.reachable_only)
     full_cfg = copy.deepcopy(cfg)
     full_cfg.max_cost = None
     features, goals, digests = [], [], []
@@ -1673,6 +1714,11 @@ def question_plan(record, scores, safe, maximum, predictor, cfg):
     visible group; the group's informative cases give it its labels, and a group none of
     whose cases is informative (every goal done, or no route to the next goal) gets no
     preference, i.e. every allowed move. Cases without an allowed move get no row.
+
+    With `reachable_only` the states are the reachable ones, and only the cases the runtime asks
+    the head about have a row: ACTION cases before the rollout stops. Cases without a preference
+    have none, and neither do the cases of a question with a MAX candidate once its first goal
+    holds, since that goal is the runtime's stop test.
     """
     scenario = decision_scenarios(record, scores, safe, maximum, predictor, cfg)
     graph, goal, digest = scenario["graph"], scenario["goal"], scenario["digest"]
@@ -1699,13 +1745,20 @@ def question_plan(record, scores, safe, maximum, predictor, cfg):
         if len(shared) and not np.allclose(features[order, shared], features[leader[order, shared], shared],
                                            atol=1e-6):
             raise ValueError("One visible state has inconsistent frozen features.")
-    member = leader[None] == np.arange(orders)[:, None, None]
-    group_informative = np.take_along_axis((member & informative[None]).any(1), leader, axis=0)
-    rows = informative | (~group_informative & has_move[None])
+    if cfg.reachable_only:
+        # With a MAX candidate the first goal is the runtime's own stop test (the selected candidate
+        # is that MAX and passes all four lights): where it holds, the rollout has stopped.
+        stopped = (achieved >= 1) & bool(maximum.any())
+        rows = informative & ~stopped
+    else:
+        stopped = np.zeros_like(informative)
+        member = leader[None] == np.arange(orders)[:, None, None]
+        group_informative = np.take_along_axis((member & informative[None]).any(1), leader, axis=0)
+        rows = informative | (~group_informative & has_move[None])
     targets = np.where(informative[:, :, None], options, graph.legal[None]) & rows[:, :, None]
     if (targets & ~graph.legal[None]).any() or not targets[rows].any(1).all() or targets[~rows].any():
         raise ValueError("Decision label action mapping is incomplete.")
-    if (rows & ~has_move[None]).any() or (informative & ~rows).any():
+    if (rows & ~has_move[None]).any() or (informative & ~stopped & ~rows).any():
         raise ValueError("Decision label action mapping is incomplete.")
     return {"graph": graph, "features": features, "digest": digest, "prefix": prefix, "achieved": achieved,
             "status": status, "informative": informative, "options": options, "leader": leader,
@@ -1713,18 +1766,24 @@ def question_plan(record, scores, safe, maximum, predictor, cfg):
 
 
 def plan_coverage(plan, cfg):
-    """One question's case dispositions and row counts, including the cases over budget."""
+    """One question's case dispositions and row counts, including the cases over budget.
+
+    With `reachable_only`, the in-budget cases the runtime never reaches count as UNVISITED.
+    """
     graph, status, rows = plan["graph"], plan["status"], plan["rows"]
     orders = status.shape[0]
     all_states = len(presence_states(cfg.zero_shots, cfg.k))
     names = np.asarray(DECISION_STATUSES)[status]
     statuses = Counter(names.reshape(-1).tolist())
-    over_budget = orders * (all_states - len(graph.states))
+    in_budget = len(budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)[0])
+    over_budget, unvisited = orders * (all_states - in_budget), orders * (in_budget - len(graph.states))
     if over_budget:
         statuses["OUT_OF_BUDGET"] += over_budget
-    informative = plan["informative"]
+    if unvisited:
+        statuses["UNVISITED"] += unvisited
+    informative = plan["informative"] & rows  # Routed rows (with reachable_only, stopped cases have none).
     return {"questions": 1, "presence_states": all_states,
-            "state_order_cases": status.size + over_budget, "action_rows": int(rows.sum()),
+            "state_order_cases": status.size + over_budget + unvisited, "action_rows": int(rows.sum()),
             "informative_rows": int(informative.sum()),
             "status_counts": dict(statuses),
             "trained_status_counts": dict(Counter(names[rows].tolist())),
@@ -1794,10 +1853,12 @@ def finetune_choices(plan, head, device, cfg):
     cannot tell apart share one decision, judged on average over them: most threads that
     reach the goal first, then fewest calls, then the pretrained head's own probability. If
     no thread reaches the goal the options are separated by that probability alone. A group
-    with no informative case keeps the head's favorite allowed move.
+    with no informative case keeps the head's favorite allowed move. Only cases that have a row
+    take part (with `reachable_only`, routed cases where the rollout has stopped have none).
     """
-    graph, achieved, leader, informative = plan["graph"], plan["achieved"], plan["leader"], plan["informative"]
-    prefix, rows = plan["prefix"], plan["rows"]
+    graph, achieved, leader, prefix = plan["graph"], plan["achieved"], plan["leader"], plan["prefix"]
+    rows = plan["rows"]
+    informative = plan["informative"] & rows
     orders, states, goals = prefix.shape
     move, probability = head_policy(head, plan["features"], graph, device)
     reached, calls = thread_outcomes(graph, move, prefix)
@@ -1857,7 +1918,7 @@ def head_fingerprint(weights):
 
 def rules_fingerprint(cfg):
     """The acquisition rules and costs themselves: every allowed move of every state and what it adds."""
-    graph = decision_graph(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    graph = decision_graph(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, cfg.reachable_only)
     digest = hashlib.sha256()
     for array in (graph.succ, graph.delta):
         digest.update(np.ascontiguousarray(array).tobytes())
@@ -1871,7 +1932,7 @@ def decision_dataset_fingerprint(records, splits, teacher, predictor, cfg):
     rules are hashed as the transition table they produce, so editing them invalidates saved labels
     even within one revision.
     """
-    config = {key: value for key, value in asdict(cfg).items() if key not in NON_CONTRACT_SETTINGS}
+    config = contract_settings(cfg)
     digest = hashlib.sha256()
     digest.update(json.dumps({"schema": 5, "revision": PIPELINE_REVISION, "config": config,
                               "rules": rules_fingerprint(cfg),
@@ -1941,25 +2002,25 @@ def pack_decision_rows(rows, cfg, keys=("h", "target", "valid")):
 
 
 @lru_cache(maxsize=8)
-def decision_valid_table(zero_shots, k, repeats, cost_unit, max_cost):
+def decision_valid_table(zero_shots, k, repeats, cost_unit, max_cost, reachable_only=False):
     """Allowed-action masks of the in-budget states, in label order."""
-    return decision_graph(zero_shots, k, repeats, cost_unit, max_cost).legal
+    return decision_graph(zero_shots, k, repeats, cost_unit, max_cost, reachable_only).legal
 
 
 def decision_valid(source, cfg):
-    table = decision_valid_table(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    table = decision_valid_table(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, cfg.reachable_only)
     return table[np.asarray(source, dtype=np.int64) % len(table)]
 
 
 def decision_case_count(cfg):
     """In-budget state/order cases of one question: zero-shot orders times in-budget states."""
-    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, cfg.reachable_only)
     return math.factorial(cfg.zero_shots) * len(states)
 
 
 def decision_row_observations(record, source, cfg):
     """Rebuild each case's label-time observation from its scenario * states + state source."""
-    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
+    states, _ = budget_state_index(cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost, cfg.reachable_only)
     template, masks, offsets = state_observation_template(
         states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
     scenario, position = np.divmod(np.asarray(source, dtype=np.int64), len(states))
@@ -3716,7 +3777,7 @@ class Workflow:
                    "pulled": f"Mirror {cfg.hf_repo}: downloaded {folder_size(self.out) / 1024**2:.1f} MiB "
                              f"into {self.out}; completed stages resume."}[state], flush=True)
         # Logs are identified by the sources below, not by the configured paths.
-        contract_cfg = {key: value for key, value in asdict(cfg).items() if key not in NON_CONTRACT_SETTINGS}
+        contract_cfg = contract_settings(cfg)
         paths = [cfg.train_file] + cfg.test_files
         self.datasets = None
         if cfg.dataset_id:
@@ -3835,17 +3896,24 @@ class Workflow:
             self.build_datasets()
         section(f"DATA AUDIT | device={self.device} | {self.cfg.n} candidates, {self.cfg.k} evaluators")
         # Names the embedded code, so a stale notebook is visible before any stage trains.
-        print(f"Implementation revision {PIPELINE_REVISION}; Stage 3 labels every presence state with its "
+        catalog = len(presence_states(self.cfg.zero_shots, self.cfg.k))
+        labeled, trained, views, unit = ("every presence state", "Stages 1-2 train on every presence state",
+                                         f"{catalog:,}", "epochs")
+        if self.cfg.reachable_only:
+            reachable = len(reachable_states(self.cfg))
+            labeled = f"every reachable state (reachable_only: {reachable:,} of {catalog:,})"
+            trained = "Stage 1 trains on every presence state and Stage 2 on every reachable one"
+            views, unit = f"{catalog:,} and {reachable:,}", "all-state epochs"
+        print(f"Implementation revision {PIPELINE_REVISION}; Stage 3 labels {labeled} with its "
               "cheapest routes to the next goal and pretrains on them (Stage 3a), then fine-tunes on the "
               "route its own continuations make cheapest (Stage 3b). Compact labels "
               f"(schema {DECISION_LABEL_SCHEMA}: a bit mask per state/order case for 3a, one byte for 3b) "
               "are bound to the input logs' content rather than their paths. Stage 4 rolls out each "
               f"question once and saves compact outcomes to {ROLLOUT_FILE}, not trajectories, for both "
-              "heads. Stages 1-2 train on every "
-              f"presence state under every zero-shot order ({len(presence_states(self.cfg.zero_shots, self.cfg.k)):,} "
+              f"heads. {trained} under every zero-shot order ({views} "
               f"x {math.factorial(self.cfg.zero_shots)} views per question), assembled on the "
               "device and never stored; each keeps the checkpoint with the lowest development "
-              f"loss (AP is only a reported metric), stops {self.cfg.view_patience:g} epochs after it, "
+              f"loss (AP is only a reported metric), stops {self.cfg.view_patience:g} {unit} after it, "
               f"and saves its training state every {self.cfg.hf_sync_minutes:g} minutes, so a new session "
               "continues inside an epoch.", flush=True)
         self.splits = split_records(self.records, self.cfg)

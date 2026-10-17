@@ -391,6 +391,50 @@ def test_snapshot_checkpoint_is_the_lowest_development_loss_over_all_outputs_and
     assert checkpoint["dev_summary"]["loss"] > 0 and checkpoint["dev_summary"]["top1"] is not None
 
 
+def test_a_schedule_scale_keeps_checks_patience_and_cap_in_all_state_epochs(capsys):
+    # Twice as few views per epoch: one all-state epoch is two epochs of these views, so the
+    # 8 checks and 0.25-epoch patience of an all-state epoch become 4 checks and 0.5 epochs here.
+    cfg = a.Config(k=2, zero_shots=2, hidden_dim=8, residual_blocks=1, batch_size=64, device="cpu",
+                   cpu_threads=1, dev_checks_per_epoch=8, view_patience=.25)
+    views = a.SnapshotViews([record(cfg, i) for i in range(4)], list(range(4)), cfg, "cpu")
+    losses = iter([.9, .8, .5, .6, .7, .1])
+
+    def evaluate(model):
+        score = next(losses)
+        return score, f"development loss {score:.4f}"
+
+    fit = a.train_on_views(a.ResNet(cfg.input_dim, cfg.n, cfg), views, 5, 3,
+                           lambda logits, y: a.teacher_loss(logits, y, cfg), evaluate, a.lower_loss, cfg, "Snapshot",
+                           schedule_scale=2.)
+    assert [entry["epoch"] for entry in fit["history"]] == [.25, .5, .75, 1., 1.25]
+    assert (fit["best"], fit["best_epoch"], fit["epochs"]) == (.5, .75, 1.25)
+    log = capsys.readouterr().out
+    assert ("4 development checks per epoch; training stops 0.5 epochs after the best check (one all-state "
+            "epoch is 2.00 of these epochs, so the checks, the patience and the 10-epoch cap keep") in log
+
+
+@pytest.mark.parametrize("reachable_only", [False, True])
+def test_reachable_only_snapshot_trains_on_reachable_views_with_the_all_state_step_schedule(reachable_only, monkeypatch):
+    cfg = small_stage_cfg()
+    cfg.reachable_only = reachable_only
+    records = [record(cfg, i) for i in range(12)]
+    splits = {"supervised": list(range(8)), "dev": list(range(8, 12))}
+    teacher = {"safe": np.eye(12, cfg.n, dtype=np.float32), "maximum": np.eye(12, cfg.n, dtype=np.float32)}
+    seen, train_on_views = {}, a.train_on_views
+
+    def track(model, views, *args, **kwargs):
+        seen.update(states=views.state_count, scale=kwargs["schedule_scale"])
+        return train_on_views(model, views, *args, **kwargs)
+
+    monkeypatch.setattr(a, "train_on_views", track)
+    checkpoint = a.fit_snapshot(records, splits, teacher, cfg, torch.device("cpu"))
+    every, reachable = len(a.presence_states(cfg.zero_shots, cfg.k)), len(a.reachable_states(cfg))
+    assert (every, reachable) == (60, 26)
+    expected = (reachable, every / reachable) if reachable_only else (every, 1.)
+    assert (seen["states"], seen["scale"]) == pytest.approx(expected)
+    assert checkpoint["presence_states"] == expected[0]
+
+
 def test_reference_score_ties_preserve_max_identity_after_slot_permutation():
     cfg = a.Config(k=1, zero_shots=2)
     r = record(cfg)
@@ -1292,6 +1336,48 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
     a.atomic_torch(tmp_path/"old_bundle.pt", old_bundle)
     with pytest.raises(ValueError, match="training contract"):
         a.load_inference_bundle(tmp_path/"old_bundle.pt")
+
+
+def test_reachable_only_pipeline_trains_stage_2_and_labels_stage_3_on_reachable_states(tmp_path, capsys):
+    train, external = tmp_path/"train.json", tmp_path/"external.json"
+    cfg = a.Config(train_file=str(train), test_files=[str(external)], output_dir=str(tmp_path/"run"),
+                   device="cpu", cpu_threads=1, k=2, zero_shots=2, teacher_folds=2, hidden_dim=8,
+                   residual_blocks=1, batch_size=16, teacher_epochs=2, snapshot_epochs=2, decision_epochs=2,
+                   decision_finetune_epochs=2, patience=2, dev_checks_per_epoch=2, decision_batch_size=16,
+                   recognition_threshold=.1, bootstrap_samples=20, reachable_only=True)
+    train.write_text(json.dumps([raw_record(i, cfg) for i in range(40)]))
+    external.write_text(json.dumps([raw_record(i, cfg, prefix="external") for i in range(4)]))
+    work = a.run_pipeline(cfg)
+    log = capsys.readouterr().out
+    assert "Stage 3 labels every reachable state (reachable_only: 26 of 60) with its cheapest routes" in log
+    assert ("Stage 1 trains on every presence state and Stage 2 on every reachable one under every zero-shot "
+            "order (60 and 26 x 2 views per question)") in log
+    # Stage 1 is unchanged; Stage 2 trains on the reachable states with the all-state step schedule.
+    assert re.search(r"^Teacher fold 1/2: \d+ questions x 2 zero-shot orders x 60 presence states", log, re.M)
+    assert re.search(r"^Snapshot: \d+ questions x 2 zero-shot orders x 26 presence states .*one all-state epoch "
+                     r"is 2\.31 of these epochs", log, re.M)
+    run = tmp_path/"run"
+    assert json.loads((run/"contract.json").read_text())["config"]["reachable_only"] is True
+    assert a.load_checkpoint(run/"snapshot_completed.pt")["presence_states"] == 26
+    cases = a.decision_case_count(cfg)
+    assert cases == 2 * 26
+    for phase, key in (("pretrain", "options"), ("finetune", "choice")):
+        for role in ("policy", "dev"):
+            assert a.load_label_file(a.decision_role_path(run, phase, role))[key].shape[1] == cases
+    questions = len(work.splits["policy"])
+    coverage = work.pretrained_checkpoint["coverage"]["policy"]
+    assert coverage["state_order_cases"] == 60 * 2 * questions
+    assert coverage["status_counts"]["UNVISITED"] == (60 - 26) * 2 * questions
+    # Only routed cases are rows: none without a preference.
+    assert set(coverage["trained_status_counts"]) == {"ACTION"}
+    assert coverage["action_rows"] == coverage["informative_rows"] > 0
+    assert work.decision_checkpoint["coverage"]["policy"]["action_rows"] == coverage["action_rows"]
+    assert set(work.results["external"]["adaptive"]["policies"]) == set(a.evaluation_methods(cfg))
+    # The switch is part of the run contract: the same folder refuses the other setting.
+    changed = copy.deepcopy(cfg)
+    changed.reachable_only = False
+    with pytest.raises(ValueError, match="different config"):
+        a.Workflow(changed)
 
 
 def test_external_development_requires_eligible_questions_and_unique_role_names():
