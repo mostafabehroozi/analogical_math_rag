@@ -6,6 +6,7 @@ from tqdm import tqdm
 from typing import Dict, Any, List
 
 from src.utils import save_json, save_json_atomic, load_json
+from src.api_batching import batch_refusals
 from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
 from src.pipeline_steps import retrieve
@@ -378,6 +379,7 @@ def build_merging_dataset(
             continue
             
         # Process the single query
+        refusal_mark = batch_refusals.mark()
         res = process_single_question(
             target_query=query,
             ground_truth=gt,
@@ -387,7 +389,10 @@ def build_merging_dataset(
             api_manager_eval=eval_mgr,
             config=config
         )
-        
+        # A refused provider batch fails every later call for its model, and
+        # the saved log would mark this question done, so the run stops instead.
+        batch_refusals.raise_if_refused(since=refusal_mark)
+
         # Add tracking metadata
         res['original_index'] = original_idx
         full_logs.append(res)

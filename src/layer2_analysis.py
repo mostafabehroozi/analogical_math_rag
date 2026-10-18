@@ -35,6 +35,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from src.utils import save_json
+from src.api_batching import batch_refusals
 from src.api_manager import model_name_for
 from src.evaluation import evaluate_single_answer_with_llm
 from src.hf_sync import periodic_sync_check
@@ -2564,8 +2565,13 @@ def run_layer2_experiments(
             for loop_idx, layer1_state in enumerate(tqdm(pending_states, desc="Layer 2 Progress")):
                 
                 # Run the actual question
+                refusal_mark = batch_refusals.mark()
                 orchestrator.run_single_query(layer1_state)
-                
+                # A refused provider batch fails every later call for its
+                # model, and the checkpoint would mark this question done, so
+                # the run stops before it is saved.
+                batch_refusals.raise_if_refused(since=refusal_mark)
+
                 # --- ITERATIVE SAVING (Happens after EVERY question) ---
                 orchestrator.save_checkpoint()
                 report = orchestrator.generate_master_report()

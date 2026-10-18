@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
 
+from src.api_batching import batch_refusals
 from src.api_manager import SUPPORTED_API_PROVIDERS, model_name_for
 from src.benchmark_data import benchmark_name_for_target_index
 from src.batching import BatchCoordinator, QuestionResult, QuestionWorkItem
@@ -548,7 +549,11 @@ def build_transformation_dataset(
     for loop_index, item in enumerate(
         tqdm(items, desc=f"Transformation DS: {experiment_name}")
     ):
+        refusal_mark = batch_refusals.mark()
         result = worker(item)
+        # A refused provider batch fails every later call for its model, and
+        # the saved log would mark this question done, so the run stops instead.
+        batch_refusals.raise_if_refused(since=refusal_mark)
         logs.append(result)
         save_json(logs, log_path)
         if result.get("status") == "SUCCESS" and result.get("dataset_entry"):

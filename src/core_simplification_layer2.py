@@ -10,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 
 from src.utils import load_json, save_json, save_json_atomic, create_trace_entry
+from src.api_batching import batch_refusals
 from src.hf_sync import periodic_sync_check, periodic_batch_sync_check
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
 from src.benchmark_data import benchmark_name_for_target_index
@@ -462,10 +463,14 @@ def execute_core_simplification_phase2(
         item_config["_TARGET_BENCHMARK_FOR_QUERY"] = benchmark_name_for_target_index(
             config, test_item["test_idx"]
         )
+        refusal_mark = batch_refusals.mark()
         branch_results = run_parallel_evaluation_branches(
             test_item, solver_mgr, eval_mgr, item_config
         )
-        
+        # A refused provider batch fails every later call for its model, and
+        # the saved result would mark this test done, so the run stops instead.
+        batch_refusals.raise_if_refused(since=refusal_mark)
+
         # Save immediately
         all_results.append(branch_results)
         save_json(all_results, results_path)

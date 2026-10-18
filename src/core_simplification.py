@@ -13,6 +13,7 @@ from src.prompts import (
 from src.evaluation import evaluate_single_answer_with_llm
 from src.benchmark_data import benchmark_name_for_target_index
 from src.utils import create_trace_entry, load_json, save_json, save_json_atomic
+from src.api_batching import batch_refusals
 from src.api_manager import model_name_for
 from src.batching import BatchCoordinator, QuestionWorkItem, QuestionResult
 from src.distributed_execution import (
@@ -434,7 +435,11 @@ def execute_core_simplification_phase1(
     for loop_index, item in enumerate(
         tqdm(items, desc=f"Phase 1: {experiment_name}")
     ):
+        refusal_mark = batch_refusals.mark()
         result = run_item(item)
+        # A refused provider batch fails every later call for its model, and
+        # the saved log would mark this question done, so the run stops instead.
+        batch_refusals.raise_if_refused(since=refusal_mark)
         full_logs.append(result)
         save_json(full_logs, log_file_path)
 
