@@ -3,9 +3,11 @@
 from pathlib import Path
 import sys
 import tempfile
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+from src import api_batching, api_manager
 
 
 def _import_orchestration():
@@ -105,6 +107,106 @@ class RunExperimentsPreflightTests(unittest.TestCase):
                 [experiment], self.config, ["q0"], None, {}, {}, ["a0"],
             )
         self.assertEqual(results, {"Merging_Dataset": ["built"]})
+
+
+UNBATCHABLE = "meta-llama/llama-3.1-8b-instruct"
+
+
+def grouping_with_one_solver_call(api_manager_solve, config, **kwargs):
+    """Stand-in for run_layer1_grouping: a failed call only fails its state."""
+    model = api_manager.model_name_for(api_manager_solve, config, "final_solver")
+    response = api_manager_solve.generate_content("Solve 1 + 1.", model)
+    return {"overall_status": "SUCCESS" if response["status"] == "SUCCESS" else "FAILURE"}
+
+
+class RefusedBatchStopsTheRunTests(unittest.TestCase):
+    """The 2026-10-18 Kaggle run: OpenRouter refused to batch the solver model."""
+
+    def setUp(self):
+        self.orchestration = _import_orchestration()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.results_dir = Path(self.temporary.name)
+        self.posts = 0
+
+        def refuse(manager, method, path, api_key, payload=None):
+            self.posts += 1
+            return 400, {"error": {"message": f"Model '{UNBATCHABLE}' does not have a :batch endpoint"}}
+
+        # Direct (non-batch) chat completions answer every call.
+        completion = SimpleNamespace(model=UNBATCHABLE, model_extra={},
+                                     choices=[SimpleNamespace(message=SimpleNamespace(content="2"))])
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: completion)))
+        fake_openai = SimpleNamespace(OpenAI=lambda **kwargs: client,
+                                      RateLimitError=Exception, APIStatusError=Exception)
+        for target, name, value in (
+            (api_manager, "openai", fake_openai),
+            (api_manager.OpenRouterAPIManager, "_batch_http", refuse),
+            (self.orchestration, "run_layer1_grouping", grouping_with_one_solver_call),
+            (self.orchestration, "periodic_sync_check", lambda *args, **kwargs: None),
+        ):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for target, name in ((api_manager, "tprint"), (api_batching, "tprint"),
+                             (api_manager.provider_pacer, "pace")):
+            patcher = patch.object(target, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.config = {
+            "RESULTS_DIR": str(self.results_dir),
+            "DISTRIBUTED_EXECUTION_ENABLED": False,
+            "BATCH_PROCESSING_ENABLED": False,
+            "BATCH_WRITE_JOURNALS": False,
+            "ENABLE_API_RETRY": False,
+            "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 0,
+            "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES": 0,
+            "API_BATCHING_ENABLED": True,
+            "API_BATCH_COLLECT_SECONDS": 0.0,
+            "OPENROUTER_MODEL_NAME_FINAL_SOLVER": UNBATCHABLE,
+            "OPENROUTER_MODEL_ROUTING": {UNBATCHABLE: {"only": ["novita/fp8"]}},
+        }
+
+    def managers(self):
+        openrouter = api_manager.OpenRouterAPIManager("test-key", {"default": {"rpm": 1000}}, self.config)
+        return {"openrouter": openrouter, "kaggle": object()}
+
+    def run_grouping(self, managers, **overrides):
+        return self.orchestration.run_experiments(
+            [{**GROUPING_EXPERIMENT, **overrides}], self.config, ["q0", "q1"], None, {},
+            managers, ["a0", "a1"],
+        )
+
+    def test_a_refused_batch_raises_before_the_question_log_is_saved(self):
+        modes = {
+            "query by query": {},
+            "batch processing": {"BATCH_PROCESSING_ENABLED": True, "BATCH_SIZE": 2,
+                                 "BATCH_MAX_WORKERS": 1},
+            "deferred solve": {"DEFER_SOLVE_STEP": True},
+        }
+        log_path = self.results_dir / f"{GROUPING_EXPERIMENT['experiment_name']}_run_log.json"
+        for mode, overrides in modes.items():
+            with self.subTest(mode):
+                self.posts = 0
+                with self.assertRaises(api_batching.BatchRefusedError) as raised:
+                    self.run_grouping(self.managers(), **overrides)
+                message = str(raised.exception)
+                self.assertIn(f"OpenRouter cannot batch {UNBATCHABLE}", message)
+                self.assertIn("API_BATCHING_ENABLED=True", message)
+                self.assertFalse(log_path.exists())
+                # In batch mode the second question failed without a request.
+                self.assertEqual(self.posts, 1)
+
+    def test_a_fixed_rerun_in_the_same_kernel_runs_every_question(self):
+        managers = self.managers()
+        with self.assertRaises(api_batching.BatchRefusedError):
+            self.run_grouping(managers)
+        self.config["API_BATCHING_ENABLED"] = {"kaggle": True, "openrouter": False}
+        logs = self.run_grouping(managers)[GROUPING_EXPERIMENT["experiment_name"]]
+        self.assertEqual([log["target_query_original_hard_list_idx"] for log in logs], [0, 1])
+        self.assertEqual({log["pipeline_status"] for log in logs}, {"SUCCESS"})
+        self.assertEqual(self.posts, 1)
 
 
 if __name__ == "__main__":

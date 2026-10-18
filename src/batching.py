@@ -9,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 from tqdm import tqdm  
+from src.api_batching import batch_refusals
 from src.context_logger import pipeline_context as api_call_context
 from src.distributed_execution import distributed_enabled, stop_new_batches_due
 from src.utils import save_json_atomic
@@ -112,6 +113,7 @@ class BatchCoordinator:
                         }
                         return QuestionResult(item, value, "FAILED", time.monotonic() - started)
 
+                refusal_mark = batch_refusals.mark()
                 with ThreadPoolExecutor(max_workers=min(self.max_workers, len(batch_items)), thread_name_prefix="question") as executor:
                     futures: Dict[Future[QuestionResult], QuestionWorkItem] = {executor.submit(execute, item): item for item in batch_items}
                     for completed, future in enumerate(as_completed(futures), start=1):
@@ -119,6 +121,10 @@ class BatchCoordinator:
                         results.append(result)
                         print(f"[BATCH {batch_id} {completed}/{len(batch_items)}] Q#{result.item.index} {result.terminal_status} ({result.elapsed_seconds:.1f}s)")
 
+                # A provider batch refused during this batch fails every later
+                # call for its model. Committing would save these questions as
+                # FAILURE logs that the resume skips, so the run stops instead.
+                batch_refusals.raise_if_refused(since=refusal_mark)
                 results.sort(key=lambda result: result.item.index)
                 failed = [result for result in results if result.terminal_status != "SUCCESS"]
                 self._write_journal(batch_id, "READY_TO_COMMIT", batch_items, terminal_statuses={str(result.item.index): result.terminal_status for result in results})

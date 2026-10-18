@@ -1,5 +1,6 @@
 import pytest
 
+from src.api_batching import BatchRefusedError, batch_refusals
 from src.batching import BatchCoordinator, QuestionWorkItem
 
 
@@ -42,6 +43,44 @@ def test_halt_policy_continues_after_failsafe_skip_only(first_status, expected_i
     assert [result.item.index for result in committed] == expected_indices
     # The stored skip remains a skip; the coordinator only classifies execution.
     assert results[0].value["status"] == first_status
+
+
+def _distributed_coordinator():
+    # Distributed workers continue after a failed batch by default.
+    return BatchCoordinator(
+        {"BATCH_SIZE": 2, "BATCH_MAX_WORKERS": 2, "BATCH_WRITE_JOURNALS": False,
+         "DISTRIBUTED_EXECUTION_ENABLED": True},
+        "grouping",
+        "full",
+    )
+
+
+def test_refused_provider_batch_stops_before_the_commit():
+    committed = []
+
+    def worker(item):
+        # The refused call already failed; the pipeline step reports FAILURE.
+        batch_refusals.record("OpenRouter cannot batch author/model with provider routing {}.")
+        return {"pipeline_status": "FAILURE"}
+
+    with pytest.raises(BatchRefusedError, match="cannot batch author/model"):
+        _distributed_coordinator().run(
+            [QuestionWorkItem(0, "q0"), QuestionWorkItem(1, "q1"), QuestionWorkItem(2, "q2")],
+            worker,
+            lambda results, batch_id, batch_number: committed.extend(results),
+        )
+    assert committed == []
+
+
+def test_refusal_recorded_before_the_batch_does_not_stop_it():
+    batch_refusals.record("A refusal from an earlier run in this kernel.")
+    committed = []
+    _distributed_coordinator().run(
+        [QuestionWorkItem(0, "q0")],
+        lambda item: {"pipeline_status": "SUCCESS"},
+        lambda results, batch_id, batch_number: committed.extend(results),
+    )
+    assert [result.item.index for result in committed] == [0]
 
 
 def test_pipeline_failure_takes_precedence_over_skip():

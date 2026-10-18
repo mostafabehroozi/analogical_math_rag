@@ -134,15 +134,11 @@ those settings bound the batch size.
   `API_BATCH_KAGGLE_N_JOBS` concurrent workers.
 - **OpenRouter**: a batch is one
   [Batch API](https://openrouter.ai/docs/batch-quickstart) job, billed at a
-  discount. The job is polled every `API_BATCH_POLL_SECONDS`. Only models with
-  a batch endpoint are accepted; others fail with HTTP 400, so leave such a
-  model out of `API_BATCHING_ENABLED`. Provider routing may use only `only` and
-  `allow_fallbacks`, and `OPENROUTER_MODEL_FALLBACKS` cannot be used; other
-  settings fail the call immediately. With `API_BATCH_FALLBACK_TO_DIRECT = True`
-  these cases instead send that model directly for the rest of the session,
-  with one warning, at the standard price. OpenRouter allows up to 24 hours per job,
-  so a job still running after `API_BATCH_TIMEOUT_SECONDS` is abandoned and its
-  calls retried, and OpenRouter may still bill it.
+  discount. The job is polled every `API_BATCH_POLL_SECONDS`. OpenRouter allows
+  up to 24 hours per job, so a job still running after
+  `API_BATCH_TIMEOUT_SECONDS` is abandoned and its calls retried, and OpenRouter
+  may still bill it. Provider routing may use only `only` and
+  `allow_fallbacks`, and `OPENROUTER_MODEL_FALLBACKS` cannot be used.
 
 ```python
 {
@@ -153,6 +149,33 @@ those settings bound the batch size.
     "API_BATCHING_ENABLED": True, "API_BATCH_MAX_SIZE": 10,
 }
 ```
+
+### Models OpenRouter will not batch
+
+Only OpenRouter models with a batch endpoint can be batched; they are listed at
+[openrouter.ai/models?variant=batch](https://openrouter.ai/models?variant=batch).
+For any other model, creating the batch fails with HTTP 400, and pinning a
+provider cannot help. HTTP 404 means the model has batch endpoints, but none of
+them matches the `only` provider pin. When OpenRouter refuses a model in either
+way, or the model's routing uses settings the Batch API does not accept, the
+run stops with `BatchRefusedError` before the current question's log is saved.
+With `BATCH_PROCESSING_ENABLED`, it stops before the current question batch is
+committed, which in distributed mode is also its checkpoint. Otherwise each
+failed question would be saved as a FAILURE log, and a resumed run counts saved
+logs as done. A rerun with a fixed configuration therefore redoes those
+questions. Until the kernel restarts, later calls for the refused model and
+routing fail at once, without another batch request.
+
+The error names the model, its provider routing and the effective
+`API_BATCHING_ENABLED` value, and lists the fixes:
+
+- leave the model out, e.g. `{"kaggle": True, "openrouter": False}`;
+- choose a model from the batch list;
+- after a 404, pin a provider that serves the model's batch endpoint, or remove
+  the pin;
+- or set `API_BATCH_FALLBACK_TO_DIRECT = True`. The run then does not stop:
+  that model is sent directly for the rest of the session, with one warning, at
+  the standard price.
 
 ## Layer-1 grouping companion run
 

@@ -43,6 +43,7 @@ ARCHITECTURAL REFACTOR: "Acquire-Optimize-Fork".
   when MIRROR_AS_EVALUATOR is active.
 """
 
+import functools
 import logging
 from tqdm import tqdm
 import os
@@ -50,6 +51,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from sentence_transformers import SentenceTransformer
 from src.context_logger import tprint
 from src.benchmark_data import benchmark_name_for_target_index
+from src.api_batching import batch_refusals
 from src.api_manager import bind_api_managers
 from src.distributed_code_compatibility import (
     WORKER_CODE_CHANGE_STATE_KEY,
@@ -734,6 +736,27 @@ def _finalize_distributed_worker_status(
     return state
 
 
+def _stop_run_on_refused_batch(run_query):
+    """Raise instead of returning a query log that a refused provider batch failed.
+
+    A batch refused while API_BATCH_FALLBACK_TO_DIRECT is off fails every later
+    call for that model, and the pipeline steps turn the failures into a
+    FAILURE log. The single-notebook resume counts saved logs as done, so the
+    error is raised before any caller saves this query's log; a rerun with a
+    fixed configuration then redoes the query. The batch coordinator makes the
+    same check before it commits a question batch.
+    """
+    @functools.wraps(run_query)
+    def run(*args, **kwargs):
+        refusal_mark = batch_refusals.mark()
+        run_log = run_query(*args, **kwargs)
+        batch_refusals.raise_if_refused(since=refusal_mark)
+        return run_log
+
+    return run
+
+
+@_stop_run_on_refused_batch
 def run_pipeline_for_single_query(
     hard_list_idx: int,
     target_query: str,

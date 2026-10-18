@@ -112,6 +112,48 @@ def fallback_to_direct(config: Dict[str, Any]) -> bool:
     return bool(config.get("API_BATCH_FALLBACK_TO_DIRECT", False))
 
 
+class BatchRefusedError(RuntimeError):
+    """A provider refused to batch a model while API_BATCH_FALLBACK_TO_DIRECT was off."""
+
+
+class _BatchRefusals:
+    """Calls that failed because their provider will not batch their model.
+
+    A refused call only fails its own response, so the pipeline would save the
+    question as a FAILURE log, which the single-notebook resume counts as done.
+    Every refused call is therefore recorded here, and the orchestrator calls
+    :meth:`raise_if_refused` before it saves a question's log or commits a
+    question batch.  Only calls after the check's :meth:`mark` count, so a
+    refusal from an earlier run in the same kernel never stops a run whose
+    calls are no longer refused.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._count = 0
+        self._latest: Dict[str, int] = {}  # refusal message -> number of its latest call
+
+    def record(self, message: str) -> None:
+        """Record one call that failed with this refusal message."""
+        with self._lock:
+            self._count += 1
+            self._latest[message] = self._count
+
+    def mark(self) -> int:
+        with self._lock:
+            return self._count
+
+    def raise_if_refused(self, since: int) -> None:
+        """Raise :class:`BatchRefusedError` if a call was refused after ``since``."""
+        with self._lock:
+            messages = [message for message, number in self._latest.items() if number > since]
+        if messages:
+            raise BatchRefusedError("\n\n".join(messages))
+
+
+batch_refusals = _BatchRefusals()
+
+
 @dataclass
 class BatchItem:
     """One caller's request.  ``payload`` is provider-specific and opaque here."""
@@ -226,4 +268,7 @@ class APIBatchDispatcher:
             item.done.set()
 
 
-__all__ = ["APIBatchDispatcher", "BatchItem", "BatchSettings", "batching_enabled", "fallback_to_direct"]
+__all__ = [
+    "APIBatchDispatcher", "BatchItem", "BatchRefusedError", "BatchSettings",
+    "batch_refusals", "batching_enabled", "fallback_to_direct",
+]

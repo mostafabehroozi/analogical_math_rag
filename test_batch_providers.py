@@ -3,12 +3,14 @@
 import contextlib
 import sys
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
 
 from src import api_batching, api_manager
 
+UNBATCHABLE = "meta-llama/llama-3.1-8b-instruct"
 BATCH_CONFIG = {
     "API_BATCHING_ENABLED": True,
     "API_BATCH_MAX_SIZE": 10,
@@ -100,12 +102,15 @@ class OpenRouterBatchTests(_Quiet):
             "reasoning": {"effort": "low"},
         })
 
-    def test_routing_the_batch_api_rejects_fails_before_any_request(self):
+    def test_routing_the_batch_api_rejects_fails_before_any_request_and_stops_the_run(self):
         config = {**self.config, "OPENROUTER_PROVIDER_ROUTING": {"order": ["provider-a"]}}
+        mark = api_batching.batch_refusals.mark()
         result = self.manager.for_config(config).generate_content("p", "author/model")
-        self.assertEqual(result["error_type"], "InvalidArgument")
-        self.assertIn("order", result["error_message"])
+        self.assertEqual(result["error_type"], "BatchRefused")
+        self.assertIn("provider routing keys ['order']", result["error_message"])
         self.assertEqual(self.http_calls, [])
+        with self.assertRaisesRegex(api_batching.BatchRefusedError, "route this model with only"):
+            api_batching.batch_refusals.raise_if_refused(since=mark)
 
     def test_batching_off_keeps_direct_requests(self):
         config = {**self.config, "API_BATCHING_ENABLED": False}
@@ -239,8 +244,8 @@ class SwitchTests(unittest.TestCase):
         self.assertIn("google/x: batched", messages[1])
 
 
-class OpenRouterFallbackTests(_Quiet):
-    """A model OpenRouter refuses to batch goes direct only when allowed."""
+class OpenRouterRefusalTests(_Quiet):
+    """A model OpenRouter refuses to batch stops the run, or goes direct when allowed."""
 
     def setUp(self):
         super().setUp()
@@ -260,49 +265,130 @@ class OpenRouterFallbackTests(_Quiet):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.creates = 0
+        # The response OpenRouter gave on Kaggle on 2026-10-18.
+        self.refusal = (400, f"Model '{UNBATCHABLE}' does not have a :batch endpoint")
 
         def fake_http(manager, method, path, api_key, payload=None):
             self.creates += 1
-            return 400, {"error": {"message": "Model 'meta-llama/llama-3.1-8b-instruct' has no batch endpoint"}}
+            code, message = self.refusal
+            return code, {"error": {"message": message}}
 
         patcher = patch.object(api_manager.OpenRouterAPIManager, "_batch_http", fake_http)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.config = {**BATCH_CONFIG, "API_BATCH_COLLECT_SECONDS": 0.0,
-                       "OPENROUTER_MODEL_ROUTING": {"meta-llama/llama-3.1-8b-instruct": {"only": ["novita/fp8"]}}}
+                       "OPENROUTER_MODEL_ROUTING": {UNBATCHABLE: {"only": ["novita/fp8"]}}}
         self.manager = api_manager.OpenRouterAPIManager("test-key", {"default": {"rpm": 1000}}, self.config)
 
-    def test_without_fallback_the_refusal_is_a_final_error(self):
-        for prompt in ("p", "q"):
-            result = self.manager.generate_content(prompt, "meta-llama/llama-3.1-8b-instruct")
-            self.assertEqual(result["error_type"], "InvalidArgument")
-            self.assertIn("API_BATCH_FALLBACK_TO_DIRECT", result["error_message"])
+    def warnings(self):
+        return [call.args[0] for call in api_manager.tprint.call_args_list
+                if call.args[0].startswith("[API BATCH openrouter]")]
+
+    def assert_run_stopped(self, mark):
+        with self.assertRaises(api_batching.BatchRefusedError) as raised:
+            api_batching.batch_refusals.raise_if_refused(since=mark)
+        return str(raised.exception)
+
+    def test_without_fallback_later_calls_fail_at_once_and_the_run_stops(self):
+        mark = api_batching.batch_refusals.mark()
+        with patch.object(api_manager.global_pause_manager, "record_result") as record_result:
+            results = [self.manager.generate_content(prompt, UNBATCHABLE) for prompt in ("p", "q")]
+        self.assertEqual([result["error_type"] for result in results], ["BatchRefused", "BatchRefused"])
+        self.assertEqual(self.creates, 1)  # The second call sent no batch request.
         self.assertEqual(self.direct_calls, [])
-        # The call log truncates the message, so the full hint is printed once.
-        warnings = [call.args[0] for call in api_manager.tprint.call_args_list
-                    if call.args[0].startswith("[API BATCH openrouter]")]
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("has no batch endpoint", warnings[0])
-        self.assertIn("API_BATCHING_ENABLED", warnings[0])
+        record_result.assert_not_called()  # A refusal never triggers the global error pause.
+        # The call log truncates the message, so it is printed in full once.
+        self.assertEqual(len(self.warnings()), 1)
+        message = self.assert_run_stopped(mark)
+        self.assertIn(message, self.warnings()[0])
+        for expected in (
+            f"OpenRouter cannot batch {UNBATCHABLE} with provider routing " + '{"only": ["novita/fp8"]}',
+            "HTTP 400: Model 'meta-llama/llama-3.1-8b-instruct' does not have a :batch endpoint.",
+            "no provider pin can help", "API_BATCHING_ENABLED=True",
+            "{'kaggle': True, 'openrouter': False}", "https://openrouter.ai/models?variant=batch",
+            "API_BATCH_FALLBACK_TO_DIRECT=True",
+        ):
+            self.assertIn(expected, message)
+
+    def test_the_error_names_the_experiments_own_switch_value(self):
+        batching = {"kaggle": True, "openrouter": [UNBATCHABLE]}
+        mark = api_batching.batch_refusals.mark()
+        self.manager.for_config({**self.config, "API_BATCHING_ENABLED": batching}).generate_content("p", UNBATCHABLE)
+        self.assertIn(f"API_BATCHING_ENABLED={batching!r}", self.assert_run_stopped(mark))
+
+    def test_404_points_at_the_provider_pin(self):
+        self.refusal = (404, "No batch endpoint matches the requested providers")
+        mark = api_batching.batch_refusals.mark()
+        self.manager.generate_content("p", UNBATCHABLE)
+        message = self.assert_run_stopped(mark)
+        self.assertIn("HTTP 404", message)
+        self.assertIn("provider.only ['novita/fp8'] matches none of them", message)
+        self.assertIn("pin a provider that serves the model's batch endpoint", message)
+        self.assertNotIn("no provider pin can help", message)
+
+    def test_calls_queued_behind_the_refused_batch_send_no_request(self):
+        bound = self.manager.for_config({**self.config, "API_BATCH_MAX_CONCURRENT_BATCHES": 1})
+        posted, release = threading.Event(), threading.Event()
+
+        def held_refusal(manager, method, path, api_key, payload=None):
+            self.creates += 1
+            posted.set()
+            release.wait(5)
+            return 400, {"error": {"message": "no :batch endpoint"}}
+
+        results = {}
+        with patch.object(api_manager.OpenRouterAPIManager, "_batch_http", held_refusal):
+            threads = [threading.Thread(target=lambda prompt=prompt: results.update(
+                {prompt: bound.generate_content(prompt, UNBATCHABLE)})) for prompt in ("p", "q")]
+            threads[0].start()
+            self.assertTrue(posted.wait(5))
+            threads[1].start()  # Waits in the queue: the only batch slot is busy.
+            deadline = time.monotonic() + 5
+            while not bound.batcher._pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            release.set()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertEqual(self.creates, 1)
+        self.assertEqual({result["error_type"] for result in results.values()}, {"BatchRefused"})
+
+    def test_an_earlier_refusal_does_not_stop_a_run_that_sends_the_model_directly(self):
+        self.manager.generate_content("p", UNBATCHABLE)
+        mark = api_batching.batch_refusals.mark()
+        fixed = self.manager.for_config({**self.config, "API_BATCHING_ENABLED": {"kaggle": True, "openrouter": False}})
+        self.assertEqual(fixed.generate_content("q", UNBATCHABLE)["text"], "direct answer")
+        api_batching.batch_refusals.raise_if_refused(since=mark)
 
     def test_fallback_sends_the_model_directly_and_remembers_it(self):
         bound = self.manager.for_config({**self.config, "API_BATCH_FALLBACK_TO_DIRECT": True})
-        first = bound.generate_content("p", "meta-llama/llama-3.1-8b-instruct")
-        second = bound.generate_content("q", "meta-llama/llama-3.1-8b-instruct")
+        mark = api_batching.batch_refusals.mark()
+        first = bound.generate_content("p", UNBATCHABLE)
+        second = bound.generate_content("q", UNBATCHABLE)
         self.assertEqual((first["text"], second["text"]), ("direct answer", "direct answer"))
         self.assertEqual(self.creates, 1)  # The second call never tried a batch.
         self.assertEqual(len(self.direct_calls), 2)
+        self.assertEqual(len(self.warnings()), 1)
+        self.assertIn("API_BATCH_FALLBACK_TO_DIRECT is on", self.warnings()[0])
+        api_batching.batch_refusals.raise_if_refused(since=mark)  # The run goes on.
+
+    def test_fallback_turned_on_after_a_refusal_sends_directly(self):
+        self.manager.generate_content("p", UNBATCHABLE)
+        bound = self.manager.for_config({**self.config, "API_BATCH_FALLBACK_TO_DIRECT": True})
+        mark = api_batching.batch_refusals.mark()
+        self.assertEqual(bound.generate_content("q", UNBATCHABLE)["text"], "direct answer")
+        self.assertEqual(self.creates, 1)
+        api_batching.batch_refusals.raise_if_refused(since=mark)
 
     def test_model_left_out_of_the_switch_goes_direct(self):
         config = {**self.config, "API_BATCHING_ENABLED": {"kaggle": True, "openrouter": ["other/model"]}}
-        result = self.manager.for_config(config).generate_content("p", "meta-llama/llama-3.1-8b-instruct")
+        result = self.manager.for_config(config).generate_content("p", UNBATCHABLE)
         self.assertEqual(result["text"], "direct answer")
         self.assertEqual(self.creates, 0)
 
     def test_fallback_also_covers_routing_the_batch_api_rejects(self):
         config = {**self.config, "API_BATCH_FALLBACK_TO_DIRECT": True,
-                  "OPENROUTER_MODEL_ROUTING": {"meta-llama/llama-3.1-8b-instruct": {"order": ["novita/fp8"]}}}
-        result = self.manager.for_config(config).generate_content("p", "meta-llama/llama-3.1-8b-instruct")
+                  "OPENROUTER_MODEL_ROUTING": {UNBATCHABLE: {"order": ["novita/fp8"]}}}
+        result = self.manager.for_config(config).generate_content("p", UNBATCHABLE)
         self.assertEqual(result["text"], "direct answer")
         self.assertEqual(self.creates, 0)
 

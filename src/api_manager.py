@@ -19,7 +19,9 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, TypedDict, Union
-from src.api_batching import APIBatchDispatcher, BatchItem, BatchSettings, batching_enabled, fallback_to_direct
+from src.api_batching import (
+    APIBatchDispatcher, BatchItem, BatchSettings, batch_refusals, batching_enabled, fallback_to_direct,
+)
 from src.context_logger import ctx_query_idx, ctx_batch_id, tprint
 from src.distributed_execution import api_deadline_due, remaining_api_seconds
 
@@ -45,7 +47,7 @@ RETRYABLE_ERROR_TYPES = {
     "OllamaConnectionError", "UnknownError", "APIStatusError",
     "RateLimitError", "BatchError", "BatchItemError", "BatchTimeout",
 }
-NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "PermissionDeniedError", "PaymentRequired", "InvalidArgument", "InvalidModel", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit", "SessionDeadline"}
+NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "PermissionDeniedError", "PaymentRequired", "InvalidArgument", "InvalidModel", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit", "SessionDeadline", "BatchRefused"}
 
 class APIResponse(TypedDict, total=False):
     status: str
@@ -380,9 +382,11 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         key = response.get("request_meta", {}).get("key", "Local")
         response_text = response.get("text") or response.get("error_message", "No text returned")
         
-        # Record success or failure to the global pause manager
+        # Record success or failure to the global pause manager. A refused
+        # batch stops the run, and pausing every API call would only delay that.
         is_success = (status == "SUCCESS")
-        global_pause_manager.record_result(is_success, config)
+        if response.get("error_type") != "BatchRefused":
+            global_pause_manager.record_result(is_success, config)
         
         # 5. Format and print the beautiful log
         log_msg = _format_api_log(provider_name, model_name, key, duration, attempt, max_attempts, status, prompt, response_text, config)
@@ -688,6 +692,16 @@ class AvalAIAPIManager(_KeyedAPIManager):
         return execute_with_retry(self.config, self.provider_name, model_name, prompt, attempt)
 
 
+# Fixes for a model the OpenRouter Batch API will not serve.
+_LEAVE_MODEL_OUT_OF_BATCHING = (
+    "leave the model out of API_BATCHING_ENABLED, e.g. {'kaggle': True, 'openrouter': False}"
+)
+_CHOOSE_BATCH_MODEL = "choose a model listed at https://openrouter.ai/models?variant=batch"
+_FALL_BACK_TO_DIRECT = (
+    "set API_BATCH_FALLBACK_TO_DIRECT=True to send its calls directly at the standard price"
+)
+
+
 class OpenRouterAPIManager(_KeyedAPIManager):
     """OpenRouter chat completions with per-model endpoint preferences."""
 
@@ -715,8 +729,11 @@ class OpenRouterAPIManager(_KeyedAPIManager):
         # (model, routing) pairs OpenRouter refused to batch; with
         # API_BATCH_FALLBACK_TO_DIRECT they are sent directly from then on.
         self.batch_unsupported: set = set()
-        # Pairs whose refusal was already printed in full (the call log truncates it).
-        self.batch_refused: set = set()
+        # Pairs OpenRouter refused while the fallback was off, with the reason
+        # and the fixes; their later calls fail without another batch request.
+        self.batch_refused: Dict[Tuple[str, str], Tuple[str, List[str]]] = {}
+        # Refusal messages already printed in full (the call log truncates them).
+        self.batch_refusals_printed: set = set()
         self._batch_unsupported_lock = threading.Lock()
         self.clients = {
             key: openai.OpenAI(
@@ -814,7 +831,7 @@ class OpenRouterAPIManager(_KeyedAPIManager):
 
         if batching_enabled(self.config, self.provider_name, model_name):
             batched = self._batched_attempt(prompt, model_name, temperature, extra_body, attempt)
-            if isinstance(batched, dict):  # A request the Batch API can never accept.
+            if isinstance(batched, dict):  # A call the Batch API cannot serve fails at once.
                 return batched
             attempt = batched
         return execute_with_retry(self.config, self.provider_name, model_name, prompt, attempt)
@@ -833,18 +850,52 @@ class OpenRouterAPIManager(_KeyedAPIManager):
             self.batch_unsupported.add(group)
         if first_time:
             tprint(
-                f"[API BATCH openrouter] {group[0]} cannot be batched ({reason}); "
+                f"[API BATCH openrouter] {group[0]} cannot be batched. {reason} "
                 "API_BATCH_FALLBACK_TO_DIRECT is on, so its calls are sent directly "
                 "at the standard (non-batch) price for the rest of this session.",
                 level="WARNING",
             )
 
-    def _warn_batch_refused(self, group: Tuple[str, str], message: str) -> None:
+    def _refuse_batch_call(self, group: Tuple[str, str], reason: str, fixes: List[str], batching: Any) -> str:
+        """Record one call that cannot be batched and return its error message.
+
+        After such a call the orchestrator stops the run before it saves the
+        question (``api_batching.batch_refusals``); the resume would count
+        its FAILURE log as done.
+        """
+        model_name, routing = group
+        message = (
+            f"OpenRouter cannot batch {model_name} with provider routing {routing}. {reason} "
+            f"API_BATCHING_ENABLED={batching!r} batches this model and "
+            "API_BATCH_FALLBACK_TO_DIRECT is off, so every call for it fails. The run stops "
+            "before saving the questions that made these calls, so a rerun redoes them. "
+            "Apply one of these fixes first:\n"
+            + "\n".join(f"  - {fix}" for fix in fixes)
+        )
+        batch_refusals.record(message)
         with self._batch_unsupported_lock:
-            first_time = group not in self.batch_refused
-            self.batch_refused.add(group)
+            first_time = message not in self.batch_refusals_printed
+            self.batch_refusals_printed.add(message)
         if first_time:
             tprint(f"[API BATCH openrouter] {message}", level="WARNING")
+        return message
+
+    @staticmethod
+    def _batch_create_refusal(code: int, detail: Any, provider: Dict[str, Any]) -> Tuple[str, List[str]]:
+        """Explain an HTTP 400/404 from POST /batches and list the fixes."""
+        reason = f"POST /batches returned HTTP {code}: {str(detail).rstrip('.')}."
+        fixes = [_LEAVE_MODEL_OUT_OF_BATCHING, _CHOOSE_BATCH_MODEL, _FALL_BACK_TO_DIRECT]
+        if code == 400:
+            return f"{reason} A 400 means the model has no batch endpoint, so no provider pin can help.", fixes
+        if provider.get("only"):
+            return (
+                f"{reason} A 404 means the model has batch endpoints, but provider.only "
+                f"{provider['only']} matches none of them.",
+                ["pin a provider that serves the model's batch endpoint in provider.only "
+                 "(OPENROUTER_MODEL_ROUTING or OPENROUTER_PROVIDER_ROUTING), or remove the pin",
+                 *fixes],
+            )
+        return f"{reason} A 404 means OpenRouter found no batch endpoint for this model ID.", fixes
 
     def _batched_attempt(
         self, prompt: str, model_name: str, temperature: Optional[float],
@@ -854,29 +905,34 @@ class OpenRouterAPIManager(_KeyedAPIManager):
         provider = extra_body.get("provider") or {}
         group = (model_name, json.dumps(provider, sort_keys=True))
         fallback = fallback_to_direct(self.config)
+        batching = self.config.get("API_BATCHING_ENABLED")
         unsupported = sorted(set(provider) - self._BATCH_PROVIDER_KEYS)
         if unsupported or extra_body.get("models"):
-            reason = (
+            rejected = (
                 f"provider routing keys {unsupported}" if unsupported
                 else f"OPENROUTER_MODEL_FALLBACKS for {model_name!r}"
             )
+            refusal = (
+                f"The Batch API does not accept {rejected}: a batch has one model, and its "
+                "provider routing may use only 'only' and 'allow_fallbacks'.",
+                ["route this model with only provider 'only'/'allow_fallbacks' and without "
+                 "OPENROUTER_MODEL_FALLBACKS", _LEAVE_MODEL_OUT_OF_BATCHING, _FALL_BACK_TO_DIRECT],
+            )
+        else:
+            refusal = self.batch_refused.get(group)  # OpenRouter refused this group earlier.
+        if refusal is not None:
             if fallback:
-                self._mark_batch_unsupported(group, f"the Batch API does not accept {reason}")
+                self._mark_batch_unsupported(group, refusal[0])
                 return direct_attempt
-            return {
-                "status": "ERROR", "text": None, "error_type": "InvalidArgument",
-                "error_message": (
-                    f"The OpenRouter Batch API does not accept {reason}; only provider "
-                    "'only'/'allow_fallbacks' are allowed. Change the routing, leave this "
-                    "model out of API_BATCHING_ENABLED, or set API_BATCH_FALLBACK_TO_DIRECT=True."
-                ),
-            }
+            return {"status": "ERROR", "text": None, "error_type": "BatchRefused",
+                    "error_message": self._refuse_batch_call(group, *refusal, batching)}
         body: Dict[str, Any] = {"messages": [{"role": "user", "content": prompt}]}
         if temperature is not None:
             body["temperature"] = temperature
         if "reasoning" in extra_body:
             body["reasoning"] = extra_body["reasoning"]
-        payload = {"model": model_name, "provider": provider, "body": body, "fallback": fallback}
+        payload = {"model": model_name, "provider": provider, "body": body,
+                   "fallback": fallback, "batching": batching}
         settings = BatchSettings.from_config(self.config)
 
         def attempt() -> APIResponse:
@@ -914,12 +970,19 @@ class OpenRouterAPIManager(_KeyedAPIManager):
     def _submit_batch(self, items: List[BatchItem], settings: BatchSettings) -> List[APIResponse]:
         model_name = items[0].payload["model"]
         provider = items[0].payload["provider"]
+        fallback = items[0].payload["fallback"]
+        # This runs on the unbound manager, so the experiment's switch comes with the call.
+        batching = items[0].payload["batching"]
         group = (model_name, json.dumps(provider, sort_keys=True))
 
         def fail_all(error_type: str, message: str, meta: Optional[Dict[str, Any]] = None) -> List[APIResponse]:
             status = "RATE_LIMITED" if error_type in ("RateLimitError", "ProactiveRateLimit") else "ERROR"
             return [{"status": status, "text": None, "error_type": error_type, "error_message": message,
                      "request_meta": dict(meta or {})} for _ in items]
+
+        if group in self.batch_refused and not fallback:
+            # Queued before OpenRouter refused this group: fail without another request.
+            return fail_all("BatchRefused", self._refuse_batch_call(group, *self.batch_refused[group], batching))
 
         lease = self.scheduler.acquire(model_name)
         if lease is None:
@@ -939,22 +1002,18 @@ class OpenRouterAPIManager(_KeyedAPIManager):
         code, batch = self._batch_http("POST", "/batches", lease.api_key, request)
         if code >= 400 or not isinstance(batch, dict) or not batch.get("id"):
             message = (batch.get("error") or {}).get("message") if isinstance(batch, dict) else None
-            if code in (400, 404) and items[0].payload.get("fallback"):
-                # Each caller now retries the same request directly; a real
-                # request error therefore still surfaces from that call.
-                self._mark_batch_unsupported(group, f"HTTP {code}: {message or batch}")
-                return fail_all("BatchUnsupported", f"Batch create failed (HTTP {code}): {message or batch}", meta)
+            if code in (400, 404):
+                refusal = self._batch_create_refusal(code, message or batch, provider)
+                if fallback:
+                    # Each caller now retries the same request directly; a real
+                    # request error therefore still surfaces from that call.
+                    self._mark_batch_unsupported(group, refusal[0])
+                    return fail_all("BatchUnsupported", f"Batch create failed (HTTP {code}): {message or batch}", meta)
+                with self._batch_unsupported_lock:
+                    self.batch_refused[group] = refusal
+                return fail_all("BatchRefused", self._refuse_batch_call(group, *refusal, batching), meta)
             error_type = self._http_error_type(code, lease.api_key, model_name) if code >= 400 else "BatchError"
-            hint = (
-                " The model or pinned provider probably has no batch endpoint: leave this model out "
-                "of API_BATCHING_ENABLED (e.g. {'kaggle': True, 'openrouter': False}) or set "
-                "API_BATCH_FALLBACK_TO_DIRECT=True."
-                if code in (400, 404) else ""
-            )
-            failure = f"Batch create failed (HTTP {code}): {message or batch}.{hint}"
-            if hint:
-                self._warn_batch_refused(group, f"{model_name}: {failure}")
-            return fail_all(error_type, failure, meta)
+            return fail_all(error_type, f"Batch create failed (HTTP {code}): {message or batch}.", meta)
         batch_id = batch["id"]
         meta["openrouter_batch_id"] = batch_id
         tprint(f"[API BATCH openrouter] {batch_id}: {len(items)} request(s) for {model_name} submitted.", level="INFO")
