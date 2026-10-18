@@ -15,10 +15,20 @@ import pytest
 
 
 def _import_orchestration():
-    sentence_transformers = ModuleType("sentence_transformers")
-    sentence_transformers.SentenceTransformer = type("SentenceTransformer", (), {})
-    with patch.dict(sys.modules, {"sentence_transformers": sentence_transformers}):
+    # Only sentence_transformers is stubbed. patch.dict(sys.modules) would also
+    # drop every src module first imported inside it, and a later test that
+    # pickles one of their classes (Layer 2's ExperimentResult checkpoint)
+    # would then meet a second copy of that module.
+    stubbed = "sentence_transformers" not in sys.modules
+    if stubbed:
+        sentence_transformers = ModuleType("sentence_transformers")
+        sentence_transformers.SentenceTransformer = type("SentenceTransformer", (), {})
+        sys.modules["sentence_transformers"] = sentence_transformers
+    try:
         from src import orchestration
+    finally:
+        if stubbed:
+            del sys.modules["sentence_transformers"]
     return orchestration
 
 
