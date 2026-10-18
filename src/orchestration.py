@@ -1777,6 +1777,27 @@ def _log_query_index(run_log: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+def _deferred_logs_by_index(run_logs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    """Keep one log per question of a deferred run, in run-log order.
+
+    Pending INTERMEDIATE_COMPLETE logs stay until their solve step replaces
+    them. A solved log is never replaced by a pending duplicate, which older
+    code appended when it reran phase 1 for questions it had already solved.
+    """
+    logs_by_index: Dict[int, Dict[str, Any]] = {}
+    for log in run_logs:
+        index = log['target_query_original_hard_list_idx']
+        current = logs_by_index.get(index)
+        if (
+            current is not None
+            and current.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'
+            and log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE'
+        ):
+            continue
+        logs_by_index[index] = log
+    return logs_by_index
+
+
 def _run_pipeline_items_in_batches(
     items: List[QuestionWorkItem],
     existing_logs: List[Dict[str, Any]],
@@ -2145,9 +2166,11 @@ def run_experiments(
 
             logger.info(f"########## Starting Phase 1 (Intermediate) for Experiment: {exp_name} ##########")
             log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
-            
-            run_logs = load_json(log_file_path) or []
-            completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE'}
+
+            # A pending log needs only its solve step and a solved log is done,
+            # so phase 1 skips every question that already has a log.
+            run_logs = list(_deferred_logs_by_index(load_json(log_file_path) or []).values())
+            completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs}
             queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
 
             if queries_to_process:
@@ -2207,15 +2230,16 @@ def run_experiments(
             log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
 
             intermediate_logs = load_json(log_file_path) or []
-            logs_to_solve = [log for log in intermediate_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
-            
-            if logs_to_solve:
-                completed_logs_map = {log['target_query_original_hard_list_idx']: log for log in intermediate_logs if log.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'}
+            # Pending logs stay in every save until solved, so a phase 2 that
+            # stops early leaves them for the next run.
+            logs_map = _deferred_logs_by_index(intermediate_logs)
+            logs_to_solve = [log for log in logs_map.values() if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
 
+            if logs_to_solve:
                 if current_config.get("BATCH_PROCESSING_ENABLED", False):
                     final_logs = _run_pipeline_items_in_batches(
                         items=[QuestionWorkItem(index=log['target_query_original_hard_list_idx'], question=log['target_query_text'], existing_log=log) for log in logs_to_solve],
-                        existing_logs=list(completed_logs_map.values()),
+                        existing_logs=list(logs_map.values()),
                         log_file_path=log_file_path,
                         experiment_name=exp_name,
                         phase_name="solve",
@@ -2235,10 +2259,10 @@ def run_experiments(
                             embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                             run_mode='solve_only', existing_log=log_to_solve, hard_solutions=hard_solutions,
                         )
-                        completed_logs_map[original_idx] = completed_log
-                        save_json(list(completed_logs_map.values()), log_file_path)
+                        logs_map[original_idx] = completed_log
+                        save_json(list(logs_map.values()), log_file_path)
                         periodic_sync_check(loop_idx, current_config)
-                    final_logs = list(completed_logs_map.values())
+                    final_logs = list(logs_map.values())
             else:
                  logger.info(f"All solve steps for '{exp_name}' are already complete.")
                  final_logs = intermediate_logs
@@ -2381,8 +2405,10 @@ def run_experiments(
                 # Single-Experiment Deferred Mode 
                 logger.info(f"Running '{exp_name}' in single-experiment deferred solve mode.")
                 print(f"\n--- {exp_name}: STARTING PHASE 1 of 2 (Intermediate Steps) ---")
-                run_logs = load_json(log_file_path) or []
-                completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE'}
+                # A pending log needs only its solve step and a solved log is done,
+                # so phase 1 skips every question that already has a log.
+                run_logs = list(_deferred_logs_by_index(load_json(log_file_path) or []).values())
+                completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs}
                 queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
 
                 if queries_to_process:
@@ -2427,14 +2453,16 @@ def run_experiments(
 
                 print(f"\n--- {exp_name}: STARTING PHASE 2 of 2 (Final Solving) ---")
                 intermediate_logs = load_json(log_file_path) or run_logs
-                logs_to_solve = [log for log in intermediate_logs if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
-                
+                # Pending logs stay in every save until solved, so a phase 2 that
+                # stops early leaves them for the next run.
+                logs_map = _deferred_logs_by_index(intermediate_logs)
+                logs_to_solve = [log for log in logs_map.values() if log.get('pipeline_status') == 'INTERMEDIATE_COMPLETE']
+
                 if logs_to_solve:
-                    completed_logs_map = {log['target_query_original_hard_list_idx']: log for log in intermediate_logs if log.get('pipeline_status') != 'INTERMEDIATE_COMPLETE'}
                     if current_config.get("BATCH_PROCESSING_ENABLED", False):
                         final_logs = _run_pipeline_items_in_batches(
                             items=[QuestionWorkItem(index=log['target_query_original_hard_list_idx'], question=log['target_query_text'], existing_log=log) for log in logs_to_solve],
-                            existing_logs=list(completed_logs_map.values()),
+                            existing_logs=list(logs_map.values()),
                             log_file_path=log_file_path,
                             experiment_name=exp_name,
                             phase_name="solve",
@@ -2454,10 +2482,10 @@ def run_experiments(
                                 embedding_model=embedding_model, exemplar_data=exemplar_data, api_managers=api_managers,
                                 run_mode='solve_only', existing_log=log_to_solve, hard_solutions=hard_solutions,
                             )
-                            completed_logs_map[original_idx] = completed_log
-                            save_json(list(completed_logs_map.values()), log_file_path)
+                            logs_map[original_idx] = completed_log
+                            save_json(list(logs_map.values()), log_file_path)
                             periodic_sync_check(loop_idx, current_config)
-                        final_logs = list(completed_logs_map.values())
+                        final_logs = list(logs_map.values())
                 else:
                     logger.info(f"All solve steps for '{exp_name}' are already complete.")
                     final_logs = intermediate_logs
