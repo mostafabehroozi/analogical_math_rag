@@ -36,9 +36,10 @@ class Interrupted(BaseException):
 class FakePipeline:
     """Returns fake logs per run_mode and records every (run_mode, index) call."""
 
-    def __init__(self, fail_solve=(), interrupt_solve=()):
+    def __init__(self, fail_solve=(), interrupt_solve=(), raise_solve=()):
         self.fail_solve = set(fail_solve)
         self.interrupt_solve = set(interrupt_solve)
+        self.raise_solve = set(raise_solve)
         self.calls = []
 
     def __call__(self, hard_list_idx, target_query, run_mode, existing_log=None, **kwargs):
@@ -55,7 +56,12 @@ class FakePipeline:
         assert existing_log["intermediate_result"] == f"retrieved for {target_query}"
         if hard_list_idx in self.interrupt_solve:
             raise Interrupted()
-        status = "FAILURE" if hard_list_idx in self.fail_solve else "SUCCESS"
+        if hard_list_idx in self.raise_solve:
+            # The real solve step updates its log in place before it can raise.
+            existing_log["pipeline_status"] = "PENDING_SOLVE"
+            existing_log["partial_solve"] = "half done"
+            raise RuntimeError(f"solve failed for {target_query}")
+        status ="FAILURE" if hard_list_idx in self.fail_solve else "SUCCESS"
         return {**existing_log, "pipeline_status": status}
 
 
@@ -157,6 +163,37 @@ def test_rerun_after_a_partial_solve_phase_solves_only_pending_logs(
 
     assert rerun.calls == [("solve_only", index) for index in rerun_solves]
     final = [(0, "SUCCESS"), (1, "FAILURE" if stop.get("fail_solve") else "SUCCESS"), (2, "SUCCESS")]
+    assert _statuses(_saved_logs(tmp_path)) == final
+    assert _statuses(results[EXPERIMENT_NAME]) == final
+
+
+def test_raised_batch_solve_keeps_the_pending_log_for_a_retry(tmp_path, branch):
+    # The batch worker catches the exception, and BATCH_FAILURE_POLICY then
+    # stops before question 2.
+    stopped = FakePipeline(raise_solve={1})
+    _run(tmp_path, branch, "batch", stopped)
+
+    assert stopped.calls == (
+        [("intermediate", index) for index in range(3)]
+        + [("solve_only", 0), ("solve_only", 1)]
+    )
+    saved = _saved_logs(tmp_path)
+    assert _statuses(saved) == [(0, "SUCCESS"), (1, PENDING), (2, PENDING)]
+    # Question 1 keeps its intermediate results, not the partial solve, and
+    # records the error.
+    failed = saved[1]
+    assert failed["intermediate_result"] == "retrieved for q1"
+    assert "partial_solve" not in failed
+    assert failed["batch_error"]["type"] == "RuntimeError"
+    assert failed["batch_error"]["message"] == "solve failed for q1"
+    assert failed["batch_metadata"]["phase"] == "solve"
+    assert failed["batch_metadata"]["terminal_status"] == "FAILED"
+
+    rerun = FakePipeline()
+    results = _run(tmp_path, branch, "batch", rerun)
+
+    assert rerun.calls == [("solve_only", 1), ("solve_only", 2)]
+    final = [(0, "SUCCESS"), (1, "SUCCESS"), (2, "SUCCESS")]
     assert _statuses(_saved_logs(tmp_path)) == final
     assert _statuses(results[EXPERIMENT_NAME]) == final
 

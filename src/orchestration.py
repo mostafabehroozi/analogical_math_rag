@@ -43,6 +43,7 @@ ARCHITECTURAL REFACTOR: "Acquire-Optimize-Fork".
   when MIRROR_AS_EVALUATOR is active.
 """
 
+import copy
 import functools
 import logging
 from tqdm import tqdm
@@ -874,6 +875,8 @@ def run_pipeline_for_single_query(
         run_log = existing_log
         # Reset status to ensure we correctly log the outcome of the solve step
         run_log['pipeline_status'] = "PENDING_SOLVE"
+        # The error of an earlier, raised solve attempt no longer applies
+        run_log.pop('batch_error', None)
         # Ensure execution_trace exists if resuming old logs
         if "execution_trace" not in run_log:
             run_log["execution_trace"] = []
@@ -1819,6 +1822,8 @@ def _run_pipeline_items_in_batches(
     unindexed_logs = [log for log in existing_logs if _log_query_index(log) is None]
 
     def worker(item: QuestionWorkItem) -> Dict[str, Any]:
+        # The solve step updates its existing log in place, so it gets a copy:
+        # if it raises, the commit still has the untouched pending log.
         return run_pipeline_for_single_query(
             hard_list_idx=item.index,
             target_query=item.question,
@@ -1827,7 +1832,7 @@ def _run_pipeline_items_in_batches(
             exemplar_data=exemplar_data,
             api_managers=api_managers,
             run_mode=run_mode,
-            existing_log=item.existing_log,
+            existing_log=copy.deepcopy(item.existing_log),
             hard_solutions=hard_solutions,
         )
 
@@ -1864,6 +1869,15 @@ def _run_pipeline_items_in_batches(
         # (The rest of your original commit logic stays exactly the same)
         for result in results:
             run_log = result.value
+            if (
+                run_mode == "solve_only"
+                and run_log.get("pipeline_status") == "FAILED_WORKER_EXCEPTION"
+                and result.item.existing_log is not None
+            ):
+                # A raised solve step has no outcome to save, and the pending log
+                # holds the costly intermediate results. It stays pending with the
+                # error attached, so the next run retries its solve step.
+                run_log = {**result.item.existing_log, "batch_error": run_log["batch_error"]}
             run_log["batch_metadata"] = {
                 "batch_id": batch_id,
                 "phase": phase_name,
