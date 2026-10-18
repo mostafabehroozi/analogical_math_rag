@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import sys
+import threading
 import time
 import traceback
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from tqdm import tqdm  
 from src.api_batching import batch_refusals
 from src.context_logger import pipeline_context as api_call_context
@@ -39,6 +41,16 @@ def _terminal_status(result: Dict[str, Any]) -> str:
     return "FAILED" if "FAIL" in status or "ERROR" in status else "SUCCESS"
 
 
+def thread_stacks(max_frames: int = 12) -> str:
+    """The innermost frames of every thread in this process."""
+    names = {thread.ident: thread.name for thread in threading.enumerate()}
+    blocks = []
+    for ident, frame in sys._current_frames().items():
+        stack = "".join(traceback.format_stack(frame)[-max_frames:])
+        blocks.append(f"--- thread {names.get(ident, ident)} ---\n{stack}")
+    return "\n".join(blocks)
+
+
 class BatchCoordinator:
     """Runs fixed, sequential batches while allowing parallel question execution."""
 
@@ -67,6 +79,33 @@ class BatchCoordinator:
             **extra,
         }
         save_json_atomic(payload, self._journal_path(batch_id))
+
+    def _completed(self, futures: Dict[Future, QuestionWorkItem], batch_id: str) -> Iterator[Future]:
+        """Yield the questions' futures as they finish, watching for a stalled batch.
+
+        If none finishes for BATCH_WATCHDOG_MINUTES, every thread's stack is
+        printed once (later intervals print one line). A thread stuck in
+        native code can be neither stopped nor inspected from outside the
+        process, so this dump is the only way to see where a batch hangs.
+        """
+        minutes = float(self.config.get("BATCH_WATCHDOG_MINUTES", 10.0) or 0.0)
+        pending = set(futures)
+        reported = False
+        while pending:
+            done, pending = wait(pending, timeout=minutes * 60 if minutes > 0 else None,
+                                 return_when=FIRST_COMPLETED)
+            if not done:
+                running = ", ".join(f"Q#{index}" for index in sorted(futures[future].index for future in pending))
+                if reported:
+                    print(f"[WATCHDOG {batch_id}] Still no question finished; running: {running}.", flush=True)
+                else:
+                    reported = True
+                    print(
+                        f"\n[WATCHDOG {batch_id}] No question finished for {minutes:g} min; still running: "
+                        f"{running}. Where every thread is now:\n{thread_stacks()}",
+                        flush=True,
+                    )
+            yield from done
 
     def run(
         self,
@@ -116,7 +155,7 @@ class BatchCoordinator:
                 refusal_mark = batch_refusals.mark()
                 with ThreadPoolExecutor(max_workers=min(self.max_workers, len(batch_items)), thread_name_prefix="question") as executor:
                     futures: Dict[Future[QuestionResult], QuestionWorkItem] = {executor.submit(execute, item): item for item in batch_items}
-                    for completed, future in enumerate(as_completed(futures), start=1):
+                    for completed, future in enumerate(self._completed(futures, batch_id), start=1):
                         result = future.result()
                         results.append(result)
                         print(f"[BATCH {batch_id} {completed}/{len(batch_items)}] Q#{result.item.index} {result.terminal_status} ({result.elapsed_seconds:.1f}s)")

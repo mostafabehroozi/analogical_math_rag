@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from src.api_batching import BatchRefusedError, batch_refusals
@@ -81,6 +83,42 @@ def test_refusal_recorded_before_the_batch_does_not_stop_it():
         lambda results, batch_id, batch_number: committed.extend(results),
     )
     assert [result.item.index for result in committed] == [0]
+
+
+def test_watchdog_prints_where_a_stalled_question_is(capsys):
+    release = threading.Event()
+
+    def stalled_step():
+        release.wait(10)  # Stands in for a call that never returns.
+
+    def worker(item):
+        if item.index == 1:
+            stalled_step()
+        return {"pipeline_status": "SUCCESS"}
+
+    coordinator = BatchCoordinator(
+        {"BATCH_SIZE": 2, "BATCH_MAX_WORKERS": 2, "BATCH_WRITE_JOURNALS": False,
+         "BATCH_WATCHDOG_MINUTES": 0.002},  # 0.12 s
+        "grouping",
+        "full",
+    )
+    timer = threading.Timer(0.5, release.set)
+    timer.start()
+    try:
+        results = coordinator.run(
+            [QuestionWorkItem(0, "q0"), QuestionWorkItem(1, "q1")],
+            worker,
+            lambda results, batch_id, batch_number: None,
+        )
+    finally:
+        release.set()
+        timer.cancel()
+    output = capsys.readouterr().out
+    assert [result.item.index for result in results] == [0, 1]
+    # One full report naming the stalled question and its frame, then one-line reminders.
+    assert output.count("No question finished for 0.002 min; still running: Q#1.") == 1
+    assert "--- thread question" in output and "in stalled_step" in output
+    assert "Still no question finished; running: Q#1." in output
 
 
 def test_pipeline_failure_takes_precedence_over_skip():

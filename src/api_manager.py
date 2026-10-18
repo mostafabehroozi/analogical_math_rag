@@ -1131,6 +1131,10 @@ def _kaggle_error_type(message: str) -> str:
         ("NotFoundError", "InvalidModel"),
         ("BadRequestError", "InvalidArgument"),
         ("UnprocessableEntityError", "InvalidArgument"),
+        # openai.APITimeoutError, or joblib's TimeoutError for a whole batch:
+        # retried, without cooling down the one shared proxy key.
+        ("TimeoutError", "APITimeoutError"),
+        ("APIConnectionError", "APIConnectionError"),
     ):
         if marker in message:
             return error_type
@@ -1172,6 +1176,7 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             )
         super().__init__([self._PROXY_KEY], model_quotas, config)
         self.kbench = kbench
+        self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0))
         self._llms: Dict[str, Any] = {}
         self._llm_lock = threading.Lock()
         self._row_task = None
@@ -1183,8 +1188,26 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
         with self._llm_lock:
             if model_name not in self._llms:
                 llm = self.kbench.llms.get(model_name)
-                self._llms[model_name] = llm if llm is not None else self.kbench.kaggle.load_model(model_name)
+                if llm is None:
+                    llm = self.kbench.kaggle.load_model(model_name)
+                self._llms[model_name] = self._bound_requests(llm)
             return self._llms[model_name]
+
+    def _bound_requests(self, llm: Any) -> Any:
+        """Give the SDK's OpenAI client API_REQUEST_TIMEOUT_SECONDS and no retries of its own.
+
+        kaggle_benchmarks builds its proxy client with the OpenAI defaults:
+        600 s per request and two silent retries. One stuck request then held
+        its question, and in a batch every question waiting on that batch, for
+        up to half an hour without a log line. Bounded, it fails like any other
+        call, is logged, and execute_with_retry retries it. Only OpenAI-API
+        actors have such a client; others keep the SDK's own settings.
+        """
+        client = getattr(llm, "client", None)
+        with_options = getattr(client, "with_options", None)
+        if callable(with_options):
+            llm.client = with_options(timeout=self.timeout_seconds, max_retries=0)
+        return llm
 
     def _prompt_options(self, temperature: Optional[float], role: Optional[str]) -> Dict[str, Any]:
         # The library currently drops temperature for proxy models; it is sent
@@ -1322,12 +1345,16 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             except Exception as error:  # An unknown model fails direct calls too.
                 return fail_runnable(error)
             _pace_provider_call(self.config, self.provider_name)
+            # A row is one request, which the client timeout normally ends. This
+            # also stops a reply that keeps trickling in, which that timeout
+            # cannot; joblib applies it only when more than one job runs.
+            row_timeout = min(settings.timeout_seconds, 2 * self.timeout_seconds)
             try:
                 runs = self._get_row_task().evaluate(
                     llm=[llm],
                     evaluation_data=frame,
                     n_jobs=min(items[0].payload["n_jobs"], len(runnable)),
-                    timeout=settings.timeout_seconds,
+                    timeout=row_timeout,
                     on_failure="continue",
                     remove_run_files=True,
                 )

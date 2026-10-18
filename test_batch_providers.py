@@ -123,7 +123,7 @@ class OpenRouterBatchTests(_Quiet):
 
 def fake_kbench():
     """A minimal stand-in for the kaggle_benchmarks API surface the manager uses."""
-    state = {"prompts": [], "chats": 0, "evaluate": [], "annotation": None}
+    state = {"prompts": [], "chats": 0, "evaluate": [], "annotation": None, "timeouts": []}
 
     class FakeLLM:
         def prompt(self, message, **options):
@@ -146,6 +146,7 @@ def fake_kbench():
 
             def evaluate(llm, evaluation_data, n_jobs, timeout, on_failure, remove_run_files):
                 state["evaluate"].append({"n_jobs": n_jobs, "rows": len(evaluation_data)})
+                state["timeouts"].append(timeout)
                 runs = []
                 rows = evaluation_data.reset_index().rename(columns={"index": "_id"})
                 for _, row in rows.iterrows():
@@ -257,6 +258,65 @@ class KaggleBenchmarksTests(_Quiet):
         result = bound.generate_content("a", "google/gemini-2.5-flash")
         self.assertEqual(result["error_type"], "RateLimitError")
         api_batching.batch_refusals.raise_if_refused(since=mark)  # Transient: not a refusal.
+
+    def kaggle_manager(self, **overrides):
+        return api_manager.KaggleBenchmarksAPIManager({"default": {"rpm": 1000}}, {**self.config, **overrides})
+
+    def test_the_proxy_client_gets_the_request_timeout_and_no_retries_of_its_own(self):
+        # kaggle_benchmarks builds it with the OpenAI defaults: 600 s and two retries.
+        options = []
+
+        class FakeClient:
+            def with_options(self, **kwargs):
+                options.append(kwargs)
+                return "bounded client"
+
+        llm = self.kbench.llms["google/gemini-2.5-flash"]
+        llm.client = FakeClient()
+        manager = self.kaggle_manager(API_REQUEST_TIMEOUT_SECONDS=42)
+        for prompt in ("a", "b"):
+            self.assertEqual(manager.generate_content(prompt, "google/gemini-2.5-flash")["text"], f"answer:{prompt}")
+        self.assertEqual(options, [{"timeout": 42.0, "max_retries": 0}])  # Once per model.
+        self.assertEqual(llm.client, "bounded client")
+
+    def test_a_timed_out_proxy_call_is_retried(self):
+        class APITimeoutError(Exception):
+            pass
+
+        calls = []
+
+        def prompt(message, **options):
+            calls.append(message)
+            if len(calls) == 1:
+                raise APITimeoutError("Request timed out.")
+            return f"answer:{message}"
+
+        self.kbench.llms["google/gemini-2.5-flash"].prompt = prompt
+        manager = self.kaggle_manager(ENABLE_API_RETRY=True, MAX_API_RETRIES=2, API_RETRY_DELAY_SECONDS=0,
+                                      API_KEY_ERROR_COOLDOWN_SECONDS=0)
+        result = manager.generate_content("a", "google/gemini-2.5-flash")
+        self.assertEqual((result["text"], calls), ("answer:a", ["a", "a"]))
+
+    def test_a_timeout_does_not_cool_down_the_shared_proxy_key(self):
+        manager = self.kaggle_manager(API_KEY_ERROR_COOLDOWN_SECONDS=600)
+        failure = manager._failure("Traceback ...\nopenai.APITimeoutError: Request timed out.", {}, "m")
+        self.assertEqual(failure["error_type"], "APITimeoutError")
+        self.assertIn("APITimeoutError", api_manager.RETRYABLE_ERROR_TYPES)
+        self.assertEqual(manager.scheduler.snapshot()["cooldowns"], {})
+        for message, expected in (
+            ("TimeoutError: ", "APITimeoutError"),  # joblib timing out a whole batch
+            ("APIConnectionError: Connection error.", "APIConnectionError"),
+            ("RateLimitError: 429, then TimeoutError", "RateLimitError"),
+        ):
+            self.assertEqual(api_manager._kaggle_error_type(message), expected)
+
+    def test_a_batch_row_may_take_twice_the_request_timeout(self):
+        for request_timeout, expected in ((2, 4), (60, 5)):  # API_BATCH_TIMEOUT_SECONDS is 5 here.
+            with self.subTest(request_timeout=request_timeout):
+                self.state["timeouts"].clear()
+                manager = self.kaggle_manager(API_BATCHING_ENABLED=True, API_REQUEST_TIMEOUT_SECONDS=request_timeout)
+                self.assertEqual(manager.generate_content("a", "google/gemini-2.5-flash")["text"], "answer:a")
+                self.assertEqual(self.state["timeouts"], [expected])
 
 
 class SwitchTests(unittest.TestCase):

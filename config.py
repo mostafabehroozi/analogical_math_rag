@@ -40,6 +40,7 @@ CONFIG = {
     "BATCH_MAX_WORKERS": 5,
     "BATCH_FAILURE_POLICY": "halt_after_failed_batch",
     "BATCH_WRITE_JOURNALS": True,
+    "BATCH_WATCHDOG_MINUTES": 10.0,  # No question of a batch finished this long: print every thread's stack (0 = off)
     "HF_SYNC_INTERVAL_BATCHES": 1,
     # Independent Kaggle workers.  Disabled keeps the original single-process
     # paths, resume rules, Layer 2 behavior, and Hugging Face sync unchanged.
@@ -103,7 +104,7 @@ CONFIG = {
     "API_BATCH_TIMEOUT_SECONDS": 1800.0,    # A batch still unfinished after this fails its requests (they retry)
     "API_BATCH_KAGGLE_N_JOBS": 5,           # Concurrent workers inside one Kaggle Benchmarks batch
     "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
-    "API_REQUEST_TIMEOUT_SECONDS": 60.0,
+    "API_REQUEST_TIMEOUT_SECONDS": 60.0,    # Per request, every provider (Kaggle proxy too); a Kaggle batch row gets at most twice this
     "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 1,            # N: Number of consecutive errors to trigger a pause (0 to disable)
     "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 10.0,  # M: Seconds to sleep when the error limit is reached
     "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES": 30.0,  # X: Pause every X minutes (0 to disable)

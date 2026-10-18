@@ -127,6 +127,11 @@ question runs.
 It is a transport switch and works alongside the two existing parallel levels:
 
 - `BATCH_PROCESSING_ENABLED` / `BATCH_MAX_WORKERS`: questions run in parallel.
+  If no question of a batch finishes for `BATCH_WATCHDOG_MINUTES` (default 10,
+  0 turns it off), the run prints the stack of every thread once, then a
+  one-line reminder per interval. A thread stuck in native code can be neither
+  stopped nor inspected from outside the process, so this dump shows where a
+  stalled batch hangs.
 - `QUESTION_PARALLEL_API_ENABLED` / `QUESTION_PARALLEL_MAX_WORKERS`: calls run
   in parallel inside a question.
 
@@ -140,7 +145,12 @@ that arrive meanwhile form the next, larger batch. Because at most
 those settings bound the batch size.
 
 - **Kaggle**: a batch is one `task.evaluate` over the prompts with
-  `API_BATCH_KAGGLE_N_JOBS` concurrent workers. A batch that fails as a whole,
+  `API_BATCH_KAGGLE_N_JOBS` concurrent workers. Every proxy request, batched or
+  direct, times out after `API_REQUEST_TIMEOUT_SECONDS` without the SDK's own
+  retries (its OpenAI defaults are 600 s and two silent retries), and a batch
+  row may take at most twice that. A stuck request therefore fails within a few
+  minutes, is logged and retried, instead of holding its whole batch for up to
+  half an hour without a log line. A batch that fails as a whole,
   for example during a proxy outage, fails each call the way a direct call
   would fail, and the calls are retried. If the SDK rejects the call itself
   (`TypeError`, `AttributeError`, `ValueError`, and similar, as an SDK version
