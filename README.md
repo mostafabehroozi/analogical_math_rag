@@ -115,6 +115,15 @@ CONFIG["API_BATCHING_ENABLED"] = {
 ```
 
 Anything not selected is sent directly with the usual retries and parallelism.
+An experiment's own `API_BATCHING_ENABLED` replaces CONFIG's for that
+experiment. If CONFIG has `{"kaggle": True, "openrouter": False}` but the
+experiment dict still says `True`, OpenRouter is batched. When the switch is
+set, `run_experiments` therefore first prints one line per experiment: the
+value it uses, which experiment set it if it overrides CONFIG, and whether each
+OpenRouter or Kaggle role is batched or sent directly. A malformed value or an
+unknown provider name, such as `"open_router"`, raises `ValueError` before any
+question runs.
+
 It is a transport switch and works alongside the two existing parallel levels:
 
 - `BATCH_PROCESSING_ENABLED` / `BATCH_MAX_WORKERS`: questions run in parallel.
@@ -131,7 +140,12 @@ that arrive meanwhile form the next, larger batch. Because at most
 those settings bound the batch size.
 
 - **Kaggle**: a batch is one `task.evaluate` over the prompts with
-  `API_BATCH_KAGGLE_N_JOBS` concurrent workers.
+  `API_BATCH_KAGGLE_N_JOBS` concurrent workers. A batch that fails as a whole,
+  for example during a proxy outage, fails each call the way a direct call
+  would fail, and the calls are retried. If the SDK rejects the call itself
+  (`TypeError`, `AttributeError`, `ValueError`, and similar, as an SDK version
+  with another signature would), every batch would fail the same way. Kaggle
+  then counts as refusing to batch that model (see below).
 - **OpenRouter**: a batch is one
   [Batch API](https://openrouter.ai/docs/batch-quickstart) job, billed at a
   discount. The job is polled every `API_BATCH_POLL_SECONDS`. OpenRouter allows
@@ -146,36 +160,41 @@ those settings bound the batch size.
     # ...
     "BATCH_PROCESSING_ENABLED": True, "BATCH_SIZE": 5, "BATCH_MAX_WORKERS": 5,
     "QUESTION_PARALLEL_API_ENABLED": True, "QUESTION_PARALLEL_MAX_WORKERS": 2,
-    "API_BATCHING_ENABLED": True, "API_BATCH_MAX_SIZE": 10,
+    "API_BATCHING_ENABLED": {"kaggle": True, "openrouter": False}, "API_BATCH_MAX_SIZE": 10,
 }
 ```
 
-### Models OpenRouter will not batch
+### Models a provider will not batch
 
 Only OpenRouter models with a batch endpoint can be batched; they are listed at
 [openrouter.ai/models?variant=batch](https://openrouter.ai/models?variant=batch).
 For any other model, creating the batch fails with HTTP 400, and pinning a
 provider cannot help. HTTP 404 means the model has batch endpoints, but none of
 them matches the `only` provider pin. When OpenRouter refuses a model in either
-way, or the model's routing uses settings the Batch API does not accept, the
-run stops with `BatchRefusedError` before the current question's log is saved.
+way, the model's routing uses settings the Batch API does not accept, or the
+Kaggle SDK rejects `task.evaluate`, the run stops with `BatchRefusedError`
+before the current question's log is saved.
 With `BATCH_PROCESSING_ENABLED`, it stops before the current question batch is
 committed, which in distributed mode is also its checkpoint. Otherwise each
 failed question would be saved as a FAILURE log, and a resumed run counts saved
 logs as done. A rerun with a fixed configuration therefore redoes those
 questions. Until the kernel restarts, later calls for the refused model and
-routing fail at once, without another batch request.
+routing fail at once, without another batch request. This also holds when an
+earlier run in the same kernel had the fallback on.
 
 The error names the model, its provider routing and the effective
-`API_BATCHING_ENABLED` value, and lists the fixes:
+`API_BATCHING_ENABLED` value. When an experiment's own value overrides CONFIG,
+it also names that experiment and CONFIG's value. It then lists the fixes:
 
-- leave the model out, e.g. `{"kaggle": True, "openrouter": False}`;
+- leave the model out, e.g. `{"kaggle": True, "openrouter": False}`, in the
+  experiment dict too if it sets the switch;
 - choose a model from the batch list;
 - after a 404, pin a provider that serves the model's batch endpoint, or remove
   the pin;
+- for Kaggle, upgrade the SDK (`pip install -U kaggle-benchmarks`);
 - or set `API_BATCH_FALLBACK_TO_DIRECT = True`. The run then does not stop:
-  that model is sent directly for the rest of the session, with one warning, at
-  the standard price.
+  that model is sent directly for the rest of the session, with one warning (at
+  the standard price on OpenRouter).
 
 ## Layer-1 grouping companion run
 

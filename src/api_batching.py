@@ -22,7 +22,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Hashable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Hashable, Iterable, List, Mapping, Optional
 
 from src.context_logger import tprint
 
@@ -58,8 +58,59 @@ _COLLECTIONS = (list, tuple, set, frozenset)
 _announced_routes: set = set()
 _announced_lock = threading.Lock()
 
+# Set by the orchestrator in an experiment's merged config when the experiment's
+# own API_BATCHING_ENABLED replaces CONFIG's, so logs and errors can say so.
+BATCHING_SOURCE_KEY = "_API_BATCHING_ENABLED_SOURCE"
 
-def batching_enabled(config: Dict[str, Any], provider_name: str, model_name: Optional[str] = None) -> bool:
+
+def batching_setting(config: Mapping[str, Any]) -> str:
+    """``API_BATCHING_ENABLED=<value>``, naming the experiment that set it, if any."""
+    text = f"API_BATCHING_ENABLED={config.get('API_BATCHING_ENABLED', False)!r}"
+    source = config.get(BATCHING_SOURCE_KEY)
+    return f"{text} ({source})" if source else text
+
+
+def validate_batching_setting(value: Any, providers: Iterable[str]) -> None:
+    """Raise ValueError for a switch value ``batching_enabled`` would misread.
+
+    A misspelled provider name would otherwise turn batching off (or leave it
+    on) without a word, and a malformed rule would fail every call.
+    """
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, Mapping):
+        names = list(value)
+        for name, rule in value.items():
+            if not (
+                rule is None or isinstance(rule, (bool, str))
+                or (isinstance(rule, _COLLECTIONS) and all(isinstance(item, str) for item in rule))
+            ):
+                raise ValueError(
+                    f"API_BATCHING_ENABLED[{name!r}] must be True/False, a model ID or a list "
+                    f"of model IDs, not {rule!r}."
+                )
+    elif isinstance(value, str):
+        names = [value]
+    elif isinstance(value, _COLLECTIONS):
+        names = list(value)
+    else:
+        raise ValueError(
+            "API_BATCHING_ENABLED must be True/False, a provider name, a list of provider "
+            f"names or a dict such as {{'kaggle': True, 'openrouter': False}}, not {value!r}."
+        )
+    known = {str(provider).lower() for provider in providers}
+    unknown = sorted(str(name) for name in names if str(name).strip().lower() not in known)
+    if unknown:
+        raise ValueError(
+            f"API_BATCHING_ENABLED names unknown provider(s) {unknown}; "
+            f"the providers are {sorted(known)}."
+        )
+
+
+def batching_enabled(
+    config: Dict[str, Any], provider_name: str, model_name: Optional[str] = None,
+    *, announce: bool = True,
+) -> bool:
     """Whether this provider batches calls for this model.
 
     ``API_BATCHING_ENABLED`` may be:
@@ -69,19 +120,21 @@ def batching_enabled(config: Dict[str, Any], provider_name: str, model_name: Opt
         list of model IDs (only those), e.g.
         ``{"kaggle": True, "openrouter": ["openai/gpt-4o-mini"]}``.
     Anything not selected is sent directly.  While the switch is set, each
-    (provider, model) route is logged once, so a run shows what it batches.
+    (provider, model) route is logged once per setting, so a run shows what it
+    batches and which setting decided it.
     """
     value = config.get("API_BATCHING_ENABLED", False)
     enabled = _batching_rule(value, provider_name, model_name)
-    if value is not False and value is not None:
-        route = (provider_name, model_name, enabled)
+    if announce and value is not False and value is not None:
+        setting = batching_setting(config)
+        route = (provider_name, model_name, enabled, setting)
         with _announced_lock:
             first_time = route not in _announced_routes
             _announced_routes.add(route)
         if first_time:
             tprint(
                 f"[API BATCH {provider_name}] {model_name}: "
-                f"{'batched' if enabled else 'sent directly'} (API_BATCHING_ENABLED={value!r}).",
+                f"{'batched' if enabled else 'sent directly'} ({setting}).",
                 level="INFO",
             )
     return enabled
@@ -236,7 +289,18 @@ class APIBatchDispatcher:
                 batch = self._take_batch()
                 self._batch_counter += 1
                 batch_number = self._batch_counter
-            self._executor.submit(self._run_batch, batch, batch_number)
+            try:
+                self._executor.submit(self._run_batch, batch, batch_number)
+            except Exception as error:  # e.g. the interpreter is shutting down
+                self._slots.release()
+                self._deliver(batch, batch_number, self._batch_error(batch, error))
+
+    @staticmethod
+    def _batch_error(batch: List[BatchItem], error: Exception) -> List[Dict[str, Any]]:
+        return [{
+            "status": "ERROR", "text": None, "error_type": "BatchError",
+            "error_message": f"{type(error).__name__}: {error}", "error_details": repr(error),
+        } for _ in batch]
 
     def _run_batch(self, batch: List[BatchItem], batch_number: int) -> None:
         settings = batch[0].settings
@@ -245,13 +309,15 @@ class APIBatchDispatcher:
         tprint(f"{label} submitting {len(batch)} request(s).", level="INFO")
         try:
             responses = self._submit_batch(batch, settings)
-            if len(responses) != len(batch):
-                raise RuntimeError(f"provider returned {len(responses)} responses for {len(batch)} requests")
+            # A caller only wakes up with its own response dict, so anything
+            # else would leave it waiting forever.
+            if len(responses) != len(batch) or not all(isinstance(response, dict) for response in responses):
+                raise RuntimeError(
+                    f"provider returned {len(responses)} responses for {len(batch)} requests, "
+                    "or a response that is not a dict"
+                )
         except Exception as error:  # A batch-level failure fails each item; callers retry.
-            responses = [{
-                "status": "ERROR", "text": None, "error_type": "BatchError",
-                "error_message": f"{type(error).__name__}: {error}", "error_details": repr(error),
-            } for _ in batch]
+            responses = self._batch_error(batch, error)
         finally:
             self._slots.release()
         succeeded = sum(1 for response in responses if response.get("status") == "SUCCESS")
@@ -260,15 +326,22 @@ class APIBatchDispatcher:
             f"{succeeded}/{len(batch)} succeeded.",
             level="INFO" if succeeded == len(batch) else "WARNING",
         )
+        self._deliver(batch, batch_number, responses)
+
+    @staticmethod
+    def _deliver(batch: List[BatchItem], batch_number: int, responses: List[Dict[str, Any]]) -> None:
         for item, response in zip(batch, responses):
-            response.setdefault("request_meta", {})
-            response["request_meta"]["api_batch"] = batch_number
-            response["request_meta"]["api_batch_size"] = len(batch)
+            meta = response.get("request_meta")
+            if not isinstance(meta, dict):
+                meta = response["request_meta"] = {}
+            meta["api_batch"] = batch_number
+            meta["api_batch_size"] = len(batch)
             item.response = response
             item.done.set()
 
 
 __all__ = [
-    "APIBatchDispatcher", "BatchItem", "BatchRefusedError", "BatchSettings",
-    "batch_refusals", "batching_enabled", "fallback_to_direct",
+    "BATCHING_SOURCE_KEY", "APIBatchDispatcher", "BatchItem", "BatchRefusedError", "BatchSettings",
+    "batch_refusals", "batching_enabled", "batching_setting", "fallback_to_direct",
+    "validate_batching_setting",
 ]

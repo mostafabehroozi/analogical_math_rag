@@ -51,8 +51,11 @@ from typing import List, Dict, Any, Optional, Tuple
 from sentence_transformers import SentenceTransformer
 from src.context_logger import tprint
 from src.benchmark_data import benchmark_name_for_target_index
-from src.api_batching import batch_refusals
-from src.api_manager import bind_api_managers
+from src.api_batching import (
+    BATCHING_SOURCE_KEY, BatchSettings, batch_refusals, batching_enabled, batching_setting,
+    validate_batching_setting,
+)
+from src.api_manager import SUPPORTED_API_PROVIDERS, bind_api_managers, model_name_for
 from src.distributed_code_compatibility import (
     WORKER_CODE_CHANGE_STATE_KEY,
     accept_worker_code_change,
@@ -330,6 +333,69 @@ def _require_standard_pipeline_managers(
         )
 
 
+_BATCHABLE_ROLES = (
+    ("adaptation", "API_PROVIDER_ADAPTATION"),
+    ("final_solver", "API_PROVIDER_SOLVER"),
+    ("evaluator", "API_PROVIDER_EVALUATOR"),
+    ("simplification", "API_PROVIDER_SIMPLIFICATION"),
+)
+
+
+def _check_api_batching(
+    experiment_configs: List[Dict[str, Any]],
+    global_config: Dict[str, Any],
+    api_managers: Dict[str, Any],
+) -> None:
+    """Fail fast on a malformed batching setup and print what each experiment batches.
+
+    API_BATCHING_ENABLED is read on every call, so a malformed value would fail
+    every call, and a misspelled provider name would batch the wrong calls
+    without a word. An experiment's own value also replaces CONFIG's, which
+    the printed line then names.
+    """
+    for exp_overrides in experiment_configs:
+        config = _merge_experiment_config(global_config, exp_overrides)
+        name = config.get("experiment_name", "unnamed_experiment")
+        value = config.get("API_BATCHING_ENABLED", False)
+        overridden = BATCHING_SOURCE_KEY in config
+        try:
+            validate_batching_setting(value, SUPPORTED_API_PROVIDERS)
+        except ValueError as error:
+            raise ValueError(f"Experiment {name!r}: {error}") from None
+        if (value is False or value is None) and not overridden:
+            continue
+        routes, batched = [], False
+        for role, provider_key in _BATCHABLE_ROLES:
+            provider = config.get(provider_key) or (
+                config.get("API_PROVIDER_ADAPTATION", "gemini")
+                if role == "simplification" else "gemini"
+            )
+            manager = api_managers.get(provider)
+            if provider not in ("openrouter", "kaggle") or manager is None:
+                continue
+            try:
+                model = model_name_for(manager, config, role)
+            except (TypeError, ValueError):
+                continue  # A role this experiment does not configure.
+            enabled = batching_enabled(config, provider, model, announce=False)
+            batched = batched or enabled
+            routes.append(f"{role} {provider}/{model} {'batched' if enabled else 'direct'}")
+        if batched:
+            try:
+                BatchSettings.from_config(config)
+            except ValueError as error:
+                raise ValueError(f"Experiment {name!r}: {error}") from None
+        message = (
+            f"API batching for experiment {name!r}: {batching_setting(config)}. "
+            + ("; ".join(routes) if routes else "No OpenRouter or Kaggle role.")
+        )
+        if overridden:
+            logging.getLogger(__name__).warning(message)
+            builtins.print(f"\n[WARNING] {message}\n", flush=True)
+        else:
+            print(message)
+
+
 _DISTRIBUTED_UNSUPPORTED_FLAGS = {
     "DEFER_SOLVE_STEP": "deferred solve mode",
 }
@@ -345,6 +411,14 @@ def _merge_experiment_config(
     """Merge one experiment while retaining coordinator-owned worker paths."""
     merged = global_config.copy()
     merged.update(overrides)
+    global_batching = global_config.get("API_BATCHING_ENABLED", False)
+    if overrides.get("API_BATCHING_ENABLED", global_batching) != global_batching:
+        # The experiment's switch replaces CONFIG's without a word, so the
+        # batching log and errors name where the value came from.
+        merged[BATCHING_SOURCE_KEY] = (
+            f"set by experiment {merged.get('experiment_name', 'unnamed_experiment')!r}; "
+            f"CONFIG has {global_batching!r}"
+        )
     if distributed_enabled(global_config):
         for key, value in global_config.items():
             if (
@@ -1855,6 +1929,7 @@ def run_experiments(
         _reject_removed_feature_flags(effective_config)
     _require_target_questions(hard_questions)
     _require_standard_pipeline_managers(experiment_configs, global_config, api_managers)
+    _check_api_batching(experiment_configs, global_config, api_managers)
 
     if distributed_enabled(global_config):
         if global_config.get("DISTRIBUTED_FINALIZER_MODE", False):

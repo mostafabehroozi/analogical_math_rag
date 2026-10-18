@@ -209,6 +209,55 @@ class KaggleBenchmarksTests(_Quiet):
         with self.assertRaisesRegex(RuntimeError, "MODEL_PROXY_URL"):
             api_manager.KaggleBenchmarksAPIManager({}, {})
 
+    def evaluate_raises(self, error):
+        """Make the SDK's task.evaluate raise ``error``; returns the list of its calls."""
+        calls = []
+
+        def task(**kwargs):
+            def decorate(func):
+                def evaluate(**kwargs):
+                    calls.append(kwargs)
+                    raise error
+                return types.SimpleNamespace(evaluate=evaluate)
+            return decorate
+
+        self.kbench.task = task
+        return calls
+
+    def test_an_sdk_that_rejects_the_batch_call_stops_the_run(self):
+        calls = self.evaluate_raises(TypeError("evaluate() got an unexpected keyword argument 'remove_run_files'"))
+        bound = self.manager.for_config({**self.config, "API_BATCHING_ENABLED": {"kaggle": True}})
+        mark = api_batching.batch_refusals.mark()
+        results = [bound.generate_content(prompt, "google/gemini-2.5-flash") for prompt in ("a", "b")]
+        self.assertEqual([result["error_type"] for result in results], ["BatchRefused", "BatchRefused"])
+        self.assertEqual(len(calls), 1)  # The second call ran no batch.
+        self.assertEqual(self.state["prompts"], [])
+        with self.assertRaises(api_batching.BatchRefusedError) as raised:
+            api_batching.batch_refusals.raise_if_refused(since=mark)
+        message = str(raised.exception)
+        for expected in ("Kaggle cannot batch google/gemini-2.5-flash", "TypeError", "remove_run_files",
+                         "API_BATCHING_ENABLED={'kaggle': True}", "API_BATCH_FALLBACK_TO_DIRECT=True",
+                         "pip install -U kaggle-benchmarks"):
+            self.assertIn(expected, message)
+
+    def test_fallback_sends_kaggle_calls_directly_after_the_sdk_rejects_batching(self):
+        self.evaluate_raises(AttributeError("'Runs' object has no attribute 'param_id'"))
+        bound = self.manager.for_config({**self.config, "API_BATCHING_ENABLED": True,
+                                         "API_BATCH_FALLBACK_TO_DIRECT": True})
+        mark = api_batching.batch_refusals.mark()
+        self.assertEqual(bound.generate_content("a", "google/gemini-2.5-flash")["text"], "answer:a")
+        self.assertEqual(bound.generate_content("b", "google/gemini-2.5-flash")["text"], "answer:b")
+        self.assertEqual(self.state["chats"], 2)
+        api_batching.batch_refusals.raise_if_refused(since=mark)  # The run goes on.
+
+    def test_a_failed_batch_is_classified_like_a_direct_call(self):
+        self.evaluate_raises(RuntimeError("RateLimitError: 429 quota"))
+        bound = self.manager.for_config({**self.config, "API_BATCHING_ENABLED": True})
+        mark = api_batching.batch_refusals.mark()
+        result = bound.generate_content("a", "google/gemini-2.5-flash")
+        self.assertEqual(result["error_type"], "RateLimitError")
+        api_batching.batch_refusals.raise_if_refused(since=mark)  # Transient: not a refusal.
+
 
 class SwitchTests(unittest.TestCase):
     def test_switch_accepts_bool_or_provider_names(self):
@@ -242,6 +291,48 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertIn("meta-llama/llama-3.1-8b-instruct: sent directly", messages[0])
         self.assertIn("google/x: batched", messages[1])
+
+    def test_the_route_log_names_an_experiment_that_overrides_config(self):
+        source = "set by experiment 'grouping'; CONFIG has {'kaggle': True, 'openrouter': False}"
+        overridden = {"API_BATCHING_ENABLED": True, api_batching.BATCHING_SOURCE_KEY: source}
+        with patch.object(api_batching, "_announced_routes", set()), \
+                patch.object(api_batching, "tprint") as log:
+            api_batching.batching_enabled(overridden, "openrouter", UNBATCHABLE)
+            api_batching.batching_enabled({"API_BATCHING_ENABLED": {"openrouter": False}}, "openrouter", UNBATCHABLE)
+        messages = [call.args[0] for call in log.call_args_list]
+        self.assertEqual(len(messages), 2)  # A different setting is announced again.
+        self.assertIn(f"batched (API_BATCHING_ENABLED=True ({source}))", messages[0])
+        self.assertIn("sent directly", messages[1])
+
+    def test_validation_rejects_misspelled_providers_and_malformed_rules(self):
+        validate = api_batching.validate_batching_setting
+        providers = api_manager.SUPPORTED_API_PROVIDERS
+        for value in (True, False, None, "kaggle", ["Kaggle", "openrouter"],
+                      {"kaggle": True, "openrouter": False}, {"openrouter": ["a/b"], "kaggle": "c/d"}):
+            validate(value, providers)
+        for value, expected in (
+            ({"kaggle": True, "open_router": False}, "open_router"),
+            (["openrouter", "kaggel"], "kaggel"),
+            ("True", "unknown provider"),
+            ({"openrouter": 3}, r"\['openrouter'\] must be"),
+            (1, "must be True/False"),
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, expected):
+                validate(value, providers)
+
+
+class DispatcherDeliveryTests(_Quiet):
+    def test_a_malformed_provider_reply_fails_the_callers_instead_of_hanging(self):
+        dispatcher = api_batching.APIBatchDispatcher("test", lambda items, settings: [None for _ in items])
+        settings = api_batching.BatchSettings(max_size=4, collect_seconds=0.0, max_concurrent_batches=1,
+                                              poll_seconds=0.01, timeout_seconds=5.0)
+        result = {}
+        caller = threading.Thread(target=lambda: result.update(dispatcher.call({}, "group", settings)))
+        caller.start()
+        caller.join(timeout=5)
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(result["error_type"], "BatchError")
+        self.assertIn("not a dict", result["error_message"])
 
 
 class OpenRouterRefusalTests(_Quiet):
@@ -315,6 +406,24 @@ class OpenRouterRefusalTests(_Quiet):
         mark = api_batching.batch_refusals.mark()
         self.manager.for_config({**self.config, "API_BATCHING_ENABLED": batching}).generate_content("p", UNBATCHABLE)
         self.assertIn(f"API_BATCHING_ENABLED={batching!r}", self.assert_run_stopped(mark))
+
+    def test_the_error_names_an_experiment_that_overrides_config(self):
+        source = "set by experiment 'grouping'; CONFIG has {'kaggle': True, 'openrouter': False}"
+        mark = api_batching.batch_refusals.mark()
+        self.manager.for_config({**self.config, api_batching.BATCHING_SOURCE_KEY: source}).generate_content(
+            "p", UNBATCHABLE)
+        message = self.assert_run_stopped(mark)
+        self.assertIn(f"API_BATCHING_ENABLED=True ({source}) batches this model", message)
+        self.assertIn("an experiment's own API_BATCHING_ENABLED replaces CONFIG's", message)
+
+    def test_turning_the_fallback_off_after_a_refusal_stops_the_run(self):
+        fallback = self.manager.for_config({**self.config, "API_BATCH_FALLBACK_TO_DIRECT": True})
+        self.assertEqual(fallback.generate_content("p", UNBATCHABLE)["text"], "direct answer")
+        mark = api_batching.batch_refusals.mark()
+        result = self.manager.generate_content("q", UNBATCHABLE)  # The fallback is off here.
+        self.assertEqual(result["error_type"], "BatchRefused")
+        self.assertEqual((self.creates, len(self.direct_calls)), (1, 1))
+        self.assert_run_stopped(mark)
 
     def test_404_points_at_the_provider_pin(self):
         self.refusal = (404, "No batch endpoint matches the requested providers")

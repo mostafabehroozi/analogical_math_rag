@@ -85,12 +85,15 @@ CONFIG = {
     # True/False for every model of both providers; a list such as ["kaggle"]
     # for those providers only; or per provider and model, e.g.
     # {"kaggle": True, "openrouter": ["openai/gpt-4o-mini"]}. Anything not
-    # selected is sent directly.
+    # selected is sent directly. An experiment's own API_BATCHING_ENABLED
+    # replaces this value for that experiment; run_experiments prints the
+    # setting each experiment uses and rejects unknown provider names.
     "API_BATCHING_ENABLED": False,
-    # When OpenRouter refuses to batch a model (HTTP 400/404 on batch create,
-    # or routing the Batch API rejects), send that model's calls directly for
-    # the rest of the session. Off, the run stops with BatchRefusedError before
-    # saving the question. Direct calls are billed at the standard price, not
+    # When a provider refuses to batch a model (OpenRouter: HTTP 400/404 on
+    # batch create, or routing the Batch API rejects; Kaggle: the SDK rejects
+    # task.evaluate), send that model's calls directly for the rest of the
+    # session. Off, the run stops with BatchRefusedError before saving the
+    # question. Direct OpenRouter calls are billed at the standard price, not
     # the batch discount.
     "API_BATCH_FALLBACK_TO_DIRECT": False,
     "API_BATCH_MAX_SIZE": 20,               # Requests per submitted batch

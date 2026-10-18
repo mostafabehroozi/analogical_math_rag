@@ -198,6 +198,37 @@ class RefusedBatchStopsTheRunTests(unittest.TestCase):
                 # In batch mode the second question failed without a request.
                 self.assertEqual(self.posts, 1)
 
+    def test_an_experiment_switch_that_overrides_config_is_named(self):
+        # CONFIG asks for Kaggle-only batching, but the experiment dict still
+        # says True, as in the notebook copy run on 2026-10-18.
+        self.config["API_BATCHING_ENABLED"] = {"kaggle": True, "openrouter": False}
+        with self.assertLogs("src.orchestration", level="WARNING") as logs, \
+                self.assertRaises(api_batching.BatchRefusedError) as raised:
+            self.run_grouping(self.managers(), API_BATCHING_ENABLED=True)
+        setting = (
+            f"API_BATCHING_ENABLED=True (set by experiment {GROUPING_EXPERIMENT['experiment_name']!r}; "
+            "CONFIG has {'kaggle': True, 'openrouter': False})"
+        )
+        self.assertIn(f"{setting} batches this model", str(raised.exception))
+        warning = "\n".join(logs.output)
+        self.assertIn(setting, warning)
+        self.assertIn(f"final_solver openrouter/{UNBATCHABLE} batched", warning)
+
+    def test_the_config_switch_alone_sends_the_model_directly(self):
+        self.config["API_BATCHING_ENABLED"] = {"kaggle": True, "openrouter": False}
+        logs = self.run_grouping(self.managers())[GROUPING_EXPERIMENT["experiment_name"]]
+        self.assertEqual({log["pipeline_status"] for log in logs}, {"SUCCESS"})
+        self.assertEqual(self.posts, 0)
+
+    def test_a_misspelled_provider_fails_before_any_question(self):
+        self.config["API_BATCHING_ENABLED"] = {"kaggle": True, "open_router": False}
+        log_path = self.results_dir / f"{GROUPING_EXPERIMENT['experiment_name']}_run_log.json"
+        with patch.object(self.orchestration, "run_pipeline_for_single_query") as pipeline, \
+                self.assertRaisesRegex(ValueError, "open_router"):
+            self.run_grouping(self.managers())
+        pipeline.assert_not_called()
+        self.assertFalse(log_path.exists())
+
     def test_a_fixed_rerun_in_the_same_kernel_runs_every_question(self):
         managers = self.managers()
         with self.assertRaises(api_batching.BatchRefusedError):
