@@ -3,6 +3,7 @@ import ast
 import copy
 import itertools
 import json
+import math
 import re
 from collections import Counter
 from pathlib import Path
@@ -213,6 +214,54 @@ def test_snapshot_views_equal_scalar_observations_and_targets_for_every_order_an
     assert torch.equal(y1, torch.cat([y2[:, :cfg.n], y2[:, 3*cfg.n+2:]], 1))
 
 
+def test_absent_candidates_have_zero_targets_that_count_in_the_loss():
+    cfg = a.Config(k=2, zero_shots=2)
+    r = record(cfg)
+    r.labels[:] = 1  # Every candidate is correct, so any 0 target comes from absence.
+    safe, maximum = np.eye(1, cfg.n, 0, np.float32)[0], np.eye(1, cfg.n, 0, np.float32)[0]
+    teacher = {"safe": safe[None], "maximum": maximum[None]}
+    states = a.presence_states(cfg.zero_shots, cfg.k)
+    full = a.State((1 << cfg.n) - 1, (1 << cfg.k) - 1)
+    partial = a.State(0b0110, 0b01)  # ZS2 and OS1 present; ZS1 (the SAFE/MAX candidate) is absent.
+    present = a.present_mask(partial, cfg).astype(np.float32)
+    # Correctness, SAFE and MAX of an absent candidate are OFF, and so is "a MAX candidate is present".
+    target = a.snapshot_target(r, safe, maximum, partial, cfg)
+    assert np.array_equal(target[:cfg.n], present)
+    assert not target[cfg.n:3*cfg.n+2].any()
+    assert np.array_equal(a.snapshot_target(r, safe, maximum, full, cfg)[:3*cfg.n+2],
+                          np.r_[np.ones(cfg.n), safe, maximum, 1, 1])
+    # The views hand Stage 1 the same zeros (order 0 is the identity order).
+    _, y = a.SnapshotViews([r], [0], cfg, "cpu").batch(torch.as_tensor([states.index(partial)]))
+    assert np.array_equal(y[0].numpy(), np.r_[present, present])
+    _, y = a.SnapshotViews([r], [0], cfg, "cpu", teacher).batch(torch.as_tensor([states.index(partial)]))
+    assert np.array_equal(y[0].numpy(), target)
+    # Stage 1: an absent candidate's logit is pushed toward 0 probability, with each group averaged
+    # over its own size; absent_weight=0 leaves it untrained, as revision 11 did.
+    y = torch.as_tensor(np.r_[r.labels * present, present][None])
+    for weight, absent_grad in ((1., .5 / 2), (0., 0.)):
+        cfg.absent_weight = weight
+        logits = torch.zeros(1, cfg.n, requires_grad=True)
+        a.teacher_loss(logits, y, cfg).backward()
+        assert logits.grad[0, present == 1].tolist() == pytest.approx([-.5 / 2] * 2)
+        assert logits.grad[0, present == 0].tolist() == pytest.approx([absent_grad] * 2)
+    # A complete state has no absent term: the loss is the plain mean BCE at any weight.
+    cfg.absent_weight = 3.
+    logits = torch.randn(4, cfg.n)
+    complete = torch.cat([torch.ones(4, cfg.n), torch.ones(4, cfg.n)], 1)
+    assert float(a.teacher_loss(logits, complete, cfg)) == pytest.approx(float(
+        torch.nn.functional.binary_cross_entropy_with_logits(logits, torch.ones(4, cfg.n))), rel=1e-6)
+    # Stage 2: each candidate block gets the same absent term; the global terms are unchanged.
+    target_t = torch.as_tensor(target[None])
+    zero = torch.zeros(1, 3*cfg.n+2)
+    cfg.absent_weight = 0.
+    untrained = float(a.snapshot_row_losses(zero, target_t, cfg)[0])
+    cfg.absent_weight = 1.
+    assert float(a.snapshot_row_losses(zero, target_t, cfg)[0]) == pytest.approx(
+        untrained + (1 + 2 * cfg.auxiliary_weight) * math.log(2), rel=1e-6)
+    with pytest.raises(AssertionError):
+        a.Config(absent_weight=-1.).validate()
+
+
 @pytest.mark.parametrize("questions,batch", [(5, 4), (5, 64), (5, 7), (1, 16), (1, 1000), (9, 5)])
 def test_snapshot_batches_mix_every_question_and_visit_every_view_once(questions, batch, monkeypatch):
     cfg = a.Config(k=2, zero_shots=2)
@@ -280,10 +329,13 @@ def test_streamed_snapshot_metrics_and_temperatures_match_materialized_arrays():
     logit_t, target_t = torch.as_tensor(logits, dtype=torch.float32), torch.as_tensor(y)
     assert summary["loss"] == pytest.approx(
         float(a.snapshot_row_losses(logit_t, target_t, cfg).mean()), rel=1e-5)
-    # ... and the batch loss keeps its original definition: block-wise masked means plus the global terms.
+    # ... and the batch loss is block-wise: the present candidates' mean plus absent_weight times the
+    # absent candidates' mean (their targets are 0), then the global terms.
     n, present = cfg.n, target_t[:, 3*cfg.n+2:]
     raw = torch.nn.functional.binary_cross_entropy_with_logits(logit_t, target_t[:, :3*n+2], reduction="none")
-    blocks = [((raw[:, b*n:(b+1)*n] * present).sum(1) / present.sum(1).clamp_min(1)).mean()
+    blocks = [((raw[:, b*n:(b+1)*n] * present).sum(1) / present.sum(1).clamp_min(1) +
+               cfg.absent_weight * (raw[:, b*n:(b+1)*n] * (1 - present)).sum(1)
+               / (1 - present).sum(1).clamp_min(1)).mean()
               for b in range(3)]
     original = blocks[0] + cfg.auxiliary_weight * (blocks[1] + blocks[2] + raw[:, 3*n:].mean(0).sum())
     assert float(a.snapshot_loss(logit_t, target_t, cfg)) == pytest.approx(float(original), rel=1e-6)
@@ -337,6 +389,39 @@ def test_teacher_checkpoint_is_the_lowest_development_correctness_loss_and_never
     with torch.no_grad():
         expected = torch.nn.functional.binary_cross_entropy_with_logits(model(x), y).item()
     assert expected == pytest.approx(min(losses), rel=1e-4)
+
+
+def test_questions_outside_the_supervised_set_are_ranked_by_the_mean_of_the_fold_teachers(tmp_path, monkeypatch):
+    # Dev questions from other benchmarks score the training file's slot prior best, so a teacher
+    # selected on them stops untrained. No teacher validates on them: supervised questions keep their
+    # out-of-fold teacher, and every other question gets the mean of the fold teachers.
+    cfg = small_stage_cfg()
+    cfg.teacher_folds = 2
+    records = [record(cfg, i) for i in range(16)]
+    splits = {"supervised": list(range(12)), "dev": list(range(12, 16))}
+    validated, original = [], a.train_teacher
+
+    def spy(records, train_ids, val_ids, *args, **kwargs):
+        validated.append(set(val_ids))
+        return original(records, train_ids, val_ids, *args, **kwargs)
+
+    monkeypatch.setattr(a, "train_teacher", spy)
+    teacher = a.fit_teachers(records, splits, cfg, "cpu", tmp_path)
+    assert len(validated) == cfg.teacher_folds and not any(ids & set(splits["dev"]) for ids in validated)
+    assert not (tmp_path / "teacher_final.pt").exists() and set(teacher) == {"scores", "safe", "maximum", "folds"}
+    folds = [a.load_checkpoint(tmp_path / f"teacher_fold_{f+1}.pt") for f in range(cfg.teacher_folds)]
+    mean = np.mean([a.teacher_predict(fold, records, splits["dev"], cfg, "cpu") for fold in folds], 0)
+    np.testing.assert_allclose(teacher["scores"][splits["dev"]], mean, rtol=1e-6)
+    uid = {r.uid: i for i, r in enumerate(records)}
+    for fold in folds:
+        heldout = [uid[u] for u in fold["heldout_ids"]]
+        np.testing.assert_allclose(teacher["scores"][heldout], a.teacher_predict(fold, records, heldout, cfg, "cpu"),
+                                   rtol=1e-6)
+    # SAFE/MAX labels follow those rankings for every question.
+    for i, r in enumerate(records):
+        safe, maximum = a.teacher_labels(teacher["scores"][i], r.labels, cfg)
+        np.testing.assert_array_equal(teacher["safe"][i], safe)
+        np.testing.assert_array_equal(teacher["maximum"][i], maximum)
 
 
 def test_stages_1_2_stop_view_patience_epochs_after_the_best_check_even_inside_an_epoch(capsys):
@@ -487,17 +572,20 @@ def test_no_max_fallback_and_strict_optional_later_filter():
     assert a.goal_condition(0, order, empty, empty, p, full, state, disabled)
 
 
-def test_max_requires_all_four_correct_lights_and_recovers_after_temporary_loss():
+def test_max_requires_the_three_stop_lights_and_recovers_after_temporary_loss():
     cfg = a.Config(k=1, zero_shots=2)
     order = [0, 1, 2]
     safe = np.array([1, 0, 0], np.float32)
     maximum = np.array([1, 0, 0], np.float32)
     p = np.zeros(3*cfg.n+2, np.float32)
-    for col in (cfg.n, 2*cfg.n, 3*cfg.n, 3*cfg.n+1):
+    for col in (cfg.n, 3*cfg.n, 3*cfg.n+1):  # selected SAFE, global SAFE, global MAX.
         p[col] = .5
+    # The selected candidate's own MAX probability is not one of the lights.
     assert a.goal_condition(0, order, safe, maximum, p, p, a.State(), cfg)
-    p[2*cfg.n] = .4999
-    assert not a.goal_condition(0, order, safe, maximum, p, p, a.State(), cfg)
+    for col in (cfg.n, 3*cfg.n, 3*cfg.n+1):
+        p[col] = .4999
+        assert not a.goal_condition(0, order, safe, maximum, p, p, a.State(), cfg)
+        p[col] = .5
 
     class Scripted:
         device = torch.device("cpu")
@@ -509,7 +597,7 @@ def test_max_requires_all_four_correct_lights_and_recovers_after_temporary_loss(
             if state.candidate_mask & 2:
                 q[1] = .8
             if state.candidate_mask not in (1, 7):
-                q[2*cfg.n] = .1  # Either intermediate addition loses MAX; full state restores it.
+                q[3*cfg.n+1] = .1  # Either intermediate addition loses global MAX; full state restores it.
             return np.zeros(cfg.head_input_dim, np.float32), q
         def predict_many(self, rec, states):
             values = [self.predict(rec, state) for state in states]
@@ -821,13 +909,17 @@ def test_max_is_checked_at_initial_state_and_after_every_kind_of_acquisition(met
 
 
 @pytest.mark.parametrize("missing", ["global_MAX", "global_SAFE", "selected_MAX", "selected_SAFE"])
-def test_max_stop_requires_every_signal_for_the_selected_available_candidate(missing):
+def test_max_stop_requires_every_stop_signal_for_the_selected_available_candidate(missing):
     cfg = a.Config()
+    assert a.STOP_SIGNALS == ("global_MAX", "global_SAFE", "selected_SAFE")
     p = np.ones(3*cfg.n+2)
     indices = {"global_MAX": 3*cfg.n+1, "global_SAFE": 3*cfg.n,
                "selected_MAX": 2*cfg.n, "selected_SAFE": cfg.n}
     p[indices[missing]] = cfg.recognition_threshold - .01
-    assert a.stopping_reason(p, a.State(), cfg) is None
+    # The selected candidate's own MAX probability is reported, not required.
+    expected = "predicted_max" if missing not in a.STOP_SIGNALS else None
+    assert a.stopping_reason(p, a.State(), cfg) == expected
+    assert a.max_recognition_signals(p, a.State(), cfg)[missing] == pytest.approx(cfg.recognition_threshold - .01)
     p[indices[missing]] = cfg.recognition_threshold
     assert a.stopping_reason(p, a.State(), cfg) == "predicted_max"
 
@@ -1072,6 +1164,8 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
             f"(schema {a.DECISION_LABEL_SCHEMA}: a bit mask per state/order case for 3a, one byte for 3b)"
             ) in log
     assert f"Stage 4 rolls out each question once and saves compact outcomes to {a.ROLLOUT_FILE}" in log
+    assert ("an absent candidate's correctness, SAFE and MAX targets are 0 and count in the loss "
+            f"(absent_weight {cfg.absent_weight:g})") in log
     assert f"(AP is only a reported metric), stops {cfg.view_patience:g} epochs after it" in log
     # Stages 1-2 report and select on development loss; AP appears only in the report tables.
     assert "development loss" in log and "development AP" not in log
@@ -1241,8 +1335,9 @@ def test_end_to_end_checkpoint_resume_splits_and_frozen_bundle(tmp_path, externa
         assert not set(fold["heldout_ids"]) & (set(fold["train_ids"]) |
                                                set(fold["validation_ids"]))
     assert {uid for fold in work.teacher["folds"] for uid in fold["heldout_ids"]} == role_uids["supervised"]
-    assert set(work.teacher["teacher"]["train_ids"]) == role_uids["supervised"]
-    assert set(work.teacher["teacher"]["validation_ids"]) == role_uids["dev"]
+    # No teacher trains or validates on dev questions; the fold teachers rank them.
+    assert not (work.out / "teacher_final.pt").exists()
+    assert not any(set(fold["validation_ids"]) & role_uids["dev"] for fold in work.teacher["folds"])
     frozen = a.cpu_state(work.predictor.model)
     assert not any(p.requires_grad for p in work.predictor.model.parameters())
     # The bundle holds both heads; each reproduces the decisions of the head it was saved from.

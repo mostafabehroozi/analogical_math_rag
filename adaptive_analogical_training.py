@@ -27,11 +27,13 @@ import torch
 from torch import nn
 
 # Stages 1-2 train on every presence state and zero-shot order, select checkpoints by development
-# loss, and stop a fraction of an epoch after the best check. A one-shot candidate does not need its
-# own evaluator. Stage 3 labels every presence state with its cheapest routes to the next goal
+# loss, and stop a fraction of an epoch after the best check. Questions outside the supervised set are
+# ranked by the mean of the fold teachers; no final teacher is trained. A one-shot candidate does not
+# need its own evaluator. Stage 3 labels every presence state with its cheapest routes to the next goal
 # (pretraining), then fine-tunes on the route that the pretrained head's own continuations make
-# cheapest.
-PIPELINE_REVISION = 10
+# cheapest. An absent candidate's correctness, SAFE and MAX outputs have target 0 in Stages 1-2 and
+# count in the loss (absent_weight), so the models switch them off themselves.
+PIPELINE_REVISION = 12
 
 
 # %% Configuration and compact data
@@ -44,7 +46,7 @@ class Config:
         "/kaggle/working/downloaded_files/dir_3/gsm8k_run_log.json",
         "/kaggle/working/downloaded_files/dir_4/math500_run_log.json",
     ])
-    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v10_bs262k_run"
+    output_dir: str = "/kaggle/working/adaptive_analogical_shared_training_v12_bs262k_run"
     resume: bool = True             # Reuse completed stages with identical contracts.
     seed: int = 75
     device: str = "auto"
@@ -81,6 +83,9 @@ class Config:
     view_patience: float = .25
     patience: int = 15              # Stage 3: epochs without a better development loss before a phase stops.
     auxiliary_weight: float = .25
+    # Stages 1-2: weight of the absent candidates' zero (OFF) targets beside the present candidates'
+    # true ones; each group is averaged over its own size. 0 leaves absent candidates untrained.
+    absent_weight: float = 1.
     calibrate: bool = True          # Development-only temperature selection.
     recognition_threshold: float = .50
     later_rank_filter: bool = True
@@ -161,6 +166,7 @@ class Config:
         assert self.decision_eval_batch_size >= 2
         assert self.dev_checks_per_epoch >= 1 and self.view_patience > 0
         assert 0 <= self.teacher_complete_share < 1 and 0 <= self.snapshot_complete_share < 1
+        assert self.absent_weight >= 0
         assert self.print_every > 0
         assert self.hf_sync_minutes > 0
         if self.hf_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", str(self.hf_repo)):
@@ -589,11 +595,23 @@ def predict_array(model, x, device, batch=1024, hidden=False):
     return np.concatenate(values)
 
 
+def candidate_block_loss(raw, present, cfg):
+    """Per-row loss of one per-candidate output block from its elementwise BCE `raw`.
+
+    The mean over the present candidates (true targets) plus `absent_weight` times the mean over the
+    absent ones (target 0, OFF). Each group is averaged over its own size, so the present candidates
+    keep their weight however few of them a state holds; a complete state has no absent term.
+    """
+    absent = 1 - present
+    return ((raw * present).sum(1) / present.sum(1).clamp_min(1) +
+            cfg.absent_weight * (raw * absent).sum(1) / absent.sum(1).clamp_min(1))
+
+
 def teacher_loss(logits, targets, cfg):
-    """Correctness of present candidates only; absent candidates carry no target."""
+    """Correctness of every candidate: a present one against its label, an absent one against 0."""
     present = targets[:, cfg.n:]
     raw = nn.functional.binary_cross_entropy_with_logits(logits, targets[:, :cfg.n], reduction="none")
-    return ((raw * present).sum(1) / present.sum(1).clamp_min(1)).mean()
+    return candidate_block_loss(raw, present, cfg).mean()
 
 
 def lower_loss(new, old):
@@ -652,7 +670,7 @@ def teacher_labels(scores, truth, cfg):
 
 
 def completed_teacher(path, expected, cfg, name):
-    """A saved fold/final teacher is reused only when its question roles match exactly."""
+    """A saved fold teacher is reused only when its question roles match exactly."""
     if not (cfg.resume and path.exists()):
         return None
     ckpt = load_checkpoint(path)
@@ -663,12 +681,18 @@ def completed_teacher(path, expected, cfg, name):
 
 
 def fit_teachers(records, splits, cfg, device, out, sync=None):
+    """Cross-fitted teachers. Each supervised question is scored by the fold teacher that never trained
+    on it; every other question (dev, audit) by the mean of the fold teachers' complete-state
+    probabilities. Each fold keeps its lowest-loss checkpoint on held-out training-file questions, so no
+    teacher is selected on the dev questions: when they come from other benchmarks, their correctness
+    loss is lowest for the training file's slot prior, so a teacher selected on them stops untrained."""
     out = Path(out)
     sup = np.array(splits["supervised"])
     rng = np.random.RandomState(cfg.seed + 1)
     rng.shuffle(sup)
     folds = np.array_split(sup, cfg.teacher_folds)
     oof, provenance = {}, []
+    total = np.zeros((len(records), cfg.n))
     for f, heldout in enumerate(folds):
         others = np.concatenate([p for j, p in enumerate(folds) if j != f])
         rng.shuffle(others)
@@ -689,27 +713,17 @@ def fit_teachers(records, splits, cfg, device, out, sync=None):
             ckpt["heldout_ids"] = expected["heldout_ids"]
             atomic_torch(fold_path, ckpt)
         progress.clear()  # The completed fold supersedes it.
-        predictions = teacher_predict(ckpt, records, heldout.tolist(), cfg, device)
-        oof.update({int(i): p for i, p in zip(heldout, predictions)})
+        predictions = teacher_predict(ckpt, records, list(range(len(records))), cfg, device)
+        total += predictions
+        oof.update({int(i): predictions[i] for i in heldout})
         provenance.append({k: ckpt[k] for k in ("train_ids", "validation_ids", "heldout_ids")})
         if sync is not None:
             sync.push(f"Stage 1: teacher fold {f+1}/{cfg.teacher_folds}")
-    final_path = out / "teacher_final.pt"
-    expected = {"train_ids": [records[i].uid for i in splits["supervised"]],
-                "validation_ids": [records[i].uid for i in splits["dev"]]}
-    progress = TrainingProgress(out, "Stage 1", final_path.name, expected, cfg, sync)
-    final = completed_teacher(final_path, expected, cfg, "Final teacher")
-    if final is None:
-        final = train_teacher(records, splits["supervised"], splits["dev"], cfg, device,
-                              cfg.seed + 100, "Final teacher", progress=progress)
-        atomic_torch(final_path, final)
-    progress.clear()
-    scores = teacher_predict(final, records, list(range(len(records))), cfg, device)
+    scores = (total / len(folds)).astype(np.float32)
     for idx, pred in oof.items():
         scores[idx] = pred
     safe, maximum = zip(*(teacher_labels(p, r.labels, cfg) for p, r in zip(scores, records)))
-    return {"teacher": final, "scores": scores, "safe": np.stack(safe),
-            "maximum": np.stack(maximum), "folds": provenance}
+    return {"scores": scores, "safe": np.stack(safe), "maximum": np.stack(maximum), "folds": provenance}
 
 
 # %% Partial snapshots and supervised prediction
@@ -1009,9 +1023,9 @@ def observation_many(record, states, cfg):
 
 
 def snapshot_target(record, safe, maximum, state, cfg):
-    """Scalar reference for SnapshotViews targets."""
+    """Scalar reference for SnapshotViews targets: an absent candidate's outputs are all 0 (OFF)."""
     cm = present_mask(state, cfg).astype(np.float32)
-    return np.r_[record.labels, safe, maximum,
+    return np.r_[record.labels * cm, safe * cm, maximum * cm,
                  float(np.any(safe * cm)), float(np.any(maximum * cm)), cm].astype(np.float32)
 
 
@@ -1030,8 +1044,8 @@ class SnapshotViews:
     default 8,160 states) holds the state-only observation bytes and masks; each
     question adds its measurements, labels, and SAFE/MAX under each zero-shot order
     (under 1 KiB). Rows equal observation(...) and snapshot_target of the
-    permuted record bit for bit. Views are indexed question-major, then
-    zero-shot order, then state.
+    permuted record bit for bit: an absent candidate's correctness, SAFE and MAX
+    targets are 0. Views are indexed question-major, then zero-shot order, then state.
     """
     def __init__(self, records, ids, cfg, device, teacher=None, states=None, complete_share=0.):
         self.cfg, self.device, self.ids = cfg, torch.device(device), list(ids)
@@ -1081,13 +1095,15 @@ class SnapshotViews:
         for (start, width), mask, value in zip(self.columns, self.masks, self.values):
             block = value[q] if value.dim() == 2 else value[q, o]
             x[:, start:start+width] = torch.where(mask[s], block, x[:, start:start+width])
-        cm, labels = x[:, :self.cfg.n], self.labels[q, o]
+        # An absent candidate's outputs are OFF: its correctness, SAFE and MAX targets are 0.
+        cm = x[:, :self.cfg.n]
+        labels = self.labels[q, o] * cm
         if self.safe is None:
             return x, torch.cat([labels, cm], 1)
-        safe, maximum = self.safe[q, o], self.maximum[q, o]
+        safe, maximum = self.safe[q, o] * cm, self.maximum[q, o] * cm
         return x, torch.cat([labels, safe, maximum,
-                             (safe * cm).amax(1, keepdim=True).gt(0).float(),
-                             (maximum * cm).amax(1, keepdim=True).gt(0).float(), cm], 1)
+                             safe.amax(1, keepdim=True).gt(0).float(),
+                             maximum.amax(1, keepdim=True).gt(0).float(), cm], 1)
 
     def batches(self, batch_size, rng, skip=0):
         """One epoch: every view once plus the complete-view repeats.
@@ -1300,11 +1316,15 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
 
 
 def snapshot_row_losses(logits, targets, cfg):
-    """The training loss of each view: correctness plus auxiliary SAFE/MAX terms (absent candidates masked)."""
+    """The training loss of each view: correctness plus auxiliary SAFE/MAX terms.
+
+    Each per-candidate block is `candidate_block_loss`: present candidates against their true targets,
+    absent ones against 0. The two global "a SAFE/MAX candidate is present" terms cover every view.
+    """
     n = cfg.n
     mask = targets[:, 3*n + 2:]
     raw = nn.functional.binary_cross_entropy_with_logits(logits, targets[:, :3*n+2], reduction="none")
-    losses = [(raw[:, b*n:(b+1)*n] * mask).sum(1) / mask.sum(1).clamp_min(1) for b in range(3)]
+    losses = [candidate_block_loss(raw[:, b*n:(b+1)*n], mask, cfg) for b in range(3)]
     return losses[0] + cfg.auxiliary_weight * (losses[1] + losses[2] + raw[:, 3*n:].sum(1))
 
 
@@ -1486,6 +1506,7 @@ class FrozenPredictor:
                 hs.append(np.concatenate([h.cpu().numpy(), np.asarray(chunk, np.float32)[:, self.columns]], 1))
                 ps.append(1 / (1 + np.exp(-np.clip(logits / self.temperatures, -40, 40))))
         features, probabilities = np.concatenate(hs), np.concatenate(ps)
+        # Training already targets 0 for absent candidates; this makes them exactly OFF.
         present = np.stack([present_mask(state, self.cfg) for state in states])
         candidate_probabilities = probabilities[:, :3*self.cfg.n].reshape(-1, 3, self.cfg.n)
         candidate_probabilities[~np.broadcast_to(present[:, None, :], candidate_probabilities.shape)] = 0
@@ -1496,16 +1517,27 @@ def selected_candidate(probabilities, state, cfg):
     return int(np.where(present_mask(state, cfg), probabilities[:cfg.n], -np.inf).argmax())
 
 
+# The runtime stops at a predicted MAX once these signals reach the recognition threshold, and a MAX
+# question's first Stage 3 goal asks for the same signals on the MAX candidate. The selected candidate's
+# own MAX probability is reported but not required: which correct candidate the teacher ranks first is
+# unstable (two fold teachers agree on it about a third of the time), so no predictor reaches 0.5 on it.
+STOP_SIGNALS = ("global_MAX", "global_SAFE", "selected_SAFE")
+
+
+def signal_columns(i, cfg):
+    """Output columns of the recognition signals when candidate `i` is the selected one."""
+    n = cfg.n
+    return {"global_MAX": 3*n+1, "global_SAFE": 3*n, "selected_MAX": 2*n+i, "selected_SAFE": n+i}
+
+
 def max_recognition_signals(probabilities, state, cfg):
-    i, n = selected_candidate(probabilities, state, cfg), cfg.n
-    return {name: float(probabilities[j]) for name, j in (
-        ("global_MAX", 3*n+1), ("global_SAFE", 3*n),
-        ("selected_MAX", 2*n+i), ("selected_SAFE", n+i))}
+    columns = signal_columns(selected_candidate(probabilities, state, cfg), cfg)
+    return {name: float(probabilities[j]) for name, j in columns.items()}
 
 
 def max_recognized(probabilities, state, cfg):
-    return all(value >= cfg.recognition_threshold
-               for value in max_recognition_signals(probabilities, state, cfg).values())
+    signals = max_recognition_signals(probabilities, state, cfg)
+    return all(signals[name] >= cfg.recognition_threshold for name in STOP_SIGNALS)
 
 
 def stopping_reason(probabilities, state, cfg):
@@ -1555,9 +1587,9 @@ def goal_condition(rank, order, safe, maximum, probabilities, full_probabilities
         return False
     n, threshold = cfg.n, cfg.recognition_threshold
     if rank == 0 and maximum.any():
+        columns = signal_columns(i, cfg)
         return (selected_candidate(probabilities, state, cfg) == i and
-                all(probabilities[j] >= threshold for j in
-                    (3*n, 3*n+1, n+i, 2*n+i)))
+                all(probabilities[columns[name]] >= threshold for name in STOP_SIGNALS))
     compare = cfg.later_rank_filter
     if compare and rank < n - 1:
         if not probabilities[i] > max(full_probabilities[j] for j in order[rank+1:]):
@@ -1577,7 +1609,8 @@ def decision_goals(order, safe, maximum, probabilities, full_probabilities, stat
     for rank, i in enumerate(order):
         met = present[:, i].copy()
         if rank == 0 and maximum.any():
-            met &= (probabilities[:, [3*n, 3*n+1, n+i, 2*n+i]] >= threshold).all(axis=1)
+            columns = signal_columns(i, cfg)
+            met &= (probabilities[:, [columns[name] for name in STOP_SIGNALS]] >= threshold).all(axis=1)
             met &= selected == i
         else:
             if cfg.later_rank_filter and rank < n - 1:
@@ -1747,7 +1780,7 @@ def question_plan(record, scores, safe, maximum, predictor, cfg):
             raise ValueError("One visible state has inconsistent frozen features.")
     if cfg.reachable_only:
         # With a MAX candidate the first goal is the runtime's own stop test (the selected candidate
-        # is that MAX and passes all four lights): where it holds, the rollout has stopped.
+        # is that MAX and passes every STOP_SIGNALS light): where it holds, the rollout has stopped.
         stopped = (achieved >= 1) & bool(maximum.any())
         rows = informative & ~stopped
     else:
@@ -3186,7 +3219,7 @@ def policy_report(records, ids, teacher, predictor, cfg, heads, title, evaluated
             "learned_continues_after_max": False,
             "inference_continues_after_max_default": cfg.continue_after_max,
             "early_stop_rule": {"reason": "predicted_max", "threshold": cfg.recognition_threshold,
-                                "signals": ["global_MAX", "global_SAFE", "selected_MAX", "selected_SAFE"]},
+                                "signals": list(STOP_SIGNALS)},
             "call_accounting": "Recorded generation, baseline/cross measurement solves, and their grading calls; excludes retrieval and target-answer grading.",
             "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg,
                                                          snapshot_cache),
@@ -3912,7 +3945,9 @@ class Workflow:
               f"question once and saves compact outcomes to {ROLLOUT_FILE}, not trajectories, for both "
               f"heads. {trained} under every zero-shot order ({views} "
               f"x {math.factorial(self.cfg.zero_shots)} views per question), assembled on the "
-              "device and never stored; each keeps the checkpoint with the lowest development "
+              "device and never stored; an absent candidate's correctness, SAFE and MAX targets are 0 "
+              f"and count in the loss (absent_weight {self.cfg.absent_weight:g}); each keeps the "
+              "checkpoint with the lowest development "
               f"loss (AP is only a reported metric), stops {self.cfg.view_patience:g} {unit} after it, "
               f"and saves its training state every {self.cfg.hf_sync_minutes:g} minutes, so a new session "
               "continues inside an epoch.", flush=True)
@@ -3965,9 +4000,11 @@ class Workflow:
         print(f"OOF labels: {len(ids)} supervised questions; empty SAFE/MAX: {empty}/{len(ids)}.")
         print("Reference rankings and SAFE/MAX labels come from complete-state predictions; "
               "partial states only train the models.")
+        print(f"Development and audit questions are ranked by the mean of the {self.cfg.teacher_folds} fold "
+              "teachers; each fold kept its lowest-loss checkpoint on held-out training-file questions.")
         teacher_report(self.records, self.splits["dev"], self.cfg, self.teacher["scores"],
-                       self.heuristics, "TEACHER DEVELOPMENT REPORT (metrics only; checkpoints are selected "
-                       "on development loss)")
+                       self.heuristics, "TEACHER DEVELOPMENT REPORT (metrics only; no teacher is selected "
+                       "on these questions)")
         self.push("Stage 1 complete: teacher folds and out-of-fold labels")
         return self
 

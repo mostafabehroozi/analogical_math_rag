@@ -281,13 +281,11 @@ def test_interrupted_teacher_stage_resumes_completed_folds_exactly(tmp_path, mon
     capsys.readouterr()
     resumed = a.Workflow(cfg).prepare().train_teacher().teacher
     log = capsys.readouterr().out
-    assert names == ["Teacher fold 2/2", "Final teacher"]
+    assert names == ["Teacher fold 2/2"]
     assert "Teacher fold 1/2" in log and "loaded completed checkpoint" in log
     assert resumed["folds"] == reference["folds"]
     for key in ("scores", "safe", "maximum"):
         np.testing.assert_array_equal(resumed[key], reference[key])
-    assert all(torch.equal(value, resumed["teacher"]["weights"][name])
-               for name, value in reference["teacher"]["weights"].items())
     # A fold file whose question roles differ is never reused.
     fold = a.load_checkpoint(run / "teacher_fold_1.pt")
     fold["heldout_ids"] = fold["heldout_ids"][::-1]
@@ -375,7 +373,7 @@ def test_pipeline_resumes_from_the_mirror_in_a_fresh_session(tmp_path, monkeypat
     remote = hub.repos["user/adaptive-run"]
     assert set(remote) == {
         "contract.json", "compact_records.pt", "data_audit.json", "split_manifest.json",
-        "teacher_fold_1.pt", "teacher_fold_2.pt", "teacher_final.pt", "teacher_completed.pt",
+        "teacher_fold_1.pt", "teacher_fold_2.pt", "teacher_completed.pt",
         "heuristics_selected_on_dev.json", "snapshot_completed.pt",
         "decision_dataset_manifest.json", "decision_label_coverage.json",
         "decision_labels/pretrain_policy.pt", "decision_labels/pretrain_dev.pt",

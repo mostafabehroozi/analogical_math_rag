@@ -17,7 +17,7 @@ DATASET_FILES = {"compact_records.pt", "dataset_manifest.json"}
 TRAINERS = ("fit_teachers", "fit_snapshot", "train_on_views", "fit_action_head", "build_route_labels",
             "build_finetune_labels", "finetune_labels")
 RUN_OUTPUT = {"contract.json", "data_audit.json", "split_manifest.json", "heuristics_selected_on_dev.json",
-              "teacher_fold_1.pt", "teacher_fold_2.pt", "teacher_final.pt", "teacher_completed.pt",
+              "teacher_fold_1.pt", "teacher_fold_2.pt", "teacher_completed.pt",
               "snapshot_completed.pt", "decision_dataset_manifest.json", "decision_label_coverage.json",
               "decision_labels/pretrain_policy.pt", "decision_labels/pretrain_dev.pt",
               "decision_labels/finetune_policy.pt", "decision_labels/finetune_dev.pt",
@@ -261,7 +261,7 @@ def test_a_session_ended_inside_model_training_continues_from_the_run_mirror(tmp
     reference_cfg.dataset_id = reference_cfg.dataset_repo = reference_cfg.hf_repo = None
     a.Workflow(reference_cfg).build_datasets().prepare().train_snapshot()
     # The session ends inside Stage 2, a few batches after its first saved check.
-    teacher_saves = (cfg.teacher_folds + 1) * cfg.teacher_epochs * cfg.dev_checks_per_epoch
+    teacher_saves = cfg.teacher_folds * cfg.teacher_epochs * cfg.dev_checks_per_epoch
     restore = interrupt_after_save(monkeypatch, teacher_saves + 1, 3)
     with pytest.raises(KeyboardInterrupt, match="simulated session end"):
         a.Workflow(cfg).build_datasets().prepare().train_snapshot()

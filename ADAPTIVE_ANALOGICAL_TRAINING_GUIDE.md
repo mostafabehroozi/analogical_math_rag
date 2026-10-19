@@ -16,16 +16,20 @@ teacher ranks, correctness labels, or future measurements.
 1. **Stage 1: reference ranking.** A ResNet reads 223 observation features and
    predicts correctness for eight candidates. Complete-state predictions define
    the teacher's deterministic ranking. Supervised questions use out-of-fold
-   predictions from the fold model that did not train on that question;
-   development questions use the final teacher. The final saved teacher need
-   not reproduce the reference ranking used for each training question.
-   Its loss masks absent candidates. Training visits every presence state
+   predictions from the fold model that did not train on that question; every
+   other question (development and audit) uses the mean of the fold models'
+   complete-state probabilities. Each fold keeps its checkpoint on held-out
+   training-file questions, and no teacher is trained or selected on the
+   development questions (see "Why no final teacher").
+   An absent candidate's correctness target is 0 and counts in its loss (see
+   "Absent candidates"). Training visits every presence state
    under every zero-shot order (see "Exhaustive Stage 1-2 training views");
    only the complete-state predictions define the ranking.
 2. **Stage 2: recognition predictor.** A second ResNet uses the same observation
    representation. It predicts eight correctness values, eight SAFE memberships,
-   eight MAX memberships, and global SAFE/MAX presence: 26 outputs. Its
-   candidate-specific losses mask absent candidates. Development-only
+   eight MAX memberships, and global SAFE/MAX presence: 26 outputs. Every
+   output of an absent candidate has target 0 and counts in its loss, and the
+   global outputs are OFF when no SAFE/MAX candidate is present. Development-only
    temperature calibration is fitted, then the 128-dimensional encoder,
    prediction heads, normalization state, and calibration are frozen.
 3. **Stage 3: acquisition head.** A network reads the frozen 128-dimensional
@@ -65,6 +69,33 @@ the complete-state development correctness loss. Stage 2 is selected by its
 own training loss, and calibrated, on every reachable runtime state (1,092 by
 default) of every development question under every zero-shot order. Average
 precision (AP) is a reported metric only (see "Checkpoint selection").
+
+**Absent candidates.** A partial state hides some candidates, and every output
+of a hidden candidate is OFF: its target is 0 and it counts in the loss, so the
+models learn to switch absent candidates off themselves rather than leaving
+those outputs untrained (revision 11 and earlier). For candidate `i` with
+presence `cm_i`:
+
+| Output | Target | Stage |
+| --- | --- | --- |
+| correctness `i` | `label_i * cm_i` | 1 and 2 |
+| SAFE `i` | `SAFE_i * cm_i` | 2 |
+| MAX `i` | `MAX_i * cm_i` | 2 |
+| global SAFE | `any(SAFE * cm)`: a SAFE candidate is present | 2 |
+| global MAX | `any(MAX * cm)`: the MAX candidate is present | 2 |
+
+SAFE and MAX keep their complete-state definition, so when the MAX candidate is
+absent no present candidate takes its place and global MAX is OFF. Each
+per-candidate block's loss is the mean cross-entropy over the present
+candidates plus `absent_weight` (default `1`) times the mean over the absent
+ones; each group is averaged over its own size, so a state with few present
+candidates does not dilute their signal, and a complete state has no absent
+term (the teacher's complete-state development loss is unchanged).
+`absent_weight=0` leaves absent candidates untrained, as revision 11 did. Top-1,
+Brier, SAFE/MAX precision and recall, and the temperatures read only the
+present candidates, since the zeros are trivial to predict from the presence
+mask in the input; the frozen predictor still sets an absent candidate's
+probabilities to exactly 0 before Stage 3 reads them.
 
 **Complete-view share.** Each question has only 6 complete views among its
 48,960, so an unweighted epoch would spend 0.012% of its training on the one
@@ -118,8 +149,7 @@ information, not selection criteria.
 **Batch size.** A batch holds `batch_size // questions` rows of every training
 question, so the batch size sets how many views of each question one step
 averages and how many steps make an epoch. The default `262144` gives 204 rows
-of each of 1,280 fold questions (131 of each of 1,999 for the final teacher and
-Stage 2), about 2.2 GB of GPU memory (about 8.5 KB per row; up to about
+of each of 1,280 fold questions (131 of each of 1,999 for Stage 2), about 2.2 GB of GPU memory (about 8.5 KB per row; up to about
 1,500,000 rows fit a 16 GB GPU), and 283 steps per fold epoch instead of 4,800
 at the earlier `16384`. On the same real-log split as above (local GPU, 64
 checks per epoch), the best development loss did not depend on it, because the
@@ -436,15 +466,15 @@ still excluded. Internal `split_fractions` are ignored in this mode.
 
 | Stage | Weight training | Development checks |
 | --- | --- | --- |
-| 1: teacher | Shared `supervised` questions | `dev`: final teacher checkpoint selection (complete-state correctness loss); the reported heuristic baselines are also chosen on `dev`, by AP |
+| 1: teacher | Shared `supervised` questions, in folds | None: each fold selects on held-out `supervised` questions (complete-state correctness loss), and `dev` questions are ranked by the mean of the folds; the reported heuristic baselines are chosen on `dev`, by AP |
 | 2: snapshot encoder and prediction heads | Same `supervised` questions | Same `dev`: checkpoint selection and temperature calibration |
 | 3a: pretrained head | Same `supervised` questions, through the `policy` alias | Same `dev`: checkpoint selection against the 3a labels |
 | 3b: fine-tuned head | Same `supervised` questions, starting from the 3a weights | Same `dev`: checkpoint selection against the 3b labels |
 
 The teacher's fold models still use internal training/validation folds and
-produce out-of-fold labels for all shared training questions. The final
-teacher trains on all shared training questions. The snapshot predictor
-stays frozen while the acquisition head trains.
+produce out-of-fold labels for all shared training questions. Development and
+audit questions are ranked by the mean of the fold models. The snapshot
+predictor stays frozen while the acquisition head trains.
 
 **Checkpoint selection.** Every stage keeps the checkpoint with the lowest
 development loss. Average precision (AP) is neither a training nor a selection
@@ -452,14 +482,32 @@ signal in any stage; it is a metric of the final reports.
 
 | Stage | Training loss | Development loss that picks the checkpoint | Reported, never selected on |
 | --- | --- | --- | --- |
-| 1: teacher | Correctness cross-entropy of the present candidates | The same loss on the complete-state `dev` views, where every candidate is present | AP, Top-1 and coverage in the ranking tables |
-| 2: snapshot | Correctness cross-entropy plus `auxiliary_weight` times the SAFE, MAX and presence cross-entropies | The same loss over every reachable state and zero-shot order of `dev`, before calibration | Top-1, Brier, SAFE/MAX precision and recall (shown during training and in the reports) |
+| 1: teacher | Correctness cross-entropy: present candidates against their label, plus `absent_weight` times absent candidates against 0 | Per fold, the same loss on the complete-state views of its held-out validation questions (20% of the other folds), where every candidate is present; no teacher selects on `dev` | AP, Top-1 and coverage in the ranking tables |
+| 2: snapshot | Correctness cross-entropy plus `auxiliary_weight` times the SAFE, MAX and presence cross-entropies; each per-candidate block adds `absent_weight` times its absent candidates against 0 | The same loss over every reachable state and zero-shot order of `dev`, before calibration | Top-1, Brier, SAFE/MAX precision and recall (shown during training and in the reports) |
 | 3a: pretrained head | Masked action cross-entropy against an even split over the cheapest first steps | The same loss on the `dev` rows | |
 | 3b: fine-tuned head | Masked action cross-entropy against one chosen action | The same loss on the `dev` rows | |
 
 The heuristic baselines in the ranking tables are not trained: the best one per
 mode is picked on `dev` by AP and reported next to the teacher. None of these
 criteria directly optimizes recognition-goal coverage or realized API savings.
+
+**Why no final teacher.** Up to revision 10, a final teacher trained on all
+`supervised` questions and kept its lowest correctness loss on `dev`; it ranked
+the `dev` and `audit` questions. With `use_test_files_for_dev_and_audit=True`
+those questions come from other benchmarks (GSM8K, MATH-500, AIME) than the
+NuminaMath training log, and there the loss is lowest for the training file's
+slot prior, not for a learned ranking. In a revision-10 Kaggle run, the five
+trained fold teachers scored complete-state `dev` losses of 0.650 to 0.694. A
+constant per-slot prior from the training file scored 0.637. The final teacher
+was kept at its first check (epoch 0.016, train loss 0.635), with `dev` loss
+0.636. It ranked like that prior: its top candidate was OS4 or OS5 on 1,552 of
+1,879 `dev` questions. Its AP was 0.7208 and its Top-1 65.1%, against 0.7118 and
+65.1% for retrieval order. The mean of the same five fold teachers, none of
+which saw a `dev` question, scored AP 0.7503 and Top-1 71.9% there, against
+0.7471 and 70.8% for the best heuristic. The `dev` ranking also defines the
+`dev` SAFE/MAX labels that Stages 2-3 select on and Stage 4 reports against.
+Revision 11 therefore ranks every question outside `supervised` by the fold
+mean and trains no final teacher.
 
 Set `use_test_files_for_dev_and_audit=False` for separate internal development
 and audit groups. `split_fractions=(0.80, 0.10, 0.10)` then means **shared
@@ -559,8 +607,7 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
   fingerprint leaves those paths out too; the records' content and their uids,
   which name each log's filename stem, identify the logs. Stages 0-2 load
   their completed checkpoints; Stage 1 also reuses completed
-  `teacher_fold_<n>.pt` and `teacher_final.pt` files whose question roles
-  match exactly, and a teacher or the snapshot model that was training
+  `teacher_fold_<n>.pt` files whose question roles match exactly, and a teacher or the snapshot model that was training
   continues from its saved training state (next item), so an interrupted
   Stage 1 or 2 repeats at most about `hf_sync_minutes` of training. Stage 3
   reuses completed questions and continues from the last completed epoch of
@@ -571,8 +618,8 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
   than a session may have left. At the first development check after every
   `hf_sync_minutes`, its current and best weights, Adam state, random states,
   position in the epoch, and history are saved atomically to
-  `training_progress/<model>.pt` (`teacher_fold_<n>.pt`, `teacher_final.pt`,
-  `snapshot.pt`) and uploaded. A session that finds the file restores it and
+  `training_progress/<model>.pt` (`teacher_fold_<n>.pt`, `snapshot.pt`) and
+  uploaded. A session that finds the file restores it and
   continues with the epoch's next batch; the epoch's batch order is rebuilt from
   its seed, so on the same device the model ends exactly as an uninterrupted
   run would. The file is bound to a hash of the questions and targets the
@@ -757,19 +804,25 @@ warns if the bound does not fit.
 **Recognizing the earlier code.** The notebook embeds its implementation, so a
 Kaggle copy uploaded before these changes keeps its old behavior. Stage 0 of
 the current workflow prints the implementation revision and the label schema
-(`Implementation revision 10; Stage 3 labels every presence state with its
+(`Implementation revision 12; Stage 3 labels every presence state with its
 cheapest routes to the next goal and pretrains on them (Stage 3a), then
 fine-tunes on the route its own continuations make cheapest (Stage 3b). Compact
 labels (schema 6: a bit mask per state/order case for 3a, one byte for 3b)`)
 before any stage trains, so the running code can be checked in the first minute
 rather than hours later. The same line ends with `Stages 1-2 train on every
 presence state under every zero-shot order (8,160 x 6 views per question),
-assembled on the device and never stored; each keeps the checkpoint with the
-lowest development loss (AP is only a reported metric), stops 0.25 epochs after
-it`. A copy that prints revision 9 stops Stages 1-2 only at epoch ends; a lower
-revision plans a single label per state with its own tie rules, or still
-requires a one-shot candidate's evaluator. None can continue a revision-10 run.
-The dataset cell before Stage 0 prints `Implementation revision 10, dataset
+assembled on the device and never stored; an absent candidate's correctness,
+SAFE and MAX targets are 0 and count in the loss (absent_weight 1); each keeps
+the checkpoint with the lowest development loss (AP is only a reported
+metric), stops 0.25 epochs after it`. A copy that prints revision 11 leaves
+absent candidates' outputs out of the loss. Stage 1 of revisions 11 and 12 also
+prints `Development and audit questions are ranked by the mean of the 5 fold
+teachers`; a copy that prints revision 10 still
+trains a `Final teacher` selected on the development questions. A copy that
+prints revision 9 stops Stages 1-2 only at epoch ends; a lower revision plans a
+single label per state with its own tie rules, or still requires a one-shot
+candidate's evaluator. None can continue a revision-12 run.
+The dataset cell before Stage 0 prints `Implementation revision 12, dataset
 schema 2: the dataset is the compact records of the input logs`; a copy that
 prints `The labels come from trained models, so the build trains them` instead
 still trains Stages 1-3a inside its datasets cell.
@@ -1038,7 +1091,7 @@ trajectories`; a notebook copy without it still writes the traced file.
 
 ### Versions
 
-This implementation uses **revision 10**, **contract schema 4**,
+This implementation uses **revision 12**, **contract schema 4**,
 **inference-bundle schema 5**, **decision-dataset schema 5** (the label
 fingerprint, without input log paths), **label-file schema 6**, and
 **dataset-store schema 2** (the dataset holds only the compact records, and its
@@ -1046,7 +1099,13 @@ version hashes only the record settings and the logs; schema 1 also held the
 model output of Stages 1-3a, which a run adopts as described in "Datasets and
 dataset IDs"; neither changes any label, checkpoint or contract, so neither
 needed a new revision). The `reachable_only` switch is not a revision either:
-off, it changes no label, checkpoint or contract. Revision 10
+off, it changes no label, checkpoint or contract. Revision 12 gives every
+absent candidate's correctness, SAFE and MAX outputs a target of 0 that counts
+in the Stage 1-2 losses (`absent_weight`, see "Absent candidates"); earlier
+revisions left those outputs out of the loss. Revision 11 ranks the
+development and audit questions by the mean of the fold teachers instead of a
+final teacher selected on the development questions (see "Why no final
+teacher"). Revision 10
 stops Stages 1-2 at the first development check `view_patience` epochs after the
 best one, inside an epoch if need be; revision 9 counted whole epochs there,
 checked at epoch ends, so its teachers trained every epoch. Revision 9
@@ -1064,7 +1123,7 @@ of development AP (Stage 1) and Top-1 then Brier (Stage 2); AP stays a reported
 metric. Revision 6 trains Stages 1-2 on exhaustive views instead of random
 snapshots. Every earlier output folder is rejected as a different contract, and
 older action/state bundles and checkpoints are rejected. Use the new default
-output directory `/kaggle/working/adaptive_analogical_shared_training_v10_bs262k_run` and
+output directory `/kaggle/working/adaptive_analogical_shared_training_v12_bs262k_run` and
 a new `hf_repo` mirror for a fresh run; old runs are not migrated. The notebook's `QUICK_PILOT` checks execution, not final model
 quality. Recorded outcomes cannot establish live provider behavior or the
 results of newly generated candidates.
