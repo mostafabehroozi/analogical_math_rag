@@ -4,6 +4,7 @@ import logging
 import contextvars
 import contextlib
 import os
+import sys
 
 
 # 1. CONTEXT VARIABLES (The "Nametags" for threads)
@@ -126,3 +127,48 @@ def tprint(message: str, level: str = "INFO"):
     else:
         print(f"{prefix} {message}")
         logger.info(message)
+
+
+# 5. IPYKERNEL THREAD-OUTPUT GUARD
+# Kaggle runs ipykernel 6.29.5. On every write, its stdout/stderr walk
+# `_thread_to_parent` (thread ident -> ident of the thread that created it)
+# to send a thread's output to its oldest ancestor's cell. The OS reuses an
+# ident as soon as its thread exits, but ipykernel prunes the map only during
+# garbage collection, so thousands of short-lived pool threads eventually
+# leave two stale entries that point at each other. Every thread whose chain
+# reaches them then loops inside print() forever at 100% CPU: Kaggle batch
+# full-0009-970-989 hung that way for 6 hours on 2026-10-19.
+class _IgnoredThreadMap(dict):
+    """A thread map that stays empty: ipykernel's writes to it are dropped."""
+
+    def __setitem__(self, key, value):
+        pass
+
+
+def guard_ipykernel_thread_output() -> int:
+    """Empty ipykernel's thread maps so that no print from a thread can hang.
+
+    ipykernel 7.1 removed both maps. With them empty, a thread's output goes
+    to the running cell, as it does there. A thread already caught in the
+    loop re-reads the map on every step, so it is released as well.
+
+    Returns how many streams were changed: 0 outside ipykernel 6.29-7.0, and
+    0 once the guard is in place.
+    """
+    ipython = sys.modules.get("IPython")
+    shell = getattr(ipython, "get_ipython", lambda: None)()
+    kernel = getattr(shell, "kernel", None)
+    streams = [sys.stdout, sys.stderr, getattr(kernel, "_stdout", None), getattr(kernel, "_stderr", None)]
+
+    changed = 0
+    for stream in streams:
+        names = [name for name in ("_thread_to_parent", "_thread_to_parent_header")
+                 if type(getattr(stream, name, None)) is dict]
+        for name in names:
+            setattr(stream, name, _IgnoredThreadMap())
+        changed += bool(names)
+    return changed
+
+
+if guard_ipykernel_thread_output():
+    print("[context_logger] Emptied ipykernel's thread maps: thread output goes to the running cell.")
