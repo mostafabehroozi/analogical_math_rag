@@ -553,13 +553,19 @@ setting, all four benchmark logs supply development questions, and their label
 build can be substantial. Keep the same output directory and configuration to
 reuse completed questions after interruption, including in a new Kaggle session
 when `hf_repo` mirrors the folder (see "Surviving Kaggle session limits"). After
-every completed training/development epoch, `decision_head_pretrain_progress.pt`
+every completed training/development epoch, and inside an epoch at the first
+question boundary every `hf_sync_minutes`, `decision_head_pretrain_progress.pt`
 (3a) or `decision_head_finetune_progress.pt` (3b) atomically saves current and
-best head weights, Adam state, question/row shuffle RNG, losses, and
-early-stopping bookkeeping. With `resume=True`, head optimization continues from
-the last completed epoch of the phase in progress; an interrupted partial epoch
-repeats from its start. Failed checkpoint writes preserve the previous
-completed epoch. Keep the training and development settings and selected device
+best head weights, Adam state, the epoch's question order, the row-shuffle RNG,
+the position in the training or development pass with its loss sums so far,
+and early-stopping bookkeeping; with `hf_repo` set, each timed save is uploaded
+at once. With `resume=True`, head optimization continues with the next question
+of the pass that was interrupted, so at most about `hf_sync_minutes` of
+training repeats. A phase runs up to `decision_epochs` (100) or
+`decision_finetune_epochs` (50) epochs of about 20 minutes each, so it can span
+several Kaggle sessions. A progress file written by earlier code, which saved
+completed epochs only, still resumes. Failed checkpoint writes preserve the
+previous save. Keep the training and development settings and selected device
 consistent when comparing a resumed run to an uninterrupted run. The pretrained
 head is saved as `decision_head_pretrained.pt` when Stage 3a finishes, and the
 fine-tuned head as `decision_head_completed.pt` when Stage 3b finishes.
@@ -588,7 +594,8 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
   phase uploads after each log it reads, and each later stage uploads when it
   completes. Inside long loops the run uploads every `hf_sync_minutes`
   (default 15): during Stage 1-2 training (with the model's training state),
-  after Stage 1 folds, during the Stage 3 label build, and after Stage 3 epochs;
+  after Stage 1 folds, during the Stage 3 label build, and during Stage 3 head
+  training (with the head's training state, inside an epoch too);
   each merged role uploads immediately. Uploads skip unchanged
   files by content hash, never include `.tmp` files, and remove per-question
   label files, a completed model's Stage 1-2 training state, the dataset build's
@@ -610,8 +617,9 @@ notebook under Add-ons > Secrets, with Internet enabled), or an existing
   `teacher_fold_<n>.pt` files whose question roles match exactly, and a teacher or the snapshot model that was training
   continues from its saved training state (next item), so an interrupted
   Stage 1 or 2 repeats at most about `hf_sync_minutes` of training. Stage 3
-  reuses completed questions and continues from the last completed epoch of
-  the phase it was in; fine-tuning labels are bound to the exact pretrained head
+  reuses completed questions and continues the phase it was in from its last
+  saved question, so it too repeats at most about `hf_sync_minutes` of
+  training; fine-tuning labels are bound to the exact pretrained head
   they were rolled out from. Stage 4 restarts if interrupted.
 - **Training state.** A teacher or the snapshot model trains for hours (a
   teacher epoch over 1,280 questions took about 17 minutes on Kaggle), longer

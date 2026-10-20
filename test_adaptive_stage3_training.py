@@ -135,17 +135,18 @@ def assert_matching_training_checkpoints(reference, actual):
 PHASE_FILES = {"pretrain": "decision_head_pretrain_progress.pt", "finetune": "decision_head_finetune_progress.pt"}
 
 
-def train_phase(phase, problem, out, pretrained=None):
+def train_phase(phase, problem, out, pretrained=None, sync=None):
     """Run one Stage 3 phase; fine-tuning needs a pretrained checkpoint."""
     cfg, records, splits, teacher, predictor = problem
     if phase == "pretrain":
-        return a.train_pretrained_head(records, splits, teacher, predictor, cfg, "cpu", out)
-    return a.train_finetuned_head(records, splits, teacher, predictor, pretrained, cfg, "cpu", out)
+        return a.train_pretrained_head(records, splits, teacher, predictor, cfg, "cpu", out, sync)
+    return a.train_finetuned_head(records, splits, teacher, predictor, pretrained, cfg, "cpu", out, sync)
 
 
 @pytest.mark.parametrize("phase", ["pretrain", "finetune"])
+@pytest.mark.parametrize("earlier_code", [False, True])
 def test_interrupted_head_resumes_last_complete_epoch_with_identical_adam_and_shuffle(
-        tmp_path, monkeypatch, phase):
+        tmp_path, monkeypatch, phase, earlier_code):
     problem = small_stage3_problem()
     complete, interrupted = tmp_path / "complete", tmp_path / "interrupted"
     complete.mkdir()
@@ -173,14 +174,119 @@ def test_interrupted_head_resumes_last_complete_epoch_with_identical_adam_and_sh
     with pytest.raises(KeyboardInterrupt, match="simulated interrupted"):
         train_phase(phase, problem, interrupted, pretrained)
     progress = a.load_checkpoint(interrupted / PHASE_FILES[phase])
-    assert progress["schema_version"] == 2 and progress["phase"] == phase and progress["epoch"] == 1
+    assert progress["schema_version"] == a.HEAD_PROGRESS_SCHEMA and progress["phase"] == phase
+    assert progress["epoch"] == 1 and progress["partial"] is None  # No timed save fell inside an epoch.
     assert len(progress["history"]) == 1 and progress["optimizer"]["state"]
+    if earlier_code:  # A run that began before epochs could be resumed inside: completed epochs only.
+        progress["schema_version"] = 2
+        del progress["partial"]
+        a.atomic_torch(interrupted / PHASE_FILES[phase], progress)
     monkeypatch.setattr(a, "masked_action_loss", original)
     for builder in ("build_route_labels", "build_finetune_labels"):
         monkeypatch.setattr(a, builder, lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
     actual = train_phase(phase, problem, interrupted, pretrained)
     assert_matching_training_checkpoints(expected, actual)
     assert a.load_checkpoint(interrupted / PHASE_FILES[phase])["epoch"] == 3
+
+
+class RecordingSync:
+    """Stands in for the Hub mirror: records each upload's message and whether it was forced."""
+    def __init__(self):
+        self.pushes = []
+
+    def push(self, message, *, force=False, required=False):
+        self.pushes.append((message, force))
+        return True
+
+
+def mid_epoch_problem():
+    """Three training and two development questions, so both passes of an epoch have an inside."""
+    cfg, records, splits, teacher, predictor = small_stage3_problem(questions=5)
+    splits = {"supervised": [0, 1, 2], "policy": [0, 1, 2], "dev": [3, 4]}
+    return cfg, records, splits, teacher, predictor
+
+
+def save_at_every_question(monkeypatch, cfg):
+    """A clock that advances a minute per reading, so every question boundary is a timed save."""
+    clock = itertools.count()
+    monkeypatch.setattr(a.time, "monotonic", lambda: 60. * next(clock))
+    cfg.hf_sync_minutes = 1
+
+
+def end_session_at_question(monkeypatch, stop):
+    """The session ends as the head starts its `stop`-th question, training and development counted."""
+    original, calls = a.masked_action_loss, 0
+
+    def session_ends(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == stop:
+            raise KeyboardInterrupt("simulated session end inside an epoch")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(a, "masked_action_loss", session_ends)
+    return original
+
+
+@pytest.mark.parametrize("phase", ["pretrain", "finetune"])
+@pytest.mark.parametrize("stop,epoch,train_done,dev_done", [
+    (2, 0, 1, 0),  # Second training question of the first epoch: nothing completed yet.
+    (5, 0, 3, 1),  # Second development question of the first epoch.
+    (7, 1, 1, 0),  # Second training question of the second epoch.
+])
+def test_head_interrupted_inside_an_epoch_resumes_at_the_next_question(
+        tmp_path, monkeypatch, capsys, phase, stop, epoch, train_done, dev_done):
+    problem = mid_epoch_problem()
+    complete, interrupted = tmp_path / "complete", tmp_path / "interrupted"
+    complete.mkdir()
+    interrupted.mkdir()
+    pretrained = train_phase("pretrain", problem, complete)
+    expected = pretrained if phase == "pretrain" else train_phase("finetune", problem, complete, pretrained)
+    if phase == "finetune":
+        train_phase("pretrain", problem, interrupted)
+    save_at_every_question(monkeypatch, problem[0])
+    original = end_session_at_question(monkeypatch, stop)
+    sync = RecordingSync()
+    with pytest.raises(KeyboardInterrupt, match="inside an epoch"):
+        train_phase(phase, problem, interrupted, pretrained, sync)
+    progress = a.load_checkpoint(interrupted / PHASE_FILES[phase])
+    assert progress["schema_version"] == a.HEAD_PROGRESS_SCHEMA and progress["epoch"] == epoch
+    assert (progress["partial"]["train_done"], progress["partial"]["dev_done"]) == (train_done, dev_done)
+    # Each timed save is uploaded at once; the last names the pass and question it reached.
+    title = a.HEAD_PHASES[phase]["title"]
+    saves = [push for push in sync.pushes if "epoch" in push[0]]
+    pass_name, done, total = ("development", dev_done, 2) if dev_done else ("training", train_done, 3)
+    assert saves[-1] == (f"{title}: epoch {epoch + 1} {pass_name}, {done}/{total} questions", True)
+    assert all(force for _, force in saves)
+    monkeypatch.setattr(a, "masked_action_loss", original)
+    for builder in ("build_route_labels", "build_finetune_labels"):
+        monkeypatch.setattr(a, builder, lambda *args, **kwargs: pytest.fail("Saved labels must be reused"))
+    capsys.readouterr()
+    actual = train_phase(phase, problem, interrupted, pretrained)
+    assert (f"{title} head resume: {epoch} completed epochs and epoch {epoch + 1} at {train_done}/3 training "
+            f"and {dev_done}/2 development questions") in capsys.readouterr().out
+    assert_matching_training_checkpoints(expected, actual)
+    assert a.load_checkpoint(interrupted / PHASE_FILES[phase])["partial"] is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("train_done", 4),                    # More questions than the training role has.
+    ("dev_done", 1),                      # Development questions before training finished.
+    ("order", np.array([0, 0, 1])),       # Not an order of the training questions.
+])
+def test_inconsistent_epoch_in_progress_is_rejected(tmp_path, monkeypatch, field, value):
+    problem = mid_epoch_problem()
+    save_at_every_question(monkeypatch, problem[0])
+    end_session_at_question(monkeypatch, 2)
+    with pytest.raises(KeyboardInterrupt, match="inside an epoch"):
+        train_phase("pretrain", problem, tmp_path)
+    path = tmp_path / PHASE_FILES["pretrain"]
+    progress = a.load_checkpoint(path)
+    progress["partial"][field] = value
+    a.atomic_torch(path, progress)
+    monkeypatch.setattr(a, "masked_action_loss", lambda *args, **kwargs: pytest.fail("Invalid progress must not train"))
+    with pytest.raises(ValueError, match="inconsistent epoch bookkeeping"):
+        train_phase("pretrain", problem, tmp_path)
 
 
 @pytest.mark.parametrize("phase", ["pretrain", "finetune"])

@@ -110,7 +110,7 @@ class Config:
     # Runtime-only mirror of output_dir on the Hugging Face Hub: Kaggle keeps its
     # working disk only while a session lives, so uploads make a run resumable.
     hf_repo: Optional[str] = None      # Private dataset repo id such as "user/run"; None disables.
-    hf_sync_minutes: float = 15.       # Uploads and Stage 1-2 progress saves inside long loops; stage ends always upload.
+    hf_sync_minutes: float = 15.       # Uploads and Stage 1-3 training-state saves inside long loops; stage ends always upload.
     # Runtime-only versioned dataset store: the compact records read from the input logs (no model is
     # involved) are uploaded once under dataset_id and downloaded, never rebuilt, whenever the Hub
     # already holds them. Everything the models produce goes to hf_repo.
@@ -1998,6 +1998,8 @@ HEAD_PHASES = {
     "finetune": {"title": "Stage 3b", "key": "choice", "extras": (),
                  "epochs": "decision_finetune_epochs", "lr": "decision_finetune_lr", "seed": 310,
                  "progress": "decision_head_finetune_progress.pt"}}
+# A phase's training state: schema 2 held completed epochs only; schema 3 adds the epoch in progress.
+HEAD_PROGRESS_SCHEMA = 3
 
 
 def question_paths(records, ids, directory):
@@ -2294,12 +2296,14 @@ def masked_action_loss(model, rows, order, cfg, device, optimizer=None, *, batch
     return float(total), count
 
 
-def decision_progress(label, completed, total, started, last_print, cfg, detail="", every=None, seconds=30):
+def decision_progress(label, completed, total, started, last_print, cfg, detail="", every=None, seconds=30,
+                      resumed=0):
+    """Print progress; `resumed` questions were done before `started`, in an earlier session."""
     now = time.monotonic()
     every = cfg.print_every if every is None else every
-    if completed == 1 or completed == total or completed % every == 0 or now - last_print >= seconds:
+    if completed == resumed + 1 or completed == total or completed % every == 0 or now - last_print >= seconds:
         elapsed = now - started
-        eta = elapsed * (total - completed) / completed
+        eta = elapsed * (total - completed) / (completed - resumed)
         print(f"{label}: {completed}/{total} questions | elapsed {elapsed/60:.1f} min | "
               f"ETA {eta/60:.1f} min{detail}", flush=True)
         return now
@@ -2347,10 +2351,21 @@ def phase_labels(phase, records, splits, cfg, out, fingerprint, builders, checke
 
 def fit_action_head(phase, records, splits, labels, predictor, cfg, device, out, fingerprint,
                     sync=None, initial_weights=None):
-    """Train the action head on one phase's labels. A completed epoch is a resume point."""
+    """Train the action head on one phase's labels, resumable inside an epoch.
+
+    One epoch re-encodes every training and development question and can outlast what a Kaggle
+    session has left, so the training state is saved to the phase's progress file at the first
+    question boundary `hf_sync_minutes` after the previous save, and uploaded then; every completed
+    epoch is saved as well. The state holds the current and best weights, Adam, the epoch's question
+    order, the row shuffle's random state, the position in the training or development pass, and the
+    pass's loss sums so far. A new session continues with the next question, so an interruption
+    repeats at most about `hf_sync_minutes` of training and, on the same device, ends as an
+    uninterrupted run would.
+    """
     spec, out = HEAD_PHASES[phase], Path(out)
     key, title = spec["key"], spec["title"]
     epochs, lr = getattr(cfg, spec["epochs"]), getattr(cfg, spec["lr"])
+    questions, dev_questions = len(splits["policy"]), len(splits["dev"])
     seed_everything(cfg.seed + spec["seed"])
 
     def question_rows(role, position):
@@ -2369,74 +2384,108 @@ def fit_action_head(phase, records, splits, labels, predictor, cfg, device, out,
     best, weights, best_epoch, stale, history = math.inf, None, 0, 0, []
     rng = np.random.RandomState(cfg.seed + spec["seed"] + 1)
     progress_path = out / spec["progress"]
-    start_epoch = 0
+    # `current` is the epoch in progress: its question order, how far each pass got, and their loss sums.
+    start_epoch, current = 0, None
     if cfg.resume and progress_path.exists():
         progress = load_checkpoint(progress_path)
-        if (progress.get("schema_version") != 2 or progress.get("phase") != phase
+        if (progress.get("schema_version") not in (2, HEAD_PROGRESS_SCHEMA) or progress.get("phase") != phase
                 or progress.get("fingerprint") != fingerprint):
             raise ValueError("Decision head progress has an incompatible training contract.")
-        start_epoch = progress["epoch"]
-        if not (0 < start_epoch <= epochs and
-                len(progress["history"]) == start_epoch and
-                1 <= progress["best_epoch"] <= start_epoch and progress["stale"] >= 0):
+        start_epoch, current = progress["epoch"], progress.get("partial")  # Schema 2 has no epoch in progress.
+        stale = progress["stale"]
+        consistent = (0 <= start_epoch <= epochs and len(progress["history"]) == start_epoch and stale >= 0
+                      and (1 <= progress["best_epoch"] <= start_epoch if start_epoch else
+                           progress["best_epoch"] == 0 and current is not None))
+        if consistent and current is not None:
+            consistent = (start_epoch < epochs and stale < cfg.patience
+                          and np.array_equal(np.sort(current["order"]), np.arange(questions))
+                          and 0 <= current["train_done"] <= questions
+                          and 0 <= current["dev_done"] < dev_questions
+                          and (current["dev_done"] == 0 or current["train_done"] == questions))
+        if not consistent:
             raise ValueError("Decision head progress has inconsistent epoch bookkeeping.")
         model.load_state_dict(progress["current_weights"])
         opt.load_state_dict(progress["optimizer"])
         rng.set_state(progress["rng_state"])
         best, weights, best_epoch = progress["dev_loss"], progress["best_weights"], progress["best_epoch"]
-        stale, history = progress["stale"], progress["history"]
+        history = progress["history"]
         del progress
-        print(f"{title} head resume: {start_epoch} completed epochs; "
-              "restored optimizer, shuffle RNG, and best development checkpoint.", flush=True)
+        where = "" if current is None else (f" and epoch {start_epoch+1} at {current['train_done']}/{questions} "
+                                            f"training and {current['dev_done']}/{dev_questions} development questions")
+        print(f"{title} head resume: {start_epoch} completed epochs{where}; restored the weights, optimizer, "
+              "shuffle RNG, and best development checkpoint.", flush=True)
+    saved_at = time.monotonic()
+
+    def checkpoint(completed, current, message):
+        """Save the training state: inside an epoch only when a save is due; each due save is uploaded."""
+        nonlocal saved_at
+        due = time.monotonic() - saved_at >= cfg.hf_sync_minutes * 60
+        if current is not None and not due:
+            return
+        atomic_torch(progress_path, {
+            "schema_version": HEAD_PROGRESS_SCHEMA, "phase": phase, "fingerprint": fingerprint,
+            "epoch": completed, "current_weights": cpu_state(model), "optimizer": opt.state_dict(),
+            "rng_state": rng.get_state(), "best_weights": weights, "best_epoch": best_epoch,
+            "dev_loss": best, "stale": stale, "history": history, "partial": current})
+        if due:
+            saved_at = time.monotonic()
+            if sync is not None:
+                sync.push(f"{title}: {message}", force=True)
+
     print(f"{title} head training: device={device}, up to {epochs} epochs at learning rate {lr:g}, "
           f"train batch={cfg.decision_batch_size}, dev batch={cfg.decision_eval_batch_size}. "
           "Labels are complete; epochs only re-encode stored observations with the frozen "
-          "predictor.", flush=True)
+          f"predictor. The training state is saved to {progress_path.name} after every epoch and every "
+          f"{cfg.hf_sync_minutes:g} minutes inside one" + (", and uploaded at each timed save"
+                                                           if sync is not None else "")
+          + ", so a new session continues with the next question.", flush=True)
     for epoch in range(start_epoch, epochs):
         if stale >= cfg.patience:
             break
-        epoch_started = time.monotonic()
+        if current is None:  # The epoch's question order is drawn first, then each question's row order.
+            current = {"order": rng.permutation(questions), "train_done": 0, "train_total": 0., "train_count": 0,
+                       "dev_done": 0, "dev_total": 0., "dev_count": 0, "seconds": 0.}
+        epoch_started = time.monotonic() - current["seconds"]
         model.train()
+        resumed = current["train_done"]
         started = last_print = time.monotonic()
-        train_total, train_count = 0., 0
-        for position, question in enumerate(rng.permutation(len(splits["policy"])), 1):
-            rows = question_rows("policy", question)
+        for position in range(resumed + 1, questions + 1):
+            rows = question_rows("policy", current["order"][position - 1])
             value, n = masked_action_loss(model, rows, rng.permutation(len(rows["target"])), cfg, device, opt)
-            train_total, train_count = train_total + value, train_count + n
             del rows
-            last_print = decision_progress(f"{title} epoch {epoch+1} train", position, len(splits["policy"]),
-                                           started, last_print, cfg, f" | rows {train_count}")
+            current.update(train_done=position, train_total=current["train_total"] + value,
+                           train_count=current["train_count"] + n, seconds=time.monotonic() - epoch_started)
+            last_print = decision_progress(f"{title} epoch {epoch+1} train", position, questions, started,
+                                           last_print, cfg, f" | rows {current['train_count']}", resumed=resumed)
+            checkpoint(epoch, current, f"epoch {epoch+1} training, {position}/{questions} questions")
         model.eval()
         with torch.no_grad():
+            resumed = current["dev_done"]
             started = last_print = time.monotonic()
-            total, count = 0., 0
-            for position in range(len(splits["dev"])):
-                rows = question_rows("dev", position)
+            for position in range(resumed + 1, dev_questions + 1):
+                rows = question_rows("dev", position - 1)
                 value, n = masked_action_loss(model, rows, range(len(rows["target"])), cfg, device,
                                               batch_size=cfg.decision_eval_batch_size)
-                total, count = total + value, count + n
                 del rows
-                last_print = decision_progress(f"{title} epoch {epoch+1} dev", position + 1, len(splits["dev"]),
-                                               started, last_print, cfg, f" | rows {count}")
-            dev_loss = total / count
+                current.update(dev_done=position, dev_total=current["dev_total"] + value,
+                               dev_count=current["dev_count"] + n, seconds=time.monotonic() - epoch_started)
+                last_print = decision_progress(f"{title} epoch {epoch+1} dev", position, dev_questions, started,
+                                               last_print, cfg, f" | rows {current['dev_count']}", resumed=resumed)
+                if position < dev_questions:  # The completed epoch is saved right after its last question.
+                    checkpoint(epoch, current, f"epoch {epoch+1} development, {position}/{dev_questions} questions")
+        train_loss = current["train_total"] / current["train_count"]
+        dev_loss = current["dev_total"] / current["dev_count"]
+        current = None
         history.append({"epoch": epoch+1, "dev_loss": dev_loss})
         if dev_loss < best - 1e-7:
             best, weights, stale, best_epoch = dev_loss, cpu_state(model), 0, epoch+1
         else:
             stale += 1
-        # Only complete train+dev epochs commit. An interruption repeats at most
-        # the current partial epoch, with the exact question/row shuffle restored.
-        atomic_torch(progress_path, {
-            "schema_version": 2, "phase": phase, "fingerprint": fingerprint, "epoch": epoch+1,
-            "current_weights": cpu_state(model), "optimizer": opt.state_dict(),
-            "rng_state": rng.get_state(), "best_weights": weights,
-            "best_epoch": best_epoch, "dev_loss": best, "stale": stale, "history": history})
-        print(f"{title} epoch {epoch+1}/{epochs}: train loss {train_total/train_count:.4f}, "
+        checkpoint(epoch + 1, None, f"epoch {epoch+1} progress")
+        print(f"{title} epoch {epoch+1}/{epochs}: train loss {train_loss:.4f}, "
               f"dev loss {dev_loss:.4f}, best {best:.4f} (epoch {best_epoch}), "
               f"patience {stale}/{cfg.patience} | elapsed {(time.monotonic()-epoch_started)/60:.1f} min",
               flush=True)
-        if sync is not None:
-            sync.push(f"{title}: epoch {epoch+1} progress")
         if stale >= cfg.patience:
             break
     return {"weights": weights, "best_epoch": best_epoch, "dev_loss": best, "history": history,
@@ -3692,7 +3741,8 @@ class OutputSync:
     already completes through atomic files in output_dir, so uploading that
     folder makes a run resumable across sessions: a new session pulls the
     folder, Stages 0-2 load their completed checkpoints, and Stage 3 continues
-    from its completed questions and epochs. Uploads skip unchanged files by
+    from its completed questions and the head's saved training state, inside an
+    epoch if need be. Uploads skip unchanged files by
     content hash, never include `.tmp` files, and remove per-question label
     files from the mirror once a role is merged, a Stage 1-2 model's training
     state once the model completes, and the dataset build's per-log records once

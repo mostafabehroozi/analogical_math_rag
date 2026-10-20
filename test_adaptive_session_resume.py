@@ -2,6 +2,7 @@
 fold-level Stage 1 resume, and the Hugging Face mirror of the output folder."""
 import copy
 import fnmatch
+import itertools
 import json
 import os
 import re
@@ -506,6 +507,50 @@ def test_moved_input_logs_resume_stages_0_to_3_without_relabeling_or_retraining(
     a.Workflow(again).train_decision_head()
     log = capsys.readouterr().out
     assert "Loaded completed pretrained decision head." in log and "Loaded completed fine-tuned decision head." in log
+
+
+def test_head_training_ended_inside_an_epoch_continues_from_the_mirror_in_a_fresh_session(
+        tmp_path, monkeypatch, capsys):
+    torch.set_num_threads(1)
+    hub = FakeHub()
+    monkeypatch.setattr(a, "hub_api", lambda: hub)
+    cfg = small_config(tmp_path, hf_repo="user/adaptive-run", hf_sync_minutes=1)
+    reference_cfg = copy.deepcopy(cfg)
+    reference_cfg.output_dir, reference_cfg.hf_repo = str(tmp_path / "reference"), None
+    reference_work = a.Workflow(reference_cfg).train_decision_head()
+    reference, pretrained = reference_work.decision_checkpoint, reference_work.pretrained_checkpoint
+    questions = len(reference_work.splits["policy"])
+    # A clock that advances a minute per reading: every question boundary is a timed save and upload.
+    clock = itertools.count()
+    monkeypatch.setattr(a.time, "monotonic", lambda: 60. * next(clock))
+    original, steps = a.masked_action_loss, 0
+
+    def session_ends(model, rows, order, config, device, optimizer=None, **kwargs):
+        nonlocal steps
+        if optimizer is not None:
+            steps += 1
+            if steps == questions + 3:  # The third training question of Stage 3a's second epoch.
+                raise KeyboardInterrupt("simulated Kaggle session end")
+        return original(model, rows, order, config, device, optimizer, **kwargs)
+
+    monkeypatch.setattr(a, "masked_action_loss", session_ends)
+    with pytest.raises(KeyboardInterrupt, match="simulated Kaggle session end"):
+        a.Workflow(cfg).train_decision_head()
+    monkeypatch.setattr(a, "masked_action_loss", original)
+    # The next session starts with an empty working disk and pulls the mirror.
+    run = tmp_path / "run"
+    shutil.rmtree(run)
+    forbid(monkeypatch, "fit_teachers", "fit_snapshot", "build_route_labels")
+    capsys.readouterr()
+    work = a.Workflow(cfg)
+    progress = a.load_checkpoint(run / "decision_head_pretrain_progress.pt")
+    assert progress["epoch"] == 1 and progress["partial"]["train_done"] == 2
+    work.train_decision_head()
+    log = capsys.readouterr().out
+    assert "Mirror user/adaptive-run: downloaded" in log and "built 0, reused" in log
+    assert f"Stage 3a head resume: 1 completed epochs and epoch 2 at 2/{questions} training" in log
+    assert_same_head(work.pretrained_checkpoint, pretrained)
+    assert_same_head(work.decision_checkpoint, reference)
 
 
 def test_completed_heads_with_another_dataset_or_pretrained_head_are_rejected(tmp_path):
