@@ -452,6 +452,164 @@ Stage 3 identity. Runs started before it existed keep their contract and labels
 and still resume. `True` is a new run: use a new `output_dir` and `hf_repo`.
 `dataset_id` can stay, because the records do not change.
 
+## Grouping phase (`grouping`, Stage 1G)
+
+A companion Layer-1 grouping run (`APPLY_LAYER1_GROUPING=True`, `LAYER1_GROUPING_ONLY_MODE=True`; for
+example `Layer1_Grouping_K5_Sizes2` with `LAYER1_GROUP_SIZES=[2]`) generated one few-shot candidate per
+group of retrieved samples and graded it against the target answer. It ran no baseline and no mirror
+evaluation, so nothing measured those candidates. With `grouping=True`, Stage 1G trains the Stage 1
+network with one extra correctness output per group, so a group's correctness is predicted from the
+zero-shot and one-shot measurements alone, and then compares selections. With `grouping=False` (the
+default) nothing changes.
+
+| Setting | Meaning |
+| --- | --- |
+| `grouping` | Turns Stage 1G on. |
+| `grouping_files` | The grouping run's log in a list: normally the one `<experiment_name>_run_log.json` that holds every benchmark's questions. Several logs (for example one per benchmark) also work. |
+| `grouping_sizes` | The grouping run's `LAYER1_GROUP_SIZES`; `(2,)` gives the `C(5,2) = 10` pairs. |
+| `grouping_weight` | Weight of the group outputs' loss beside the candidates' (default 1). It counts in checkpoint selection. |
+| `grouping_shuffle_control` | Also trains a control whose group labels are permuted within each question. |
+
+These settings and the grouping logs stay outside the run contract and the Stage 3 identity.
+`grouping_manifest.json` and the grouping teachers' checkpoints bind them instead. The phase can
+therefore be turned on in a finished run's `output_dir`: it reuses that run's Stage 1 teacher and
+changes no other stage.
+
+**The grouping log.** Like a Layer-1 log, it is a list of run logs keyed by the global
+`target_query_original_hard_list_idx`, with `execution_mode="layer1_grouping_only"`. Each entry's
+`layer1_grouping_state` holds:
+- `retrieved_set`: corpus ids in true descending similarity, with correct scores;
+- `candidate_set["group_s2_pA-B"]`: the group's `source_exemplar_indices` (corpus ids), its
+  `source_retrieval_positions`, and `generation_status`;
+- `ground_truth_labels`: `is_correct` and `evaluation_status` per group;
+- `metadata.effective_group_sizes`.
+
+A question whose worker failed is saved without a state (`FAILED_WORKER_EXCEPTION`).
+
+**One log, split by benchmark.** A grouping run over the combined `TARGET_BENCHMARKS` writes every
+benchmark's questions into that one log, and the phase reads it as it is: no separate split step.
+Each entry goes to the Layer-1 log that holds its question (see Join). The questions of `train_file`
+therefore train the grouping teacher, and each test file's questions are reported on their own. The
+audit counts the joined questions of each Layer-1 log (`joined_by_layer1_log`) and prints one row per
+Layer-1 log, with its split (train or test). The global index, benchmark order, and file layout do not
+matter. A question in two grouping logs keeps the first log's entry
+(`in_an_earlier_grouping_log`). The phase stops with an explanation when no `train_file` question has
+a group label.
+
+**Join.** Building the grouping data reads the grouping logs and trains, loads, or runs no model. Each
+entry joins the record with the same normalized question text, in whichever Layer-1 log holds it (the
+dataset keeps each question text once). The join then requires:
+- the same retrieved corpus ids;
+- the same similarity values, compared as a sorted set;
+- the configured group sizes.
+
+Every other case is counted in `grouping_data_audit.json`, never counted as wrong:
+
+| Count | Meaning |
+| --- | --- |
+| `missing_grouping_state` | The entry has no grouping state (a failed question). |
+| `not_in_layer1` | No eligible record of any Layer-1 log has this question text. |
+| `retrieval_mismatch`, `grouping_retrieval_not_descending`, `similarity_mismatch` | The two runs retrieved different exemplars, or the grouping retrieval is not in similarity order. |
+| `group_sizes_mismatch`, `duplicate_group`, `duplicate` | The log does not match `grouping_sizes`, holds a group twice, or holds a question twice. |
+| `incomplete_labels` | Joined, but some group's generation or grading failed: that label is unknown (-1). |
+| `eligible` | Joined with every group label known. |
+| `index_differs` | Joined by text although the global index differs (noted only). |
+| `layer1_scores_misattached` | The Layer-1 log attached a similarity score to another exemplar, as the mirrored logs do (noted only; see below). Tied scores never count. |
+
+Layer-1 logs written before 2026-09-21 list each exemplar's similarity score at the mirrored position:
+the corpus-id order is the true order, but the scores are reversed. `parse_record` sorts by those
+scores, so record slot 1 (R1/OS1) of such a log is truly the farthest exemplar. The grouping run lists
+true positions with correct scores. Group labels therefore reach their outputs through corpus ids, and
+every similarity-based selection below uses the grouping log's true order. `parse_record` and Stages
+1-4 are unchanged.
+
+**Grouping teacher.** It uses Stage 1's input (223 numbers), folds, views, complete-view share, and
+selection rule. It has `n + G` outputs: the eight candidates, then one per group. Groups are
+`itertools.combinations` of record slots, smallest size first.
+
+| Group target in a presence state | Value |
+| --- | --- |
+| Every source of the group is in use (its one-shot candidate or its evaluator is acquired) | The recorded label |
+| Otherwise | 0, counted with `absent_weight` |
+| Label unknown | Left out of the loss |
+
+The loss is Stage 1's correctness loss plus `grouping_weight` times the group block. The group block
+averages present and absent groups over their own counts, like a candidate block. Each fold keeps the
+checkpoint with the lowest loss on the complete states of its held-out training-file questions. In a
+complete state every group is present, so that loss is the candidate loss plus the weighted mean group
+cross-entropy. As in Stage 1, supervised questions are scored out of fold and every other question by
+the mean of the fold teachers. The folds are saved as `grouping_teacher_fold_<n>.pt` and the result as
+`grouping_teacher_completed.pt`; both are bound to the group labels and settings.
+
+**Report** (`WORK.grouping_report()`, `grouping_results.json`). It covers the supervised questions (out
+of fold), the pooled audit, and each test file. Each report uses only the questions with every group
+label known, so all methods answer the same questions and every difference is paired. pass@1 means the
+one returned candidate is correct.
+
+| Method | top-0 | top-1 | top-2 |
+| --- | --- | --- | --- |
+| Similarity (no model) | `zs_0` | the one-shot of the truly nearest exemplar | the group of the two nearest exemplars |
+| Stage 1 teacher, grouping teacher, and the Stage 1 heuristics, reranked | best-scored zero-shot | best-scored one-shot | the group of the two best-scored one-shots' sources |
+| Grouping teacher: best group output | | | the pair with the highest group output |
+| Stage 1 member pairs (mean, min, max, noisy-OR) | | | the pair whose members' Stage 1 one-shot probabilities combine highest |
+
+Zero-shot and one-shot candidates never take each other's place: top-0 is always a zero-shot and top-1
+always a one-shot. Ties go to the fewer examples (zero-shot, then one-shot, then group), then the
+nearer exemplar, then the lower zero-shot index.
+
+The other tables:
+- **Best-of-N levels.** Level 0 takes the best of the zero-shots, level 1 adds the one-shots, and level
+  s adds the groups up to size s, each chosen by predicted correctness. Columns: the grouping teacher;
+  the Stage 1 teacher, scoring a group by the mean of its members' one-shot probabilities; random (the
+  mean label of the level); oracle (any correct candidate in the level); and each scorer's share of
+  zero-shot, one-shot, and group picks. Level 0 equals reranked top-0, and the Stage 1 teacher's level 1
+  is its usual Top-1.
+- **Paired differences**, each with a 95% bootstrap interval over questions:
+  - grouping teacher level-max vs level-1;
+  - grouping teacher level-1 vs Stage 1 level-1, which shows whether training group outputs changes
+    the candidate ranking;
+  - grouping teacher level-max vs Stage 1 level-max with member pairs;
+  - reranked top-2 vs similarity top-2;
+  - reranked top-2 vs top-1;
+  - best group output vs Stage 1 member pairs (mean);
+  - with the control, the grouping teacher vs the control.
+- **Level switches.** Every question falls into one row from level 1 to the top level: same pick,
+  rescued, broken, both correct, or both wrong.
+- **Group outputs.** Cross-entropy beside the constant prior of the supervised group labels, AP, and
+  Brier score. Within-question hit@1, on questions with both a correct and a wrong group, sits beside
+  the hit rate of a random pick.
+- **Calibration.** Ten bins per family (zero-shot, one-shot, group), in the JSON. Level 2 compares
+  unmeasured group probabilities with measured candidates, so their calibration matters.
+- **Strata.** The main rows again, on questions whose five one-shot labels disagree and on those where
+  they all agree. In the test logs about half the questions have unanimous one-shots, and there a group's
+  label mostly follows the question's difficulty.
+- **Calls.** Similarity picks generate one candidate. Reranks, best group outputs, and levels need the
+  full measured pool (`full_cost`), plus one generation whenever a group is chosen, since groups are
+  never measured. The oracle is a reference: it needs every candidate generated and graded against the
+  answer.
+
+How to read it:
+- If the best group output does not beat Stage 1's member pairs, the group outputs know nothing beyond
+  the one-shot predictions.
+- If the shuffled-label control matches the teacher, the teacher learned question difficulty, not which
+  exemplars combine well.
+- The one-shots-disagree stratum is where pair-specific skill can show.
+- AIME has almost no correct candidates, so its numbers are near zero for every method.
+
+**Artifacts:**
+- `grouping_records.pt`: each joined question's group labels and true retrieval ranks, plus the audit;
+- `grouping_manifest.json`: the grouping logs' name, size, and SHA-256, the group sizes, and the
+  records' digest;
+- `grouping_data_audit.json`;
+- `grouping_teacher_fold_<n>.pt` and `grouping_teacher_completed.pt`;
+- with the control, `grouping_shuffle_teacher_*`;
+- `grouping_results.json`.
+
+While the data is built, each finished log is saved in `grouping_progress/`, and a teacher in training
+saves its state in `training_progress/`. Both folders go once complete. With `hf_repo` everything is
+mirrored, and a new session loads the completed grouping data and teachers. A manifest made from other
+grouping logs, group sizes, or records stops the phase with an explanation.
+
 ## Training, artifacts, and evaluation
 
 All three stages train on exactly the same question group: `supervised`.
@@ -1107,7 +1265,9 @@ version hashes only the record settings and the logs; schema 1 also held the
 model output of Stages 1-3a, which a run adopts as described in "Datasets and
 dataset IDs"; neither changes any label, checkpoint or contract, so neither
 needed a new revision). The `reachable_only` switch is not a revision either:
-off, it changes no label, checkpoint or contract. Revision 12 gives every
+off, it changes no label, checkpoint or contract.
+Neither is the grouping phase (Stage 1G): off, it changes nothing; on, it changes
+no other stage, and `grouping_manifest.json` and its checkpoints bind its settings. Revision 12 gives every
 absent candidate's correctness, SAFE and MAX outputs a target of 0 that counts
 in the Stage 1-2 losses (`absent_weight`, see "Absent candidates"); earlier
 revisions left those outputs out of the loss. Revision 11 ranks the

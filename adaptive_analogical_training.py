@@ -18,7 +18,7 @@ import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
-from itertools import permutations
+from itertools import combinations, permutations
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -116,10 +116,31 @@ class Config:
     # already holds them. Everything the models produce goes to hf_repo.
     dataset_id: Optional[str] = None   # Name of the dataset family, e.g. "adaptive-v10"; None disables.
     dataset_repo: Optional[str] = None # Private dataset repo that holds every dataset_id, e.g. "user/datasets".
+    # Optional grouping phase (Stage 1G): the Stage 1 network with one extra correctness output per
+    # few-shot group of retrieved samples, trained on a companion Layer-1 grouping run's labels and
+    # compared with similarity, reranked and best-of-N selections. Off, nothing changes. These settings
+    # and the grouping logs stay outside the run contract; grouping_manifest.json binds them.
+    grouping: bool = False
+    # The grouping run's log: usually one file holding every benchmark's questions (the grouping
+    # experiment's <experiment_name>_run_log.json), or several files. Each question joins its Layer-1 record
+    # by text, so its own Layer-1 log decides whether it trains (train_file) or is reported (a test file).
+    grouping_files: list = field(default_factory=list)
+    grouping_sizes: tuple = (2,)                # The grouping run's LAYER1_GROUP_SIZES.
+    grouping_weight: float = 1.                 # Weight of the group outputs' loss beside the candidates'.
+    grouping_shuffle_control: bool = False      # Also train a control on group labels permuted per question.
 
     @property
     def n(self):
         return self.zero_shots + self.k
+
+    @property
+    def group_members(self):
+        """[groups, k] 0/1 matrix of the sources (record slots) each group uses, in output order."""
+        return group_members(self.k, tuple(self.grouping_sizes))
+
+    @property
+    def group_count(self):
+        return len(self.group_members)
 
     @property
     def action_count(self):
@@ -181,6 +202,20 @@ class Config:
         if self.dataset_repo is not None and self.dataset_repo == self.hf_repo:
             raise ValueError("dataset_repo must differ from hf_repo: the run mirror would download the "
                              "datasets stored beside it.")
+        assert type(self.grouping) is bool and type(self.grouping_shuffle_control) is bool
+        if self.grouping:
+            if isinstance(self.grouping_files, str) or not self.grouping_files:
+                raise ValueError("grouping=True needs grouping_files: a list holding the grouping run's log (one "
+                                 "file with every benchmark's questions) or several grouping logs.")
+            names = [Path(p).name for p in self.grouping_files]
+            if len(set(names)) != len(names):
+                raise ValueError("Each grouping run log needs a unique filename.")
+            sizes = list(self.grouping_sizes)
+            if (not sizes or any(type(s) is not int or not 2 <= s <= self.k for s in sizes)
+                    or sizes != sorted(set(sizes))):
+                raise ValueError(f"grouping_sizes must be increasing distinct integers from 2 to k={self.k}, "
+                                 "as the grouping run's LAYER1_GROUP_SIZES.")
+            assert self.grouping_weight >= 0
         fixed_acquisition_sequences(self)
 
 
@@ -194,11 +229,16 @@ NON_CONTRACT_SETTINGS = ("resume", "output_dir", "device", "cpu_threads", "print
 # Contract settings added after revision 10's runs began, with the value that reproduces those runs. At
 # that value a setting stays out of the run contract and the Stage 3 identity, so those runs still resume.
 LATER_CONTRACT_DEFAULTS = {"reachable_only": False}
+# The optional grouping phase changes no other stage: its settings and logs are bound by
+# grouping_manifest.json and its checkpoints, never by the run contract, so turning it on in a
+# finished run reuses that run's Stages 1-4.
+GROUPING_SETTINGS = ("grouping", "grouping_files", "grouping_sizes", "grouping_weight", "grouping_shuffle_control")
 
 
 def contract_settings(cfg):
     """The settings a run contract and the Stage 3 identity hold."""
     return {key: value for key, value in asdict(cfg).items() if key not in NON_CONTRACT_SETTINGS
+            and key not in GROUPING_SETTINGS
             and not (key in LATER_CONTRACT_DEFAULTS and value == LATER_CONTRACT_DEFAULTS[key])}
 
 
@@ -619,27 +659,54 @@ def lower_loss(new, old):
     return new < old - 1e-8
 
 
-def train_teacher(records, train_ids, val_ids, cfg, device, seed, name, progress=None):
+def grouping_teacher_loss(logits, targets, cfg):
+    """Stage 1's correctness loss plus `grouping_weight` times the group outputs' loss.
+
+    Targets are `[labels, presence, group labels, group presence, group known]` (see `group_target`).
+    A group whose sources are all in use is trained against its recorded label and any other against
+    0 with `absent_weight`, each averaged over its own count like a candidate block; a group without a
+    recorded label is left out of the loss.
+    """
+    n, groups = cfg.n, cfg.group_count
+    label = targets[:, 2*n:2*n+groups]
+    present, known = targets[:, 2*n+groups:2*n+2*groups], targets[:, 2*n+2*groups:]
+    raw = nn.functional.binary_cross_entropy_with_logits(logits[:, n:], label, reduction="none")
+    on, off = present * known, (1 - present) * known
+    block = ((raw * on).sum(1) / on.sum(1).clamp_min(1) +
+             cfg.absent_weight * (raw * off).sum(1) / off.sum(1).clamp_min(1))
+    return teacher_loss(logits[:, :n], targets[:, :2*n], cfg) + cfg.grouping_weight * block.mean()
+
+
+def train_teacher(records, train_ids, val_ids, cfg, device, seed, name, progress=None, groups=None):
     """Train on every presence state and zero-shot order; keep the checkpoint with the lowest
     development correctness loss on complete states. AP is a report metric, never a training signal.
-    With a `TrainingProgress`, an interrupted training continues from its last saved check."""
+    With a `TrainingProgress`, an interrupted training continues from its last saved check.
+
+    `groups` (the grouping phase: `{"labels": [records, groups] int8, -1 unknown}`) adds one output per
+    group of `cfg.group_members`; the loss, and so the selection, becomes `grouping_teacher_loss`."""
     seed_everything(seed)
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
     # The ranking passed to later stages is read from complete states, so selection is too.
     vx = np.stack([observation(records[i], full, cfg) for i in val_ids])
     # Every candidate is present in a complete state, so each carries a correctness target.
-    vy = torch.as_tensor(np.stack([np.r_[records[i].labels, np.ones(cfg.n)] for i in val_ids]),
-                         dtype=torch.float32)
+    vy = np.stack([np.r_[records[i].labels, np.ones(cfg.n)] for i in val_ids])
+    loss_of, outputs = teacher_loss, cfg.n
+    if groups is not None:
+        # Every group is present in a complete state; only its recorded labels count.
+        vy = np.concatenate([vy, np.stack([group_target(groups["labels"][i], full, cfg) for i in val_ids])], 1)
+        loss_of, outputs = grouping_teacher_loss, cfg.n + cfg.group_count
+    vy = torch.as_tensor(vy, dtype=torch.float32)
     # The complete view is the one later stages read, so it gets its own share of training.
-    views = SnapshotViews(records, train_ids, cfg, device, complete_share=cfg.teacher_complete_share)
-    model = ResNet(cfg.input_dim, cfg.n, cfg).to(device)
+    views = SnapshotViews(records, train_ids, cfg, device, complete_share=cfg.teacher_complete_share,
+                          groups=groups)
+    model = ResNet(cfg.input_dim, outputs, cfg).to(device)
 
     def evaluate(model):
         # The training loss itself, on the complete-state development views.
-        score = float(teacher_loss(torch.as_tensor(predict_array(model, vx, device)), vy, cfg))
+        score = float(loss_of(torch.as_tensor(predict_array(model, vx, device)), vy, cfg))
         return score, f"development loss {score:.4f}"
 
-    fit = train_on_views(model, views, cfg.teacher_epochs, seed, lambda logits, y: teacher_loss(logits, y, cfg),
+    fit = train_on_views(model, views, cfg.teacher_epochs, seed, lambda logits, y: loss_of(logits, y, cfg),
                          evaluate, lower_loss, cfg, name, progress=progress)
     print(f"{name:<24} | epochs {fit['epochs']:6.2f} | best {fit['best_epoch']:6.2f} | "
           f"development loss {fit['best']:.4f}")
@@ -649,7 +716,9 @@ def train_teacher(records, train_ids, val_ids, cfg, device, seed, name, progress
 
 
 def teacher_predict(checkpoint, records, ids, cfg, device):
-    model = ResNet(cfg.input_dim, cfg.n, cfg).to(device)
+    # A grouping-phase teacher also has one output per group after the n candidates.
+    outputs = checkpoint["weights"]["output_layer.weight"].shape[0]
+    model = ResNet(cfg.input_dim, outputs, cfg).to(device)
     model.load_state_dict(checkpoint["weights"])
     full = State((1 << cfg.n)-1, (1 << cfg.k)-1)
     x = np.stack([observation(records[i], full, cfg) for i in ids])
@@ -680,19 +749,24 @@ def completed_teacher(path, expected, cfg, name):
     return ckpt
 
 
-def fit_teachers(records, splits, cfg, device, out, sync=None):
+def fit_teachers(records, splits, cfg, device, out, sync=None, groups=None, prefix="teacher",
+                 stage="Stage 1", title="Teacher", identity=None):
     """Cross-fitted teachers. Each supervised question is scored by the fold teacher that never trained
     on it; every other question (dev, audit) by the mean of the fold teachers' complete-state
     probabilities. Each fold keeps its lowest-loss checkpoint on held-out training-file questions, so no
     teacher is selected on the dev questions: when they come from other benchmarks, their correctness
-    loss is lowest for the training file's slot prior, so a teacher selected on them stops untrained."""
+    loss is lowest for the training file's slot prior, so a teacher selected on them stops untrained.
+
+    The grouping phase passes `groups` (one extra output per group), its own file `prefix`, and an
+    `identity` that its saved folds must match; the folds are Stage 1's, and `group_scores` holds the
+    group outputs' probabilities beside the candidates' `scores`."""
     out = Path(out)
     sup = np.array(splits["supervised"])
     rng = np.random.RandomState(cfg.seed + 1)
     rng.shuffle(sup)
     folds = np.array_split(sup, cfg.teacher_folds)
     oof, provenance = {}, []
-    total = np.zeros((len(records), cfg.n))
+    total = np.zeros((len(records), cfg.n + (0 if groups is None else cfg.group_count)))
     for f, heldout in enumerate(folds):
         others = np.concatenate([p for j, p in enumerate(folds) if j != f])
         rng.shuffle(others)
@@ -700,17 +774,18 @@ def fit_teachers(records, splits, cfg, device, out, sync=None):
         train_ids, val_ids = others[nv:].tolist(), others[:nv].tolist()
         if not train_ids:
             raise ValueError("Too few training records for nested teacher fold.")
-        name, fold_path = f"Teacher fold {f+1}/{cfg.teacher_folds}", out / f"teacher_fold_{f+1}.pt"
+        name, fold_path = f"{title} fold {f+1}/{cfg.teacher_folds}", out / f"{prefix}_fold_{f+1}.pt"
         expected = {"train_ids": [records[i].uid for i in train_ids],
                     "validation_ids": [records[i].uid for i in val_ids],
-                    "heldout_ids": [records[i].uid for i in heldout]}
+                    "heldout_ids": [records[i].uid for i in heldout], **(identity or {})}
         # Each fold completes as an atomic file, and the fold in training saves its state, so an
         # interrupted Stage 1 resumes inside that fold.
-        progress = TrainingProgress(out, "Stage 1", fold_path.name, expected, cfg, sync)
+        progress = TrainingProgress(out, stage, fold_path.name, expected, cfg, sync)
         ckpt = completed_teacher(fold_path, expected, cfg, name)
         if ckpt is None:
-            ckpt = train_teacher(records, train_ids, val_ids, cfg, device, cfg.seed + f, name, progress=progress)
-            ckpt["heldout_ids"] = expected["heldout_ids"]
+            ckpt = train_teacher(records, train_ids, val_ids, cfg, device, cfg.seed + f, name, progress=progress,
+                                 groups=groups)
+            ckpt.update({key: value for key, value in expected.items() if key not in ckpt})
             atomic_torch(fold_path, ckpt)
         progress.clear()  # The completed fold supersedes it.
         predictions = teacher_predict(ckpt, records, list(range(len(records))), cfg, device)
@@ -718,12 +793,16 @@ def fit_teachers(records, splits, cfg, device, out, sync=None):
         oof.update({int(i): predictions[i] for i in heldout})
         provenance.append({k: ckpt[k] for k in ("train_ids", "validation_ids", "heldout_ids")})
         if sync is not None:
-            sync.push(f"Stage 1: teacher fold {f+1}/{cfg.teacher_folds}")
+            sync.push(f"{stage}: {title.lower()} fold {f+1}/{cfg.teacher_folds}")
     scores = (total / len(folds)).astype(np.float32)
     for idx, pred in oof.items():
         scores[idx] = pred
+    scores, group_scores = np.ascontiguousarray(scores[:, :cfg.n]), np.ascontiguousarray(scores[:, cfg.n:])
     safe, maximum = zip(*(teacher_labels(p, r.labels, cfg) for p, r in zip(scores, records)))
-    return {"scores": scores, "safe": np.stack(safe), "maximum": np.stack(maximum), "folds": provenance}
+    result = {"scores": scores, "safe": np.stack(safe), "maximum": np.stack(maximum), "folds": provenance}
+    if groups is not None:
+        result["group_scores"] = group_scores
+    return result
 
 
 # %% Partial snapshots and supervised prediction
@@ -1029,6 +1108,19 @@ def snapshot_target(record, safe, maximum, state, cfg):
                  float(np.any(safe * cm)), float(np.any(maximum * cm)), cm].astype(np.float32)
 
 
+def group_target(labels, state, cfg):
+    """Scalar reference for the grouping phase's group targets at one presence state.
+
+    `labels` holds one recorded label per group (1, 0, or -1 when unknown). A group is present when
+    every one of its sources is in use (its one-shot candidate or its evaluator is acquired); a present
+    group's target is its label and any other group's is 0 (OFF). Returns `[target, present, known]`.
+    """
+    labels, members = np.asarray(labels), cfg.group_members
+    used = bit_array(used_sources(state, cfg), cfg.k).astype(np.float32)
+    present = (members @ used == members.sum(1)).astype(np.float32)
+    return np.r_[(labels == 1) * present, present, labels >= 0].astype(np.float32)
+
+
 SNAPSHOT_EVAL_BATCH = 16384
 
 
@@ -1046,8 +1138,11 @@ class SnapshotViews:
     (under 1 KiB). Rows equal observation(...) and snapshot_target of the
     permuted record bit for bit: an absent candidate's correctness, SAFE and MAX
     targets are 0. Views are indexed question-major, then zero-shot order, then state.
+
+    `groups` (the grouping phase) appends `group_target` to the teacher targets: one recorded label
+    per group of retrieved samples, the same under every zero-shot order.
     """
-    def __init__(self, records, ids, cfg, device, teacher=None, states=None, complete_share=0.):
+    def __init__(self, records, ids, cfg, device, teacher=None, states=None, complete_share=0., groups=None):
         self.cfg, self.device, self.ids = cfg, torch.device(device), list(ids)
         states = presence_states(cfg.zero_shots, cfg.k) if states is None else tuple(states)
         full = State((1 << cfg.n) - 1, (1 << cfg.k) - 1)
@@ -1073,6 +1168,14 @@ class SnapshotViews:
         if teacher is not None:
             self.safe = put([teacher["safe"][i][slots] for i in self.ids], (len(orders), cfg.n))
             self.maximum = put([teacher["maximum"][i][slots] for i in self.ids], (len(orders), cfg.n))
+        self.group_labels = self.group_known = self.group_members = None
+        if groups is not None:
+            raw = np.asarray(groups["labels"])[self.ids].reshape(len(self.ids), cfg.group_count)
+            self.group_labels = torch.as_tensor((raw == 1).astype(np.float32), device=self.device)
+            self.group_known = torch.as_tensor((raw >= 0).astype(np.float32), device=self.device)
+            self.group_members = torch.tensor(cfg.group_members, device=self.device)
+            # Where the acquired-evaluator mask starts, the columns head_columns also reads.
+            self.evaluator_start = int(head_columns(cfg)[cfg.n])
         self.state_count, self.order_count = len(states), len(orders)
         self.per_question = self.state_count * self.order_count
         self.rows = len(self.ids) * self.per_question
@@ -1099,11 +1202,18 @@ class SnapshotViews:
         cm = x[:, :self.cfg.n]
         labels = self.labels[q, o] * cm
         if self.safe is None:
-            return x, torch.cat([labels, cm], 1)
-        safe, maximum = self.safe[q, o] * cm, self.maximum[q, o] * cm
-        return x, torch.cat([labels, safe, maximum,
-                             safe.amax(1, keepdim=True).gt(0).float(),
-                             maximum.amax(1, keepdim=True).gt(0).float(), cm], 1)
+            targets = [labels, cm]
+        else:
+            safe, maximum = self.safe[q, o] * cm, self.maximum[q, o] * cm
+            targets = [labels, safe, maximum, safe.amax(1, keepdim=True).gt(0).float(),
+                       maximum.amax(1, keepdim=True).gt(0).float(), cm]
+        if self.group_labels is not None:
+            # A group is present once each of its sources is in use: its evaluator or one-shot acquired.
+            used = torch.maximum(x[:, self.evaluator_start:self.evaluator_start + self.cfg.k],
+                                 cm[:, self.cfg.zero_shots:])
+            present = (used @ self.group_members.T).eq(self.group_members.sum(1)).float()
+            targets += [self.group_labels[q] * present, present, self.group_known[q]]
+        return x, torch.cat(targets, 1)
 
     def batches(self, batch_size, rng, skip=0):
         """One epoch: every view once plus the complete-view repeats.
@@ -1144,7 +1254,8 @@ class SnapshotViews:
         """SHA-256 of what the views hold: their geometry, states, and every question's values and targets."""
         digest = hashlib.sha256(json.dumps([len(self.ids), self.state_count, self.order_count,
                                             self.complete_state, self.complete_copies]).encode())
-        for tensor in (self.template, *self.values, self.labels, self.safe, self.maximum):
+        for tensor in (self.template, *self.values, self.labels, self.safe, self.maximum,
+                       self.group_labels, self.group_known, self.group_members):
             if tensor is not None:
                 digest.update(tensor.cpu().numpy().tobytes())
         return digest.hexdigest()
@@ -2589,6 +2700,469 @@ def train_finetuned_head(records, splits, teacher, predictor, pretrained, cfg, d
         raise AssertionError("Frozen Stage 2 predictor changed during decision training.")
     return {**checkpoint, "coverage": coverage, "pretrained_fingerprint": head_fingerprint(pretrained["weights"])}
 
+# %% Grouping phase: group labels, teacher outputs, and comparisons
+# A companion Layer-1 grouping run generated and graded one few-shot candidate per group of retrieved
+# samples (every pair for LAYER1_GROUP_SIZES=[2]); none was mirror-evaluated. The grouping phase
+# (Stage 1G) trains the Stage 1 network with one extra correctness output per group, so a group's
+# correctness is predicted from the zero/one-shot measurements alone, and compares its selections with
+# similarity, reranked, and best-of-N choices. Its data is what the grouping logs determine (no model is
+# involved) and its teachers are run output; neither touches compact_records.pt, the run contract, or
+# Stages 1-4.
+GROUPING_SCHEMA = 1
+GROUPING_RECORDS = "grouping_records.pt"
+GROUPING_MANIFEST = "grouping_manifest.json"
+GROUPING_PROGRESS_DIR = "grouping_progress"
+GROUPING_RESULTS = "grouping_results.json"
+GROUP_FAMILIES = ("zero-shot", "one-shot", "group")
+MEMBER_COMBINATIONS = {"mean": np.mean, "min": np.min, "max": np.max,
+                       "noisy-OR": lambda p: 1 - np.prod(1 - np.asarray(p))}
+
+
+@lru_cache(maxsize=8)
+def group_members(k, sizes):
+    """[groups, k] 0/1 matrix: each configured size's source combinations, smallest size first.
+
+    Sources are record slots (the evaluator order of `parse_record`). A logged group is matched to its
+    output by its corpus ids, never by the grouping log's own retrieval positions.
+    """
+    members = np.asarray([[float(j in combo) for j in range(k)]
+                          for size in sizes for combo in combinations(range(k), size)], np.float32).reshape(-1, k)
+    members.setflags(write=False)
+    return members
+
+
+def parse_grouping(item, by_group, cfg):
+    """One grouping-log entry joined to its Layer-1 record: `(record, labels, true_rank, notes)`.
+
+    The join is by normalized question text (`by_group` maps it to the record of whichever Layer-1 log
+    holds the question), and the retrieved corpus ids and similarity values must agree. `labels` has one entry per group of `cfg.group_members`:
+    1 or 0, or -1 when its candidate is missing or its generation or grading failed. The grouping
+    run lists its retrieval in true descending similarity with correct scores, so `true_rank[j]` (its
+    position of record slot j) is the true similarity rank. Layer-1 logs written before 2026-09-21
+    listed each score at the mirrored position, which makes record slot 1 the farthest source;
+    `notes["layer1_scores_misattached"]` says whether any record slot carries another exemplar's score.
+    Raises ValueError with an audit reason.
+    """
+    if not isinstance(item, dict):
+        raise ValueError("not_an_object")
+    state = item.get("layer1_grouping_state", item)
+    if not isinstance(state, dict) or not isinstance(state.get("candidate_set"), dict):
+        raise ValueError("missing_grouping_state")
+    text = item.get("target_query_text") or state.get("target_query_data", {}).get("query_text")
+    if not text:
+        raise ValueError("missing_target_text")
+    record = by_group.get(normalized_group(text))
+    if record is None:
+        raise ValueError("not_in_layer1")
+    metadata = state.get("metadata", {})
+    try:
+        sizes = sorted(int(size) for size in metadata.get(
+            "effective_group_sizes", metadata.get("config_snapshot", {}).get("LAYER1_GROUP_SIZES")))
+    except (TypeError, ValueError):
+        raise ValueError("group_sizes_mismatch") from None
+    if sizes != list(cfg.grouping_sizes):
+        raise ValueError("group_sizes_mismatch")
+    try:
+        ids = [str(row["corpus_index"]) for row in state.get("retrieved_set", [])]
+        similarity = np.asarray([float(row["similarity_score"]) for row in state.get("retrieved_set", [])],
+                                np.float32)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("retrieval_mismatch") from None
+    if len(ids) != cfg.k or sorted(ids) != sorted(record.evaluator_ids):
+        raise ValueError("retrieval_mismatch")
+    if np.any(np.diff(similarity) > 1e-6):
+        raise ValueError("grouping_retrieval_not_descending")
+    # Only the values are compared, as a sorted set: the Layer-1 log attached them to other exemplars.
+    if not np.allclose(similarity, record.similarity, atol=1e-5):
+        raise ValueError("similarity_mismatch")
+    position = {cid: p for p, cid in enumerate(ids)}
+    true_rank = np.asarray([position[e] for e in record.evaluator_ids], np.int8)
+    found = {}
+    for cid, candidate in state["candidate_set"].items():
+        if not isinstance(candidate, dict):
+            continue
+        members = frozenset(str(x) for x in candidate.get("source_exemplar_indices") or [])
+        if members in found:
+            raise ValueError("duplicate_group")
+        found[members] = (str(cid), candidate)
+    outcomes = {str(key): value for key, value in (state.get("ground_truth_labels") or {}).items()}
+    labels = np.full(cfg.group_count, -1, np.int8)
+    for g, row in enumerate(cfg.group_members):
+        entry = found.get(frozenset(record.evaluator_ids[j] for j in np.flatnonzero(row)))
+        if entry is None:
+            continue
+        outcome = outcomes.get(entry[0], {})
+        if (entry[1].get("generation_status") == "SUCCESS" and entry[1].get("candidate_text")
+                and isinstance(outcome, dict) and outcome.get("evaluation_status") == "SUCCESS"
+                and type(outcome.get("is_correct")) is bool):
+            labels[g] = int(outcome["is_correct"])
+    # Record slot j shows the score the Layer-1 log listed beside evaluator_ids[j]; tied scores agree anyway.
+    notes = {"index_differs": str(item.get("target_query_original_hard_list_idx")) != record.uid.split("::", 1)[1],
+             "layer1_scores_misattached": not np.allclose(record.similarity, similarity[true_rank], atol=1e-5)}
+    return record, labels, true_rank, notes
+
+
+def read_grouping_log(path, records, cfg):
+    """One grouping log's joined questions `{uid: (labels, true_rank)}` and its audit counts.
+
+    The grouping run usually writes every benchmark's questions into one log. Each entry joins the
+    record with the same question text in whichever Layer-1 log holds it (the dataset keeps each
+    question text once), so the train and test questions of one grouping log separate by their own
+    Layer-1 log, and `joined_by_layer1_log` counts them.
+    """
+    by_group = {r.group: r for r in records}
+    joined, counts, by_log = {}, Counter(), Counter()
+    for _, item in iter_log(path):
+        counts["total"] += 1
+        try:
+            record, labels, true_rank, notes = parse_grouping(item, by_group, cfg)
+        except ValueError as exc:
+            counts[str(exc)] += 1
+            continue
+        if record.uid in joined:
+            counts["duplicate"] += 1
+            continue
+        joined[record.uid] = (labels, true_rank)
+        known = labels >= 0
+        counts["joined"] += 1
+        by_log[record.benchmark] += 1
+        counts["eligible" if known.all() else "incomplete_labels"] += 1
+        counts["group_labels_known"] += int(known.sum())
+        counts["group_labels_correct"] += int((labels == 1).sum())
+        counts.update(name for name, value in notes.items() if value)
+    if not counts["total"]:
+        raise ValueError(f"No entries found in {path}; expected a Layer-1 grouping run log.")
+    return joined, {**counts, "joined_by_layer1_log": dict(by_log)}
+
+
+def grouping_benchmark_audit(records, grouping, train_stem):
+    """Per Layer-1 log: its eligible questions, how many joined a grouping entry, and their labels."""
+    rows = {}
+    for i, record in enumerate(records):
+        row = rows.setdefault(record.benchmark, Counter())
+        labels = grouping["labels"][i]
+        row["layer1_questions"] += 1
+        row["joined"] += int((grouping["true_rank"][i] >= 0).all())
+        row["eligible"] += int(grouping["eligible"][i])
+        row["group_labels_known"] += int((labels >= 0).sum())
+        row["group_labels_correct"] += int((labels == 1).sum())
+    return {name: {"role": "train" if name == train_stem else "test", **row} for name, row in rows.items()}
+
+
+class GroupingProgress:
+    """The grouping data build's checkpoint: each finished grouping log, bound to its content and settings."""
+    def __init__(self, out, identity, sync=None, resume=True):
+        self.folder, self.identity, self.sync, self.resume = Path(out) / GROUPING_PROGRESS_DIR, identity, sync, resume
+
+    def key(self, source):
+        return hashlib.sha256(json.dumps({"identity": self.identity, "source": source},
+                                         sort_keys=True).encode()).hexdigest()
+
+    def path(self, position, source):
+        return self.folder / f"{position + 1:02d}_{Path(source['name']).stem}.pt"
+
+    def load(self, position, source):
+        path = self.path(position, source)
+        if not (self.resume and path.exists()):
+            return None
+        saved = load_checkpoint(path)
+        if saved.get("identity") != self.key(source):
+            print(f"WARNING: {path} was read from another grouping log or settings; it is read again.", flush=True)
+            return None
+        return saved["joined"], saved["counts"]
+
+    def save(self, position, source, joined, counts):
+        self.folder.mkdir(parents=True, exist_ok=True)
+        atomic_torch(self.path(position, source), {"identity": self.key(source), "joined": joined, "counts": counts})
+        if self.sync is not None:
+            self.sync.push(f"Grouping data: {source['name']}", force=True)
+
+    def clear(self):
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+
+def grouping_arrays(records, data, cfg):
+    """The grouping data aligned with the records.
+
+    `labels` [records, groups] (-1 when unknown or not joined), `true_rank` [records, k] (-1 when not
+    joined), and `eligible` [records]: joined with every group label known.
+    """
+    labels = np.full((len(records), cfg.group_count), -1, np.int8)
+    true_rank = np.full((len(records), cfg.k), -1, np.int8)
+    for i, record in enumerate(records):
+        entry = data["joined"].get(record.uid)
+        if entry is not None:
+            labels[i], true_rank[i] = entry
+    return {"labels": labels, "true_rank": true_rank,
+            "eligible": (labels >= 0).all(1) & (true_rank >= 0).all(1)}
+
+
+def shuffled_group_labels(labels, seed):
+    """The control's labels: each question's group labels permuted among its groups."""
+    rng = np.random.RandomState(seed)
+    return np.stack([row[rng.permutation(len(row))] for row in labels]) if len(labels) else labels.copy()
+
+
+def grouping_identity(labels, cfg, control=False):
+    """What a grouping teacher is bound to beside its folds: its labels and the grouping settings."""
+    return {"grouping": {"schema_version": GROUPING_SCHEMA, "control": control,
+                         "labels_sha256": hashlib.sha256(np.ascontiguousarray(labels).tobytes()).hexdigest(),
+                         "grouping_sizes": list(cfg.grouping_sizes), "grouping_weight": float(cfg.grouping_weight)}}
+
+
+def grouping_question(record, group_labels, true_rank, base, grouped, heuristics, cfg, control=None):
+    """Every choice the grouping report compares for one question.
+
+    Items index `[zero-shots, one-shots by record slot, groups of cfg.group_members]`. `base` holds the
+    Stage 1 teacher's n candidate probabilities, `grouped` (and `control`) a grouping teacher's
+    `(candidate probabilities, group probabilities)`, and `heuristics` maps a name to n heuristic scores.
+    Families stay separate: top-0 is a zero-shot, top-1 a one-shot, top-2 the group of the two
+    nearest (or best-scored) sources. Ties go to the fewer examples, then the nearer source, then the
+    lower zero-shot index. Returns the items' correctness, `{method: {column: item}}`, and
+    `{level: {column: item, or random/oracle correctness}}`.
+    """
+    n, zs, members = cfg.n, cfg.zero_shots, cfg.group_members
+    sizes = members.sum(1).astype(int)
+    slots = [np.flatnonzero(row) for row in members]
+    correct = np.r_[record.labels, group_labels].astype(np.float64)
+    tie = ([(0, z) for z in range(zs)] + [(1, int(true_rank[j])) for j in range(cfg.k)] +
+           [(2, int(sizes[g]), tuple(sorted(int(true_rank[j]) for j in slots[g]))) for g in range(len(slots))])
+    zero, one = list(range(zs)), list(range(zs, n))
+    pairs = [n + g for g in range(len(slots)) if sizes[g] == 2]
+    group_of = {frozenset(s.tolist()): n + g for g, s in enumerate(slots)}
+
+    def best(items, values):
+        return min(items, key=lambda item: (-float(values[item]), tie[item])) if items else None
+
+    def pair_of(sources):
+        return group_of.get(frozenset(int(j) for j in sources)) if pairs else None
+
+    def member_scored(values, combine):
+        return np.r_[values[:n], [combine(values[zs + s]) for s in slots]]
+
+    nearest = [int(np.flatnonzero(true_rank == rank)[0]) for rank in (0, 1)]
+    choices = {"Similarity (no model)": {"top0": 0, "top1": zs + nearest[0], "top2": pair_of(nearest)}}
+    rerankers = {"Stage 1 teacher": base, "Grouping teacher": grouped[0]}
+    full = {"Grouping teacher": np.r_[grouped[0], grouped[1]]}
+    if control is not None:
+        rerankers["Shuffled-label control"] = control[0]
+        full["Shuffled-label control"] = np.r_[control[0], control[1]]
+    rerankers.update({f"Heuristic {name}": values for name, values in heuristics.items()})
+    for name, values in rerankers.items():
+        ranked = sorted(one, key=lambda item: (-float(values[item]), tie[item]))
+        choices[f"{name} rerank"] = {"top0": best(zero, values), "top1": ranked[0],
+                                     "top2": pair_of([item - zs for item in ranked[:2]])}
+    for name, values in full.items():
+        choices[f"{name}: best group output"] = {"top2": best(pairs, values)}
+    for label, combine in MEMBER_COMBINATIONS.items():
+        choices[f"Stage 1 member pairs ({label})"] = {"top2": best(pairs, member_scored(base, combine))}
+    # Best-of-N levels: level 0 the zero-shots, level 1 adds the one-shots, level s the groups up to size s.
+    scorers = {"Stage 1 teacher": member_scored(base, np.mean), **full}
+    levels = {}
+    for level in range(max(cfg.grouping_sizes) + 1):
+        items = zero + (one if level >= 1 else []) + [n + g for g in range(len(slots)) if 2 <= sizes[g] <= level]
+        levels[level] = {"random": float(correct[items].mean()), "oracle": float(correct[items].max()),
+                         **{name: best(items, values) for name, values in scorers.items()}}
+    return correct, choices, levels
+
+
+def group_output_quality(probabilities, labels, prior):
+    """Group outputs against their labels: loss beside the constant prior, AP, Brier, and within-question hit@1."""
+    p = np.clip(np.asarray(probabilities, np.float64), 1e-7, 1 - 1e-7)
+    y = np.asarray(labels, np.float64)
+    q = float(np.clip(prior, 1e-7, 1 - 1e-7))
+    flat_p, flat_y = p.ravel(), y.ravel()
+    mixed = (y.min(1) == 0) & (y.max(1) == 1)
+    hit = y[np.arange(len(y)), p.argmax(1)]
+    return {"bce": float(-np.mean(flat_y * np.log(flat_p) + (1 - flat_y) * np.log(1 - flat_p))),
+            "prior": float(prior),
+            "prior_bce": float(-np.mean(flat_y * np.log(q) + (1 - flat_y) * np.log(1 - q))),
+            "ap": ap_score(np.argsort(-flat_p, kind="stable"), flat_y), "positive_rate": float(flat_y.mean()),
+            "brier": float(np.mean((flat_p - flat_y) ** 2)), "hit_questions": int(mixed.sum()),
+            "hit_at_1": float(hit[mixed].mean()) if mixed.any() else None,
+            "random_hit_at_1": float(y[mixed].mean()) if mixed.any() else None}
+
+
+def calibration_bins(probabilities, labels, bins=10):
+    p, y = np.asarray(probabilities, np.float64).ravel(), np.asarray(labels, np.float64).ravel()
+    which = np.minimum((p * bins).astype(int), bins - 1)
+    return [{"bin": f"{b / bins:.1f}-{(b + 1) / bins:.1f}", "count": int((which == b).sum()),
+             "mean_predicted": float(p[which == b].mean()) if (which == b).any() else None,
+             "observed": float(y[which == b].mean()) if (which == b).any() else None} for b in range(bins)]
+
+
+def grouping_tables(records, ids, grouping, base, teacher, heuristics, cfg, prior, control=None):
+    """The grouping report of one question set, on the questions with every group label known.
+
+    Every method answers each question with one candidate (pass@1) on the same questions, so every
+    difference is paired. `base` is the Stage 1 teacher's scores, `teacher` and `control` grouping
+    teachers (`scores`, `group_scores`), `heuristics` the Stage 1 heuristics chosen on dev.
+    """
+    eligible = [i for i in ids if grouping["eligible"][i]]
+    result = {"questions": len(eligible), "excluded_without_group_labels": len(ids) - len(eligible)}
+    if not eligible:
+        return result
+    n, zs, top_level = cfg.n, cfg.zero_shots, max(cfg.grouping_sizes)
+    picks, level_values, corrects, mixed = {}, {}, [], []
+    for i in eligible:
+        record = records[i]
+        hs = {f"{mode} ({spec[1]}/{spec[2]})": heuristic_scores(record, cfg, *spec)
+              for mode, spec in heuristics.items()}
+        correct, choices, levels = grouping_question(
+            record, grouping["labels"][i], grouping["true_rank"][i], base[i],
+            (teacher["scores"][i], teacher["group_scores"][i]), hs, cfg,
+            None if control is None else (control["scores"][i], control["group_scores"][i]))
+        corrects.append(correct)
+        mixed.append(0 < record.labels[zs:].sum() < cfg.k)
+        for method, row in choices.items():
+            for column, item in row.items():
+                picks.setdefault((method, column), []).append(item)
+        for level, row in levels.items():
+            for column, value in row.items():
+                level_values.setdefault((level, column), []).append(value)
+    corrects, mixed = np.stack(corrects), np.asarray(mixed)
+
+    def correctness(items):
+        return np.asarray([corrects[q, item] for q, item in enumerate(items)], np.float64)
+
+    def family(items):
+        return np.asarray([0 if item < zs else 1 if item < n else 2 for item in items])
+
+    top = {key: correctness(items) for key, items in picks.items() if None not in items}
+    level = {key: np.asarray(values, np.float64) if key[1] in ("random", "oracle") else correctness(values)
+             for key, values in level_values.items()}
+    scorers = [column for (lv, column) in level if lv == 0 and column not in ("random", "oracle")]
+
+    def summary(mask):
+        tables = {"questions": int(mask.sum()), "top_k": {}, "levels": {}}
+        for (method, column), values in top.items():
+            tables["top_k"].setdefault(method, {})[column] = float(values[mask].mean()) if mask.any() else None
+        for (lv, column), values in level.items():
+            tables["levels"].setdefault(str(lv), {})[column] = float(values[mask].mean()) if mask.any() else None
+        return tables
+
+    result.update(summary(np.ones(len(eligible), bool)))
+    result["level_family_share"] = {str(lv): {name: dict(zip(GROUP_FAMILIES, np.bincount(
+        family(level_values[(lv, name)]), minlength=3).astype(float) / len(eligible))) for name in scorers}
+        for lv in range(top_level + 1)}
+    full_cost = cfg.full_cost
+    result["calls"] = {
+        "unit": cfg.cost_unit,
+        "note": ("Similarity picks generate one candidate. Reranks, best group outputs, and levels need the "
+                 "full measured Layer-1 pool, plus one generation when a group is chosen (groups are never "
+                 "measured). Random and oracle are references, not methods; the oracle needs every candidate "
+                 "generated and graded against the answer."),
+        "top_k": {method: {column: (1. if method.startswith("Similarity") else
+                                    full_cost + float(np.mean(family(picks[(method, column)]) == 2)))
+                           for column in row} for method, row in result["top_k"].items()},
+        "levels": {str(lv): {name: full_cost + float(np.mean(family(level_values[(lv, name)]) == 2))
+                             for name in scorers} for lv in range(top_level + 1)}}
+    comparisons = {
+        f"Grouping teacher level-{top_level} vs level-1": (level[(top_level, "Grouping teacher")],
+                                                           level[(1, "Grouping teacher")]),
+        "Grouping teacher level-1 vs Stage 1 teacher level-1": (level[(1, "Grouping teacher")],
+                                                                level[(1, "Stage 1 teacher")]),
+        f"Grouping teacher level-{top_level} vs Stage 1 teacher level-{top_level} (member pairs)": (
+            level[(top_level, "Grouping teacher")], level[(top_level, "Stage 1 teacher")]),
+        "Grouping teacher rerank top-2 vs similarity top-2": (top.get(("Grouping teacher rerank", "top2")),
+                                                              top.get(("Similarity (no model)", "top2"))),
+        "Grouping teacher rerank top-2 vs top-1": (top.get(("Grouping teacher rerank", "top2")),
+                                                   top.get(("Grouping teacher rerank", "top1"))),
+        "Grouping teacher best group output vs Stage 1 member pairs (mean)": (
+            top.get(("Grouping teacher: best group output", "top2")),
+            top.get(("Stage 1 member pairs (mean)", "top2")))}
+    if control is not None:
+        comparisons[f"Grouping teacher level-{top_level} vs shuffled-label control"] = (
+            level[(top_level, "Grouping teacher")], level[(top_level, "Shuffled-label control")])
+        comparisons["Grouping teacher best group output vs shuffled-label control"] = (
+            top.get(("Grouping teacher: best group output", "top2")),
+            top.get(("Shuffled-label control: best group output", "top2")))
+    result["comparisons"] = {name: bootstrap_difference(first - second, cfg.bootstrap_samples, cfg.seed)
+                             for name, (first, second) in comparisons.items()
+                             if first is not None and second is not None}
+    if top_level >= 2:
+        before, after = level_values[(1, "Grouping teacher")], level_values[(top_level, "Grouping teacher")]
+        first, second = level[(1, "Grouping teacher")], level[(top_level, "Grouping teacher")]
+        same = np.asarray([x == y for x, y in zip(before, after)])
+        rows = {"same pick": same, "switched: rescued": ~same & (first == 0) & (second == 1),
+                "switched: broken": ~same & (first == 1) & (second == 0),
+                "switched: both correct": ~same & (first == 1) & (second == 1),
+                "switched: both wrong": ~same & (first == 0) & (second == 0)}
+        result["switch"] = {"from": "level-1", "to": f"level-{top_level}",
+                            **{name: {"questions": int(mask.sum()), "share": float(mask.mean())}
+                               for name, mask in rows.items()}}
+    labels = grouping["labels"][eligible]
+    result["group_outputs"] = {"Grouping teacher": group_output_quality(teacher["group_scores"][eligible], labels, prior)}
+    if control is not None:
+        result["group_outputs"]["Shuffled-label control"] = group_output_quality(
+            control["group_scores"][eligible], labels, prior)
+    candidates = np.stack([records[i].labels for i in eligible])
+    result["calibration"] = {
+        "zero-shot": calibration_bins(teacher["scores"][eligible][:, :zs], candidates[:, :zs]),
+        "one-shot": calibration_bins(teacher["scores"][eligible][:, zs:], candidates[:, zs:]),
+        "group": calibration_bins(teacher["group_scores"][eligible], labels)}
+    result["strata"] = {"one-shots mixed": summary(mixed), "one-shots unanimous": summary(~mixed)}
+    return result
+
+
+def print_grouping_tables(title, result, cfg):
+    section(title)
+    if not result.get("questions"):
+        print(f"No question with every group label known ({result.get('excluded_without_group_labels', 0)} "
+              "without); see grouping_data_audit.json. No metric is imputed.")
+        return
+    percent = lambda value: "--" if value is None else f"{value:.1%}"
+    print(f"Questions with every group label known: {result['questions']} (excluded: "
+          f"{result['excluded_without_group_labels']}). pass@1 = the one returned candidate is correct.")
+    print(f"{'Method':<58} | {'top-0':>7} | {'top-1':>7} | {'top-2':>7}")
+    print("-" * 88)
+    for method, row in result["top_k"].items():
+        print(f"{method:<58} | " + " | ".join(f"{percent(row.get(column)):>7}" for column in ("top0", "top1", "top2")))
+    print("top-0 is a zero-shot, top-1 a one-shot, top-2 the group of two sources; families never replace "
+          "one another. Similarity uses the true retrieval order (from the grouping log).")
+    scorers = [name for name in next(iter(result["levels"].values())) if name not in ("random", "oracle")]
+    print(f"\n{'Best-of-N level':<16} | {'random':>7} | " + " | ".join(f"{name:>22}" for name in scorers)
+          + f" | {'oracle':>7}")
+    print("-" * (36 + 25 * len(scorers)))
+    for level, row in result["levels"].items():
+        print(f"{'level-' + level:<16} | {percent(row['random']):>7} | "
+              + " | ".join(f"{percent(row[name]):>22}" for name in scorers) + f" | {percent(row['oracle']):>7}")
+    print("Level 0 = zero-shots, 1 = + one-shots, s = + groups up to size s. Stage 1 scores a group by the "
+          "mean of its members' one-shot probabilities (no group outputs).")
+    for level, shares in result["level_family_share"].items():
+        print(f"level-{level} picks: " + "; ".join(
+            f"{name} " + "/".join(f"{share[family]:.0%}" for family in GROUP_FAMILIES)
+            for name, share in shares.items()) + "  (zero-shot/one-shot/group)")
+    print(f"\n{'Paired difference (pass@1)':<84} | {'delta':>8} | {'95% CI':>17}")
+    print("-" * 116)
+    for name, item in result["comparisons"].items():
+        low, high = item["ci95"]
+        print(f"{name:<84} | {item['delta'] * 100:+7.2f}pp | [{low * 100:+6.2f}, {high * 100:+6.2f}]pp")
+    if "switch" in result:
+        print(f"\nGrouping teacher, {result['switch']['from']} -> {result['switch']['to']}: " + "; ".join(
+            f"{name} {value['questions']} ({value['share']:.1%})" for name, value in result["switch"].items()
+            if isinstance(value, dict)))
+    for name, quality in result["group_outputs"].items():
+        hit = ("--" if quality["hit_at_1"] is None else
+               f"{quality['hit_at_1']:.1%} vs random {quality['random_hit_at_1']:.1%}")
+        print(f"{name} group outputs: BCE {quality['bce']:.4f} vs constant prior {quality['prior_bce']:.4f} "
+              f"(prior {quality['prior']:.1%}); AP {quality['ap']:.4f} (positives {quality['positive_rate']:.1%}); "
+              f"Brier {quality['brier']:.4f}; within-question hit@1 {hit} on {quality['hit_questions']} questions")
+    for stratum, tables in result["strata"].items():
+        if not tables["questions"]:
+            continue
+        rows = [("Similarity top-2", tables["top_k"].get("Similarity (no model)", {}).get("top2")),
+                ("Grouping rerank top-2", tables["top_k"].get("Grouping teacher rerank", {}).get("top2")),
+                ("Best group output", tables["top_k"].get("Grouping teacher: best group output", {}).get("top2")),
+                *[(f"level-{lv} grouping", row.get("Grouping teacher")) for lv, row in tables["levels"].items()],
+                *[(f"level-{lv} oracle", row.get("oracle")) for lv, row in tables["levels"].items()]]
+        print(f"{stratum} ({tables['questions']} questions): " + "; ".join(
+            f"{name} {percent(value)}" for name, value in rows if value is not None))
+    calls = result["calls"]
+    print(f"Calls ({calls['unit']}): similarity top-k 1; reranks, best group outputs and levels {cfg.full_cost:g} "
+          f"for the measured pool (+1 per chosen group). {calls['note']}")
+
+
 # %% Reports, artifacts, and stage orchestration
 def wilson_interval(errors, total):
     if not total:
@@ -3796,7 +4370,8 @@ class OutputSync:
                 self.api.upload_folder(folder_path=str(self.out), repo_id=self.repo, repo_type="dataset",
                                        commit_message=message, ignore_patterns=list(self.ignore_patterns),
                                        delete_patterns=["decision_labels/*/*.pt", f"{PROGRESS_DIR}/*",
-                                                        f"{DATASET_PROGRESS_DIR}/*", LEGACY_TRAJECTORY_FILE],
+                                                        f"{DATASET_PROGRESS_DIR}/*", f"{GROUPING_PROGRESS_DIR}/*",
+                                                        LEGACY_TRAJECTORY_FILE],
                                        **scope)
             except Exception as exc:  # Network, rate limit, or credentials; local files stay complete.
                 error = exc
@@ -3922,7 +4497,7 @@ class Workflow:
         mirrors = [mirror for mirror in (stored, run_sync)
                    if mirror is not None]
         self.sync = None if not mirrors else mirrors[0] if len(mirrors) == 1 else SyncGroup(*mirrors)
-        self.records, self.splits = None, None
+        self.records, self.splits, self.grouping = None, None, None
 
     def build_datasets(self):
         """The dataset phase: the input logs read into compact records, once. No neural network is involved.
@@ -4001,6 +4576,12 @@ class Workflow:
               f"loss (AP is only a reported metric), stops {self.cfg.view_patience:g} {unit} after it, "
               f"and saves its training state every {self.cfg.hf_sync_minutes:g} minutes, so a new session "
               "continues inside an epoch.", flush=True)
+        if self.cfg.grouping:
+            print(f"Grouping phase ON (Stage 1G): the Stage 1 network with {self.cfg.group_count} group outputs "
+                  f"(group sizes {list(self.cfg.grouping_sizes)}) beside the {self.cfg.n} candidates, from "
+                  f"{len(self.cfg.grouping_files)} grouping log(s) split by each question's Layer-1 log; it "
+                  f"changes no other stage, and {GROUPING_MANIFEST} binds its settings outside the run "
+                  "contract.", flush=True)
         self.splits = split_records(self.records, self.cfg)
         print(f"{'Dataset':<32} | {'Read':>6} | {'Eligible':>8} | {'Excluded':>8} | {'Oracle':>7}")
         print("-"*76)
@@ -4057,6 +4638,176 @@ class Workflow:
                        "on these questions)")
         self.push("Stage 1 complete: teacher folds and out-of-fold labels")
         return self
+
+    def build_grouping_dataset(self):
+        """The grouping phase's data: the grouping logs' group labels joined to the records, once.
+
+        The grouping run usually writes one log with every benchmark's questions. Each entry joins the
+        record with the same question text in whichever Layer-1 log holds it, so the questions of
+        train_file train the grouping teacher and each test file's questions are reported on their own.
+        Like the dataset phase, it reads logs and trains, loads, or runs no model. Each finished log is
+        saved and uploaded, and grouping_manifest.json binds the result to the grouping logs' content,
+        the group sizes, and the records.
+        """
+        if not self.cfg.grouping:
+            print("Grouping phase is OFF (grouping=False): nothing to build.")
+            return self
+        if self.records is None:
+            self.build_datasets()
+        cfg = self.cfg
+        section(f"GROUPING DATA | {cfg.group_count} groups of sizes {list(cfg.grouping_sizes)} per question")
+        layer1 = [cfg.train_file] + list(cfg.test_files)
+        paths = list(cfg.grouping_files)
+        sources = ([{key: source[key] for key in ("name", "bytes", "sha256")} for source in input_sources(paths)]
+                   if all(Path(p).is_file() for p in paths) else None)
+        expected = {"schema_version": GROUPING_SCHEMA,
+                    "settings": {"k": cfg.k, "zero_shots": cfg.zero_shots, "grouping_sizes": list(cfg.grouping_sizes)},
+                    "layer1_logs": [Path(p).stem for p in layer1], "records_sha256": data_digest(self.records)}
+        manifest_path, records_path = self.out / GROUPING_MANIFEST, self.out / GROUPING_RECORDS
+        if manifest_path.exists():
+            old = json.loads(manifest_path.read_text(encoding="utf-8"))
+            same_logs = (old.get("sources") == sources if sources is not None else
+                         [source.get("name") for source in old.get("sources", [])] == [Path(p).name for p in paths])
+            if {key: old.get(key) for key in expected} != expected or not same_logs:
+                raise ValueError(f"{manifest_path} was built from other grouping logs, group sizes, or records. "
+                                 "Point grouping_files at the logs it names, or remove "
+                                 f"{GROUPING_MANIFEST}, {GROUPING_RECORDS}, and the grouping_* checkpoints.")
+        if cfg.resume and records_path.exists() and manifest_path.exists():
+            data = load_checkpoint(records_path)
+            print("Using cached grouping data (" + (f"{GROUPING_MANIFEST} matches the grouping logs' content"
+                  if sources is not None else f"the grouping logs are not attached; {GROUPING_MANIFEST} matches "
+                  "their names") + ").")
+        else:
+            if sources is None:
+                missing = [p for p in paths if not Path(p).is_file()]
+                raise FileNotFoundError(f"Grouping logs not found: {missing}.")
+            print(f"Reading {len(paths)} grouping log(s). Every entry joins the record with the same question "
+                  "text in whichever Layer-1 log holds it, so train_file's questions train the grouping teacher "
+                  "and each test file's questions are reported on their own; the retrieved corpus ids and "
+                  "similarity values must agree.", flush=True)
+            progress = GroupingProgress(self.out, expected, self.sync, cfg.resume)
+            data = {"schema_version": GROUPING_SCHEMA, "joined": {}, "audit": {}}
+            for position, (path, source) in enumerate(zip(paths, sources)):
+                saved = progress.load(position, source)
+                if saved is None:
+                    joined, counts = read_grouping_log(path, self.records, cfg)
+                    joined = {uid: (labels.tolist(), rank.tolist()) for uid, (labels, rank) in joined.items()}
+                    progress.save(position, source, joined, counts)
+                else:
+                    joined, counts = saved
+                # A question in two grouping logs keeps the entry of the first one.
+                repeated = [uid for uid in joined if uid in data["joined"]]
+                data["joined"].update({uid: value for uid, value in joined.items() if uid not in data["joined"]})
+                data["audit"][source["name"]] = {**counts, **({"in_an_earlier_grouping_log": len(repeated)}
+                                                              if repeated else {})}
+            atomic_torch(records_path, data)
+            atomic_json(manifest_path, {**expected, "sources": sources})
+            progress.clear()  # grouping_records.pt holds every log now.
+        self.grouping = grouping_arrays(self.records, data, cfg)
+        benchmarks = grouping_benchmark_audit(self.records, self.grouping, Path(cfg.train_file).stem)
+        atomic_json(self.out / "grouping_data_audit.json", {"grouping_logs": data["audit"],
+                                                            "layer1_logs": benchmarks})
+        print(f"{'Grouping log':<44} | {'Read':>6} | {'Joined':>6} | {'Eligible':>8} | {'Labels correct':>14}")
+        print("-" * 90)
+        for name, counts in data["audit"].items():
+            known = counts.get("group_labels_known", 0)
+            rate = counts.get("group_labels_correct", 0) / known if known else 0.
+            print(f"{name:<44} | {counts.get('total', 0):6d} | {counts.get('joined', 0):6d} | "
+                  f"{counts.get('eligible', 0):8d} | {rate:13.1%}")
+            notes = {key: value for key, value in counts.items() if value and key not in {
+                "total", "joined", "eligible", "group_labels_known", "group_labels_correct", "joined_by_layer1_log"}}
+            if notes:
+                print("  " + ", ".join(f"{key}={value}" for key, value in sorted(notes.items())))
+        print(f"\n{'Layer-1 log (split)':<44} | {'Questions':>9} | {'Joined':>6} | {'Eligible':>8} | "
+              f"{'Labels correct':>14}")
+        print("-" * 93)
+        for name, row in benchmarks.items():
+            known = row["group_labels_known"]
+            rate = row["group_labels_correct"] / known if known else 0.
+            print(f"{name + ' (' + row['role'] + ')':<44} | {row['layer1_questions']:9d} | {row['joined']:6d} | "
+                  f"{row['eligible']:8d} | {rate:13.1%}")
+        missing = [name for name, row in benchmarks.items() if not row["joined"]]
+        if missing:
+            print(f"WARNING: no grouping entry matches a question of {missing}; their grouping reports are empty.",
+                  flush=True)
+        print("Eligible = joined with every group label known; layer1_scores_misattached counts the questions whose "
+              "Layer-1 log attached similarity scores to other exemplars (mirrored before 2026-09-21, which makes "
+              "record slot 1 the farthest source). Group labels and similarity selections use the grouping log.")
+        self.push("Grouping phase: grouping data")
+        return self
+
+    def _grouping_teacher(self, prefix, title, labels, control):
+        identity = grouping_identity(labels, self.cfg, control)
+        path = self.out / f"{prefix}_completed.pt"
+        if self.cfg.resume and path.exists():
+            checkpoint = load_checkpoint(path)
+            if checkpoint.get("grouping") == identity["grouping"]:
+                print(f"Loaded completed {title.lower()}.")
+                return checkpoint
+            print(f"WARNING: {path.name} was trained on other group labels or grouping settings; it trains again.",
+                  flush=True)
+        checkpoint = fit_teachers(self.records, self.splits, self.cfg, self.device, self.out, self.sync,
+                                  groups={"labels": labels}, prefix=prefix, stage="Stage 1G", title=title,
+                                  identity=identity)
+        checkpoint.update(identity)
+        atomic_torch(path, checkpoint)
+        clear_progress(self.out, f"{prefix}_*.pt")
+        return checkpoint
+
+    def train_grouping(self):
+        """Stage 1G: the Stage 1 network with one correctness output per group, on Stage 1's folds."""
+        if not self.cfg.grouping:
+            print("Grouping phase is OFF (grouping=False): no grouping teacher.")
+            return self
+        if not hasattr(self, "teacher"):
+            self.train_teacher()
+        if self.grouping is None:
+            self.build_grouping_dataset()
+        cfg = self.cfg
+        if not (self.grouping["labels"][self.splits["supervised"]] >= 0).any():
+            raise ValueError(f"No question of train_file ({Path(cfg.train_file).name}) has a group label in "
+                             f"grouping_files, so the grouping teacher has nothing to train on; see "
+                             "grouping_data_audit.json.")
+        section(f"STAGE 1G | Grouping teacher: {cfg.n} candidate and {cfg.group_count} group correctness outputs")
+        print(f"Same input, folds, views, and selection as Stage 1. A group's target is its recorded label while "
+              f"all its sources are in use (one-shot or evaluator acquired), otherwise 0 (absent_weight "
+              f"{cfg.absent_weight:g}); groups without a recorded label are left out. Group loss weight "
+              f"{cfg.grouping_weight:g}, included in checkpoint selection.", flush=True)
+        self.grouping_teacher = self._grouping_teacher("grouping_teacher", "Grouping teacher",
+                                                       self.grouping["labels"], False)
+        self.grouping_control = None
+        if cfg.grouping_shuffle_control:
+            self.grouping_control = self._grouping_teacher(
+                "grouping_shuffle_teacher", "Shuffled-label control",
+                shuffled_group_labels(self.grouping["labels"], cfg.seed + 500), True)
+        self.push("Stage 1G: grouping teacher folds")
+        return self
+
+    def grouping_report(self):
+        """Stage 1G report: top-0/1/2 by similarity and by reranking, best-of-N levels, and extra comparisons."""
+        if not self.cfg.grouping:
+            print("Grouping phase is OFF (grouping=False): no grouping report.")
+            return None
+        if not hasattr(self, "grouping_teacher"):
+            self.train_grouping()
+        supervised = self.grouping["labels"][self.splits["supervised"]]
+        known = supervised[supervised >= 0]
+        prior = float(known.mean()) if known.size else .5
+        results = {"settings": {key: getattr(self.cfg, key) for key in GROUPING_SETTINGS},
+                   "group_label_prior": prior, "heuristics": self.heuristics,
+                   "evaluation_protocol": split_protocol(self.cfg, self.splits), "reports": {}}
+        for name in ["supervised", "audit"] + [Path(p).stem for p in self.cfg.test_files]:
+            table = grouping_tables(self.records, self.splits[name], self.grouping, self.teacher["scores"],
+                                    self.grouping_teacher, self.heuristics, self.cfg, prior, self.grouping_control)
+            scope = " (out-of-fold teachers)" if name == "supervised" else ""
+            print_grouping_tables(f"GROUPING | {name}{scope}", table, self.cfg)
+            results["reports"][name] = table
+        atomic_json(self.out / GROUPING_RESULTS, results)
+        print(f"Saved {GROUPING_RESULTS}. Teachers' scores are out-of-fold on supervised questions and the "
+              "mean of the fold teachers elsewhere; no teacher is selected on these questions.")
+        self.grouping_results = results
+        self.push("Stage 1G complete: grouping report")
+        return results
 
     def train_snapshot(self):
         if not hasattr(self, "teacher"):
@@ -4254,7 +5005,10 @@ def load_inference_bundle(path, device="cpu", variant="supervised"):
 
 def run_pipeline(cfg=None):
     work = Workflow(cfg or Config())
-    work.build_datasets().prepare().train_decision_head()
+    work.build_datasets().prepare().train_teacher()
+    if work.cfg.grouping:
+        work.grouping_report()
+    work.train_decision_head()
     work.report()
     return work
 

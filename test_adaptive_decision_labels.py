@@ -544,7 +544,8 @@ def test_reachable_only_is_off_by_default_and_enters_the_identity_only_when_on()
     # Off, the contract and the Stage 3 identity hold exactly what they held before the setting existed,
     # so runs started earlier still resume.
     assert a.contract_settings(off) == {key: value for key, value in a.asdict(off).items()
-                                        if key not in a.NON_CONTRACT_SETTINGS and key != "reachable_only"}
+                                        if key not in a.NON_CONTRACT_SETTINGS and key not in a.GROUPING_SETTINGS
+                                        and key != "reachable_only"}
     assert a.contract_settings(on) == {**a.contract_settings(off), "reachable_only": True}
     records = [a.Record(str(i), str(i), "synthetic", list(range(off.n)), list(range(off.k)),
                         np.ones(off.k, np.float32), np.ones(off.k, np.float32),
