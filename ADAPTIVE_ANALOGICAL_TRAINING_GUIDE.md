@@ -452,6 +452,28 @@ Stage 3 identity. Runs started before it existed keep their contract and labels
 and still resume. `True` is a new run: use a new `output_dir` and `hf_repo`.
 `dataset_id` can stay, because the records do not change.
 
+## Without decision heads (`decision_heads`)
+
+`decision_heads=False` skips Stage 3: no decision labels, heads, or inference bundle are built. Stage 4
+still rolls out the full pool and every fixed acquisition order (`fixed_acquisition_orders`: interleaved,
+evaluators first, zero-shots first, or custom sequences). Each fixed order stops at the first predicted MAX
+of the frozen Stage 2 predictor, which is where it saves API calls; it needs only Stages 1 and 2. The two
+learned methods keep their place in every table and in `results.json` with all values 0:
+- their rows in tables 1, 3 and 4;
+- every paired comparison that names one of them;
+- `paired_top1`, the continuation diagnostics, and `decision_training`.
+
+`final_rollouts.jsonl` holds only the methods that ran, and `results.json` records
+`"decision_heads": false`. The setting changes no stage's output, so it stays out of the run contract,
+and a finished run can be reported either way.
+
+The grouping phase has priority: `grouping=True` switches the decision heads off whatever
+`decision_heads` says. The pipeline therefore runs in one of two ways:
+- decision heads on, grouping off;
+- grouping on, decision heads off.
+
+Stage 0 prints which one is in effect.
+
 ## Grouping phase (`grouping`, Stage 1G)
 
 A companion Layer-1 grouping run (`APPLY_LAYER1_GROUPING=True`, `LAYER1_GROUPING_ONLY_MODE=True`; for
@@ -460,7 +482,8 @@ group of retrieved samples and graded it against the target answer. It ran no ba
 evaluation, so nothing measured those candidates. With `grouping=True`, Stage 1G trains the Stage 1
 network with one extra correctness output per group, so a group's correctness is predicted from the
 zero-shot and one-shot measurements alone, and then compares selections. With `grouping=False` (the
-default) nothing changes.
+default) nothing changes. With `grouping=True` the decision heads are off (Stage 3 is skipped;
+see "Without decision heads").
 
 | Setting | Meaning |
 | --- | --- |

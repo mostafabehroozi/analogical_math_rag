@@ -99,6 +99,10 @@ class Config:
     decision_finetune_lr: float = 3e-5
     decision_batch_size: int = 128
     decision_eval_batch_size: int = 4096  # Frozen dev forwards; no optimizer changes.
+    # Stage 3 decision heads. False skips Stage 3: Stage 4 reports the full pool and the fixed acquisition
+    # orders, each stopping at the first predicted MAX, with the learned heads' rows as zeros. The grouping
+    # phase has priority: grouping=True switches the decision heads off whatever this says.
+    decision_heads: bool = True
     # Evaluation only: built-in order names or explicit [ZS1, R1, OS1, ...] sequences.
     fixed_acquisition_orders: dict = field(default_factory=lambda: {
         "fixed": "interleaved",
@@ -132,6 +136,11 @@ class Config:
     @property
     def n(self):
         return self.zero_shots + self.k
+
+    @property
+    def use_decision_heads(self):
+        """Whether Stage 3 runs: the grouping phase has priority and switches the decision heads off."""
+        return self.decision_heads and not self.grouping
 
     @property
     def group_members(self):
@@ -203,6 +212,7 @@ class Config:
             raise ValueError("dataset_repo must differ from hf_repo: the run mirror would download the "
                              "datasets stored beside it.")
         assert type(self.grouping) is bool and type(self.grouping_shuffle_control) is bool
+        assert type(self.decision_heads) is bool
         if self.grouping:
             if isinstance(self.grouping_files, str) or not self.grouping_files:
                 raise ValueError("grouping=True needs grouping_files: a list holding the grouping run's log (one "
@@ -225,7 +235,7 @@ class Config:
 NON_CONTRACT_SETTINGS = ("resume", "output_dir", "device", "cpu_threads", "print_every",
                          "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size",
                          "hf_repo", "hf_sync_minutes", "train_file", "test_files",
-                         "dataset_id", "dataset_repo")
+                         "dataset_id", "dataset_repo", "decision_heads")
 # Contract settings added after revision 10's runs began, with the value that reproduces those runs. At
 # that value a setting stays out of the run contract and the Stage 3 identity, so those runs still resume.
 LATER_CONTRACT_DEFAULTS = {"reachable_only": False}
@@ -3297,7 +3307,22 @@ LEARNED_METHODS = ("supervised_pretrained", "supervised")
 
 
 def evaluation_methods(cfg):
+    """The methods Stage 4 rolls out; the learned heads only while the decision heads are on."""
+    return ("full", *cfg.fixed_acquisition_orders, *(LEARNED_METHODS if cfg.use_decision_heads else ()))
+
+
+def reported_methods(cfg):
+    """Every method a report lists; a learned head that did not run is shown as zeros (`zeroed`)."""
     return ("full", *cfg.fixed_acquisition_orders, *LEARNED_METHODS)
+
+
+def zeroed(value):
+    """The same report structure with every number as 0, for a method that was not run."""
+    if isinstance(value, dict):
+        return {key: zeroed(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [zeroed(item) for item in value]
+    return value if isinstance(value, str) else 0
 
 def rollout(record, maximum, predictor, cfg, policy="supervised", head=None, trace=False,
             continue_after_max=None):
@@ -3662,7 +3687,8 @@ def question_report(record, scores, safe, maximum, predictor, cfg, heads, sink=N
                                                 row["call_counts"]["total_calls"] for row in rows)}
     return {"methods": methods,
             "continuation": {method: question_continuation(record, scores, safe, maximum, predictor, cfg,
-                                                           heads[method]) for method in LEARNED_METHODS}}
+                                                           heads[method])
+                             for method in LEARNED_METHODS if method in methods}}
 
 
 # Each evaluation rollout's MAX-recognition outcome, in report order with its label.
@@ -3709,13 +3735,19 @@ def method_comparisons(questions, cfg):
 
     Each method is compared with the full pool, then each learned head with each fixed order,
     then the fine-tuned head with the pretrained one, on saved calls and top-1 over all
-    questions and on exact MAX over MAX-present questions.
+    questions and on exact MAX over MAX-present questions. A pair with a method that was not
+    run (the decision heads off) is all zeros.
     """
-    pairs = [(name, "full") for name in evaluation_methods(cfg) if name != "full"]
+    pairs = [(name, "full") for name in reported_methods(cfg) if name != "full"]
     pairs += [(learned, name) for learned in LEARNED_METHODS for name in cfg.fixed_acquisition_orders]
     pairs += [("supervised", "supervised_pretrained")]
+    rolled = evaluation_methods(cfg)
     result = {}
     for first, second in pairs:
+        if first not in rolled or second not in rolled:
+            result[f"{first} vs {second}"] = {key: {"delta": 0., "ci95": [0., 0.], "benefits": 0, "harms": 0}
+                                              for key in ("saved_calls", "top1", "exact_max")}
+            continue
         def difference(key, keep=lambda question: True):
             values = [np.mean(question["methods"][first][key]) - np.mean(question["methods"][second][key])
                       for question in questions if keep(question)]
@@ -3735,6 +3767,9 @@ def interval_text(item, scale=1., unit=""):
 
 def paired_top1(questions, cfg):
     """Fine-tuned head minus each other method's top-1, paired within questions as in paired_interval."""
+    if "supervised" not in evaluation_methods(cfg):  # The decision heads are off: zeros.
+        return {baseline: {"delta": 0., "ci95": [0., 0.], "benefits": 0, "harms": 0}
+                for baseline in reported_methods(cfg) if baseline != "supervised"}
     return {baseline: bootstrap_difference(
                 [np.mean([x - y for x, y in zip(question["methods"]["supervised"]["correct"],
                                                 question["methods"][baseline]["correct"])])
@@ -3774,8 +3809,15 @@ def policy_report(records, ids, teacher, predictor, cfg, heads, title, evaluated
             reasons.update(question["methods"][name]["reasons"])
         summary[name] = summarize_questions([question["methods"][name]["means"] for question in questions],
                                             reasons)
+    # With the decision heads off, the learned heads were never trained or rolled out: zeros.
+    skipped = [name for name in reported_methods(cfg) if name not in summary]
+    summary.update({name: zeroed(summary["full"]) for name in skipped})
     comparisons = method_comparisons(questions, cfg)
-    outcomes = {name: recognition_outcomes(questions, name) for name in summary if name != "full"}
+    outcomes = {name: (zeroed(recognition_outcomes(questions, "full")) if name in skipped else
+                       recognition_outcomes(questions, name)) for name in summary if name != "full"}
+    if skipped:
+        print(f"Decision heads off ({'grouping=True' if cfg.grouping else 'decision_heads=False'}): "
+              f"{', '.join(skipped)} were not trained or rolled out and are shown as zeros.")
     sizes = {group: item["n"] for group, item in summary["full"]["call_savings"].items()}
     full_calls = acquisition_call_counts(cfg.n, cfg.k, cfg)["total_calls"]
     print(f"Questions: {sizes['all']} | MAX present {sizes['max_present']} | no MAX {sizes['no_max']} "
@@ -3846,8 +3888,9 @@ def policy_report(records, ids, teacher, predictor, cfg, heads, title, evaluated
             "call_accounting": "Recorded generation, baseline/cross measurement solves, and their grading calls; excludes retrieval and target-answer grading.",
             "snapshot_diagnostics": stage_snapshot_audit(records, ids, teacher, predictor, cfg,
                                                          snapshot_cache),
-            "continuation": {method: continuation_summary([question["continuation"][method]
-                                                           for question in questions], cfg)
+            "continuation": {method: (zeroed(continuation_summary([], cfg)) if method in skipped else
+                                      continuation_summary([question["continuation"][method]
+                                                            for question in questions], cfg))
                              for method in LEARNED_METHODS}}, questions
 
 
@@ -4582,6 +4625,11 @@ class Workflow:
                   f"{len(self.cfg.grouping_files)} grouping log(s) split by each question's Layer-1 log; it "
                   f"changes no other stage, and {GROUPING_MANIFEST} binds its settings outside the run "
                   "contract.", flush=True)
+        if not self.cfg.use_decision_heads:
+            print("Decision heads OFF (" + ("grouping=True has priority over decision_heads"
+                  if self.cfg.grouping else "decision_heads=False") + "): Stage 3 is skipped, and Stage 4 reports "
+                  "the full pool and the fixed acquisition orders with MAX stopping; the learned heads' rows "
+                  "are zeros.", flush=True)
         self.splits = split_records(self.records, self.cfg)
         print(f"{'Dataset':<32} | {'Read':>6} | {'Eligible':>8} | {'Excluded':>8} | {'Oracle':>7}")
         print("-"*76)
@@ -4837,8 +4885,25 @@ class Workflow:
         head.load_state_dict(checkpoint["weights"])
         return head.eval()
 
+    def skip_decision_heads(self):
+        """Stage 3 is off (decision_heads=False, or grouping=True, which has priority): no labels, no heads."""
+        if not hasattr(self, "predictor"):
+            self.train_snapshot()
+        if not hasattr(self, "heads"):
+            reason = ("grouping=True, which switches the decision heads off" if self.cfg.grouping
+                      else "decision_heads=False")
+            section(f"STAGE 3 | Skipped: {reason}")
+            print("No Stage 3 labels or heads are built. Stage 4 reports the full pool and the fixed acquisition "
+                  "orders, each stopping at the first predicted MAX of the frozen snapshot predictor; the "
+                  "supervised_pretrained and supervised rows are zeros, and no inference bundle is written.",
+                  flush=True)
+        self.heads = {}
+        return self
+
     def train_pretrained_head(self):
         """Stage 3a: pretrain on every cheapest first step of every state."""
+        if not self.cfg.use_decision_heads:
+            return self.skip_decision_heads()
         if not hasattr(self, "predictor"):
             self.train_snapshot()
         section("STAGE 3a | Pretraining the frozen-encoder head on every cheapest first step")
@@ -4863,6 +4928,8 @@ class Workflow:
 
     def train_decision_head(self):
         """Stage 3: the pretrained head (3a), then its fine-tuned successor (3b) and the inference bundle."""
+        if not self.cfg.use_decision_heads:
+            return self.skip_decision_heads()
         if not hasattr(self, "pretrained_checkpoint"):
             self.train_pretrained_head()
         section("STAGE 3b | Fine-tuning on the cheapest continuation of the pretrained head")
@@ -4913,16 +4980,17 @@ class Workflow:
 
     def report(self):
         if not hasattr(self, "heads"):
-            self.train_decision_head()
+            self.train_decision_head()  # Skipped, and the heads left empty, while the decision heads are off.
+        if self.cfg.use_decision_heads:
+            training = {name: {"best_epoch": checkpoint["best_epoch"], "dev_loss": checkpoint["dev_loss"],
+                               "coverage": checkpoint["coverage"]}
+                        for name, checkpoint in (("supervised_pretrained", self.pretrained_checkpoint),
+                                                 ("supervised", self.decision_checkpoint))}
+        else:
+            training = {name: {"best_epoch": 0, "dev_loss": 0, "coverage": {}} for name in LEARNED_METHODS}
         results = {"evaluation_protocol": split_protocol(self.cfg, self.splits),
-                   "decision_training": {
-                       "supervised_pretrained": {"best_epoch": self.pretrained_checkpoint["best_epoch"],
-                                                 "dev_loss": self.pretrained_checkpoint["dev_loss"],
-                                                 "coverage": self.pretrained_checkpoint["coverage"]},
-                       "supervised": {"best_epoch": self.decision_checkpoint["best_epoch"],
-                                      "dev_loss": self.decision_checkpoint["dev_loss"],
-                                      "coverage": self.decision_checkpoint["coverage"]},
-                       "action_names": action_names(self.cfg)}}
+                   "decision_heads": self.cfg.use_decision_heads,
+                   "decision_training": {**training, "action_names": action_names(self.cfg)}}
         external = [Path(path).stem for path in self.cfg.test_files]
         names = ["audit"] + external
         rollout_path = self.out / ROLLOUT_FILE
@@ -4966,9 +5034,10 @@ class Workflow:
                     "mean_cost": float(np.mean([
                         results[name]["adaptive"]["policies"][method]["mean_cost"]
                         for name in available]))}
-                    for method in evaluation_methods(self.cfg)}}
+                    for method in reported_methods(self.cfg)}}
         atomic_json(self.out / "results.json", results)
-        print(f"Saved reports, rollout outcomes, checkpoints, and inference bundle to {self.out}")
+        print(f"Saved reports, rollout outcomes, checkpoints" +
+              (", and inference bundle" if self.cfg.use_decision_heads else "") + f" to {self.out}")
         print(f"{ROLLOUT_FILE}: one line per question, zero-shot order, and method; "
               "WORK.rollout_audit(name, position) recomputes a question's full trajectories.")
         print("These are cached historical outcomes, not live API or Kaggle evidence.")
