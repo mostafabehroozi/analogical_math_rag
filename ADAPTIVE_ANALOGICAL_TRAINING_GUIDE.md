@@ -118,6 +118,13 @@ recognition, so by default its complete views count like any other view
 (0.012% of its rows). `0` disables the repeats. The teacher is selected on its
 complete-state development loss, Stage 2 on its loss over every reachable state.
 
+`teacher_complete_share=1` trains the teacher on complete views alone. Six
+views per question fill about one optimizer step, so an epoch counts as many
+steps as one all-state epoch (every view once). `teacher_epochs`,
+`dev_checks_per_epoch`, and `view_patience` then keep their meaning in
+optimizer steps, and each fold checkpoint records the ratio as
+`schedule_scale`. Summaries report best checks in all-state epochs.
+
 One epoch visits every view once (plus those repeats): about 98 million views
 for 2,000 training questions. The defaults are therefore `batch_size=262144`,
 `teacher_epochs=snapshot_epochs=10`, and `dev_checks_per_epoch=8`. Development
@@ -452,42 +459,131 @@ Stage 3 identity. Runs started before it existed keep their contract and labels
 and still resume. `True` is a new run: use a new `output_dir` and `hf_repo`.
 `dataset_id` can stay, because the records do not change.
 
-## Without decision heads (`decision_heads`)
+## Choosing the stages (`stages`)
 
-`decision_heads=False` skips Stage 3: no decision labels, heads, or inference bundle are built. Stage 4
-still rolls out the full pool and every fixed acquisition order (`fixed_acquisition_orders`: interleaved,
-evaluators first, zero-shots first, or custom sequences). Each fixed order stops at the first predicted MAX
-of the frozen Stage 2 predictor, which is where it saves API calls; it needs only Stages 1 and 2. The two
-learned methods keep their place in every table and in `results.json` with all values 0:
+`stages` lists the phases a configuration runs. They form a chain, because each phase learns from the
+one before it:
+
+| Phase | Needs | What it trains | What it reports |
+| --- | --- | --- | --- |
+| `"teacher"` | - | Stage 1: the fold teachers, their out-of-fold ranking and SAFE/MAX labels | the ranking (AP, top-1) on every question set beside the heuristics and the retrieval order |
+| `"snapshot"` | `"teacher"` | Stage 2: the frozen snapshot predictor | its agreement with the teacher's list, and Stage 4 with the full pool and the fixed orders |
+| `"decision_heads"` | `"snapshot"` | Stage 3: the pretrained and fine-tuned heads, and the inference bundle | both heads in Stage 4 |
+| `"grouping"` | `"teacher"` | Stage 1G: the grouping teacher | the grouping report |
+
+The default is `("teacher", "snapshot", "decision_heads")`. A phase without the one it needs, an unknown
+name, or a repeated one stops `Config.validate()` with an explanation, for example
+`stages=('teacher', 'decision_heads'): 'decision_heads' needs 'snapshot' first`. Stage 0 prints the chain
+in effect (`Stages: teacher -> snapshot`). `stages` changes no stage's output, so it stays out of the run
+contract: a finished teacher-only run can add `"snapshot"` later in the same `output_dir`, and its Stage 1
+is loaded, not retrained. Saved configurations from before `stages` (inference bundles with the
+`decision_heads` and `grouping` switches) still load.
+
+**The teacher alone.** Without `"snapshot"`, Stages 2-4 are skipped, and `report()` writes the teacher's
+ranking on every question set to `results.json`: the supervised questions (scored out of fold), the
+development set, the audit set when it differs, and every test file.
+
+**The snapshot predictor against the teacher's list.** After Stage 2 freezes the predictor, it is compared
+with the teacher's list on every question set (`snapshot_fidelity.json`), over every reachable state and
+on the complete state. At each state the list is the teacher's complete-state ranking restricted to the
+present candidates:
+- Agree@1: the predictor's best present candidate is the list's first present one;
+- Tau: the Kendall rank correlation between the predictor's correctness and the teacher's scores, over
+  the present pairs the teacher orders;
+- Top-1 snapshot and Top-1 list: whether each pick is correct, so the predictor's own accuracy sits beside
+  the accuracy of following the list;
+- MAX P/R and SAFE P/R: precision and recall of the calibrated global "a MAX/SAFE candidate is present"
+  outputs at the recognition threshold, against the teacher's labels. These are the stop signals.
+
+The snapshot predictor trains on the supervised questions, so their row is in-sample.
+
+**Without decision heads.** Without `"decision_heads"`, Stage 3 is skipped: no decision labels, heads, or
+inference bundle are built. Stage 4 still rolls out the full pool and every fixed acquisition order
+(`fixed_acquisition_orders`: interleaved, evaluators first, zero-shots first, or custom sequences). Each
+fixed order stops at the first predicted MAX of the frozen Stage 2 predictor, which is where it saves API
+calls; it needs only Stages 1 and 2. The two learned methods keep their place in every table and in
+`results.json` with all values 0:
 - their rows in tables 1, 3 and 4;
 - every paired comparison that names one of them;
 - `paired_top1`, the continuation diagnostics, and `decision_training`.
 
-`final_rollouts.jsonl` holds only the methods that ran, and `results.json` records
-`"decision_heads": false`. The setting changes no stage's output, so it stays out of the run contract,
-and a finished run can be reported either way.
+`final_rollouts.jsonl` holds only the methods that ran, and `results.json` records `"decision_heads": false`
+and the `stages`.
 
-The grouping phase has priority: `grouping=True` switches the decision heads off whatever
-`decision_heads` says. The pipeline therefore runs in one of two ways:
-- decision heads on, grouping off;
-- grouping on, decision heads off.
+The grouping phase has priority: with `"grouping"` in `stages` the decision heads are off whatever else
+the list says. When the grouping phase is off, the decision heads are the idea under test; when it is on,
+the grouping phase is. Stage 0 prints which one is in effect.
 
-Stage 0 prints which one is in effect.
+## Several configurations (A/B tests)
 
-## Grouping phase (`grouping`, Stage 1G)
+`run_experiments(CFG, EXPERIMENTS, root)` runs several configurations one after another and compares
+them. Each experiment is a dict: a `"name"` and the settings it changes in `CFG`, with `"stages"` choosing
+its phases. For example:
+
+```python
+EXPERIMENTS = [
+    {"name": "teacher_share_100", "stages": ("teacher",), "teacher_complete_share": 1.0},
+    {"name": "teacher_share_1", "stages": ("teacher",), "teacher_complete_share": 0.01},
+    {"name": "snapshot_reachable", "stages": ("teacher", "snapshot"), "reachable_only": True},
+    {"name": "full_chain", "stages": ("teacher", "snapshot", "decision_heads")},
+    {"name": "grouping", "stages": ("teacher", "grouping")},
+]
+```
+
+Every experiment is checked before the first one trains: its name (letters, digits, `.`, `_` and `-`,
+since it names a folder and a Hub repository), unknown settings (with the nearest setting name),
+`Config.validate()`, and the stage chain. The plan table then lists each experiment's stages and the
+settings it changes.
+
+Each experiment runs in its own output folder, `<root>/<name>` (`root` defaults to `CFG.output_dir +
+"_experiments"`), and its own Hub mirror, `<hf_repo>-<name>`, unless it sets `output_dir` or `hf_repo`
+itself. Its run contract, checkpoints, and resume work exactly as for a single run, and `dataset_id` is
+shared, so the records are read from the logs once. Two experiments may share a folder only with the same
+run contract and mirror: for example, a grouping experiment on top of a finished run.
+
+At its end each experiment saves a compact summary, `experiment_<name>.json`, beside its run (and
+mirrored). It is bound to the experiment's name, every setting except the runtime controls, the
+implementation revision, and the input logs' content. In a later session a finished experiment is not run
+again: its summary is read from the folder, or downloaded alone from its mirror (the run itself is not
+pulled). Changing an experiment's settings under the same name runs it again, and its run contract then
+asks for a new name or folder when a contract setting changed.
+
+The suite does not print the per-set report tables (they stay in each run's `results.json`; pass
+`detailed_reports=True` to print them). Each experiment prints one compact summary instead:
+- the teacher's AP and top-1 on every question set, beside the heuristic chosen on dev and the retrieval
+  order, with the folds' best check and held-out loss;
+- with the snapshot predictor, its comparison with the teacher's list, and Stage 4's API calls, saved
+  calls, top-1, exact MAX, MAX stops and stop precision per method, on the audit set and per test file;
+- with the decision heads, where each head was selected;
+- with the grouping phase, its headline pass@1 numbers per set.
+
+The comparison at the end puts the experiments side by side, one table per stage, each experiment on the
+stages it ran. Every table has a paired difference from the stage's reference, the first experiment that
+ran the stage (in Stage 4, the first that ran the method), with a 95% bootstrap interval over the
+questions both report:
+- teacher: development AP and top-1, and AP / top-1 on every set;
+- snapshot: development agreement with the teacher's list;
+- Stage 4: top-1 and saved calls on the audit set;
+- grouping: the audit set's headline numbers.
+
+It is saved to `<root>/experiments_summary.json`. A single run can print and save the same summary with
+`WORK.experiment_summary()`.
+
+## Grouping phase (`"grouping"` in `stages`, Stage 1G)
 
 A companion Layer-1 grouping run (`APPLY_LAYER1_GROUPING=True`, `LAYER1_GROUPING_ONLY_MODE=True`; for
 example `Layer1_Grouping_K5_Sizes2` with `LAYER1_GROUP_SIZES=[2]`) generated one few-shot candidate per
 group of retrieved samples and graded it against the target answer. It ran no baseline and no mirror
-evaluation, so nothing measured those candidates. With `grouping=True`, Stage 1G trains the Stage 1
+evaluation, so nothing measured those candidates. With `"grouping"` in `stages`, Stage 1G trains the Stage 1
 network with one extra correctness output per group, so a group's correctness is predicted from the
-zero-shot and one-shot measurements alone, and then compares selections. With `grouping=False` (the
-default) nothing changes. With `grouping=True` the decision heads are off (Stage 3 is skipped;
-see "Without decision heads").
+zero-shot and one-shot measurements alone, and then compares selections. Without it (the default)
+nothing changes. With it the decision heads are off (Stage 3 is skipped; see "Choosing the
+stages"). `stages=("teacher", "grouping")` tests the grouping phase alone, without the snapshot
+predictor and Stage 4.
 
 | Setting | Meaning |
 | --- | --- |
-| `grouping` | Turns Stage 1G on. |
+| `"grouping"` in `stages` | Turns Stage 1G on. |
 | `grouping_files` | The grouping run's log in a list: normally the one `<experiment_name>_run_log.json` that holds every benchmark's questions. Several logs (for example one per benchmark) also work. |
 | `grouping_sizes` | The grouping run's `LAYER1_GROUP_SIZES`; `(2,)` gives the `C(5,2) = 10` pairs. |
 | `grouping_weight` | Weight of the group outputs' loss beside the candidates' (default 1). It counts in checkpoint selection. |

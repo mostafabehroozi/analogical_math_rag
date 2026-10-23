@@ -76,6 +76,8 @@ def expected_labels(layer1, parsed, cfg):
 
 
 COMBINED = "Layer1_Grouping_K3_Size2_run_log"
+# The grouping phase on top of the teacher and the snapshot predictor (Stage 4 with the fixed orders).
+GROUPING_STAGES = ("teacher", "snapshot", "grouping")
 
 
 def grouping_config(root, combined=True, **overrides):
@@ -88,7 +90,7 @@ def grouping_config(root, combined=True, **overrides):
     files = {name: root / f"{name}.json" for name in ("train", "external", "train_grouping", "external_grouping",
                                                         COMBINED)}
     grouping = [files[COMBINED]] if combined else [files["train_grouping"], files["external_grouping"]]
-    settings = dict(train_file=str(files["train"]), test_files=[str(files["external"])], grouping=True,
+    settings = dict(train_file=str(files["train"]), test_files=[str(files["external"])], stages=GROUPING_STAGES,
                     grouping_files=[str(path) for path in grouping],
                     use_test_files_for_dev_and_audit=True, output_dir=str(root / "run"), device="cpu",
                     cpu_threads=1, k=3, zero_shots=2, teacher_folds=2, hidden_dim=8, residual_blocks=1,
@@ -116,19 +118,20 @@ def test_group_members_follow_the_configured_sizes_in_combination_order():
 
 def test_grouping_settings_are_validated_and_stay_outside_the_run_contract():
     one = ["/logs/Layer1_Grouping_K5_Sizes2_run_log.json"]  # The grouping run's single log.
+    ON = ("teacher", "grouping")
     with pytest.raises(ValueError, match="grouping_files"):
-        a.Config(grouping=True).validate()
+        a.Config(stages=ON).validate()
     with pytest.raises(ValueError, match="grouping_files"):
-        a.Config(grouping=True, grouping_files=one[0]).validate()  # A list, not a bare path.
+        a.Config(stages=ON, grouping_files=one[0]).validate()  # A list, not a bare path.
     with pytest.raises(ValueError, match="unique filename"):
-        a.Config(grouping=True, grouping_files=["/a/run_log.json", "/b/run_log.json"]).validate()
+        a.Config(stages=ON, grouping_files=["/a/run_log.json", "/b/run_log.json"]).validate()
     for sizes in ((1,), (6,), (3, 2), (2, 2), ()):
         with pytest.raises(ValueError, match="grouping_sizes"):
-            a.Config(grouping=True, grouping_files=one, grouping_sizes=sizes).validate()
+            a.Config(stages=ON, grouping_files=one, grouping_sizes=sizes).validate()
     with pytest.raises(AssertionError):
-        a.Config(grouping=True, grouping_files=one, grouping_weight=-1.).validate()
-    a.Config(grouping=True, grouping_files=[f"/logs/{name}_grouping.json" for name in ("numina", "gsm8k")]).validate()
-    on = a.Config(grouping=True, grouping_files=one, grouping_sizes=(2, 3), grouping_weight=.5,
+        a.Config(stages=ON, grouping_files=one, grouping_weight=-1.).validate()
+    a.Config(stages=ON, grouping_files=[f"/logs/{name}_grouping.json" for name in ("numina", "gsm8k")]).validate()
+    on = a.Config(stages=ON, grouping_files=one, grouping_sizes=(2, 3), grouping_weight=.5,
                   grouping_shuffle_control=True)
     on.validate()
     # Off or on, the run contract (and so the Stage 3 identity) holds the same settings.
@@ -387,7 +390,7 @@ def test_grouping_tables_are_paired_add_up_and_are_json_ready():
 
 
 def test_the_grouping_phase_joins_trains_and_reports_and_can_join_a_finished_run(tmp_path, monkeypatch, capsys):
-    off = grouping_config(tmp_path, grouping=False)
+    off = grouping_config(tmp_path, stages=("teacher", "snapshot"))
     work = a.Workflow(off).build_datasets().prepare().train_teacher()
     assert work.grouping_report() is None and "Grouping phase is OFF" in capsys.readouterr().out
     contract = (tmp_path / "run" / "contract.json").read_bytes()

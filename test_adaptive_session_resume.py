@@ -375,7 +375,7 @@ def test_pipeline_resumes_from_the_mirror_in_a_fresh_session(tmp_path, monkeypat
     assert set(remote) == {
         "contract.json", "compact_records.pt", "data_audit.json", "split_manifest.json",
         "teacher_fold_1.pt", "teacher_fold_2.pt", "teacher_completed.pt",
-        "heuristics_selected_on_dev.json", "snapshot_completed.pt",
+        "heuristics_selected_on_dev.json", "snapshot_completed.pt", "snapshot_fidelity.json",
         "decision_dataset_manifest.json", "decision_label_coverage.json",
         "decision_labels/pretrain_policy.pt", "decision_labels/pretrain_dev.pt",
         "decision_labels/finetune_policy.pt", "decision_labels/finetune_dev.pt",

@@ -6,7 +6,9 @@ No provider calls are made. Acquisition is simulated from recorded Layer-1 data.
 from __future__ import annotations
 
 import copy
+import difflib
 import fnmatch
+import gc
 import hashlib
 import json
 import math
@@ -16,7 +18,7 @@ import re
 import shutil
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields, replace
 from functools import lru_cache
 from itertools import combinations, permutations
 from pathlib import Path
@@ -37,6 +39,12 @@ PIPELINE_REVISION = 12
 
 
 # %% Configuration and compact data
+# The phases a configuration can run, each with the phases it needs first. The snapshot predictor learns
+# the teacher's SAFE/MAX labels and the decision heads read the frozen snapshot predictor, so they form a
+# chain; the grouping phase needs only the teacher.
+STAGES = {"teacher": (), "snapshot": ("teacher",), "decision_heads": ("snapshot",), "grouping": ("teacher",)}
+
+
 @dataclass
 class Config:
     train_file: str = "/kaggle/working/downloaded_files/dir_5/numina_hard_run_log.json"
@@ -69,7 +77,8 @@ class Config:
     weight_decay: float = 1e-4
     teacher_epochs: int = 10
     snapshot_epochs: int = 10
-    # Complete views (6 of 48,960 per question) are repeated to this share of each epoch.
+    # Complete views (6 of 48,960 per question) are repeated to this share of each epoch. 1 trains the
+    # teacher on complete views only, with an all-state epoch's optimizer steps per epoch.
     teacher_complete_share: float = .15
     snapshot_complete_share: float = 0.   # 0: complete views appear once per order, like any other.
     # Only the states the runtime can reach (1,092 of 8,160 by default): Stage 2 trains on them, keeping
@@ -99,10 +108,12 @@ class Config:
     decision_finetune_lr: float = 3e-5
     decision_batch_size: int = 128
     decision_eval_batch_size: int = 4096  # Frozen dev forwards; no optimizer changes.
-    # Stage 3 decision heads. False skips Stage 3: Stage 4 reports the full pool and the fixed acquisition
-    # orders, each stopping at the first predicted MAX, with the learned heads' rows as zeros. The grouping
-    # phase has priority: grouping=True switches the decision heads off whatever this says.
-    decision_heads: bool = True
+    # The phases this configuration runs (see STAGES). ("teacher",) trains and reports the teacher; adding
+    # "snapshot" also trains the frozen snapshot predictor and reports it against the teacher's list and in
+    # Stage 4 with the full pool and the fixed orders; adding "decision_heads" trains both Stage 3 heads and
+    # reports them in Stage 4. "grouping" runs the grouping phase (Stage 1G) after the teacher and has
+    # priority: it switches the decision heads off, so Stage 4 then shows the learned heads' rows as zeros.
+    stages: tuple = ("teacher", "snapshot", "decision_heads")
     # Evaluation only: built-in order names or explicit [ZS1, R1, OS1, ...] sequences.
     fixed_acquisition_orders: dict = field(default_factory=lambda: {
         "fixed": "interleaved",
@@ -120,11 +131,10 @@ class Config:
     # already holds them. Everything the models produce goes to hf_repo.
     dataset_id: Optional[str] = None   # Name of the dataset family, e.g. "adaptive-v10"; None disables.
     dataset_repo: Optional[str] = None # Private dataset repo that holds every dataset_id, e.g. "user/datasets".
-    # Optional grouping phase (Stage 1G): the Stage 1 network with one extra correctness output per
-    # few-shot group of retrieved samples, trained on a companion Layer-1 grouping run's labels and
-    # compared with similarity, reranked and best-of-N selections. Off, nothing changes. These settings
-    # and the grouping logs stay outside the run contract; grouping_manifest.json binds them.
-    grouping: bool = False
+    # Optional grouping phase (Stage 1G, "grouping" in stages): the Stage 1 network with one extra
+    # correctness output per few-shot group of retrieved samples, trained on a companion Layer-1 grouping
+    # run's labels and compared with similarity, reranked and best-of-N selections. Off, nothing changes.
+    # These settings and the grouping logs stay outside the run contract; grouping_manifest.json binds them.
     # The grouping run's log: usually one file holding every benchmark's questions (the grouping
     # experiment's <experiment_name>_run_log.json), or several files. Each question joins its Layer-1 record
     # by text, so its own Layer-1 log decides whether it trains (train_file) or is reported (a test file).
@@ -138,9 +148,19 @@ class Config:
         return self.zero_shots + self.k
 
     @property
+    def grouping(self):
+        """Whether the grouping phase (Stage 1G) runs."""
+        return "grouping" in self.stages
+
+    @property
+    def use_snapshot(self):
+        """Whether Stage 2 trains the snapshot predictor, and so whether Stage 4 can roll out acquisitions."""
+        return "snapshot" in self.stages
+
+    @property
     def use_decision_heads(self):
         """Whether Stage 3 runs: the grouping phase has priority and switches the decision heads off."""
-        return self.decision_heads and not self.grouping
+        return "decision_heads" in self.stages and not self.grouping
 
     @property
     def group_members(self):
@@ -195,7 +215,7 @@ class Config:
         assert self.decision_finetune_epochs > 0 and self.decision_finetune_lr > 0
         assert self.decision_eval_batch_size >= 2
         assert self.dev_checks_per_epoch >= 1 and self.view_patience > 0
-        assert 0 <= self.teacher_complete_share < 1 and 0 <= self.snapshot_complete_share < 1
+        assert 0 <= self.teacher_complete_share <= 1 and 0 <= self.snapshot_complete_share < 1
         assert self.absent_weight >= 0
         assert self.print_every > 0
         assert self.hf_sync_minutes > 0
@@ -211,11 +231,21 @@ class Config:
         if self.dataset_repo is not None and self.dataset_repo == self.hf_repo:
             raise ValueError("dataset_repo must differ from hf_repo: the run mirror would download the "
                              "datasets stored beside it.")
-        assert type(self.grouping) is bool and type(self.grouping_shuffle_control) is bool
-        assert type(self.decision_heads) is bool
+        assert type(self.grouping_shuffle_control) is bool
+        stages = list(self.stages) if isinstance(self.stages, (list, tuple)) else []
+        if not stages or len(set(stages)) != len(stages) or not set(stages) <= set(STAGES):
+            raise ValueError(f"stages={self.stages!r}: list distinct phases from {list(STAGES)}, for example "
+                             "('teacher',), ('teacher', 'snapshot'), ('teacher', 'snapshot', 'decision_heads') "
+                             "or ('teacher', 'grouping').")
+        for stage in stages:
+            missing = [need for need in STAGES[stage] if need not in stages]
+            if missing:
+                raise ValueError(f"stages={tuple(stages)}: '{stage}' needs {missing[0]!r} first. Each phase needs "
+                                 "the one before it (teacher -> snapshot -> decision_heads), and grouping needs "
+                                 "the teacher.")
         if self.grouping:
             if isinstance(self.grouping_files, str) or not self.grouping_files:
-                raise ValueError("grouping=True needs grouping_files: a list holding the grouping run's log (one "
+                raise ValueError("The grouping stage needs grouping_files: a list holding the grouping run's log (one "
                                  "file with every benchmark's questions) or several grouping logs.")
             names = [Path(p).name for p in self.grouping_files]
             if len(set(names)) != len(names):
@@ -235,7 +265,7 @@ class Config:
 NON_CONTRACT_SETTINGS = ("resume", "output_dir", "device", "cpu_threads", "print_every",
                          "fixed_acquisition_orders", "continue_after_max", "decision_eval_batch_size",
                          "hf_repo", "hf_sync_minutes", "train_file", "test_files",
-                         "dataset_id", "dataset_repo", "decision_heads")
+                         "dataset_id", "dataset_repo", "stages")
 # Contract settings added after revision 10's runs began, with the value that reproduces those runs. At
 # that value a setting stays out of the run contract and the Stage 3 identity, so those runs still resume.
 LATER_CONTRACT_DEFAULTS = {"reachable_only": False}
@@ -250,6 +280,16 @@ def contract_settings(cfg):
     return {key: value for key, value in asdict(cfg).items() if key not in NON_CONTRACT_SETTINGS
             and key not in GROUPING_SETTINGS
             and not (key in LATER_CONTRACT_DEFAULTS and value == LATER_CONTRACT_DEFAULTS[key])}
+
+
+def saved_config(values):
+    """A Config from a saved `asdict(Config)`, also one written while the decision_heads and grouping
+    switches stood where `stages` is now."""
+    values = dict(values)
+    if "stages" not in values:
+        stages = ["teacher", "snapshot"] + (["decision_heads"] if values.pop("decision_heads", True) else [])
+        values["stages"] = tuple(stages + (["grouping"] if values.pop("grouping", False) else []))
+    return Config(**values)
 
 
 @dataclass
@@ -706,9 +746,18 @@ def train_teacher(records, train_ids, val_ids, cfg, device, seed, name, progress
         vy = np.concatenate([vy, np.stack([group_target(groups["labels"][i], full, cfg) for i in val_ids])], 1)
         loss_of, outputs = grouping_teacher_loss, cfg.n + cfg.group_count
     vy = torch.as_tensor(vy, dtype=torch.float32)
-    # The complete view is the one later stages read, so it gets its own share of training.
-    views = SnapshotViews(records, train_ids, cfg, device, complete_share=cfg.teacher_complete_share,
-                          groups=groups)
+    # The complete view is the one later stages read, so it gets its own share of training; share 1
+    # trains on complete views alone.
+    complete_only = cfg.teacher_complete_share == 1
+    views = SnapshotViews(records, train_ids, cfg, device, states=(full,) if complete_only else None,
+                          complete_share=0. if complete_only else cfg.teacher_complete_share, groups=groups)
+    scale = 1.
+    if complete_only:
+        # Complete views fill about one step per epoch. One all-state epoch's optimizer steps (every view
+        # once) count as an epoch, so the checks, the patience and the epoch cap keep their meaning.
+        every = len(presence_states(cfg.zero_shots, cfg.k)) * views.order_count
+        scale = (epoch_steps(every, len(train_ids), cfg.batch_size) /
+                 epoch_steps(views.epoch_per_question, len(train_ids), cfg.batch_size))
     model = ResNet(cfg.input_dim, outputs, cfg).to(device)
 
     def evaluate(model):
@@ -717,10 +766,12 @@ def train_teacher(records, train_ids, val_ids, cfg, device, seed, name, progress
         return score, f"development loss {score:.4f}"
 
     fit = train_on_views(model, views, cfg.teacher_epochs, seed, lambda logits, y: loss_of(logits, y, cfg),
-                         evaluate, lower_loss, cfg, name, progress=progress)
+                         evaluate, lower_loss, cfg, name, progress=progress, schedule_scale=scale)
     print(f"{name:<24} | epochs {fit['epochs']:6.2f} | best {fit['best_epoch']:6.2f} | "
           f"development loss {fit['best']:.4f}")
+    # Epochs are counted in these views' epochs; schedule_scale of them make one all-state epoch.
     return {"weights": fit["weights"], "best_epoch": fit["best_epoch"], "history": fit["history"],
+            "schedule_scale": scale,
             "train_ids": [records[i].uid for i in train_ids],
             "validation_ids": [records[i].uid for i in val_ids]}
 
@@ -1139,6 +1190,16 @@ def complete_copies(state_count, share):
     return max(1, round(share * (state_count - 1) / (1 - share))) if share else 1
 
 
+def epoch_steps(per, count, batch_size):
+    """Optimizer steps in one epoch of `per` rows for each of `count` questions (SnapshotViews.batches)."""
+    # Rows per question per batch: about batch_size rows in all, at least one per
+    # question (so more questions than batch_size rows give larger batches).
+    steps = max(1, -(-per // max(1, batch_size // max(1, count))))
+    if count == 1:
+        steps = max(1, min(steps, per // 2))  # BatchNorm cannot train on a single row.
+    return steps
+
+
 class SnapshotViews:
     """Every (question, zero-shot order, presence state) view, assembled per batch.
 
@@ -1159,7 +1220,8 @@ class SnapshotViews:
         template, masks, (sim, base, ccs) = state_observation_template(
             states, cfg.zero_shots, cfg.k, cfg.repeats, cfg.cost_unit, cfg.max_cost)
         orders = list(permutations(range(cfg.zero_shots)))
-        slots = np.asarray([list(order) + list(range(cfg.zero_shots, cfg.n)) for order in orders])
+        # Record slot of each permuted position, per zero-shot order.
+        self.slots = slots = np.asarray([list(order) + list(range(cfg.zero_shots, cfg.n)) for order in orders])
 
         def put(values, shape):
             array = np.stack(values) if values else np.zeros((0, *shape))
@@ -1237,11 +1299,7 @@ class SnapshotViews:
         continues with the batches an uninterrupted one draws.
         """
         per, count = self.epoch_per_question, len(self.ids)
-        # Rows per question per batch: about batch_size rows in all, at least one per
-        # question (so more questions than batch_size rows give larger batches).
-        steps = max(1, -(-per // max(1, batch_size // max(1, count))))
-        if count == 1:
-            steps = max(1, min(steps, per // 2))  # BatchNorm cannot train on a single row.
+        steps = epoch_steps(per, count, batch_size)
         order = torch.as_tensor(rng.permutation(per), device=self.device)
         start = torch.as_tensor(rng.randint(0, per, count), device=self.device)
         base = torch.arange(count, device=self.device) * self.per_question
@@ -1342,8 +1400,9 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
     a check every `hf_sync_minutes`, and a saved state resumes.
 
     One all-state epoch spans `schedule_scale` epochs of these views (more than one when only the
-    reachable states are trained), so `epochs`, `dev_checks_per_epoch`, and `view_patience` count
-    all-state epochs and keep their spacing in optimizer steps.
+    reachable states, or only the complete ones, are trained), so `epochs`, `dev_checks_per_epoch`,
+    and `view_patience` count all-state epochs and keep their spacing in optimizer steps; the epoch
+    line is then printed once per all-state epoch.
     """
     if views.rows < 2:
         raise ValueError(f"{name}: too few training views.")
@@ -1425,6 +1484,8 @@ def train_on_views(model, views, epochs, seed, loss_of, evaluate, better, cfg, n
                                             if views.device.type == "cuda" else None),
                                "elapsed": time.monotonic() - started},
                               f"{name} training progress at epoch {position:.3f}")
+        if not (stopped or (epoch + 1) % max(1, round(schedule_scale)) == 0 or epoch + 1 == epochs):
+            continue
         # Training loss averages this epoch's rows up to its last check.
         print(f"{name} | epoch {position:6.3f} | train loss {float(epoch_total) / max(1, done - seen):.4f} | "
               f"latest {text} | best {best_text} at epoch {best_epoch:.3f} | "
@@ -1495,6 +1556,102 @@ def summarize_snapshot_sums(sums):
                for metric, base in (("precision", "predicted"), ("recall", "true"))}}
 
 
+FIDELITY_FIELDS = ("views", "agree", "tau", "tau_views", "snapshot_top1", "list_top1",
+                   "max_predicted", "max_true_positive", "max_true", "safe_predicted", "safe_true_positive", "safe_true")
+
+
+def fidelity_sums(predictor, views, scores, cfg):
+    """Per-question sums of how closely the frozen snapshot predictor follows the teacher's list.
+
+    At each view the teacher's list is its complete-state ranking (`scores`) restricted to the present
+    candidates. `agree` counts views whose snapshot pick (the present candidate with the highest
+    correctness) is the list's first present candidate; `tau` sums each view's Kendall tau between the
+    snapshot's correctness and the teacher's scores over the present pairs the teacher orders;
+    `snapshot_top1` and `list_top1` count views whose pick is correct. The MAX and SAFE fields compare the
+    calibrated global "a MAX/SAFE candidate is present" outputs, at the recognition threshold, with the
+    teacher's labels.
+    """
+    n, device = cfg.n, views.device
+    listed = torch.as_tensor(np.stack([np.asarray(scores[i])[views.slots] for i in views.ids]),
+                             dtype=torch.float32, device=device)
+    temperatures = torch.as_tensor(predictor.temperatures, dtype=torch.float32, device=device)
+    upper = torch.ones((n, n), dtype=torch.bool, device=device).triu(1)
+    sums = torch.zeros((len(views.ids), len(FIDELITY_FIELDS)), dtype=torch.float64, device=device)
+    model = predictor.model.eval()
+    with torch.no_grad():
+        for lo in range(0, views.rows, SNAPSHOT_EVAL_BATCH):
+            index = torch.arange(lo, min(views.rows, lo + SNAPSHOT_EVAL_BATCH), device=device)
+            q, o = index // views.per_question, index // views.state_count % views.order_count
+            x, y = views.batch(index)
+            p, s, present = torch.sigmoid(model(x) / temperatures), listed[q, o], y[:, 3*n+2:].bool()
+            absent = torch.full_like(s, -math.inf)
+            mine = torch.where(present, p[:, :n], absent).argmax(1)
+            theirs = torch.where(present, s, absent).argmax(1)
+            pairs = present[:, :, None] & present[:, None, :] & upper & (s[:, :, None] != s[:, None, :])
+            agreement = ((p[:, :n, None] - p[:, None, :n]).sign() * (s[:, :, None] - s[:, None, :]).sign()
+                         * pairs).sum((1, 2))
+            count = pairs.sum((1, 2))
+            columns = [torch.ones_like(p[:, 0]), mine == theirs, agreement / count.clamp_min(1), count > 0,
+                       y[:, :n].gather(1, mine[:, None])[:, 0], y[:, :n].gather(1, theirs[:, None])[:, 0]]
+            for col in (3*n+1, 3*n):
+                predicted, true = p[:, col] >= cfg.recognition_threshold, y[:, col] > .5
+                columns += [predicted, predicted & true, true]
+            sums.index_add_(0, q, torch.stack([c.double() for c in columns], 1))
+    return sums.cpu().numpy()
+
+
+def summarize_fidelity(sums):
+    total = dict(zip(FIDELITY_FIELDS, np.asarray(sums, np.float64).reshape(-1, len(FIDELITY_FIELDS)).sum(0)))
+    ratio = lambda a, b: float(a / b) if b else None
+    return {"views": int(total["views"]), "agree_top1": ratio(total["agree"], total["views"]),
+            "kendall_tau": ratio(total["tau"], total["tau_views"]),
+            "snapshot_top1": ratio(total["snapshot_top1"], total["views"]),
+            "list_top1": ratio(total["list_top1"], total["views"]),
+            **{f"{name}_{metric}": ratio(total[f"{name}_true_positive"], total[f"{name}_{base}"])
+               for name in ("max", "safe") for metric, base in (("precision", "predicted"), ("recall", "true"))}}
+
+
+def snapshot_fidelity(records, sets, teacher, predictor, cfg):
+    """The frozen snapshot predictor against the teacher's list, on every reachable state and on the
+    complete state, for each question set (`sets`: name -> question indices). Each question's sums are
+    computed once; `per_question` holds each set's per-question agreement on reachable states."""
+    union = sorted({i for ids in sets.values() for i in ids})
+    full = State((1 << cfg.n) - 1, (1 << cfg.k) - 1)
+    sums = {}
+    for scope, states in (("reachable", reachable_states(cfg)), ("complete", (full,))):
+        views = SnapshotViews(records, union, cfg, predictor.device, teacher, states)
+        sums[scope] = dict(zip(union, fidelity_sums(predictor, views, teacher["scores"], cfg)))
+    agree, views = FIDELITY_FIELDS.index("agree"), FIDELITY_FIELDS.index("views")
+    return {"sets": {name: {scope: summarize_fidelity([sums[scope][i] for i in ids]) for scope in sums}
+                     for name, ids in sets.items() if ids},
+            "per_question": {name: {"uids": [records[i].uid for i in ids],
+                                    "agree_top1": [float(sums["reachable"][i][agree] / sums["reachable"][i][views])
+                                                   for i in ids]}
+                             for name, ids in sets.items() if ids}}
+
+
+def print_snapshot_fidelity(sets, threshold):
+    """The table of `snapshot_fidelity(...)["sets"]`."""
+    percent = lambda value: "--" if value is None else f"{value:.1%}"
+    print(f"Snapshot vs the teacher's list: the teacher's complete-state ranking restricted to the present "
+          f"candidates, on every reachable state (calibrated outputs; threshold {threshold:g}).")
+    print(f"{'Set':<24} | {'Agree@1':>7} | {'Tau':>6} | {'Top-1 snapshot':>14} | {'Top-1 list':>10} | "
+          f"{'MAX P/R':>13} | {'SAFE P/R':>13} | {'Complete agree@1':>16}")
+    print("-" * 132)
+    for name, scopes in sets.items():
+        row, complete = scopes["reachable"], scopes["complete"]
+        tau = "--" if row["kendall_tau"] is None else f"{row['kendall_tau']:.3f}"
+        print(f"{name:<24} | {percent(row['agree_top1']):>7} | {tau:>6} | {percent(row['snapshot_top1']):>14} | "
+              f"{percent(row['list_top1']):>10} | "
+              f"{percent(row['max_precision']) + '/' + percent(row['max_recall']):>13} | "
+              f"{percent(row['safe_precision']) + '/' + percent(row['safe_recall']):>13} | "
+              f"{percent(complete['agree_top1']):>16}")
+    print("Agree@1: the snapshot's best present candidate is the list's first present one. Tau: Kendall rank "
+          "correlation with the list over present pairs. Top-1: that pick is correct. MAX/SAFE P/R: the global "
+          "'a MAX/SAFE candidate is present' outputs against the teacher's labels (stop signals). The snapshot "
+          "trains on the supervised questions.")
+
+
 def temperature_vector(temperatures, cfg):
     return np.r_[np.repeat(temperatures[:3], cfg.n), temperatures[3:]].astype(np.float32)
 
@@ -1563,7 +1720,7 @@ def fit_snapshot(records, splits, teacher, cfg, device, out=None, sync=None):
     print(f"Snapshot selected at epoch {fit['best_epoch']:.2f}; development loss {fit['best']:.4f} "
           f"({dev_summary['loss']:.4f} calibrated), Top-1 {dev_summary['top1']:.1%}.")
     return {"weights": fit["weights"], "temperatures": temps, "history": fit["history"],
-            "best_epoch": fit["best_epoch"], "input_dim": cfg.input_dim,
+            "best_epoch": fit["best_epoch"], "schedule_scale": scale, "input_dim": cfg.input_dim,
             "presence_states": views.state_count, "zero_shot_orders": views.order_count,
             "views_per_epoch": views.rows, "rows_per_epoch": views.epoch_rows,
             "complete_copies": views.complete_copies, "dev_summary": dev_summary}
@@ -3220,10 +3377,13 @@ def select_heuristics(records, ids, cfg):
     return selected
 
 
-def teacher_report(records, ids, cfg, scores, heuristics, title):
-    section(title)
+def teacher_report(records, ids, cfg, scores, heuristics, title, verbose=True):
+    """Ranking metrics of the retrieval order, the heuristics, and the teacher; printed when `verbose`."""
+    if verbose:
+        section(title)
     if not ids:
-        print("No eligible records. See data_audit.json for exclusions; no metric is imputed.")
+        if verbose:
+            print("No eligible records. See data_audit.json for exclusions; no metric is imputed.")
         return None
     baseline = {i: np.zeros(cfg.n) for i in ids}
     methods = {"Baseline (Retrieval Order)": baseline}
@@ -3232,6 +3392,8 @@ def teacher_report(records, ids, cfg, scores, heuristics, title):
             i: heuristic_scores(records[i], cfg, *spec) for i in ids}
     methods["ResNet teacher"] = scores
     metrics = {name: ranking_metrics(records, ids, s, cfg) for name, s in methods.items()}
+    if not verbose:
+        return metrics
     base_ap = metrics["Baseline (Retrieval Order)"]["ap"]
     print(f"Queries: {len(ids)} | Full-pool oracle coverage: {metrics['ResNet teacher']['coverage']:.1%}")
     print(f"{'Ranking method':<43} | {'Mean AP':>8} | {'Top-1':>8} | {'AP delta':>9}")
@@ -3240,6 +3402,37 @@ def teacher_report(records, ids, cfg, scores, heuristics, title):
         print(f"{name:<43} | {m['ap']:8.4f} | {m['top1']:7.1%} | {(m['ap']-base_ap)*100:+8.2f}pp")
     print("All eligible questions included, including all-wrong pools. Heuristics selected on development only.")
     return metrics
+
+
+def evaluation_sets(cfg, splits):
+    """The question sets each stage is reported on, in print order: the supervised (training-file)
+    questions, development, audit when it is not the same questions, and every test file."""
+    sets = {"supervised": splits["supervised"], "dev": splits["dev"]}
+    if sorted(splits["audit"]) != sorted(splits["dev"]):
+        sets["audit"] = splits["audit"]
+    sets.update({Path(path).stem: splits[Path(path).stem] for path in cfg.test_files})
+    return sets
+
+
+def question_ranking(records, ids, scores, cfg):
+    """Each question's AP and top-1 correctness under `scores`, in `ids` order."""
+    rows = []
+    for idx in ids:
+        order = ranked_indices(scores[idx], retrieval_order(cfg))
+        rows.append((ap_score(order, records[idx].labels), float(records[idx].labels[order[0]])))
+    return np.asarray(rows, np.float64).reshape(-1, 2)
+
+
+def model_training(path, fallback_scale=1.):
+    """Where a saved Stage 1-2 model was selected: its best check and development loss, in all-state epochs."""
+    if not Path(path).is_file():
+        return None
+    checkpoint = load_checkpoint(path)
+    scale = checkpoint.get("schedule_scale", fallback_scale)
+    losses = [row["dev_loss"] for row in checkpoint.get("history", [])]
+    return {"best_epoch": float(checkpoint["best_epoch"]) / scale,
+            "epochs": float(checkpoint["history"][-1]["epoch"]) / scale if losses else 0.,
+            "dev_loss": float(min(losses)) if losses else None}
 
 
 def fixed_order_items(cfg, order="interleaved"):
@@ -3314,6 +3507,18 @@ def evaluation_methods(cfg):
 def reported_methods(cfg):
     """Every method a report lists; a learned head that did not run is shown as zeros (`zeroed`)."""
     return ("full", *cfg.fixed_acquisition_orders, *LEARNED_METHODS)
+
+
+def heads_off_reason(cfg):
+    """Why Stage 3 does not run."""
+    return ("'grouping' is in stages and has priority over 'decision_heads'"
+            if cfg.grouping and "decision_heads" in cfg.stages else "'decision_heads' is not in stages")
+
+
+def stage_chain(cfg):
+    """The phases a configuration runs, in the order they run, as printed in plans and summaries."""
+    return " -> ".join(stage for stage in ("teacher", "grouping", "snapshot", "decision_heads")
+                       if stage in cfg.stages and (stage != "decision_heads" or cfg.use_decision_heads))
 
 
 def zeroed(value):
@@ -3758,6 +3963,15 @@ def method_comparisons(questions, cfg):
     return result
 
 
+def question_outcomes(records, ids, questions, cfg):
+    """Each question's top-1 and saved API calls for every method that ran (zero-shot orders averaged)."""
+    return {"uids": [records[i].uid for i in ids],
+            "methods": {method: {"top1": [float(q["methods"][method]["means"]["correct"]) for q in questions],
+                                 "saved_calls": [float(np.mean(q["methods"][method]["saved_calls"]))
+                                                 for q in questions]}
+                        for method in evaluation_methods(cfg)}}
+
+
 def interval_text(item, scale=1., unit=""):
     if item is None:
         return "--"
@@ -3777,46 +3991,11 @@ def paired_top1(questions, cfg):
             for baseline in evaluation_methods(cfg) if baseline != "supervised"}
 
 
-def policy_report(records, ids, teacher, predictor, cfg, heads, title, evaluated=None, sink=None,
-                  snapshot_cache=None):
-    """One report's acquisition comparison and its questions' report inputs, in `ids` order.
-
-    `heads` maps each learned method to its decision head. `evaluated` maps question indices to question_report results, so reports that share
-    questions (the pooled audit and each benchmark) roll every question out once per
-    method and zero-shot order. New rollouts stream their outcomes to `sink`;
-    `snapshot_cache` shares the snapshot diagnostic's per-question sums the same way.
-    """
-    section(title)
-    if not ids:
-        print("No eligible questions; metrics are unavailable.")
-        return None, []
-    evaluated = {} if evaluated is None else evaluated
-    missing = [idx for idx in ids if idx not in evaluated]
-    shared = f"; {len(ids) - len(missing)} reuse earlier rollouts" if len(missing) < len(ids) else ""
-    print(f"Stage 4 rollouts: {len(missing)} questions x {math.factorial(cfg.zero_shots)} zero-shot "
-          f"orders x {len(evaluation_methods(cfg))} methods{shared}.", flush=True)
-    started = last_print = time.monotonic()
-    for position, idx in enumerate(missing, 1):
-        evaluated[idx] = question_report(records[idx], teacher["scores"][idx], teacher["safe"][idx],
-                                         teacher["maximum"][idx], predictor, cfg, heads, sink)
-        last_print = decision_progress("Stage 4 rollouts", position, len(missing), started, last_print, cfg,
-                                       every=max(cfg.print_every, -(-len(missing) // 10)), seconds=300)
-    questions = [evaluated[idx] for idx in ids]
-    summary = {}
-    for name in evaluation_methods(cfg):
-        reasons = Counter()
-        for question in questions:  # In row order, as policy_summary counts them.
-            reasons.update(question["methods"][name]["reasons"])
-        summary[name] = summarize_questions([question["methods"][name]["means"] for question in questions],
-                                            reasons)
-    # With the decision heads off, the learned heads were never trained or rolled out: zeros.
-    skipped = [name for name in reported_methods(cfg) if name not in summary]
-    summary.update({name: zeroed(summary["full"]) for name in skipped})
-    comparisons = method_comparisons(questions, cfg)
-    outcomes = {name: (zeroed(recognition_outcomes(questions, "full")) if name in skipped else
-                       recognition_outcomes(questions, name)) for name in summary if name != "full"}
+def print_policy_tables(summary, comparisons, outcomes, skipped, cfg):
+    """policy_report's four tables: calls versus accuracy, paired differences, savings by question
+    group, and MAX recognition outcomes."""
     if skipped:
-        print(f"Decision heads off ({'grouping=True' if cfg.grouping else 'decision_heads=False'}): "
+        print(f"Decision heads off ({heads_off_reason(cfg)}): "
               f"{', '.join(skipped)} were not trained or rolled out and are shown as zeros.")
     sizes = {group: item["n"] for group, item in summary["full"]["call_savings"].items()}
     full_calls = acquisition_call_counts(cfg.n, cfg.k, cfg)["total_calls"]
@@ -3878,6 +4057,49 @@ def policy_report(records, ids, teacher, predictor, cfg, heads, title, evaluated
           "of rollouts stopped at a predicted MAX; stop precision = share of those stops returning the MAX.")
     print("Top-1 lost/gained pair each rollout with the full pool in the same zero-shot order; "
           f"95% CI from a {cfg.bootstrap_samples}-sample bootstrap over questions.")
+
+
+def policy_report(records, ids, teacher, predictor, cfg, heads, title, evaluated=None, sink=None,
+                  snapshot_cache=None, verbose=True):
+    """One report's acquisition comparison and its questions' report inputs, in `ids` order.
+
+    `heads` maps each learned method to its decision head. `evaluated` maps question indices to question_report results, so reports that share
+    questions (the pooled audit and each benchmark) roll every question out once per
+    method and zero-shot order. New rollouts stream their outcomes to `sink`;
+    `snapshot_cache` shares the snapshot diagnostic's per-question sums the same way.
+    Without `verbose` only the rollout progress is printed, not the tables.
+    """
+    section(title)
+    if not ids:
+        print("No eligible questions; metrics are unavailable.")
+        return None, []
+    evaluated = {} if evaluated is None else evaluated
+    missing = [idx for idx in ids if idx not in evaluated]
+    shared = f"; {len(ids) - len(missing)} reuse earlier rollouts" if len(missing) < len(ids) else ""
+    print(f"Stage 4 rollouts: {len(missing)} questions x {math.factorial(cfg.zero_shots)} zero-shot "
+          f"orders x {len(evaluation_methods(cfg))} methods{shared}.", flush=True)
+    started = last_print = time.monotonic()
+    for position, idx in enumerate(missing, 1):
+        evaluated[idx] = question_report(records[idx], teacher["scores"][idx], teacher["safe"][idx],
+                                         teacher["maximum"][idx], predictor, cfg, heads, sink)
+        last_print = decision_progress("Stage 4 rollouts", position, len(missing), started, last_print, cfg,
+                                       every=max(cfg.print_every, -(-len(missing) // 10)), seconds=300)
+    questions = [evaluated[idx] for idx in ids]
+    summary = {}
+    for name in evaluation_methods(cfg):
+        reasons = Counter()
+        for question in questions:  # In row order, as policy_summary counts them.
+            reasons.update(question["methods"][name]["reasons"])
+        summary[name] = summarize_questions([question["methods"][name]["means"] for question in questions],
+                                            reasons)
+    # With the decision heads off, the learned heads were never trained or rolled out: zeros.
+    skipped = [name for name in reported_methods(cfg) if name not in summary]
+    summary.update({name: zeroed(summary["full"]) for name in skipped})
+    comparisons = method_comparisons(questions, cfg)
+    outcomes = {name: (zeroed(recognition_outcomes(questions, "full")) if name in skipped else
+                       recognition_outcomes(questions, name)) for name in summary if name != "full"}
+    if verbose:
+        print_policy_tables(summary, comparisons, outcomes, skipped, cfg)
     return {"policies": summary, "comparisons": comparisons, "recognition_outcomes": outcomes,
             "cost_unit": cfg.cost_unit,
             "fixed_acquisition_sequences": fixed_acquisition_sequences(cfg),
@@ -4392,6 +4614,20 @@ class OutputSync:
         shutil.rmtree(self.out / ".cache", ignore_errors=True)  # Download bookkeeping only.
         return "pulled"
 
+    def fetch(self, relative, folder):
+        """Download one mirrored file into `folder`, never into the output folder (an empty output folder is
+        what makes `pull` download the run); its local path, or None when the mirror lacks it."""
+        if (not self.api.repo_exists(self.repo, repo_type="dataset")
+                or relative not in self.api.list_repo_files(self.repo, repo_type="dataset")):
+            return None
+        folder = Path(folder)
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True)
+        self.api.snapshot_download(repo_id=self.repo, repo_type="dataset", local_dir=str(folder),
+                                   allow_patterns=[relative])
+        path = folder / relative
+        return path if path.is_file() else None
+
     def push(self, message, *, force=False, required=False):
         """Upload changed files; inside loops only once per interval, at stage ends always.
 
@@ -4458,10 +4694,15 @@ def contract_identity(contract):
 
 
 class Workflow:
-    """Notebook stages; completed checkpoints resume, interrupted stages restart safely."""
-    def __init__(self, cfg):
+    """Notebook stages; completed checkpoints resume, interrupted stages restart safely.
+
+    `cfg.stages` decides which stages run. Without `detailed_reports` (an experiment suite), the
+    per-set report tables are not printed; `experiment_summary` prints and saves the compact results.
+    """
+    def __init__(self, cfg, detailed_reports=True):
         self.cfg = copy.deepcopy(cfg)
         self.cfg.validate()
+        self.detailed_reports = detailed_reports
         torch.set_num_threads(cfg.cpu_threads)
         seed_everything(cfg.seed)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else torch.device(cfg.device)
@@ -4625,9 +4866,15 @@ class Workflow:
                   f"{len(self.cfg.grouping_files)} grouping log(s) split by each question's Layer-1 log; it "
                   f"changes no other stage, and {GROUPING_MANIFEST} binds its settings outside the run "
                   "contract.", flush=True)
-        if not self.cfg.use_decision_heads:
-            print("Decision heads OFF (" + ("grouping=True has priority over decision_heads"
-                  if self.cfg.grouping else "decision_heads=False") + "): Stage 3 is skipped, and Stage 4 reports "
+        print(f"Stages: {stage_chain(self.cfg)}.", flush=True)
+        if self.cfg.teacher_complete_share == 1:
+            print("teacher_complete_share=1: the teacher trains on complete views only, counting one all-state "
+                  "epoch's optimizer steps as an epoch.", flush=True)
+        if not self.cfg.use_snapshot:
+            print("No 'snapshot' in stages: Stages 2-4 are skipped; the report is the teacher's ranking on every "
+                  "question set.", flush=True)
+        elif not self.cfg.use_decision_heads:
+            print(f"Decision heads OFF ({heads_off_reason(self.cfg)}): Stage 3 is skipped, and Stage 4 reports "
                   "the full pool and the fixed acquisition orders with MAX stopping; the learned heads' rows "
                   "are zeros.", flush=True)
         self.splits = split_records(self.records, self.cfg)
@@ -4683,7 +4930,7 @@ class Workflow:
               "teachers; each fold kept its lowest-loss checkpoint on held-out training-file questions.")
         teacher_report(self.records, self.splits["dev"], self.cfg, self.teacher["scores"],
                        self.heuristics, "TEACHER DEVELOPMENT REPORT (metrics only; no teacher is selected "
-                       "on these questions)")
+                       "on these questions)", verbose=self.detailed_reports)
         self.push("Stage 1 complete: teacher folds and out-of-fold labels")
         return self
 
@@ -4698,7 +4945,7 @@ class Workflow:
         the group sizes, and the records.
         """
         if not self.cfg.grouping:
-            print("Grouping phase is OFF (grouping=False): nothing to build.")
+            print("Grouping phase is OFF ('grouping' is not in stages): nothing to build.")
             return self
         if self.records is None:
             self.build_datasets()
@@ -4805,7 +5052,7 @@ class Workflow:
     def train_grouping(self):
         """Stage 1G: the Stage 1 network with one correctness output per group, on Stage 1's folds."""
         if not self.cfg.grouping:
-            print("Grouping phase is OFF (grouping=False): no grouping teacher.")
+            print("Grouping phase is OFF ('grouping' is not in stages): no grouping teacher.")
             return self
         if not hasattr(self, "teacher"):
             self.train_teacher()
@@ -4834,7 +5081,7 @@ class Workflow:
     def grouping_report(self):
         """Stage 1G report: top-0/1/2 by similarity and by reranking, best-of-N levels, and extra comparisons."""
         if not self.cfg.grouping:
-            print("Grouping phase is OFF (grouping=False): no grouping report.")
+            print("Grouping phase is OFF ('grouping' is not in stages): no grouping report.")
             return None
         if not hasattr(self, "grouping_teacher"):
             self.train_grouping()
@@ -4848,7 +5095,8 @@ class Workflow:
             table = grouping_tables(self.records, self.splits[name], self.grouping, self.teacher["scores"],
                                     self.grouping_teacher, self.heuristics, self.cfg, prior, self.grouping_control)
             scope = " (out-of-fold teachers)" if name == "supervised" else ""
-            print_grouping_tables(f"GROUPING | {name}{scope}", table, self.cfg)
+            if self.detailed_reports:
+                print_grouping_tables(f"GROUPING | {name}{scope}", table, self.cfg)
             results["reports"][name] = table
         atomic_json(self.out / GROUPING_RESULTS, results)
         print(f"Saved {GROUPING_RESULTS}. Teachers' scores are out-of-fold on supervised questions and the "
@@ -4858,6 +5106,10 @@ class Workflow:
         return results
 
     def train_snapshot(self):
+        """Stage 2: the snapshot predictor, frozen, then compared with the teacher's list on every question set."""
+        if not self.cfg.use_snapshot:
+            print(f"STAGE 2 | Skipped: 'snapshot' is not in stages ({stage_chain(self.cfg)}).")
+            return self
         if not hasattr(self, "teacher"):
             self.train_teacher()
         section(f"STAGE 2 | Snapshot ResNet ({self.cfg.input_dim} inputs, {3*self.cfg.n+2} prediction outputs)")
@@ -4874,6 +5126,11 @@ class Workflow:
         print("Encoder and prediction heads frozen. Development temperature calibration: "
               + ("enabled." if self.cfg.calibrate else "disabled."))
         print(f"Recognition threshold for supervised goals: {self.cfg.recognition_threshold:.2f}.")
+        self.snapshot_fidelity = snapshot_fidelity(self.records, evaluation_sets(self.cfg, self.splits), self.teacher,
+                                                   self.predictor, self.cfg)
+        atomic_json(self.out / "snapshot_fidelity.json", self.snapshot_fidelity["sets"])
+        if self.detailed_reports:
+            print_snapshot_fidelity(self.snapshot_fidelity["sets"], self.cfg.recognition_threshold)
         self.push("Stage 2 complete: frozen snapshot predictor")
         return self
 
@@ -4886,13 +5143,11 @@ class Workflow:
         return head.eval()
 
     def skip_decision_heads(self):
-        """Stage 3 is off (decision_heads=False, or grouping=True, which has priority): no labels, no heads."""
-        if not hasattr(self, "predictor"):
+        """Stage 3 is off ('decision_heads' not in stages, or 'grouping', which has priority): no labels, no heads."""
+        if self.cfg.use_snapshot and not hasattr(self, "predictor"):
             self.train_snapshot()
-        if not hasattr(self, "heads"):
-            reason = ("grouping=True, which switches the decision heads off" if self.cfg.grouping
-                      else "decision_heads=False")
-            section(f"STAGE 3 | Skipped: {reason}")
+        if self.cfg.use_snapshot and not hasattr(self, "heads"):  # Without it, Stage 0 said Stages 2-4 are off.
+            section(f"STAGE 3 | Skipped: {heads_off_reason(self.cfg)}")
             print("No Stage 3 labels or heads are built. Stage 4 reports the full pool and the fixed acquisition "
                   "orders, each stopping at the first predicted MAX of the frozen snapshot predictor; the "
                   "supervised_pretrained and supervised rows are zeros, and no inference bundle is written.",
@@ -4978,9 +5233,31 @@ class Workflow:
         return question_rollout_audit(self.records, self.splits[name][position], self.teacher,
                                       self.predictor, self.cfg, self.heads, self.out, name)
 
+    def ranking_report(self):
+        """The report of a configuration without the snapshot predictor: the teacher's ranking on every set."""
+        if not hasattr(self, "teacher"):
+            self.train_teacher()
+        results = {"evaluation_protocol": split_protocol(self.cfg, self.splits), "stages": list(self.cfg.stages),
+                   "decision_heads": False}
+        for name, ids in evaluation_sets(self.cfg, self.splits).items():
+            scope = " (out-of-fold teachers)" if name == "supervised" else ""
+            results[name] = {"ranking": teacher_report(self.records, ids, self.cfg, self.teacher["scores"],
+                                                       self.heuristics, f"RANKING | {name}{scope} ({len(ids)} "
+                                                       "eligible questions)", verbose=self.detailed_reports),
+                             "adaptive": None}
+        atomic_json(self.out / "results.json", results)
+        print(f"Saved the teacher's rankings to {self.out / 'results.json'}; Stage 4 needs 'snapshot' in stages.")
+        self.results = results
+        self.push("Report: teacher rankings")
+        return results
+
     def report(self):
+        """Stage 4: acquisition rollouts on the audit set and every test file. Without 'snapshot' in stages,
+        the teacher's ranking on every question set (`ranking_report`)."""
         if not hasattr(self, "heads"):
             self.train_decision_head()  # Skipped, and the heads left empty, while the decision heads are off.
+        if not self.cfg.use_snapshot:
+            return self.ranking_report()
         if self.cfg.use_decision_heads:
             training = {name: {"best_epoch": checkpoint["best_epoch"], "dev_loss": checkpoint["dev_loss"],
                                "coverage": checkpoint["coverage"]}
@@ -4988,7 +5265,7 @@ class Workflow:
                                                  ("supervised", self.decision_checkpoint))}
         else:
             training = {name: {"best_epoch": 0, "dev_loss": 0, "coverage": {}} for name in LEARNED_METHODS}
-        results = {"evaluation_protocol": split_protocol(self.cfg, self.splits),
+        results = {"evaluation_protocol": split_protocol(self.cfg, self.splits), "stages": list(self.cfg.stages),
                    "decision_heads": self.cfg.use_decision_heads,
                    "decision_training": {**training, "action_names": action_names(self.cfg)}}
         external = [Path(path).stem for path in self.cfg.test_files]
@@ -5004,13 +5281,16 @@ class Workflow:
                     ids = self.splits[name]
                     ranking = teacher_report(self.records, ids, self.cfg,
                                              self.teacher["scores"], self.heuristics,
-                                             f"RANKING | {name} ({len(ids)} eligible questions)")
+                                             f"RANKING | {name} ({len(ids)} eligible questions)",
+                                             verbose=self.detailed_reports)
                     policy, questions = policy_report(self.records, ids, self.teacher, self.predictor,
                                                       self.cfg, self.heads, f"ACQUISITION | {name}",
-                                                      evaluated, handle, snapshots)
+                                                      evaluated, handle, snapshots, verbose=self.detailed_reports)
                     results[name] = {"ranking": ranking, "adaptive": policy}
                     if questions:
                         results[name]["paired_top1"] = paired_top1(questions, self.cfg)
+                    if name == "audit":  # Per question, for paired comparisons between experiments.
+                        self.audit_outcomes = question_outcomes(self.records, ids, questions, self.cfg)
         except BaseException:
             tmp.unlink(missing_ok=True)  # Stage 4 restarts; partial outcomes are never reused.
             raise
@@ -5045,6 +5325,20 @@ class Workflow:
         self.push("Stage 4 complete: reports and rollout outcomes")
         return results
 
+    def experiment_summary(self, name=None):
+        """The compact results of every stage this configuration ran, printed and saved as
+        experiment_<name>.json (the output folder's name by default). An experiment suite compares them."""
+        name = name or self.out.name
+        if self.cfg.grouping and not hasattr(self, "grouping_results"):
+            self.grouping_report()
+        if not hasattr(self, "results"):
+            self.report()
+        summary = summarize_experiment(self, name)
+        atomic_json(self.out / experiment_file(name), summary)
+        print_experiment_summary(summary)
+        self.push(f"Experiment {name}: summary")
+        return summary
+
 
 def load_inference_bundle(path, device="cpu", variant="supervised"):
     """The config, frozen predictor, and one decision head of a bundle.
@@ -5058,7 +5352,7 @@ def load_inference_bundle(path, device="cpu", variant="supervised"):
     heads = {"supervised": "decision_head", "supervised_pretrained": "pretrained_head"}
     if variant not in heads:
         raise ValueError(f"Unknown decision head variant {variant!r}; use one of {sorted(heads)}.")
-    cfg = Config(**bundle["config"])
+    cfg = saved_config(bundle["config"])
     cfg.validate()
     checkpoint = bundle[heads[variant]]
     if (bundle.get("action_names") != action_names(cfg) or
@@ -5072,14 +5366,489 @@ def load_inference_bundle(path, device="cpu", variant="supervised"):
     return cfg, predictor, head
 
 
-def run_pipeline(cfg=None):
-    work = Workflow(cfg or Config())
+def run_pipeline(cfg=None, detailed_reports=True):
+    """Every stage in `cfg.stages`, in order, then the report."""
+    work = Workflow(cfg or Config(), detailed_reports)
     work.build_datasets().prepare().train_teacher()
     if work.cfg.grouping:
         work.grouping_report()
-    work.train_decision_head()
+    work.train_decision_head()  # Trains the snapshot predictor first; skipped stages print why.
     work.report()
     return work
+
+
+# %% Experiment suites: several configurations, run and compared
+# An experiment is {"name": ..., <Config setting>: <value>, ...}: the base configuration with the settings it
+# changes, "stages" choosing its phases. Each runs in its own output folder and Hub mirror, so its run contract,
+# checkpoints and resume work as for a single run. A finished experiment keeps a compact summary
+# (experiment_<name>.json, mirrored with the run) that the comparison reads, and is not run again.
+EXPERIMENT_SUMMARY_SCHEMA = 1
+# Runtime controls and storage change no result: a finished experiment's summary stays valid across them.
+RUNTIME_SETTINGS = ("resume", "output_dir", "device", "cpu_threads", "print_every", "hf_repo", "hf_sync_minutes",
+                    "dataset_id", "dataset_repo", "decision_eval_batch_size")
+EXPERIMENT_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?"
+
+
+def experiment_file(name):
+    return f"experiment_{name}.json"
+
+
+def experiment_definition(name, cfg):
+    """What a finished experiment's summary stands for: its name, the implementation revision, and every
+    setting except the runtime controls, with the input logs by filename (their content is checked apart)."""
+    settings = {key: value for key, value in asdict(cfg).items()
+                if key not in RUNTIME_SETTINGS and (cfg.grouping or key not in GROUPING_SETTINGS)}
+    settings.update(train_file=Path(cfg.train_file).name, test_files=[Path(p).name for p in cfg.test_files])
+    if cfg.grouping:
+        settings["grouping_files"] = [Path(p).name for p in cfg.grouping_files]
+    return json.loads(json.dumps(canonical_settings({"name": name, "implementation_revision": PIPELINE_REVISION,
+                                                     "settings": settings})))
+
+
+def experiment_plan(base, experiments, root=None):
+    """Each experiment as (name, configuration, changed settings), all checked before anything runs.
+
+    `experiments` lists dicts: "name" plus the Config settings that differ from `base`. Unless an
+    experiment sets them, its output folder is <root>/<name> (root defaults to base.output_dir +
+    "_experiments") and its Hub mirror <base.hf_repo>-<name>. Experiments may share a folder (for
+    example a grouping experiment on top of a finished run) only with the same run contract and mirror.
+    """
+    root = Path(root or f"{base.output_dir}_experiments")
+    if (root / "contract.json").exists():
+        raise ValueError(f"{root} holds a single run (contract.json); experiments need a folder of their own: "
+                         "pass another root.")
+    if not experiments:
+        raise ValueError("No experiments: list at least one {'name': ..., <setting>: <value>} entry.")
+    known, plan = {item.name for item in fields(Config)}, []
+    for position, entry in enumerate(experiments, 1):
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            raise ValueError(f"Experiment {position} must be a dict with a 'name' and the settings it changes.")
+        name, changes = entry["name"], {key: value for key, value in entry.items() if key != "name"}
+        if not re.fullmatch(EXPERIMENT_NAME, name) or "--" in name or ".." in name:
+            raise ValueError(f"Experiment name {name!r}: use 1-64 letters, digits, '.', '_' or '-', starting and "
+                             "ending with a letter or digit (it names a folder and a Hub repository).")
+        if any(name == other for other, _, _ in plan):
+            raise ValueError(f"Two experiments are named {name!r}; each needs its own name.")
+        unknown = sorted(set(changes) - known)
+        if unknown:
+            hints = {key: difflib.get_close_matches(key, known, 1) for key in unknown}
+            raise ValueError(f"Experiment {name!r}: unknown setting(s) " + ", ".join(
+                f"{key!r}" + (f" (did you mean {hints[key][0]!r}?)" if hints[key] else "") for key in unknown) + ".")
+        cfg = copy.deepcopy(replace(base, **changes))
+        cfg.stages, cfg.test_files = tuple(cfg.stages), list(cfg.test_files)
+        cfg.grouping_files = list(cfg.grouping_files)
+        if "output_dir" not in changes:
+            cfg.output_dir = str(root / name)
+        if base.hf_repo and "hf_repo" not in changes:
+            cfg.hf_repo = f"{base.hf_repo}-{name}"
+        if cfg.hf_repo and len(cfg.hf_repo.split("/")[-1]) > 96:
+            raise ValueError(f"Experiment {name!r}: the Hub repository name {cfg.hf_repo!r} is over 96 characters; "
+                             "use a shorter name or set hf_repo.")
+        try:
+            cfg.validate()
+        except (AssertionError, ValueError) as exc:
+            raise ValueError(f"Experiment {name!r} has an invalid configuration: "
+                             f"{exc or 'a Config.validate() check failed (see the traceback above)'}") from exc
+        plan.append((name, cfg, changes))
+    folders, mirrors = {}, {}
+    logs = lambda cfg: [Path(path).name for path in [cfg.train_file, *cfg.test_files]]
+    for name, cfg, _ in plan:
+        folder = str(Path(cfg.output_dir).resolve())
+        if folder in folders:
+            other, first = folders[folder]
+            if (cfg.hf_repo != first.hf_repo or contract_settings(cfg) != contract_settings(first)
+                    or logs(cfg) != logs(first)):
+                raise ValueError(f"Experiments {other!r} and {name!r} share {cfg.output_dir} but not its run contract "
+                                 "or Hub mirror; give one its own output_dir (the default).")
+            continue
+        folders[folder] = (name, cfg)
+        if cfg.hf_repo and mirrors.setdefault(cfg.hf_repo, name) != name:
+            raise ValueError(f"Experiments {mirrors[cfg.hf_repo]!r} and {name!r} use the Hub mirror {cfg.hf_repo} "
+                             "for different output folders; give each its own hf_repo (the default).")
+    return plan
+
+
+def print_experiment_plan(plan, root):
+    section(f"EXPERIMENTS | {len(plan)} configurations, run one after another under {root}")
+    print(f"{'#':>2} | {'Experiment':<24} | {'Stages':<48} | Settings changed from the base configuration")
+    print("-" * 132)
+    for position, (name, cfg, changes) in enumerate(plan, 1):
+        changed = ", ".join(f"{key}={value!r}" for key, value in changes.items() if key != "stages")
+        print(f"{position:>2} | {name:<24} | {stage_chain(cfg):<48} | {changed or 'none'}")
+    print("Each phase needs the one before it (teacher -> snapshot -> decision_heads); grouping needs the teacher "
+          "and switches the decision heads off. Each experiment has its own output folder (<root>/<name>) and "
+          "Hub mirror (<hf_repo>-<name>) unless it sets them; a finished one is not run again.", flush=True)
+
+
+def finished_experiment(name, cfg, root, sources):
+    """The saved summary of an experiment that finished with this definition, from its folder or its Hub
+    mirror (never pulling the whole run); None when it has to run. `sources` identifies the input logs
+    when they are attached."""
+    relative = experiment_file(name)
+    path = Path(cfg.output_dir) / relative
+    if cfg.resume and not path.is_file() and cfg.hf_repo:
+        path = OutputSync(cfg.output_dir, cfg.hf_repo, cfg.hf_sync_minutes).fetch(relative, root / ".summaries" / name)
+    if not cfg.resume or path is None or not path.is_file():
+        return None
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    if saved.get("definition") != experiment_definition(name, cfg):
+        print(f"{relative} was written with other settings or stages, so the experiment runs; its finished stages "
+              "are reused where its run contract allows.", flush=True)
+        return None
+    if sources is not None and saved.get("sources") != sources:
+        print(f"{relative} was written for other input logs (content differs), so the experiment runs.", flush=True)
+        return None
+    return saved
+
+
+def acquisition_row(item):
+    """One Stage 4 method's headline numbers: total API calls per question and what they bought."""
+    calls = item["call_savings"]["all"]
+    return {"calls": calls["total_calls"]["mean_used"], "saved": calls["total_calls"]["saved_fraction"],
+            "top1": item["top1_correct"], "exact_max": item["exact_max_recovery"],
+            "max_stops": calls["predicted_max_stop_rate"], "stop_precision": calls["predicted_max_stop_precision"]}
+
+
+def grouping_row(table):
+    """The grouping report's headline numbers for one question set (pass@1 of the one returned candidate)."""
+    if not table.get("questions"):
+        return {"questions": 0}
+    top, levels = table["top_k"], table["levels"]
+    last = max(levels, key=int)
+    quality = table["group_outputs"]["Grouping teacher"]
+    return {"questions": table["questions"],
+            "similarity_top1": top.get("Similarity (no model)", {}).get("top1"),
+            "similarity_top2": top.get("Similarity (no model)", {}).get("top2"),
+            "teacher_rerank_top1": top.get("Stage 1 teacher rerank", {}).get("top1"),
+            "grouping_rerank_top2": top.get("Grouping teacher rerank", {}).get("top2"),
+            "best_group_output": top.get("Grouping teacher: best group output", {}).get("top2"),
+            "level1": levels.get("1", {}).get("Grouping teacher"), "top_level": int(last),
+            "level_top": levels[last].get("Grouping teacher"), "oracle_top": levels[last].get("oracle"),
+            "group_ap": quality["ap"], "group_hit_at_1": quality["hit_at_1"]}
+
+
+def summarize_experiment(work, name):
+    """The compact results of a Workflow whose stages have run (Workflow.experiment_summary saves them).
+
+    Per stage: the teacher's ranking on every question set beside the dev-selected heuristic and the
+    retrieval order; the snapshot predictor against the teacher's list; Stage 4's calls and accuracy per
+    method; the heads' selection; the grouping headline numbers. `per_question` keeps what paired
+    comparisons between experiments need.
+    """
+    cfg, records = work.cfg, work.records
+    sets, dev = evaluation_sets(cfg, work.splits), work.splits["dev"]
+    specs = {f"{mode} ({spec[1]}/{spec[2]})": spec for mode, spec in work.heuristics.items()}
+    heuristic = max(specs, key=lambda label: ranking_metrics(
+        records, dev, {i: heuristic_scores(records[i], cfg, *specs[label]) for i in dev}, cfg)["ap"])
+    retrieval = np.zeros((len(records), cfg.n))
+    teacher = {"heuristic": heuristic, "sets": {},
+               "training": [model_training(work.out / f"teacher_fold_{f + 1}.pt") for f in range(cfg.teacher_folds)]}
+    per_question = {}
+    for set_name, ids in sets.items():
+        if not ids:
+            continue
+        own = question_ranking(records, ids, work.teacher["scores"], cfg)
+        chosen = question_ranking(records, ids, {i: heuristic_scores(records[i], cfg, *specs[heuristic])
+                                                 for i in ids}, cfg)
+        base = question_ranking(records, ids, retrieval, cfg)
+        teacher["sets"][set_name] = {
+            "questions": len(ids), "ap": float(own[:, 0].mean()), "top1": float(own[:, 1].mean()),
+            "heuristic_ap": float(chosen[:, 0].mean()), "heuristic_top1": float(chosen[:, 1].mean()),
+            "retrieval_ap": float(base[:, 0].mean()), "retrieval_top1": float(base[:, 1].mean()),
+            "oracle": float(np.mean([bool(records[i].labels.any()) for i in ids]))}
+        if set_name in ("supervised", "dev"):
+            per_question[f"teacher_{set_name}"] = {"uids": [records[i].uid for i in ids],
+                                                   "ap": own[:, 0].tolist(), "top1": own[:, 1].tolist()}
+    snapshot = acquisition = heads = grouping = None
+    if cfg.use_snapshot:
+        snapshot = {"training": model_training(work.out / "snapshot_completed.pt"),
+                    "sets": work.snapshot_fidelity["sets"]}
+        per_question["snapshot_dev"] = work.snapshot_fidelity["per_question"].get("dev")
+        methods = list(evaluation_methods(cfg))
+        acquisition = {"methods": methods, "sets": {}}
+        for set_name in ["audit"] + [Path(path).stem for path in cfg.test_files]:
+            adaptive = work.results[set_name]["adaptive"]
+            if adaptive is not None:
+                acquisition["sets"][set_name] = {"questions": adaptive["policies"]["full"]["n"], "methods": {
+                    method: acquisition_row(adaptive["policies"][method]) for method in methods}}
+        per_question["acquisition_audit"] = getattr(work, "audit_outcomes", None)
+    if cfg.use_decision_heads:
+        heads = {method: {"best_epoch": int(checkpoint["best_epoch"]), "dev_loss": float(checkpoint["dev_loss"])}
+                 for method, checkpoint in (("supervised_pretrained", work.pretrained_checkpoint),
+                                            ("supervised", work.decision_checkpoint))}
+    if cfg.grouping:
+        grouping = {"training": [model_training(work.out / f"grouping_teacher_fold_{f + 1}.pt")
+                                 for f in range(cfg.teacher_folds)],
+                    "sets": {set_name: grouping_row(table)
+                             for set_name, table in work.grouping_results["reports"].items()}}
+    return {"schema_version": EXPERIMENT_SUMMARY_SCHEMA, "name": name, "stages": stage_chain(cfg),
+            "definition": experiment_definition(name, cfg),
+            "sources": [{key: source[key] for key in ("name", "bytes", "sha256")} for source in work.sources],
+            "completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "teacher": teacher, "snapshot": snapshot, "acquisition": acquisition, "decision_heads": heads,
+            "grouping": grouping, "per_question": per_question}
+
+
+def as_percent(value):
+    return "--" if value is None else f"{value:.1%}"
+
+
+def as_number(value, digits=4):
+    return "--" if value is None else f"{value:.{digits}f}"
+
+
+def training_text(models):
+    """Where the fold models (or one model) kept their checkpoint, in all-state epochs."""
+    models = [model for model in (models if isinstance(models, list) else [models]) if model]
+    if not models:
+        return "training details unavailable"
+    epochs = [model["best_epoch"] for model in models]
+    losses = [model["dev_loss"] for model in models if model["dev_loss"] is not None]
+    spread = f" (folds {min(epochs):.3f}-{max(epochs):.3f})" if len(models) > 1 else ""
+    return (f"best check at epoch {np.mean(epochs):.3f}{spread}, development loss "
+            f"{np.mean(losses):.4f}" if losses else f"best check at epoch {np.mean(epochs):.3f}{spread}")
+
+
+def print_experiment_summary(summary):
+    """One experiment's compact results, stage by stage; every table covers each question set."""
+    section(f"SUMMARY | {summary['name']} | {summary['stages']}")
+    settings = summary["definition"]["settings"]
+    teacher = summary["teacher"]
+    print(f"Teacher ({settings['teacher_folds']:g} folds, complete share {settings['teacher_complete_share']:g}): "
+          f"{training_text(teacher['training'])} on held-out training-file questions.")
+    print(f"{'Set':<24} | {'Questions':>9} | {'AP':>6} | {'Top-1':>6} | {'Heuristic AP':>12} | "
+          f"{'Heuristic top-1':>15} | {'Retrieval AP':>12} | {'Retrieval top-1':>15} | {'Oracle':>6}")
+    print("-" * 132)
+    for name, row in teacher["sets"].items():
+        label = name + (" (out-of-fold)" if name == "supervised" else "")
+        print(f"{label:<24} | {row['questions']:>9} | {row['ap']:.4f} | {as_percent(row['top1']):>6} | "
+              f"{row['heuristic_ap']:>12.4f} | {as_percent(row['heuristic_top1']):>15} | {row['retrieval_ap']:>12.4f} | "
+              f"{as_percent(row['retrieval_top1']):>15} | {as_percent(row['oracle']):>6}")
+    print(f"Heuristic: {teacher['heuristic']}, chosen on dev. Supervised questions are ranked by the fold teacher "
+          "that never trained on them, the other sets by the mean of the folds. Oracle: some candidate is correct.")
+    grouping = summary.get("grouping")
+    if grouping:
+        print(f"\nGrouping teacher: {training_text(grouping['training'])}. Pass@1 of the one returned candidate on "
+              "the questions with every group label known:")
+        print(f"{'Set':<24} | {'Questions':>9} | {'Sim top-1':>9} | {'Sim top-2':>9} | {'Stage 1 top-1':>13} | "
+              f"{'Grouping top-2':>14} | {'Best group':>10} | {'Level 1 -> top':>15} | {'Oracle':>6} | {'Group AP':>8}")
+        print("-" * 132)
+        for name, row in grouping["sets"].items():
+            if not row["questions"]:
+                print(f"{name:<24} | {0:>9} | no question with every group label known")
+                continue
+            levels = f"{as_percent(row['level1'])} -> {as_percent(row['level_top'])}"
+            print(f"{name:<24} | {row['questions']:>9} | {as_percent(row['similarity_top1']):>9} | "
+                  f"{as_percent(row['similarity_top2']):>9} | {as_percent(row['teacher_rerank_top1']):>13} | "
+                  f"{as_percent(row['grouping_rerank_top2']):>14} | {as_percent(row['best_group_output']):>10} | "
+                  f"{levels:>15} | {as_percent(row['oracle_top']):>6} | {as_number(row['group_ap']):>8}")
+        print("Sim: the nearest source(s) by similarity. Stage 1 top-1: the Stage 1 teacher's best one-shot. Grouping "
+              "top-2: the pair of the grouping teacher's two best one-shots; best group: its best group output. "
+              "Levels: the grouping teacher's best-of-N pick without and with groups; oracle: any item correct.")
+    snapshot = summary.get("snapshot")
+    if snapshot:
+        print(f"\nSnapshot predictor: {training_text(snapshot['training'])} (uncalibrated, reachable dev states).")
+        print_snapshot_fidelity(snapshot["sets"], settings["recognition_threshold"])
+    acquisition = summary.get("acquisition")
+    if acquisition and acquisition["sets"]:
+        audit = acquisition["sets"].get("audit")
+        if audit:
+            print(f"\nStage 4 on audit ({audit['questions']} questions): API calls per question and what they buy, "
+                  "stopping at the first predicted MAX.")
+            print(f"{'Method':<26} | {'API calls':>9} | {'Saved':>6} | {'Top-1':>6} | {'Exact MAX':>9} | "
+                  f"{'MAX stops':>9} | {'Stop precision':>14}")
+            print("-" * 96)
+            for method, row in audit["methods"].items():
+                print(f"{method:<26} | {row['calls']:>9.1f} | {as_percent(row['saved']):>6} | "
+                      f"{as_percent(row['top1']):>6} | {as_percent(row['exact_max']):>9} | "
+                      f"{as_percent(row['max_stops']):>9} | {as_percent(row['stop_precision']):>14}")
+        files = [name for name in acquisition["sets"] if name != "audit"]
+        if files:
+            print("\nTop-1 / saved calls per test file")
+            print(f"{'Method':<26} | " + " | ".join(f"{name[:15]:>15}" for name in files))
+            for method in acquisition["methods"]:
+                cells = [acquisition["sets"][name]["methods"][method] for name in files]
+                print(f"{method:<26} | " + " | ".join(
+                    f"{as_percent(cell['top1']) + ' / ' + as_percent(cell['saved']):>15}" for cell in cells))
+    heads = summary.get("decision_heads")
+    if heads:
+        print("\nDecision heads: " + "; ".join(f"{method} kept epoch {row['best_epoch']} (development loss "
+                                               f"{row['dev_loss']:.4f})" for method, row in heads.items()) + ".")
+    elif snapshot:
+        print("\nDecision heads did not run: Stage 4 shows the full pool and the fixed orders only.")
+
+
+def paired_delta(reference, other, key, samples, seed):
+    """`other` minus `reference` over the questions both report, with a bootstrap 95% CI over them."""
+    if not reference or not other:
+        return None
+    known = dict(zip(reference["uids"], reference[key]))
+    differences = [value - known[uid] for uid, value in zip(other["uids"], other[key]) if uid in known]
+    return bootstrap_difference(differences, samples, seed) if differences else None
+
+
+def method_outcomes(outcomes, method):
+    """One method's per-question audit outcomes (question_outcomes), or None when it did not run."""
+    if not outcomes or method not in outcomes["methods"]:
+        return None
+    return {"uids": outcomes["uids"], **outcomes["methods"][method]}
+
+
+def compare_experiments(summaries, samples=1000, seed=75):
+    """Paired differences of every experiment from the stage's reference, the first experiment that ran
+    the stage (for Stage 4, the first that ran the method): the teacher's dev AP and top-1, the snapshot's
+    dev agreement with the teacher's list, and each Stage 4 method's audit top-1 and saved calls."""
+    comparison = {}
+    for stage, part, metrics in (("teacher", "teacher_dev", ("ap", "top1")),
+                                 ("snapshot", "snapshot_dev", ("agree_top1",))):
+        ran = [summary for summary in summaries if summary.get(stage)]
+        if ran:
+            reference = ran[0]["per_question"].get(part)
+            comparison[stage] = {"reference": ran[0]["name"], "deltas": {
+                summary["name"]: {metric: paired_delta(reference, summary["per_question"].get(part), metric, samples,
+                                                       seed) for metric in metrics}
+                for summary in ran[1:]}}
+    # Stage 4 compares each method with the first experiment that ran that method.
+    references, deltas = {}, {}
+    for summary in summaries:
+        outcomes = (summary["per_question"].get("acquisition_audit") if summary.get("acquisition") else None)
+        for method in (summary["acquisition"]["methods"] if outcomes else ()):
+            if method not in references:
+                references[method] = (summary["name"], method_outcomes(outcomes, method))
+                continue
+            deltas.setdefault(summary["name"], {})[method] = {
+                metric: paired_delta(references[method][1], method_outcomes(outcomes, method), metric, samples, seed)
+                for metric in ("top1", "saved_calls")}
+    if references:
+        comparison["acquisition"] = {"reference": {method: name for method, (name, _) in references.items()},
+                                     "deltas": deltas}
+    return comparison
+
+
+def print_experiment_comparison(summaries, comparison):
+    """The experiments side by side, one table per stage, each with paired differences from its reference."""
+    section(f"EXPERIMENT COMPARISON | {len(summaries)} configurations")
+    print("Delta = experiment minus the stage's reference (the first experiment that ran the stage; in Stage 4, the "
+          "method), paired over the questions both report, with a 95% bootstrap CI.")
+
+    def delta(stage, name, *keys, scale=100., unit="pp"):
+        reference = comparison[stage]["reference"]
+        if name == (reference.get(keys[0]) if isinstance(reference, dict) else reference):
+            return "reference"
+        item = comparison[stage]["deltas"].get(name)
+        for key in keys:
+            item = None if item is None else item.get(key)
+        return interval_text(item, scale, unit)
+
+    print(f"\nTeacher: dev = {'pooled test files' if summaries[0]['definition']['settings']['use_test_files_for_dev_and_audit'] else 'held-out training-file questions'}")
+    print(f"{'Experiment':<24} | {'Stages':<37} | {'OOF AP':>6} | {'Dev AP':>6} | {'Dev top-1':>9} | "
+          f"{'Delta dev AP':>24} | {'Delta dev top-1':>24} | {'Best epoch':>10}")
+    print("-" * 160)
+    for summary in summaries:
+        sets, folds = summary["teacher"]["sets"], [fold for fold in summary["teacher"]["training"] if fold]
+        epoch = f"{np.mean([fold['best_epoch'] for fold in folds]):.3f}" if folds else "--"
+        print(f"{summary['name']:<24} | {summary['stages']:<37} | {as_number(sets.get('supervised', {}).get('ap')):>6} | "
+              f"{as_number(sets['dev']['ap']):>6} | {as_percent(sets['dev']['top1']):>9} | "
+              f"{delta('teacher', summary['name'], 'ap'):>24} | {delta('teacher', summary['name'], 'top1'):>24} | "
+              f"{epoch:>10}")
+    names = list(summaries[0]["teacher"]["sets"])
+    print("\nTeacher AP / top-1 per set")
+    print(f"{'Experiment':<24} | " + " | ".join(f"{name[:15]:>15}" for name in names))
+    for summary in summaries:
+        sets = summary["teacher"]["sets"]
+        print(f"{summary['name']:<24} | " + " | ".join(
+            f"{(as_number(sets[name]['ap'], 3) + ' / ' + as_percent(sets[name]['top1'])) if name in sets else '--':>15}"
+            for name in names))
+    snapshots = [summary for summary in summaries if summary.get("snapshot")]
+    if snapshots:
+        print("\nSnapshot vs the teacher's list (dev, reachable states)")
+        print(f"{'Experiment':<24} | {'Agree@1':>7} | {'Tau':>6} | {'Top-1 snap/list':>15} | {'MAX P/R':>13} | "
+              f"{'SAFE P/R':>13} | {'Complete agree@1':>16} | {'Delta agree@1':>24}")
+        print("-" * 140)
+        for summary in snapshots:
+            dev = summary["snapshot"]["sets"]["dev"]
+            row, complete = dev["reachable"], dev["complete"]
+            print(f"{summary['name']:<24} | {as_percent(row['agree_top1']):>7} | {as_number(row['kendall_tau'], 3):>6} | "
+                  f"{as_percent(row['snapshot_top1']) + '/' + as_percent(row['list_top1']):>15} | "
+                  f"{as_percent(row['max_precision']) + '/' + as_percent(row['max_recall']):>13} | "
+                  f"{as_percent(row['safe_precision']) + '/' + as_percent(row['safe_recall']):>13} | "
+                  f"{as_percent(complete['agree_top1']):>16} | {delta('snapshot', summary['name'], 'agree_top1'):>24}")
+    acquired = [summary for summary in summaries if summary.get("acquisition") and "audit" in summary["acquisition"]["sets"]]
+    if acquired:
+        print("\nStage 4 on audit: the full pool, the first fixed order, and the learned heads that ran")
+        print(f"{'Experiment':<24} | {'Method':<22} | {'Calls':>6} | {'Saved':>6} | {'Top-1':>6} | {'Exact MAX':>9} | "
+              f"{'Stop prec.':>10} | {'Delta top-1':>24} | {'Delta saved calls':>22}")
+        print("-" * 150)
+        for summary in acquired:
+            methods = summary["acquisition"]["methods"]
+            shown = [method for method in methods if method == "full" or method in LEARNED_METHODS or
+                     method == next((m for m in methods if m.startswith("fixed")), None)]
+            for method in shown:
+                row = summary["acquisition"]["sets"]["audit"]["methods"][method]
+                print(f"{summary['name'] if method == shown[0] else '':<24} | {method:<22} | {row['calls']:>6.1f} | "
+                      f"{as_percent(row['saved']):>6} | {as_percent(row['top1']):>6} | {as_percent(row['exact_max']):>9} | "
+                      f"{as_percent(row['stop_precision']):>10} | "
+                      f"{delta('acquisition', summary['name'], method, 'top1'):>24} | "
+                      f"{delta('acquisition', summary['name'], method, 'saved_calls', scale=1., unit=''):>22}")
+    grouped = [summary for summary in summaries if summary.get("grouping")]
+    if grouped:
+        print("\nGrouping on audit (pass@1)")
+        print(f"{'Experiment':<24} | {'Questions':>9} | {'Sim top-2':>9} | {'Grouping top-2':>14} | {'Best group':>10} | "
+              f"{'Level 1 -> top':>15} | {'Oracle':>6} | {'Group AP':>8}")
+        for summary in grouped:
+            row = summary["grouping"]["sets"].get("audit", {"questions": 0})
+            if not row["questions"]:
+                print(f"{summary['name']:<24} | {0:>9} | no question with every group label known")
+                continue
+            print(f"{summary['name']:<24} | {row['questions']:>9} | {as_percent(row['similarity_top2']):>9} | "
+                  f"{as_percent(row['grouping_rerank_top2']):>14} | {as_percent(row['best_group_output']):>10} | "
+                  f"{as_percent(row['level1']) + ' -> ' + as_percent(row['level_top']):>15} | "
+                  f"{as_percent(row['oracle_top']):>6} | {as_number(row['group_ap']):>8}")
+
+
+def run_experiments(base, experiments, root=None, detailed_reports=False):
+    """Run several configurations of the pipeline one after another, then compare them.
+
+    `experiments` lists dicts: "name" plus the Config settings that differ from `base`, "stages" choosing the
+    phases (see STAGES), for example {"name": "share_1pct", "stages": ("teacher",),
+    "teacher_complete_share": .01}. Every configuration is checked before the first one runs. Each runs all
+    its stages in its own output folder and Hub mirror (experiment_plan), resuming as a single run does, and
+    saves its summary there; one that finished in an earlier session is not run again. Without
+    `detailed_reports` the per-set report tables are left to results.json, and each experiment prints its
+    compact summary instead. The comparison, one table per stage with paired differences from the stage's
+    first experiment, is printed at the end and saved to <root>/experiments_summary.json.
+    """
+    plan = experiment_plan(base, experiments, root)
+    root = Path(root or f"{base.output_dir}_experiments")
+    root.mkdir(parents=True, exist_ok=True)
+    print_experiment_plan(plan, root)
+    summaries, logs = [], {}
+    for position, (name, cfg, _) in enumerate(plan, 1):
+        section(f"EXPERIMENT {position}/{len(plan)} | {name} | {stage_chain(cfg)}")
+        paths = (cfg.train_file, *cfg.test_files)
+        if paths not in logs:  # Read once per suite: identifies the logs a saved summary was made from.
+            logs[paths] = ([{key: source[key] for key in ("name", "bytes", "sha256")} for source in input_sources(paths)]
+                           if all(Path(p).is_file() for p in paths) else None)
+        summary = finished_experiment(name, cfg, root, logs[paths])
+        if summary is not None:
+            print(f"Finished in an earlier session with these settings: its saved summary is used. Delete "
+                  f"{experiment_file(name)} from {cfg.output_dir} and its mirror to run it again.", flush=True)
+            print_experiment_summary(summary)
+        else:
+            work = run_pipeline(cfg, detailed_reports)
+            summary = work.experiment_summary(name)
+            del work  # Free its tensors before the next experiment.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        summaries.append(summary)
+    comparison = compare_experiments(summaries, base.bootstrap_samples, base.seed)
+    atomic_json(root / "experiments_summary.json", {
+        "experiments": [{key: value for key, value in summary.items() if key != "per_question"}
+                        for summary in summaries], "comparison": comparison})
+    print_experiment_comparison(summaries, comparison)
+    print(f"\nSaved {root / 'experiments_summary.json'}; each experiment's full results are in its output folder.")
+    return {"experiments": summaries, "comparison": comparison}
 
 
 # %% CLI (the standalone notebook runs each stage in its own cell)
