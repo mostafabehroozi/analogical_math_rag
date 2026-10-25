@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from src.benchmark_data import benchmark_name_for_target_index, uses_exact_final_answers
 
@@ -567,6 +567,28 @@ Model Output:
 Ground Truth:
 {ground_truth}
 
+""",
+"evaluator_packed_v1": """Your task is to evaluate, for each item below, if the final answer in its 'Model Output' is equivalent to its 'Ground Truth'.
+Each 'Model Output' is the end of a longer solution, so its final answer is near the end. Each 'Ground Truth' is the exact final answer.
+The items are unrelated; judge each one on its own.
+
+For every item, follow these two steps precisely:
+
+Step 1: Extract Final Answer
+Extract only the final numerical or definitive answer expression from the item's 'Model Output', writing "Extraction Failed" if you cannot confidently extract an answer.
+
+Step 2: Evaluate Equivalence
+- Compare your 'Extracted Model Final Answer' directly with the item's 'Ground Truth'.
+- If extraction failed, the evaluation must be 'false'.
+- Consider common mathematical equivalences (e.g., "1/2" vs "0.5", "1,000" vs "1000", "$5" vs "5").
+- Respond ONLY with the single word 'true' or 'false' for the evaluation.
+
+Output Format (Strictly follow this format: one block per item, in item order):
+Item [item number]
+Extracted Model Final Answer: [Your extracted Final answer from that item's Model Output]
+Evaluation: [true OR false]
+
+{items_block}
 """,
     "duplicate_question_check_v1": """You are a text comparison assistant. Your task is to determine if the 'Main Question' is identical to ANY of the questions in the 'Retrieved Questions' list.
 
@@ -1633,6 +1655,14 @@ def create_evaluation_prompt(model_answer: str, ground_truth: str, config: Dict[
             template_name = config.get("PROMPT_TEMPLATE_EVALUATOR", "evaluator_v1")
     template = PROMPT_TEMPLATES[template_name]
     return template.format(model_answer=model_answer, ground_truth=ground_truth)
+
+def create_packed_evaluation_prompt(items: List[Tuple[str, str]]) -> str:
+    """One evaluator prompt for several (output tail, ground-truth answer) pairs."""
+    items_block = "\n\n".join(
+        f"<Item {number}>\nModel Output:\n{output}\n\nGround Truth:\n{ground_truth}\n</Item {number}>"
+        for number, (output, ground_truth) in enumerate(items, start=1)
+    )
+    return PROMPT_TEMPLATES["evaluator_packed_v1"].format(items_block=items_block)
 
 def create_duplicate_check_prompt(main_question_text: str, retrieved_questions: List[str]) -> str:
     template = PROMPT_TEMPLATES["duplicate_question_check_v1"]

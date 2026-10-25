@@ -262,6 +262,8 @@ _RUNTIME_PREFIXES = (
     "DISTRIBUTED_", "HF_SYNC_", "BATCH_", "QUESTION_PARALLEL_",
     # Provider batch submission changes transport only, never request content.
     "API_BATCH",
+    # The answer bank reuses judge verdicts; a resumed run may switch it on.
+    "ANSWER_BANK_", "ANSWER_JUDGE_", "EVAL_LAZY_PASS_AT_K",
 )
 _RUNTIME_EXACT = {
     "BASE_OUTPUT_DIR", "DATA_DIR", "LOGS_DIR", "OUTPUTS_DIR", "RESULTS_DIR",

@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Set
 import pandas as pd
 from tqdm import tqdm
 
-from src.evaluation import evaluate_single_answer_with_llm
+from src.evaluation import LAZY_SKIP_STATUS, evaluate_single_answer_with_llm
 from src.api_manager import bind_api_managers
 from src.orchestration import run_pipeline_for_single_query
 from src.utils import load_json, save_json
@@ -525,7 +525,7 @@ def retry_failed_evaluations(
         retries_needed = []
         for eval_idx, log in enumerate(detailed_evaluations):
             for attempt_idx, status in enumerate(log.get("evaluation_status_list", [])):
-                if status != "SUCCESS":
+                if status not in ("SUCCESS", LAZY_SKIP_STATUS):
                     retries_needed.append((eval_idx, attempt_idx))
 
         if not retries_needed:
@@ -621,7 +621,7 @@ def generate_error_report(
             for log in detailed_evaluations:
                 hard_idx = log["hard_list_idx"]
                 for i, status in enumerate(log.get("evaluation_status_list", [])):
-                    if status != "SUCCESS":
+                    if status not in ("SUCCESS", LAZY_SKIP_STATUS):
                         error_details = log.get("evaluation_error_details", [])[i] or {}
                         error_records.append({
                             "phase": "evaluation", "experiment_name": exp_name, "query_hard_list_idx": hard_idx,

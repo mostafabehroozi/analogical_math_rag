@@ -285,6 +285,17 @@ CONFIG = {
     "APPLY_FULL_PIPELINE_RETRY": False,
     "PASS_K_VALUES_TO_REPORT": [1, 2, 3, 4, 5],
     "EVAL_PARSE_BOXED_GROUND_TRUTH": True,  # Extract \boxed{} line from NuminaMath solutions
+    "EVAL_LAZY_PASS_AT_K": True,  # Skip judging a strategy's attempts after its first correct one (Pass@K is unchanged)
+
+    # Answer bank: fewer evaluator calls (src/answer_bank.py). Every comparison
+    # reuses earlier LLM verdicts for the same answer and ground truth, decides
+    # exact and plain-number matches by rule, and calls the judge only for the rest.
+    "ANSWER_BANK_ENABLED": True,               # False = every comparison calls the LLM judge, as before
+    "ANSWER_BANK_PATH": None,                  # None = RESULTS_DIR/answer_bank.jsonl
+    "ANSWER_BANK_AUDIT_RATE": 0.05,            # Share of bank/rule/packed verdicts re-judged by the ordinary prompt
+    "ANSWER_BANK_RECHECK_HITS": 10,            # A banked answer reused this often in a session is re-judged once
+    "ANSWER_JUDGE_PACK_MAX_ITEMS": 20,         # Comparisons packed into one judge prompt (1 = never pack)
+    "ANSWER_JUDGE_PACK_COLLECT_SECONDS": 2.0,  # How long a packed prompt waits for more comparisons
 
     
     "APPLY_LAYER1_BASE_EXECUTION": False,  # Enable/disable Layer 1 system
