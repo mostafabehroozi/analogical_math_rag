@@ -3,6 +3,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from src.benchmark_data import benchmark_name_for_target_index, uses_exact_final_answers
 
 EXEMPLAR_FORMAT = "Question: {question}\nRationale and Answer: {solution}"
+# The one-shot mirror candidates' example layout (mirror_hypothesis_gen_v1).
+MIRROR_EXEMPLAR_FORMAT = "question:\n{question}\n\nSolution:\n{solution}"
 
 PROMPT_TEMPLATES: Dict[str, str] = {
 
@@ -865,7 +867,32 @@ Final Answer:
 </Your  Answer/Output Format>
 """,
 
-    "mirror_hypothesis_gen_zero_shot_v1": """You are an expert mathematician. Solve the following problem step-by-step.
+    # mirror_hypothesis_gen_v1 with any number of examples, each in
+    # MIRROR_EXEMPLAR_FORMAT: one example reproduces the one-shot prompt exactly.
+    "mirror_hypothesis_gen_multi_shot_v1": """You are an expert in analogical reasoning, highly skilled at identifying and extracting patterns, reasoning pathways, problem-solving strategies, and conceptual frameworks from similar solved examples. Your primary task is to solve the main question by drawing meaningful analogies from the provided solved examples.
+
+<Instructions>
+Analyze the solved examples to identify key reasoning patterns, structures, and strategies that lead to their answers. Use these insights as guidance—rather than strict templates—and adapt them to the main question while applying your own reasoning to reach a solution.
+</Instructions>
+
+<Solved Examples>
+{examples_block}
+</Solved Examples>
+
+<Main Question to Solve>
+{main_question_text}
+</Main Question to Solve>
+
+<Your Answer/Output Format>
+Rationale:
+[Your step-by-step rationale for the Main Question]
+
+Final Answer:
+[Your final answer to the Main Question]
+</Your  Answer/Output Format>
+""",
+
+    "mirror_hypothesis_gen_zero_shot_v1":"""You are an expert mathematician. Solve the following problem step-by-step.
 
 <Question to Solve>
 {target_query}

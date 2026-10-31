@@ -27,7 +27,7 @@ directory.
 - `src/evaluation.py` — answer evaluation and aggregate metrics.
 - `src/benchmark_data.py` — Hugging Face benchmark schemas, downloads, and
   question/ground-truth normalization.
-- `src/layer1_grouping.py` - independent all-combinations few-shot generation
+- `src/layer1_grouping.py` - all-combinations few-shot generation, optionally mirror-evaluated
   and target-answer evaluation without the Layer 1 CCS matrix.
 - `src/layer1_base_execution.py`, `src/layer2_analysis.py`, and
   `src/layer2_integration.py` — cached execution and offline analysis.
@@ -227,7 +227,47 @@ ordinary Layer-1 JSON by `target_query_original_hard_list_idx`:
 For K retrieved samples this makes one solver call and one correctness-
 evaluation call for every configured combination. For example, K=5 and sizes
 `[2, 3]` creates `C(5,2) + C(5,3) = 20` candidates. Grouping does not run
-baseline or candidate-conditioned CCS calls.
+baseline calls, and without `LAYER1_GROUPING_MIRROR_EVALUATION` it runs no
+candidate-conditioned CCS calls either.
+
+### Few-shot candidates beside the zero- and one-shot candidates
+
+To measure 2-shot (or larger) candidates in the same experiment as the zero-
+and one-shot candidates, enable grouping next to Layer 1:
+
+```python
+{
+    "experiment_name": "allbenchmarks_Zshot3-1shot5-2shot10-ret5-mir5",
+    "APPLY_LAYER1_BASE_EXECUTION": True,
+    "LAYER1_ZERO_SHOT_CANDIDATES_N": 3,
+    "LAYER1_ONE_SHOT_CANDIDATES_N": 5,
+    "TOP_N_CANDIDATES_RETRIEVAL": 5,
+    "MIRROR_N_OPTIMIZATION": 5,
+    "APPLY_LAYER1_GROUPING": True,
+    "LAYER1_GROUP_SIZES": [2],          # every pair of the 5 retrieved samples
+    "LAYER1_GROUPING_PROMPT_TEMPLATE": "mirror_hypothesis_gen_multi_shot_v1",
+    "LAYER1_GROUPING_TEMPERATURE": 0.0,
+    "LAYER1_GROUPING_MIRROR_EVALUATION": True,
+}
+```
+
+Grouping then runs after Layer 1 on the same retrieved samples. Each group
+candidate gets what a one-shot candidate gets:
+
+- generation with the one-shot prompt holding k examples (one example gives the
+  one-shot prompt exactly) at the one-shot temperature;
+- a cross-evaluation (CCS) row against every retrieved sample, with the same
+  verification prompt and `MIRROR_N_OPTIMIZATION` runs;
+- a ground-truth label.
+
+The evaluator baselines come from Layer 1.
+The run-log entry keeps them in `layer1_grouping_state` (`candidate_set`,
+`cross_evaluation_matrix`, `ground_truth_labels`), keyed `group_s<size>_p<positions>`,
+because Layer 2 and the adaptive pipeline read Layer 1's candidate set as zero-
+and one-shot candidates only. Cost per question with K=5: 10 generations,
+`10 * 5 * MIRROR_N_OPTIMIZATION` mirror solves, and as many judgments plus 10
+ground-truth judgments. A grouping state that is not `SUCCESS` is retried even
+when the standard pipeline that follows it succeeded.
 
 Runtime data is written below the configured `local_data/` or Kaggle output
 directory; it is not source code and should not be edited by hand.

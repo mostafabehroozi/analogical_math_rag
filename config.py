@@ -306,14 +306,21 @@ CONFIG = {
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
     "LAYER1_ZERO_SHOT_CANDIDATES_N": 5,    # Number of zero-shot candidates to generate in Layer 1 (0 = OFF)
 
-    # Layer-1 grouping is an independent, lower-cost companion run. It creates
-    # one candidate for every configured combination of retrieved exemplars and
-    # evaluates only target-answer correctness (no baseline or CCS matrix).
+    # Layer-1 grouping creates one few-shot candidate for every configured
+    # combination of retrieved exemplars (sizes 2..K) and evaluates its
+    # target-answer correctness. With Layer 1 enabled in the same experiment it
+    # reuses Layer 1's retrieval and runs after it. Its candidates are stored in
+    # layer1_grouping_state, never in Layer 1's candidate set.
     "APPLY_LAYER1_GROUPING": False,
     "LAYER1_GROUPING_ONLY_MODE": False,
     "LAYER1_GROUP_SIZES": [2],
+    # "mirror_hypothesis_gen_multi_shot_v1" = the one-shot candidates' prompt
+    # with k examples (the default is the earlier companion runs' prompt).
     "LAYER1_GROUPING_PROMPT_TEMPLATE": "layer1_grouping_solver_v1",
-    "LAYER1_GROUPING_TEMPERATURE": 0.0,
+    "LAYER1_GROUPING_TEMPERATURE": 0.0,  # One-shot candidates also use 0.0
+    # True = cross-evaluate every group candidate like a Layer-1 candidate
+    # (each retrieved sample as evaluator, MIRROR_N_OPTIMIZATION runs each).
+    "LAYER1_GROUPING_MIRROR_EVALUATION": False,
     
     "APPLY_LAYER2_ANALYSIS": False,
     "LAYER2_CONFIG": {

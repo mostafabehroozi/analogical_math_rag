@@ -105,6 +105,15 @@ def _log_needs_generation_retry(log: Dict[str, Any]) -> bool:
     if "FAILURE" in status or "PARTIAL" in status:
         return True
 
+    # A run that continues past grouping takes its pipeline status from the
+    # standard pipeline, so the grouping state is checked on its own.
+    if "layer1_grouping_state" in log:
+        grouping_state = log["layer1_grouping_state"]
+        if not isinstance(grouping_state, dict) or str(
+            grouping_state.get("overall_status", "")
+        ).upper() != "SUCCESS":
+            return True
+
     if "layer1_base_execution_state" in log:
         return _is_incomplete_layer1_state(log["layer1_base_execution_state"])
 

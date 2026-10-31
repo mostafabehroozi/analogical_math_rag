@@ -841,6 +841,14 @@ def run_log_successful(log: Mapping[str, Any], require_layer1: bool = False) -> 
         return False
     if require_layer1 and not layer1_state_complete(log.get("layer1_base_execution_state")):
         return False
+    # A run that continues past grouping takes pipeline_status from the standard
+    # pipeline, so its grouping state must report success itself.
+    grouping_state = log.get("layer1_grouping_state")
+    if "layer1_grouping_state" in log and not (
+        isinstance(grouping_state, Mapping)
+        and str(grouping_state.get("overall_status", "")).upper() == "SUCCESS"
+    ):
+        return False
     return True
 
 

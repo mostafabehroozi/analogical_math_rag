@@ -909,12 +909,14 @@ def run_pipeline_for_single_query(
                     "OPENROUTER_REASONING_EFFORT_EVALUATOR",
                     "KAGGLE_MODEL_NAME_ADAPTATION", "KAGGLE_MODEL_NAME_FINAL_SOLVER",
                     "KAGGLE_MODEL_NAME_EVALUATOR", "KAGGLE_MODEL_NAME_SIMPLIFICATION",
-                    "KAGGLE_REASONING_EFFORT",
-                    # Layer 1 Flags
+                    "KAGGLE_REASONING_EFFORT", "AVALAI_REASONING_EFFORT",
+                    # Layer 1 Flags (a generation retry rebuilds the experiment from these)
                     "APPLY_LAYER1_BASE_EXECUTION", "LAYER1_ONLY_MODE", "LAYER1_CACHE_DIR",
                     "LAYER1_N_CANDIDATES", "LAYER1_ONE_SHOT_CANDIDATES_N", "LAYER1_DATASET_NAME",
+                    "LAYER1_ZERO_SHOT_CANDIDATES_N", "MIRROR_N_OPTIMIZATION",
                     "APPLY_LAYER1_GROUPING", "LAYER1_GROUPING_ONLY_MODE", "LAYER1_GROUP_SIZES",
                     "LAYER1_GROUPING_PROMPT_TEMPLATE", "LAYER1_GROUPING_TEMPERATURE",
+                    "LAYER1_GROUPING_MIRROR_EVALUATION",
                     # Reverse Validation Flags
                     "APPLY_REVERSE_VALIDATION", "REVERSE_VALIDATION_CANDIDATES_N",
                     "REVERSE_VALIDATION_RETRIEVAL_K", "REVERSE_VALIDATION_ATTEMPTS_N",

@@ -1,10 +1,16 @@
 """Generate and evaluate few-shot candidates for every requested retrieval group.
 
-This is deliberately separate from :mod:`src.layer1_base_execution`.  It does
-not calculate evaluator baselines, candidate-conditioned CCS, or a cross-
-evaluation matrix.  For a retrieval set of size K and configured group sizes
-S, its generation cost is ``sum(comb(K, s) for s in S)`` solver calls plus the
-same number of target-answer evaluations.
+This is deliberately separate from :mod:`src.layer1_base_execution`, whose
+candidate set downstream readers (Layer 2, the adaptive pipeline) expect to hold
+only zero- and one-shot candidates.  It never calculates evaluator baselines; a
+run that also enables Layer 1 has them there.  For a retrieval set of size K and
+configured group sizes S, its generation cost is
+``G = sum(comb(K, s) for s in S)`` solver calls plus the same number of
+target-answer evaluations.  With ``LAYER1_GROUPING_MIRROR_EVALUATION`` every
+group candidate is also cross-evaluated exactly like a Layer-1 candidate
+(Step D: every retrieved sample as evaluator, ``MIRROR_N_OPTIMIZATION`` runs
+each), which adds ``G * K * MIRROR_N_OPTIMIZATION`` solver calls and as many
+evaluations.
 """
 
 from __future__ import annotations
@@ -18,8 +24,11 @@ import numpy as np
 
 from src.evaluation import evaluate_single_answer_with_llm
 from src.parallel_utils import run_parallel_api_calls
-from src.prompts import EXEMPLAR_FORMAT, PROMPT_TEMPLATES
+from src.prompts import EXEMPLAR_FORMAT, MIRROR_EXEMPLAR_FORMAT, PROMPT_TEMPLATES
 from src.utils import create_trace_entry
+
+# Per-example layout of each grouping template; any other template uses EXEMPLAR_FORMAT.
+_EXEMPLAR_FORMATS = {"mirror_hypothesis_gen_multi_shot_v1": MIRROR_EXEMPLAR_FORMAT}
 
 
 def normalize_group_sizes(value: Any, retrieved_count: int) -> List[int]:
@@ -120,6 +129,7 @@ def build_group_prompt(
     template = PROMPT_TEMPLATES.get(template_name)
     if template is None:
         raise ValueError(f"Unknown LAYER1_GROUPING_PROMPT_TEMPLATE: {template_name!r}")
+    exemplar_format = _EXEMPLAR_FORMATS.get(template_name, EXEMPLAR_FORMAT)
 
     questions = exemplar_data.get("questions", [])
     solutions = exemplar_data.get("solutions", [])
@@ -130,7 +140,7 @@ def build_group_prompt(
                 f"Grouping member {corpus_index} has no matching question/solution."
             )
         examples.append(
-            EXEMPLAR_FORMAT.format(
+            exemplar_format.format(
                 question=questions[corpus_index], solution=solutions[corpus_index]
             )
         )
@@ -171,6 +181,7 @@ def run_layer1_grouping(
     """Generate all configured retrieval combinations and label their answers."""
     logger = logging.getLogger(__name__)
     trace: List[Dict[str, Any]] = []
+    mirror_evaluation = bool(config.get("LAYER1_GROUPING_MIRROR_EVALUATION", False))
     state: Dict[str, Any] = {
         "metadata": {
             "query_index": target_query_index,
@@ -184,6 +195,11 @@ def run_layer1_grouping(
                 "LAYER1_GROUPING_PROMPT_TEMPLATE": config.get(
                     "LAYER1_GROUPING_PROMPT_TEMPLATE", "layer1_grouping_solver_v1"
                 ),
+                "LAYER1_GROUPING_TEMPERATURE": config.get(
+                    "LAYER1_GROUPING_TEMPERATURE", 0.0
+                ),
+                "LAYER1_GROUPING_MIRROR_EVALUATION": mirror_evaluation,
+                "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION"),
             },
         },
         "target_query_data": {
@@ -201,6 +217,9 @@ def run_layer1_grouping(
             "ground_truth_evaluation": "PENDING",
         },
     }
+    if mirror_evaluation:
+        state["cross_evaluation_matrix"] = {}
+        state["step_statuses"]["cross_evaluation"] = "PENDING"
 
     try:
         if retrieved_set is None:
@@ -293,6 +312,35 @@ def run_layer1_grouping(
             if successful_generation
             else "FAILURE"
         )
+
+        if mirror_evaluation:
+            # Layer 1's Step D for the group candidates: the same prompt,
+            # temperature, evaluators, and runs, keyed by candidate id.
+            from src.pipeline_steps import _evaluate_mirror_consistency
+
+            try:
+                state["cross_evaluation_matrix"] = _evaluate_mirror_consistency(
+                    target_query=target_query,
+                    hypotheses={
+                        candidate_id: candidate["candidate_text"]
+                        for candidate_id, candidate in state["candidate_set"].items()
+                        if candidate["generation_status"] == "SUCCESS"
+                    },
+                    validation_indices=[
+                        member["corpus_index"] for member in active_retrieved_set
+                    ],
+                    exemplar_data=exemplar_data,
+                    api_manager_solve=api_manager_solve,
+                    api_manager_eval=api_manager_eval,
+                    config=config,
+                    trace_accumulator=trace,
+                )
+                state["step_statuses"]["cross_evaluation"] = "SUCCESS"
+            except Exception as exc:
+                logger.error(
+                    "Layer-1 grouping cross-evaluation failed: %s", exc, exc_info=True
+                )
+                state["step_statuses"]["cross_evaluation"] = "FAILURE"
 
         def evaluation_task(candidate_id: str, candidate_text: str):
             result = evaluate_single_answer_with_llm(
