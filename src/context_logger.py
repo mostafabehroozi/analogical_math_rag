@@ -12,6 +12,37 @@ import sys
 # it doesn't accidentally overwrite Thread B which is named "Q#6".
 ctx_query_idx = contextvars.ContextVar('ctx_query_idx', default="N/A")
 ctx_batch_id = contextvars.ContextVar('ctx_batch_id', default="N/A")
+# The API calls of the running question that failed for good (retries spent,
+# no key left, ...). None outside a batch question. Worker pools copy the
+# context, so every copy appends to the question's one list.
+ctx_api_failures = contextvars.ContextVar('ctx_api_failures', default=None)
+
+
+@contextlib.contextmanager
+def track_api_failures():
+    """Collect the final API failures of the calls made inside this block."""
+    failures = []
+    token = ctx_api_failures.set(failures)
+    try:
+        yield failures
+    finally:
+        ctx_api_failures.reset(token)
+
+
+@contextlib.contextmanager
+def tolerated_api_failures():
+    """Calls whose failure the caller recovers from do not fail the question."""
+    token = ctx_api_failures.set(None)
+    try:
+        yield
+    finally:
+        ctx_api_failures.reset(token)
+
+
+def record_api_failure(failure: dict) -> None:
+    failures = ctx_api_failures.get()
+    if failures is not None:
+        failures.append(failure)
 
 
 # 2. CONTEXT MANAGER (How threads put their nametags on)

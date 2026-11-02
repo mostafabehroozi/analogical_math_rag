@@ -7,12 +7,13 @@ import sys
 import threading
 import time
 import traceback
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
-from tqdm import tqdm  
+from tqdm import tqdm
 from src.api_batching import batch_refusals
-from src.context_logger import pipeline_context as api_call_context
+from src.context_logger import pipeline_context as api_call_context, track_api_failures
 from src.distributed_execution import distributed_enabled, stop_new_batches_due
 from src.utils import save_json_atomic
 
@@ -39,6 +40,16 @@ def _terminal_status(result: Dict[str, Any]) -> str:
     if status == "SKIPPED_FAILSAFE":
         return "SUCCESS"
     return "FAILED" if "FAIL" in status or "ERROR" in status else "SUCCESS"
+
+
+def _api_failure_note(failures: List[Dict[str, Any]]) -> str:
+    kinds = Counter(str(failure.get("error_type")) for failure in failures)
+    counts = ", ".join(f"{kind} x{count}" for kind, count in kinds.most_common())
+    first = failures[0]
+    return (
+        f"{len(failures)} API call(s) failed for good ({counts}); first: "
+        f"{first.get('error_message')} @ {first.get('caller')}"
+    )
 
 
 def thread_stacks(max_frames: int = 12) -> str:
@@ -140,9 +151,19 @@ class BatchCoordinator:
                 def execute(item: QuestionWorkItem) -> QuestionResult:
                     started = time.monotonic()
                     try:
-                        with api_call_context(query_idx=item.index, batch_id=batch_id):
+                        with api_call_context(query_idx=item.index, batch_id=batch_id), track_api_failures() as api_failures:
                             value = worker(item)
-                        return QuestionResult(item, value, _terminal_status(value), time.monotonic() - started)
+                        terminal_status = _terminal_status(value)
+                        # A question with a call that failed for good is
+                        # incomplete, whatever its steps reported: on Kaggle on
+                        # 2026-11-02, 658 questions whose every call failed
+                        # were saved as SUCCESS with no candidates.
+                        if api_failures:
+                            value["api_failures"] = list(api_failures)
+                            terminal_status = "FAILED"
+                        else:
+                            value.pop("api_failures", None)  # From an earlier attempt.
+                        return QuestionResult(item, value, terminal_status, time.monotonic() - started)
                     except Exception as exc:  # Keep sibling questions running after a worker failure.
                         value = {
                             "target_query_original_hard_list_idx": item.index,
@@ -159,6 +180,8 @@ class BatchCoordinator:
                         result = future.result()
                         results.append(result)
                         print(f"[BATCH {batch_id} {completed}/{len(batch_items)}] Q#{result.item.index} {result.terminal_status} ({result.elapsed_seconds:.1f}s)")
+                        if result.value.get("api_failures"):
+                            print(f"    ↳ {_api_failure_note(result.value['api_failures'])}")
 
                 # A provider batch refused during this batch fails every later
                 # call for its model. Committing would save these questions as

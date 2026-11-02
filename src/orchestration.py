@@ -1782,6 +1782,19 @@ def _log_query_index(run_log: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+# A question with an API call that failed for good (src/batching.py) is saved
+# with this status, and a resumed run redoes it instead of skipping its log.
+API_FAILURE_STATUS = "FAILED_API_ERRORS"
+
+
+def _done_indices(run_logs: List[Dict[str, Any]]) -> set:
+    """The questions a resumed run skips: every logged one but API failures."""
+    return {
+        log['target_query_original_hard_list_idx'] for log in run_logs
+        if log.get('pipeline_status') != API_FAILURE_STATUS
+    }
+
+
 def _deferred_logs_by_index(run_logs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
     """Keep one log per question of a deferred run, in run-log order.
 
@@ -1865,21 +1878,33 @@ def _run_pipeline_items_in_batches(
             if is_error and isinstance(result.value, dict) and "batch_error" in result.value:
                 error_msg = result.value["batch_error"].get("message", "Unknown error")
                 print(f"      ↳ ERROR DETAILS: {error_msg}")
-                
+            if isinstance(result.value, dict) and result.value.get("api_failures"):
+                failure = result.value["api_failures"][0]
+                print(
+                    f"      ↳ {len(result.value['api_failures'])} API call(s) failed for good, e.g. "
+                    f"{failure.get('error_type')}: {failure.get('error_message')}. "
+                    "A rerun redoes this question."
+                )
+
         print(f"{'='*70}\n")
 
         # (The rest of your original commit logic stays exactly the same)
         for result in results:
             run_log = result.value
+            api_failures = run_log.get("api_failures")
             if (
                 run_mode == "solve_only"
-                and run_log.get("pipeline_status") == "FAILED_WORKER_EXCEPTION"
+                and (run_log.get("pipeline_status") == "FAILED_WORKER_EXCEPTION" or api_failures)
                 and result.item.existing_log is not None
             ):
-                # A raised solve step has no outcome to save, and the pending log
-                # holds the costly intermediate results. It stays pending with the
-                # error attached, so the next run retries its solve step.
-                run_log = {**result.item.existing_log, "batch_error": run_log["batch_error"]}
+                # A raised or incomplete solve step has no outcome to save, and
+                # the pending log holds the costly intermediate results. It stays
+                # pending with the error attached, so the next run retries its
+                # solve step.
+                errors = {key: run_log[key] for key in ("batch_error", "api_failures") if key in run_log}
+                run_log = {**result.item.existing_log, **errors}
+            elif api_failures:
+                run_log["pipeline_status"] = API_FAILURE_STATUS
             run_log["batch_metadata"] = {
                 "batch_id": batch_id,
                 "phase": phase_name,
@@ -2184,9 +2209,10 @@ def run_experiments(
             log_file_path = os.path.join(global_config['RESULTS_DIR'], f"{exp_name}_run_log.json")
 
             # A pending log needs only its solve step and a solved log is done,
-            # so phase 1 skips every question that already has a log.
+            # so phase 1 skips every question that already has a log, except
+            # one saved with API calls that failed for good.
             run_logs = list(_deferred_logs_by_index(load_json(log_file_path) or []).values())
-            completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs}
+            completed_intermediate_indices = _done_indices(run_logs)
             queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
 
             if queries_to_process:
@@ -2362,9 +2388,7 @@ def run_experiments(
                     )
                 else:
                     # Preserve the legacy single-notebook resume behavior.
-                    completed_indices = {
-                        log['target_query_original_hard_list_idx'] for log in run_logs
-                    }
+                    completed_indices = _done_indices(run_logs)
                     queries_to_process = [
                         (idx, q) for idx, q in enumerate(hard_questions)
                         if idx not in completed_indices
@@ -2422,9 +2446,10 @@ def run_experiments(
                 logger.info(f"Running '{exp_name}' in single-experiment deferred solve mode.")
                 print(f"\n--- {exp_name}: STARTING PHASE 1 of 2 (Intermediate Steps) ---")
                 # A pending log needs only its solve step and a solved log is done,
-                # so phase 1 skips every question that already has a log.
+                # so phase 1 skips every question that already has a log, except
+                # one saved with API calls that failed for good.
                 run_logs = list(_deferred_logs_by_index(load_json(log_file_path) or []).values())
-                completed_intermediate_indices = {log['target_query_original_hard_list_idx'] for log in run_logs}
+                completed_intermediate_indices = _done_indices(run_logs)
                 queries_to_process = [(idx, q) for idx, q in enumerate(hard_questions) if idx not in completed_intermediate_indices]
 
                 if queries_to_process:

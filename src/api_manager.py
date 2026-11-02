@@ -14,6 +14,7 @@ import time
 import inspect
 import json
 import os
+import re
 import copy
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ from src.api_batching import (
     APIBatchDispatcher, BatchItem, BatchSettings, batch_refusals, batching_enabled,
     batching_setting, fallback_to_direct,
 )
-from src.context_logger import ctx_query_idx, ctx_batch_id, tprint
+from src.context_logger import ctx_query_idx, ctx_batch_id, record_api_failure, tprint
 from src.distributed_execution import api_deadline_due, remaining_api_seconds
 
 try:  # Keep scheduler/batch tests importable without optional provider SDKs.
@@ -47,8 +48,13 @@ RETRYABLE_ERROR_TYPES = {
     "APITimeoutError", "APIConnectionError", "ResourceExhausted",
     "OllamaConnectionError", "UnknownError", "APIStatusError",
     "RateLimitError", "BatchError", "BatchItemError", "BatchTimeout",
+    "ProxyAuthenticationError", "ProxyPermissionDeniedError",
 }
 NON_RETRYABLE_ERROR_TYPES = {"AuthenticationError", "PermissionDeniedError", "PaymentRequired", "InvalidArgument", "InvalidModel", "Safety", "NoChoices", "ModelMismatch", "ProactiveRateLimit", "SessionDeadline", "BatchRefused"}
+# Final failures that are the request's own outcome (a blocked or malformed
+# prompt, an empty reply): the pipeline stores them as the call's result and a
+# rerun would get them again, so they do not fail the question that made them.
+REQUEST_OUTCOME_ERROR_TYPES = {"InvalidArgument", "Safety", "NoChoices"}
 
 class APIResponse(TypedDict, total=False):
     status: str
@@ -61,6 +67,15 @@ class APIResponse(TypedDict, total=False):
 
 def _mask_key(api_key: str) -> str:
     return f"…{api_key[-4:]}" if api_key else "<missing>"
+
+
+def _exception_line(message: Any) -> str:
+    """The 'module.SomeError: detail' line of a traceback, else its last line."""
+    lines = [line.strip() for line in str(message or "").splitlines() if line.strip()]
+    for line in reversed(lines):
+        if re.match(r"[\w.]*(Error|Exception)\b", line):
+            return line
+    return lines[-1] if lines else ""
 
 
 def _get_api_caller_location() -> str:
@@ -342,8 +357,21 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
     retry_all = config.get("RETRY_ALL_API_ERRORS", True)
     last_response: Optional[APIResponse] = None
 
+    def final(response: APIResponse) -> APIResponse:
+        # The batch coordinator fails a question whose call failed for good,
+        # so the question is not saved as complete with this call missing.
+        if response.get("error_type") not in REQUEST_OUTCOME_ERROR_TYPES:
+            record_api_failure({
+                "provider": provider_name,
+                "model": model_name,
+                "error_type": response.get("error_type") or response.get("status"),
+                "error_message": _exception_line(response.get("error_message"))[:300],
+                "caller": caller_loc,
+            })
+        return response
+
     def deadline_response() -> APIResponse:
-        return {
+        return final({
             "status": "ERROR",
             "text": None,
             "error_type": "SessionDeadline",
@@ -351,12 +379,12 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
                 "Distributed session API deadline reached; this question will be "
                 "checkpointed as incomplete and retried by the same worker next session."
             ),
-        }
-    
+        })
+
     for attempt in range(1, max_attempts + 1):
         if api_deadline_due(config):
             return deadline_response()
-        
+
         # Check if the system is globally paused before making ANY request
         global_pause_manager.wait_if_needed(config)
         if api_deadline_due(config):
@@ -385,8 +413,11 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         
         # Record success or failure to the global pause manager. A refused
         # batch stops the run, and pausing every API call would only delay that.
+        # A call no key could take never reached the provider, so it is no sign
+        # that the provider needs a rest (32,000 such refusals paused a Kaggle
+        # run 2,135 times on 2026-11-02).
         is_success = (status == "SUCCESS")
-        if response.get("error_type") != "BatchRefused":
+        if response.get("error_type") not in ("BatchRefused", "ProactiveRateLimit"):
             global_pause_manager.record_result(is_success, config)
         
         # 5. Format and print the beautiful log
@@ -412,8 +443,11 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
 
         if not retryable or attempt == max_attempts:
             response["retry_exhausted"] = attempt == max_attempts
-            tprint(f"[API ERROR] Final failure. Type: {error_type} @ {caller_loc}", level="ERROR")
-            return response
+            # The call log keeps only the start of the message, which for a
+            # traceback is no help; the exception line says what went wrong.
+            detail = _exception_line(response.get("error_message"))[:300]
+            tprint(f"[API ERROR] Final failure. Type: {error_type} @ {caller_loc}: {detail}", level="ERROR")
+            return final(response)
         
         # Wait before retrying
         retry_delay = float(config.get("API_RETRY_DELAY_SECONDS", 20.0))
@@ -1123,21 +1157,25 @@ def bind_api_managers(api_managers: Dict[str, Any], config: Dict[str, Any]) -> D
 
 
 def _kaggle_error_type(message: str) -> str:
-    """Classify a Kaggle model-proxy failure from its exception name or traceback."""
-    for marker, error_type in (
-        ("RateLimitError", "RateLimitError"),
-        ("AuthenticationError", "AuthenticationError"),
-        ("PermissionDeniedError", "PermissionDeniedError"),
-        ("NotFoundError", "InvalidModel"),
-        ("BadRequestError", "InvalidArgument"),
-        ("UnprocessableEntityError", "InvalidArgument"),
-        # openai.APITimeoutError, or joblib's TimeoutError for a whole batch:
-        # retried, without cooling down the one shared proxy key.
-        ("TimeoutError", "APITimeoutError"),
-        ("APIConnectionError", "APIConnectionError"),
-    ):
-        if marker in message:
-            return error_type
+    """Classify a Kaggle model-proxy failure from its exception name or traceback.
+
+    The exception line decides first: the frames above it may name other errors.
+    """
+    for text in (_exception_line(message), message):
+        for marker, error_type in (
+            ("RateLimitError", "RateLimitError"),
+            ("AuthenticationError", "AuthenticationError"),
+            ("PermissionDeniedError", "PermissionDeniedError"),
+            ("NotFoundError", "InvalidModel"),
+            ("BadRequestError", "InvalidArgument"),
+            ("UnprocessableEntityError", "InvalidArgument"),
+            # openai.APITimeoutError, or joblib's TimeoutError for a whole batch:
+            # retried, without cooling down the one shared proxy key.
+            ("TimeoutError", "APITimeoutError"),
+            ("APIConnectionError", "APIConnectionError"),
+        ):
+            if marker in text:
+                return error_type
     return "UnknownError"
 
 
@@ -1230,12 +1268,22 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
     def _failure(self, message: str, meta: Dict[str, Any], model_name: str) -> APIResponse:
         error_type = _kaggle_error_type(message)
         if error_type in ("AuthenticationError", "PermissionDeniedError"):
-            self.scheduler.disable(self._PROXY_KEY, error_type)
+            # Every call shares the one proxy pseudo-key, so disabling it for a
+            # denied request failed every later call of the session: a 403 on
+            # 1 of 10 batch rows (the other 9 succeeded) left 32,052 calls
+            # without quota on Kaggle on 2026-11-02. The request is retried
+            # instead; a proxy that denies everything exhausts the retries.
+            error_type = f"Proxy{error_type}"
         elif error_type in ("RateLimitError", "UnknownError"):
             self.scheduler.cooldown(self._PROXY_KEY, model_name)
         status = "RATE_LIMITED" if error_type == "RateLimitError" else "ERROR"
+        # A traceback's tail starts mid-frame; lead with its exception line.
+        summary = _exception_line(message)
+        error_message = message[-2000:]
+        if summary and not error_message.startswith(summary):
+            error_message = f"{summary}\n{error_message}"
         return {"status": status, "text": None, "error_type": error_type,
-                "error_message": message[-2000:], "request_meta": meta}
+                "error_message": error_message, "request_meta": meta}
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
         self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")

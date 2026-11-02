@@ -1135,18 +1135,30 @@ def sync_workspace_to_hub(config: dict):
         api = HfApi(token=hf_token)
 
         # 2. Upload only the specific folders using an allowlist to prevent leaks
-        api.upload_large_folder(
-            folder_path=local_outputs_dir,
-            repo_id=repo_id,
-            repo_type="dataset",
-            # ONLY upload files inside these specific directories
-            allow_patterns=[
-                "outputs/logs/**",     # Logs folder in Kaggle mode
-                "outputs/results/**",  # Results folder in Kaggle mode
-                "logs/**",             # Logs folder in Offline mode
-                "results/**"           # Results folder in Offline mode
-            ]
-        )
+        allow_patterns = [
+            "outputs/logs/**",     # Logs folder in Kaggle mode
+            "outputs/results/**",  # Results folder in Kaggle mode
+            "logs/**",             # Logs folder in Offline mode
+            "results/**"           # Results folder in Offline mode
+        ]
+        # upload_large_folder needs huggingface_hub >= 0.25. Kaggle's
+        # benchmark-model kernel has an older one, where every sync of a
+        # 66-batch run failed with an AttributeError (2026-11-02).
+        if hasattr(api, "upload_large_folder"):
+            api.upload_large_folder(
+                folder_path=local_outputs_dir,
+                repo_id=repo_id,
+                repo_type="dataset",
+                allow_patterns=allow_patterns,
+            )
+        else:
+            api.upload_folder(
+                folder_path=local_outputs_dir,
+                repo_id=repo_id,
+                repo_type="dataset",
+                allow_patterns=allow_patterns,
+                commit_message="Sync workspace",
+            )
         logger.info(f"Successfully synced '{local_outputs_dir}' to {repo_id}.")
         print(f"✅ Backup complete: Results synced to Hugging Face ({repo_id})")
         

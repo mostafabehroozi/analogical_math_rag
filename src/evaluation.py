@@ -37,6 +37,7 @@ from src.answer_bank import (
     get_answer_bank, parse_packed_reply, rule_verdict, same_answer,
 )
 from src.benchmark_data import benchmark_name_for_target_index, uses_exact_final_answers
+from src.context_logger import tolerated_api_failures
 
 # Pass@K attempts after the first correct one are not judged when
 # EVAL_LAZY_PASS_AT_K is on; every Pass@K value stays the same.
@@ -215,7 +216,9 @@ def _evaluate_with_answer_bank(
 
         method = result.get("judge_method")
         if method in _AUDITED_METHODS and _needs_llm_check(bank, case, method, config):
-            checked, _ = _bank_single_judge(case, model_answer, ground_truth, api_manager, config, bank, "audit")
+            # A failed audit keeps the verdict above.
+            with tolerated_api_failures():
+                checked, _ = _bank_single_judge(case, model_answer, ground_truth, api_manager, config, bank, "audit")
             if checked["status"] == "SUCCESS":
                 if checked["is_correct"] != result["is_correct"]:
                     logging.getLogger(__name__).warning(
@@ -308,9 +311,11 @@ def _bank_packed_judge(
     """Judge several answers in one call; None for any item the reply does not settle."""
     from src.prompts import create_packed_evaluation_prompt
     prompt = create_packed_evaluation_prompt([(case.tail, case.gt_answer) for case in cases])
-    response = _unwrap_response(api_manager.generate_content(
-        prompt, judge_model, temperature, avalai_role="evaluator"
-    ))
+    # If this call fails, every answer is judged by its own call instead.
+    with tolerated_api_failures():
+        response = _unwrap_response(api_manager.generate_content(
+            prompt, judge_model, temperature, avalai_role="evaluator"
+        ))
     if response.get("status") != "SUCCESS":
         return [None] * len(cases)
     outcomes = []
