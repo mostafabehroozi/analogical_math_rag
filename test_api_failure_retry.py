@@ -96,6 +96,18 @@ def quiet_api_logs():
         yield
 
 
+def test_a_failed_call_is_printed_in_full():
+    detail = "openai.PermissionDeniedError: Error code: 403 - {'code': '', 'message': '" + "x" * 500 + "'}"
+    message = DENIED.rsplit("\n", 1)[0] + "\n" + detail
+    with patch.object(api_manager, "tprint") as printed:
+        failing_call(NO_RETRY, {"status": "ERROR", "error_type": "PermissionDeniedError", "error_message": message})
+    attempt_log, final_line = (call.args[0] for call in printed.call_args_list)
+    assert detail in attempt_log and "_base_client.py" in attempt_log
+    assert final_line.endswith(detail)
+    ok = api_manager._format_api_log("p", "m", "k", 0.1, 1, 1, "SUCCESS", "prompt", "y" * 500, {})
+    assert "y" * 71 not in ok  # Successful replies stay one short line.
+
+
 def test_a_call_no_key_could_take_does_not_pause_every_api_call():
     pause = api_manager._GlobalAPIPauseManager()
     config = {**NO_RETRY, "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 1, "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 600}

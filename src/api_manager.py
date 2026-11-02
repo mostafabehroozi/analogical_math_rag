@@ -336,12 +336,16 @@ def _format_api_log(provider: str, model: str, key: str, duration: float, attemp
     in_trunc = in_trunc.replace('\n', ' ') 
     
     out_trunc = ""
-    if response_text:
+    if response_text and status != "SUCCESS":
+        # An error is printed in full, traceback included: cut to one line it
+        # never said why a call failed.
+        out_trunc = str(response_text).replace('\n', '\n          ')
+    elif response_text:
         out_trunc = (response_text[:trunc_len] + '...') if len(response_text) > trunc_len else str(response_text)
         out_trunc = out_trunc.replace('\n', ' ')
-        
+
     status_icon = "🟢" if status == "SUCCESS" else "🔴"
-    
+
     log_str = f"⏱️ {duration:.2f}s | [{provider} | {model} | Key: {key}] | Att: {attempt}/{max_attempts} | {status_icon} {status}\n"
     log_str += f"    ↳ IN : \"{in_trunc}\"\n"
     log_str += f"    ↳ OUT: \"{out_trunc}\""
@@ -365,7 +369,7 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
                 "provider": provider_name,
                 "model": model_name,
                 "error_type": response.get("error_type") or response.get("status"),
-                "error_message": _exception_line(response.get("error_message"))[:300],
+                "error_message": _exception_line(response.get("error_message")),
                 "caller": caller_loc,
             })
         return response
@@ -443,9 +447,9 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
 
         if not retryable or attempt == max_attempts:
             response["retry_exhausted"] = attempt == max_attempts
-            # The call log keeps only the start of the message, which for a
-            # traceback is no help; the exception line says what went wrong.
-            detail = _exception_line(response.get("error_message"))[:300]
+            # The call log above holds the whole message; this line repeats
+            # its exception line, which says what went wrong.
+            detail = _exception_line(response.get("error_message"))
             tprint(f"[API ERROR] Final failure. Type: {error_type} @ {caller_loc}: {detail}", level="ERROR")
             return final(response)
         
@@ -1022,7 +1026,7 @@ class OpenRouterAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
         try:
             data = response.json()
         except ValueError:
-            data = {"error": {"message": response.text[:500]}}
+            data = {"error": {"message": response.text}}
         return response.status_code, data
 
     def _http_error_type(self, code: int, api_key: str, model_name: str) -> str:
@@ -1277,9 +1281,9 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
         elif error_type in ("RateLimitError", "UnknownError"):
             self.scheduler.cooldown(self._PROXY_KEY, model_name)
         status = "RATE_LIMITED" if error_type == "RateLimitError" else "ERROR"
-        # A traceback's tail starts mid-frame; lead with its exception line.
+        # The whole message is kept, led by its exception line.
         summary = _exception_line(message)
-        error_message = message[-2000:]
+        error_message = message
         if summary and not error_message.startswith(summary):
             error_message = f"{summary}\n{error_message}"
         return {"status": status, "text": None, "error_type": error_type,
