@@ -520,8 +520,19 @@ def _execute_baseline_calculation(
         }
     """
     logger = logging.getLogger(__name__)
+
+    if not config.get("LAYER1_BASE_CCS_ENABLED", False):
+        # No generation or evaluation calls: every attempt counts as wrong, so
+        # each sample's base CCS is 0/n with n = MIRROR_N_OPTIMIZATION.
+        n_attempts = config.get("MIRROR_N_OPTIMIZATION", 3)
+        print(f"    -> Base CCS disabled: assuming 0/{n_attempts} for {len(retrieved_indices)} samples (no API calls).")
+        return {
+            "status": "SUCCESS",
+            "intrinsic_baselines": {idx: 0 / n_attempts for idx in retrieved_indices},
+        }
+
     logger.info(f"[Layer 1 - Step C] Calculating intrinsic baselines for {len(retrieved_indices)} samples")
-    
+
     try:
         # Use the existing _calculate_baseline_difficulty function
         baselines = _calculate_baseline_difficulty(
@@ -759,6 +770,18 @@ def run_layer1_base_execution(
                 expected_zs,
             )
             cached_state = None
+        if (
+            cached_state
+            and config.get("LAYER1_BASE_CCS_ENABLED", False)
+            # States written before the switch existed computed the base CCS.
+            and not cached_state.get("metadata", {}).get("config_snapshot", {}).get("LAYER1_BASE_CCS_ENABLED", True)
+        ):
+            logger.warning(
+                "Ignoring Layer 1 cache for query #%s because its base CCS was "
+                "assumed 0 (LAYER1_BASE_CCS_ENABLED was off) and it is now on.",
+                target_query_index,
+            )
+            cached_state = None
         if cached_state:
             last_step = cached_state.get("metadata", {}).get("last_completed_step", -1)
             if last_step == 4:  # Full Cache Hit
@@ -781,7 +804,8 @@ def run_layer1_base_execution(
                 "LAYER1_ONE_SHOT_CANDIDATES_N": config.get("LAYER1_ONE_SHOT_CANDIDATES_N"),
                 "LAYER1_N_CANDIDATES": config.get("LAYER1_N_CANDIDATES"),
                 "LAYER1_ZERO_SHOT_CANDIDATES_N": config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0),
-                "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION")
+                "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION"),
+                "LAYER1_BASE_CCS_ENABLED": bool(config.get("LAYER1_BASE_CCS_ENABLED", False)),
             }
         },
         "target_query_data": {

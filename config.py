@@ -305,6 +305,10 @@ CONFIG = {
     "LAYER1_ONE_SHOT_CANDIDATES_N": None,  # Number of 1-shot candidates (None = use TOP_N_CANDIDATES_RETRIEVAL)
     "LAYER1_DATASET_NAME": "hard_questions",  # Dataset name for cache filename organization
     "LAYER1_ZERO_SHOT_CANDIDATES_N": 5,    # Number of zero-shot candidates to generate in Layer 1 (0 = OFF)
+    # Base CCS (Step C: each retrieved sample solved alone, MIRROR_N_OPTIMIZATION
+    # attempts). False = make no Step C API calls and log every sample's base CCS
+    # as 0/MIRROR_N_OPTIMIZATION (all attempts counted as wrong).
+    "LAYER1_BASE_CCS_ENABLED": False,
 
     # Layer-1 grouping creates one few-shot candidate for every configured
     # combination of retrieved exemplars (sizes 2..K) and evaluates its
