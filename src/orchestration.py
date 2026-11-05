@@ -56,7 +56,10 @@ from src.api_batching import (
     BATCHING_SOURCE_KEY, BatchSettings, batch_refusals, batching_enabled, batching_setting,
     validate_batching_setting,
 )
-from src.api_manager import SUPPORTED_API_PROVIDERS, bind_api_managers, model_name_for
+from src.api_manager import (
+    SUPPORTED_API_PROVIDERS, attach_provider_pools, bind_api_managers, model_name_for,
+)
+from src.api_routing import is_pool, pool_spec, role_provider, validate_scoped_settings
 from src.distributed_code_compatibility import (
     WORKER_CODE_CHANGE_STATE_KEY,
     accept_worker_code_change,
@@ -342,6 +345,51 @@ _BATCHABLE_ROLES = (
 )
 
 
+def _role_endpoints(
+    config: Dict[str, Any], role: str, api_managers: Dict[str, Any],
+) -> List[Tuple[str, str]]:
+    """The (provider, model) pairs a role calls: its provider's model, or its pool's endpoints."""
+    name = role_provider(config, role)
+    if is_pool(config, name):
+        return [(endpoint.provider, endpoint.model) for endpoint in pool_spec(config, name).endpoints]
+    manager = api_managers.get(name)
+    if manager is None:
+        return []
+    try:
+        return [(name, model_name_for(manager, config, role))]
+    except (TypeError, ValueError):
+        return []  # A role this experiment does not configure.
+
+
+def _check_api_routing(
+    experiment_configs: List[Dict[str, Any]],
+    global_config: Dict[str, Any],
+    api_managers: Dict[str, Any],
+) -> None:
+    """Register provider pools and fail fast on malformed per-provider settings.
+
+    Prints each pool's endpoints once per experiment, so a run shows which
+    providers and models serve a pooled role.
+    """
+    attach_provider_pools(api_managers, global_config, experiment_configs)
+    for exp_overrides in experiment_configs:
+        config = _merge_experiment_config(global_config, exp_overrides)
+        name = config.get("experiment_name", "unnamed_experiment")
+        try:
+            validate_scoped_settings(config, SUPPORTED_API_PROVIDERS)
+        except ValueError as error:
+            raise ValueError(f"Experiment {name!r}: {error}") from None
+        for role, _ in _BATCHABLE_ROLES:
+            pool = role_provider(config, role)
+            if is_pool(config, pool):
+                spec = pool_spec(config, pool)
+                endpoints = ", ".join(
+                    f"{endpoint.label}" + (f" x{endpoint.weight:g}" if endpoint.weight != 1 else "")
+                    for endpoint in spec.endpoints
+                )
+                print(f"API pool for experiment {name!r}: {role} -> {pool!r} ({spec.routing}): {endpoints}")
+
+
 def _check_api_batching(
     experiment_configs: List[Dict[str, Any]],
     global_config: Dict[str, Any],
@@ -366,21 +414,13 @@ def _check_api_batching(
         if (value is False or value is None) and not overridden:
             continue
         routes, batched = [], False
-        for role, provider_key in _BATCHABLE_ROLES:
-            provider = config.get(provider_key) or (
-                config.get("API_PROVIDER_ADAPTATION", "gemini")
-                if role == "simplification" else "gemini"
-            )
-            manager = api_managers.get(provider)
-            if provider not in ("openrouter", "kaggle") or manager is None:
-                continue
-            try:
-                model = model_name_for(manager, config, role)
-            except (TypeError, ValueError):
-                continue  # A role this experiment does not configure.
-            enabled = batching_enabled(config, provider, model, announce=False)
-            batched = batched or enabled
-            routes.append(f"{role} {provider}/{model} {'batched' if enabled else 'direct'}")
+        for role, _ in _BATCHABLE_ROLES:
+            for provider, model in _role_endpoints(config, role, api_managers):
+                if provider not in ("openrouter", "kaggle"):
+                    continue
+                enabled = batching_enabled(config, provider, model, announce=False)
+                batched = batched or enabled
+                routes.append(f"{role} {provider}/{model} {'batched' if enabled else 'direct'}")
         if batched:
             try:
                 BatchSettings.from_config(config)
@@ -900,6 +940,7 @@ def run_pipeline_for_single_query(
                     # managers as the original experiment-level configuration.
                     "API_PROVIDER_ADAPTATION", "API_PROVIDER_SOLVER",
                     "API_PROVIDER_EVALUATOR", "API_PROVIDER_SIMPLIFICATION",
+                    "API_PROVIDER_POOLS",
                     "OPENROUTER_MODEL_NAME_ADAPTATION", "OPENROUTER_MODEL_NAME_FINAL_SOLVER",
                     "OPENROUTER_MODEL_NAME_EVALUATOR", "OPENROUTER_MODEL_NAME_SIMPLIFICATION",
                     "OPENROUTER_PROVIDER_ROUTING", "OPENROUTER_MODEL_ROUTING",
@@ -1991,6 +2032,7 @@ def run_experiments(
         effective_config = _merge_experiment_config(global_config, exp_overrides)
         _reject_removed_feature_flags(effective_config)
     _require_target_questions(hard_questions)
+    _check_api_routing(experiment_configs, global_config, api_managers)
     _require_standard_pipeline_managers(experiment_configs, global_config, api_managers)
     _check_api_batching(experiment_configs, global_config, api_managers)
 

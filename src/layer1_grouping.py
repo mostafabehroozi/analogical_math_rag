@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from src.api_routing import is_pool, pool_label
 from src.evaluation import evaluate_single_answer_with_llm
 from src.parallel_utils import run_parallel_api_calls
 from src.prompts import EXEMPLAR_FORMAT, MIRROR_EXEMPLAR_FORMAT, PROMPT_TEMPLATES
@@ -150,6 +151,8 @@ def build_group_prompt(
 
 
 def _solver_model_name(config: Dict[str, Any]) -> str:
+    if is_pool(config, config.get("API_PROVIDER_SOLVER")):
+        return pool_label(config["API_PROVIDER_SOLVER"])
     provider = str(config.get("API_PROVIDER_SOLVER", "gemini")).strip().lower()
     key_by_provider = {
         "gemini": "GEMINI_MODEL_NAME_FINAL_SOLVER",

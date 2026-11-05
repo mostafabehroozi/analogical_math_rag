@@ -8,6 +8,8 @@ interface remains compatible with the rest of the pipeline.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import threading
 import time
@@ -19,12 +21,18 @@ import copy
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Deque, Dict, Hashable, List, Optional, Tuple, TypedDict, Union
+from typing import Any, Callable, Deque, Dict, Hashable, Iterator, List, Optional, Tuple, TypedDict, Union
 from src.api_batching import (
     APIBatchDispatcher, BatchItem, BatchSettings, batch_refusals, batching_enabled,
     batching_setting, fallback_to_direct,
 )
-from src.context_logger import ctx_query_idx, ctx_batch_id, record_api_failure, tprint
+from src.api_routing import (
+    PoolEndpoint, PoolSpec, is_pool, pool_label, pool_spec, resolve_scoped, scoped_value,
+    used_pool_names, validate_provider_pools,
+)
+from src.context_logger import (
+    ctx_api_failures, ctx_query_idx, ctx_batch_id, record_api_failure, tprint, track_api_failures,
+)
 from src.distributed_execution import api_deadline_due, remaining_api_seconds
 
 try:  # Keep scheduler/batch tests importable without optional provider SDKs.
@@ -90,21 +98,35 @@ def _get_api_caller_location() -> str:
         pass
     return "Unknown Location"
 
-# Thread-safe Global API Pause & Backoff Manager
+# Thread-safe API pause & backoff manager
 class _GlobalAPIPauseManager:
-    """Tracks consecutive errors and periodic breaks across all threads."""
+    """Periodic breaks for every call, and error backoff per provider.
+
+    The scheduled break (GLOBAL_PERIODIC_PAUSE_*) pauses every API call. The
+    error backoff (GLOBAL_CONSECUTIVE_ERROR_*) counts consecutive failures per
+    provider and pauses only that provider: one failing provider no longer
+    stops the calls to the others. Both error settings accept a dict per
+    provider (src/api_routing.py).
+    """
     def __init__(self):
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
-        self._consecutive_errors = 0
-        self._pause_until = 0.0
+        self._consecutive_errors: Dict[Optional[str], int] = defaultdict(int)
+        self._pause_until = 0.0  # The scheduled break, for every provider.
+        self._provider_pause_until: Dict[Optional[str], float] = defaultdict(float)
         self._last_periodic_pause = time.monotonic()
 
-    def wait_if_needed(self, config: Dict[str, Any]) -> None:
-        """Pauses the calling thread if a global break or error backoff is active."""
+    def pause_remaining(self, provider_name: Optional[str] = None, now: Optional[float] = None) -> float:
+        """Seconds until calls to this provider may start again (0 = now)."""
+        with self._condition:
+            now = time.monotonic() if now is None else now
+            return max(0.0, self._pause_until - now, self._provider_pause_until[provider_name] - now)
+
+    def wait_if_needed(self, config: Dict[str, Any], provider_name: Optional[str] = None) -> None:
+        """Pauses the calling thread while a break or this provider's error backoff runs."""
         with self._condition:
             now = time.monotonic()
-            
+
             # 1. Check if a periodic break is due
             interval_mins = config.get("GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES")
             if interval_mins and interval_mins > 0:
@@ -114,98 +136,156 @@ class _GlobalAPIPauseManager:
                     tprint(f"⏰ [GLOBAL PAUSE] Scheduled periodic break! Pausing all new API calls for {duration}s.", level="WARNING")
                     self._pause_until = max(self._pause_until, now + duration)
                     self._last_periodic_pause = now
-            
+
             # 2. Put the thread to sleep until the pause expires
             while True:
                 now = time.monotonic()
                 if api_deadline_due(config, now):
                     return
-                if now >= self._pause_until:
+                wait_time = self.pause_remaining(provider_name, now)
+                if wait_time <= 0:
                     break
-                wait_time = self._pause_until - now
                 remaining = remaining_api_seconds(config, now)
                 if remaining is not None:
                     wait_time = min(wait_time, remaining)
                 self._condition.wait(timeout=wait_time)
 
-    def record_result(self, is_success: bool, config: Dict[str, Any]) -> None:
-        """Updates the consecutive error counter after an API call."""
+    def record_result(self, is_success: bool, config: Dict[str, Any], provider_name: Optional[str] = None) -> None:
+        """Updates this provider's consecutive error counter after an API call."""
         with self._condition:
             if is_success:
-                self._consecutive_errors = 0
+                self._consecutive_errors[provider_name] = 0
             else:
-                self._consecutive_errors += 1
-                limit = config.get("GLOBAL_CONSECUTIVE_ERROR_LIMIT")
-                if limit and limit > 0 and self._consecutive_errors >= limit:
-                    pause_secs = config.get("GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS", 60.0)
-                    tprint(f"🛑 [GLOBAL PAUSE] {self._consecutive_errors} consecutive errors hit! Pausing all new API calls for {pause_secs}s to recover.", level="ERROR")
-                    
+                self._consecutive_errors[provider_name] += 1
+                errors = self._consecutive_errors[provider_name]
+                limit = scoped_value(config, "GLOBAL_CONSECUTIVE_ERROR_LIMIT", provider_name)
+                if limit and limit > 0 and errors >= limit:
+                    pause_secs = float(scoped_value(config, "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS", provider_name, default=60.0))
+                    tprint(f"🛑 [PROVIDER PAUSE] {errors} consecutive errors from '{provider_name}'! Pausing its new API calls for {pause_secs}s to recover.", level="ERROR")
+
                     now = time.monotonic()
-                    self._pause_until = max(self._pause_until, now + pause_secs)
-                    self._consecutive_errors = 0  # Reset so it doesn't trigger repeatedly
+                    until = self._provider_pause_until
+                    until[provider_name] = max(until[provider_name], now + pause_secs)
+                    self._consecutive_errors[provider_name] = 0  # Reset so it doesn't trigger repeatedly
                     self._condition.notify_all()
 
 # Create the single shared manager for the whole application
 global_pause_manager = _GlobalAPIPauseManager()
 
-# Per-provider rate pacer — enforces a minimum time gap between
-#       consecutive API calls to the same provider, across all threads.
+
+def _limit_key(provider_name: str, model_name: Optional[str], model_specific: bool) -> Hashable:
+    """A provider shares one clock/limit unless the model has its own entry."""
+    return (provider_name, model_name) if model_specific else provider_name
+
+
+def _limit_label(key: Hashable) -> str:
+    return "/".join(key) if isinstance(key, tuple) else str(key)
+
+
+# Rate pacer — enforces a minimum time gap between consecutive API calls to
+# the same provider (or to one model with its own gap), across all threads.
 class _ProviderRatePacer:
-    """Thread-safe minimum-interval enforcer for API calls per provider."""
+    """Thread-safe minimum-interval enforcer, one clock per provider or model."""
 
     def __init__(self) -> None:
         self._creation_lock = threading.Lock()
-        self._locks: Dict[str, threading.Lock] = {}
-        self._last_call_time: Dict[str, float] = {}
+        self._locks: Dict[Hashable, threading.Lock] = {}
+        self._last_call_time: Dict[Hashable, float] = {}
 
-    def _get_lock(self, provider_name: str) -> threading.Lock:
-        """Double-checked-locking creation of a per-provider lock."""
-        if provider_name not in self._locks:
+    def _get_lock(self, key: Hashable) -> threading.Lock:
+        """Double-checked-locking creation of a per-clock lock."""
+        if key not in self._locks:
             with self._creation_lock:
-                if provider_name not in self._locks:
-                    self._locks[provider_name] = threading.Lock()
-        return self._locks[provider_name]
+                if key not in self._locks:
+                    self._locks[key] = threading.Lock()
+        return self._locks[key]
 
-    def pace(self, provider_name: str, min_seconds: float) -> None:
-        """Block until it is safe to make the next API call to *provider_name*."""
+    def pace(self, key: Hashable, min_seconds: float) -> None:
+        """Block until it is safe to make the next API call on this clock."""
         if min_seconds <= 0:
             return
-            
-        lock = self._get_lock(provider_name)
-        
-        # Acquire the lock so only one thread per provider can check/wait at a time
+
+        lock = self._get_lock(key)
+
+        # Acquire the lock so only one thread per clock can check/wait at a time
         with lock:
             now = time.monotonic()
-            last = self._last_call_time.get(provider_name, 0.0)
+            last = self._last_call_time.get(key, 0.0)
             elapsed = now - last
-            
+
             if elapsed < min_seconds:
                 wait_time = min_seconds - elapsed
                 tprint(
-                    f"⏳ [PACER] Provider '{provider_name}' pacing: "
+                    f"⏳ [PACER] '{_limit_label(key)}' pacing: "
                     f"sleeping {wait_time:.2f}s "
                     f"(min gap={min_seconds}s, elapsed={elapsed:.2f}s).",
                     level="DEBUG",
                 )
                 time.sleep(wait_time)
-                
+
             # Record the time we release the lock (when the API call is about to start)
-            self._last_call_time[provider_name] = time.monotonic()
+            self._last_call_time[key] = time.monotonic()
 
 # Global pacer instance shared across all threads / all API managers
 provider_pacer = _ProviderRatePacer()
 
 
-def _pace_provider_call(config: Dict[str, Any], provider_name: str) -> None:
-    """Apply the configured gap between outgoing calls to this provider."""
-    configured_delay = config.get("GLOBAL_API_CALL_DELAY_SECONDS", 0.0)
-    # Accept the former single numeric value for existing callers.
-    if isinstance(configured_delay, dict):
-        configured_delay = configured_delay.get(provider_name, 0.0)
-    delay = float(configured_delay)
+def _pace_provider_call(config: Dict[str, Any], provider_name: str, model_name: Optional[str] = None) -> None:
+    """Apply the configured gap between outgoing calls to this provider or model.
+
+    GLOBAL_API_CALL_DELAY_SECONDS is a number for every provider, or a dict
+    per provider and model (src/api_routing.py). MIN_TIME_BETWEEN_API_CALLS_SECONDS,
+    when enabled, is a floor under every gap.
+    """
+    configured, model_specific = resolve_scoped(
+        config.get("GLOBAL_API_CALL_DELAY_SECONDS", 0.0), provider_name, model_name
+    )
+    delay = float(configured or 0.0)
     if config.get("ENABLE_MIN_TIME_BETWEEN_API_CALLS", False):
         delay = max(delay, float(config.get("MIN_TIME_BETWEEN_API_CALLS_SECONDS", 0.0)))
-    provider_pacer.pace(provider_name, delay)
+    provider_pacer.pace(_limit_key(provider_name, model_name, model_specific), delay)
+
+
+class _ConcurrencyLimiter:
+    """API_MAX_CONCURRENT_CALLS: requests in flight per provider (or per model)."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._in_flight: Dict[Hashable, int] = defaultdict(int)
+
+    @contextlib.contextmanager
+    def slot(self, config: Dict[str, Any], provider_name: str, model_name: Optional[str]) -> Iterator[None]:
+        limit, model_specific = resolve_scoped(config.get("API_MAX_CONCURRENT_CALLS"), provider_name, model_name)
+        if limit is None or int(limit) <= 0:
+            yield
+            return
+        key = _limit_key(provider_name, model_name, model_specific)
+        with self._condition:
+            while self._in_flight[key] >= int(limit):
+                self._condition.wait()
+            self._in_flight[key] += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._in_flight[key] -= 1
+                self._condition.notify_all()
+
+
+concurrency_limiter = _ConcurrencyLimiter()
+
+
+def _request_timeout(config: Dict[str, Any], provider_name: str) -> float:
+    """API_REQUEST_TIMEOUT_SECONDS, a number or a dict per provider."""
+    return float(scoped_value(config, "API_REQUEST_TIMEOUT_SECONDS", provider_name, default=300.0))
+
+
+@contextlib.contextmanager
+def _call_slot(config: Dict[str, Any], provider_name: str, model_name: Optional[str]) -> Iterator[None]:
+    """Hold a concurrency slot, wait the call gap, then send inside the block."""
+    with concurrency_limiter.slot(config, provider_name, model_name):
+        _pace_provider_call(config, provider_name, model_name)
+        yield
 
 
 @dataclass(frozen=True)
@@ -305,7 +385,9 @@ class RPMKeyScheduler:
                 self._condition.wait(timeout=wait_seconds)
 
     def cooldown(self, api_key: str, model_name: str, seconds: Optional[float] = None) -> None:
-        delay = float(seconds if seconds is not None else self.config.get("API_KEY_ERROR_COOLDOWN_SECONDS", 20.0))
+        if seconds is None:
+            seconds = scoped_value(self.config, "API_KEY_ERROR_COOLDOWN_SECONDS", self.provider_name, model_name, 20.0)
+        delay = float(seconds)
         with self._condition:
             key = (api_key, model_name)
             self._cooldown_until[key] = max(self._cooldown_until[key], time.monotonic() + max(0.0, delay))
@@ -352,51 +434,96 @@ def _format_api_log(provider: str, model: str, key: str, duration: float, attemp
     return log_str
 
 
+@dataclass(frozen=True)
+class _PoolAttempt:
+    """Set while a provider pool makes one attempt: the pool, not the call, retries."""
+    pool: str
+    attempt: int
+    max_attempts: int
+
+
+_pool_attempt: contextvars.ContextVar[Optional[_PoolAttempt]] = contextvars.ContextVar(
+    "api_pool_attempt", default=None
+)
+
+
+def _max_attempts(config: Dict[str, Any], provider_name: Optional[str], model_name: Optional[str]) -> int:
+    """MAX_API_RETRIES (total attempts, the first included) for this provider and model."""
+    if not config.get("ENABLE_API_RETRY", False):
+        return 1
+    return max(1, int(scoped_value(config, "MAX_API_RETRIES", provider_name, model_name, 3)))
+
+
+def _retry_delay(config: Dict[str, Any], provider_name: Optional[str], model_name: Optional[str]) -> float:
+    return max(0.0, float(scoped_value(config, "API_RETRY_DELAY_SECONDS", provider_name, model_name, 20.0)))
+
+
+def _is_retryable(error_type: Optional[str], config: Dict[str, Any]) -> bool:
+    # A session deadline is a local stop signal, not a failed API call.
+    if error_type == "SessionDeadline" or error_type in NON_RETRYABLE_ERROR_TYPES:
+        return False
+    if config.get("RETRY_ALL_API_ERRORS", True):
+        return True
+    return error_type in RETRYABLE_ERROR_TYPES
+
+
+def _record_final_failure(response: APIResponse, provider_name: str, model_name: str, caller: str) -> APIResponse:
+    # The batch coordinator fails a question whose call failed for good,
+    # so the question is not saved as complete with this call missing.
+    if response.get("error_type") not in REQUEST_OUTCOME_ERROR_TYPES:
+        record_api_failure({
+            "provider": provider_name,
+            "model": model_name,
+            "error_type": response.get("error_type") or response.get("status"),
+            "error_message": _exception_line(response.get("error_message")),
+            "caller": caller,
+        })
+    return response
+
+
+def _deadline_error() -> APIResponse:
+    return {
+        "status": "ERROR",
+        "text": None,
+        "error_type": "SessionDeadline",
+        "error_message": (
+            "Distributed session API deadline reached; this question will be "
+            "checkpointed as incomplete and retried by the same worker next session."
+        ),
+    }
+
+
 def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: str, prompt: str, api_call_func: Callable[[], APIResponse]) -> APIResponse:
-    """Retry logic that times the execution, respects global pauses, and prints clean logs."""
+    """Retry logic that times the execution, respects pauses, and prints clean logs.
+
+    MAX_API_RETRIES and API_RETRY_DELAY_SECONDS may be set per provider and
+    model (src/api_routing.py). Inside a provider pool's attempt the call is
+    made once and returned as it is: the pool retries it, on another
+    endpoint when one is free, and records the final failure itself.
+    """
     caller_loc = _get_api_caller_location()
-    
-    # Determine max attempts based on config
-    max_attempts = max(1, int(config.get("MAX_API_RETRIES", 3))) if config.get("ENABLE_API_RETRY", False) else 1
-    retry_all = config.get("RETRY_ALL_API_ERRORS", True)
+    pool_attempt = _pool_attempt.get()
+    max_attempts = 1 if pool_attempt else _max_attempts(config, provider_name, model_name)
+    log_provider = f"{pool_label(pool_attempt.pool)} → {provider_name}" if pool_attempt else provider_name
     last_response: Optional[APIResponse] = None
 
     def final(response: APIResponse) -> APIResponse:
-        # The batch coordinator fails a question whose call failed for good,
-        # so the question is not saved as complete with this call missing.
-        if response.get("error_type") not in REQUEST_OUTCOME_ERROR_TYPES:
-            record_api_failure({
-                "provider": provider_name,
-                "model": model_name,
-                "error_type": response.get("error_type") or response.get("status"),
-                "error_message": _exception_line(response.get("error_message")),
-                "caller": caller_loc,
-            })
-        return response
-
-    def deadline_response() -> APIResponse:
-        return final({
-            "status": "ERROR",
-            "text": None,
-            "error_type": "SessionDeadline",
-            "error_message": (
-                "Distributed session API deadline reached; this question will be "
-                "checkpointed as incomplete and retried by the same worker next session."
-            ),
-        })
+        if pool_attempt:
+            return response
+        return _record_final_failure(response, provider_name, model_name, caller_loc)
 
     for attempt in range(1, max_attempts + 1):
         if api_deadline_due(config):
-            return deadline_response()
+            return final(_deadline_error())
 
-        # Check if the system is globally paused before making ANY request
-        global_pause_manager.wait_if_needed(config)
+        # Wait out a scheduled break or this provider's error backoff first.
+        global_pause_manager.wait_if_needed(config, provider_name)
         if api_deadline_due(config):
-            return deadline_response()
-        
+            return final(_deadline_error())
+
         # 1. Start the Timer
         start_time = time.monotonic()
-        
+
         # 2. Make the API Call
         try:
             response = api_call_func()
@@ -406,27 +533,28 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
                 "error_type": type(error).__name__,
                 "error_message": str(error), "error_details": repr(error),
             }
-        
+
         # 3. Stop the Timer
         duration = time.monotonic() - start_time
-        
+
         # 4. Extract data for logging
         status = response.get("status", "ERROR")
         key = response.get("request_meta", {}).get("key", "Local")
         response_text = response.get("text") or response.get("error_message", "No text returned")
-        
-        # Record success or failure to the global pause manager. A refused
-        # batch stops the run, and pausing every API call would only delay that.
+
+        # Record success or failure for this provider's error backoff. A refused
+        # batch stops the run, and pausing the provider would only delay that.
         # A call no key could take never reached the provider, so it is no sign
         # that the provider needs a rest (32,000 such refusals paused a Kaggle
         # run 2,135 times on 2026-11-02).
         is_success = (status == "SUCCESS")
         if response.get("error_type") not in ("BatchRefused", "ProactiveRateLimit"):
-            global_pause_manager.record_result(is_success, config)
-        
+            global_pause_manager.record_result(is_success, config, provider_name)
+
         # 5. Format and print the beautiful log
-        log_msg = _format_api_log(provider_name, model_name, key, duration, attempt, max_attempts, status, prompt, response_text, config)
-        
+        shown_attempt, shown_max = (pool_attempt.attempt, pool_attempt.max_attempts) if pool_attempt else (attempt, max_attempts)
+        log_msg = _format_api_log(log_provider, model_name, key, duration, shown_attempt, shown_max, status, prompt, response_text, config)
+
         if is_success:
             tprint(log_msg, level="INFO")
             return response
@@ -434,17 +562,10 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         # If we reach here, it failed
         error_type = response.get("error_type") or status
         tprint(log_msg, level="WARNING")
-        
-        # A session deadline is a local stop signal, not a failed API call.
-        if error_type == "SessionDeadline":
-            retryable = False
-        elif error_type in NON_RETRYABLE_ERROR_TYPES:
-            retryable = False
-        elif retry_all:
-            retryable = True
-        else:
-            retryable = error_type in RETRYABLE_ERROR_TYPES and error_type not in NON_RETRYABLE_ERROR_TYPES
+        if pool_attempt:
+            return response
 
+        retryable = _is_retryable(error_type, config)
         if not retryable or attempt == max_attempts:
             response["retry_exhausted"] = attempt == max_attempts
             # The call log above holds the whole message; this line repeats
@@ -452,18 +573,18 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
             detail = _exception_line(response.get("error_message"))
             tprint(f"[API ERROR] Final failure. Type: {error_type} @ {caller_loc}: {detail}", level="ERROR")
             return final(response)
-        
+
         # Wait before retrying
-        retry_delay = float(config.get("API_RETRY_DELAY_SECONDS", 20.0))
+        retry_delay = _retry_delay(config, provider_name, model_name)
         remaining = remaining_api_seconds(config)
         if remaining is not None:
             if remaining <= 0:
-                return deadline_response()
+                return final(_deadline_error())
             retry_delay = min(retry_delay, remaining)
         time.sleep(max(0.0, retry_delay))
-            
+
         last_response = response
-        
+
     final_resp = last_response or {"status": "ERROR", "text": None, "error_type": "RetryError", "error_message": "No API attempt made"}
     return final_resp
 
@@ -534,7 +655,13 @@ SUPPORTED_API_PROVIDERS = frozenset({"gemini", "avalai", "openrouter", "kaggle",
 
 
 def model_name_for(manager: Any, config: Dict[str, Any], role: str) -> str:
-    """Resolve a role's model for any configured API provider."""
+    """Resolve a role's model for any configured API provider.
+
+    A provider pool returns its label ("pool:<name>"); each of its responses
+    names the endpoint that served it in ``request_meta``.
+    """
+    if isinstance(manager, ProviderPool):
+        return manager.label
     provider = getattr(manager, "provider_name", None)
     if provider not in SUPPORTED_API_PROVIDERS:
         raise TypeError(f"Unsupported API manager: {type(manager)}")
@@ -560,7 +687,7 @@ class GeminiAPIManager(_KeyedAPIManager):
         if genai is None:
             raise ImportError("GeminiAPIManager requires the 'google-genai' package. Run: pip install google-genai")
         
-        self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0))
+        self.timeout_seconds = _request_timeout(self.config, self.provider_name)
         self.clients = {
             key: genai.Client(
                 api_key=key, 
@@ -568,14 +695,19 @@ class GeminiAPIManager(_KeyedAPIManager):
             ) for key in self.api_keys_list
         }
         
-    def _get_max_tokens(self, model_name: str) -> Optional[int]:
+    def _get_max_tokens(self, model_name: str, role: Optional[str] = None) -> Optional[int]:
         if model_name == self.config.get("GEMINI_MODEL_NAME_FINAL_SOLVER"):
             return self.config.get("DEFAULT_FINAL_SOLVER_MAX_TOKENS", 8192)
         elif model_name == self.config.get("GEMINI_MODEL_NAME_ADAPTATION"):
             return self.config.get("DEFAULT_ADAPTATION_MAX_TOKENS", 2048)
         elif model_name == self.config.get("GEMINI_MODEL_NAME_EVALUATOR"):
             return self.config.get("DEFAULT_EVALUATOR_MAX_TOKENS", 512)
-        return None
+        # A pool endpoint's model need not be a configured role model: use the role's limit.
+        return {
+            "final_solver": self.config.get("DEFAULT_FINAL_SOLVER_MAX_TOKENS"),
+            "adaptation": self.config.get("DEFAULT_ADAPTATION_MAX_TOKENS"),
+            "evaluator": self.config.get("DEFAULT_EVALUATOR_MAX_TOKENS"),
+        }.get(role)
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
         self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
@@ -590,7 +722,7 @@ class GeminiAPIManager(_KeyedAPIManager):
             if temperature is not None:
                 config_kwargs["temperature"] = temperature
                 
-            max_tokens = self._get_max_tokens(model_name)
+            max_tokens = self._get_max_tokens(model_name, avalai_role)
             if max_tokens is not None:
                 config_kwargs["max_output_tokens"] = max_tokens
 
@@ -607,12 +739,12 @@ class GeminiAPIManager(_KeyedAPIManager):
             try:
                 clean_model_name = model_name.replace("models/", "")
                 client = self.clients[lease.api_key]
-                _pace_provider_call(self.config, self.provider_name)
-                response = client.models.generate_content(
-                    model=clean_model_name,
-                    contents=prompt,
-                    config=gen_config
-                )
+                with _call_slot(self.config, self.provider_name, model_name):
+                    response = client.models.generate_content(
+                        model=clean_model_name,
+                        contents=prompt,
+                        config=gen_config
+                    )
                 
                 text = response.text
                 if text:
@@ -660,7 +792,7 @@ class AvalAIAPIManager(_KeyedAPIManager):
         if "GLOBAL_API_CALL_DELAY_SECONDS" not in self.config:
             self.config["GLOBAL_API_CALL_DELAY_SECONDS"] = global_delay_seconds
         
-        timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0))
+        timeout_seconds = _request_timeout(self.config, self.provider_name)
         self.clients = {
             key: openai.OpenAI(
                 api_key=key, 
@@ -705,8 +837,8 @@ class AvalAIAPIManager(_KeyedAPIManager):
                         }
                     }
                 
-                _pace_provider_call(self.config, self.provider_name)
-                completion = self.clients[lease.api_key].chat.completions.create(**kwargs)
+                with _call_slot(self.config, self.provider_name, model_name):
+                    completion = self.clients[lease.api_key].chat.completions.create(**kwargs)
                 returned_model = getattr(completion, "model", None)
                 if returned_model and returned_model != model_name:
                     self.logger.debug(f"Provider returned model '{returned_model}' instead of requested '{model_name}'. Proceeding.")
@@ -834,7 +966,7 @@ class OpenRouterAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             headers["X-OpenRouter-Title"] = self.config["OPENROUTER_APP_TITLE"]
         self.base_url = base_url.rstrip("/")
         self.headers = headers
-        self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0))
+        self.timeout_seconds = _request_timeout(self.config, self.provider_name)
         self.batcher = APIBatchDispatcher(self.provider_name, self._submit_batch)
         # Batch groups are (model, routing) pairs.
         self._init_batch_refusals()
@@ -842,7 +974,7 @@ class OpenRouterAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             key: openai.OpenAI(
                 api_key=key,
                 base_url=base_url,
-                timeout=float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0)),
+                timeout=_request_timeout(self.config, self.provider_name),
                 default_headers=headers,
                 max_retries=0,
             ) for key in self.api_keys_list
@@ -898,8 +1030,8 @@ class OpenRouterAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             if extra_body:
                 kwargs["extra_body"] = extra_body
             try:
-                _pace_provider_call(self.config, self.provider_name)
-                completion = self.clients[lease.api_key].chat.completions.create(**kwargs)
+                with _call_slot(self.config, self.provider_name, model_name):
+                    completion = self.clients[lease.api_key].chat.completions.create(**kwargs)
                 meta["returned_model"] = getattr(completion, "model", None)
                 router_meta = getattr(completion, "openrouter_metadata", None)
                 if router_meta is None:
@@ -1072,7 +1204,7 @@ class OpenRouterAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             {"custom_id": f"req-{position}", "body": item.payload["body"]}
             for position, item in enumerate(items)
         ]
-        _pace_provider_call(self.config, self.provider_name)
+        _pace_provider_call(self.config, self.provider_name, model_name)
         code, batch = self._batch_http("POST", "/batches", lease.api_key, request)
         if code >= 400 or not isinstance(batch, dict) or not batch.get("id"):
             message = (batch.get("error") or {}).get("message") if isinstance(batch, dict) else None
@@ -1218,7 +1350,7 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             )
         super().__init__([self._PROXY_KEY], model_quotas, config)
         self.kbench = kbench
-        self.timeout_seconds = float(self.config.get("API_REQUEST_TIMEOUT_SECONDS", 300.0))
+        self.timeout_seconds = _request_timeout(self.config, self.provider_name)
         self._llms: Dict[str, Any] = {}
         self._llm_lock = threading.Lock()
         self._row_task = None
@@ -1300,8 +1432,8 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             meta = self._request_meta(lease)
             try:
                 llm = self._llm(model_name)
-                _pace_provider_call(self.config, self.provider_name)
-                with self.kbench.chats.new("analogical-math-rag", orphan=True):
+                with _call_slot(self.config, self.provider_name, model_name), \
+                        self.kbench.chats.new("analogical-math-rag", orphan=True):
                     text = llm.prompt(prompt, **options)
             except Exception as error:
                 return self._failure(f"{type(error).__name__}: {error}", meta, model_name)
@@ -1396,7 +1528,7 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
                 llm = self._llm(model_name)
             except Exception as error:  # An unknown model fails direct calls too.
                 return fail_runnable(error)
-            _pace_provider_call(self.config, self.provider_name)
+            _pace_provider_call(self.config, self.provider_name, model_name)
             # A row is one request, which the client timeout normally ends. This
             # also stops a reply that keeps trickling in, which that timeout
             # cannot; joblib applies it only when more than one job runs.
@@ -1470,8 +1602,8 @@ class OllamaAPIManager(_ConfigBindable):
                         options["temperature"] = temperature
                     if self.config.get("OLLAMA_THINK_MODE"):
                         options["think"] = self.config["OLLAMA_THINK_MODE"]
-                    _pace_provider_call(self.config, "ollama")
-                    response = self.client.generate(model=model_name, prompt=prompt, options=options)
+                    with _call_slot(self.config, "ollama", model_name):
+                        response = self.client.generate(model=model_name, prompt=prompt, options=options)
                     return {"status": "SUCCESS", "text": response["response"], "error_type": None, "error_message": None, "error_details": None}
                 except ollama.ResponseError as error:
                     return {"status": "ERROR", "text": None, "error_type": "OllamaResponseError", "error_message": str(error), "error_details": repr(error)}
@@ -1479,3 +1611,205 @@ class OllamaAPIManager(_ConfigBindable):
                     return {"status": "ERROR", "text": None, "error_type": "OllamaConnectionError", "error_message": str(error), "error_details": repr(error)}
 
         return execute_with_retry(self.config, "ollama", model_name, prompt, attempt)
+
+
+class ProviderPool(_ConfigBindable):
+    """A role served by several (provider, model) endpoints (API_PROVIDER_POOLS).
+
+    A pool stands in ``api_managers`` under its own name, so a role selects it
+    like a provider: ``API_PROVIDER_EVALUATOR="judges"``. Every call goes to
+    one endpoint through that provider's own manager, so the endpoint keeps
+    its provider's keys, RPM quota, call gap, concurrency limit, error
+    backoff and batching. Calls to different providers therefore never wait
+    for each other.
+
+    Routing:
+      * ``"spread"`` (default): the endpoint with the fewest calls in flight
+        per weight; calls made one after another rotate by weight.
+      * ``"failover"``: the first listed endpoint takes every call; the next
+        one is used only while the earlier ones are failing.
+
+    The pool runs the retries: a failed attempt is retried at once on another
+    endpoint that is not failing, and on a failing one only after its
+    API_RETRY_DELAY_SECONDS. Each endpoint gets up to its MAX_API_RETRIES
+    attempts per call; an error that cannot succeed on retry (a refused key,
+    an unknown model, a blocked prompt) retires that endpoint for the call
+    only. A question fails only when every endpoint failed. The pool's
+    definition is read from the bound experiment configuration on each call.
+    """
+
+    provider_name = "pool"
+
+    def __init__(self, name: str, managers: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> None:
+        self.name = name
+        self.label = pool_label(name)
+        self.managers = managers  # The shared provider name -> manager dict.
+        self.config = config or {}
+        # Shared by every binding of this pool, keyed by endpoint label.
+        self._lock = threading.Lock()
+        self._in_flight: Dict[str, int] = defaultdict(int)
+        self._served: Dict[str, float] = defaultdict(float)
+        self._failing_until: Dict[str, float] = defaultdict(float)
+
+    def spec(self) -> PoolSpec:
+        if not is_pool(self.config, self.name):
+            raise ValueError(
+                f"Experiment {self.config.get('experiment_name', 'unnamed_experiment')!r} selects "
+                f"{self.name!r}, which its API_PROVIDER_POOLS does not define."
+            )
+        return pool_spec(self.config, self.name)
+
+    def _member(self, endpoint: PoolEndpoint) -> Any:
+        manager = self.managers.get(endpoint.provider)
+        if manager is None or isinstance(manager, ProviderPool):
+            raise ValueError(
+                f"{self.label} lists {endpoint.label}, but no '{endpoint.provider}' API manager "
+                f"is initialized (initialized: {sorted(self.managers)})."
+            )
+        return manager.for_config(self.config) if isinstance(manager, _ConfigBindable) else manager
+
+    def _pick(
+        self, spec: PoolSpec, budgets: Dict[PoolEndpoint, int], failures: Dict[PoolEndpoint, int],
+    ) -> Optional[Tuple[PoolEndpoint, float]]:
+        """Reserve the next endpoint; return it and how long it is still failing/paused.
+
+        Ready endpoints come first, and among them those this call has failed
+        on least; a failing or paused one is waited for only when no endpoint
+        is ready.
+        """
+        with self._lock:
+            now = time.monotonic()
+            best = None
+            for position, endpoint in enumerate(spec.endpoints):
+                if budgets[endpoint] <= 0:
+                    continue
+                wait = max(self._failing_until[endpoint.label] - now,
+                           global_pause_manager.pause_remaining(endpoint.provider, now), 0.0)
+                if wait > 0:
+                    rank = (1, failures[endpoint], wait, position)
+                elif spec.routing == "failover":
+                    rank = (0, failures[endpoint], position)
+                else:
+                    weight = endpoint.weight
+                    rank = (0, failures[endpoint], self._in_flight[endpoint.label] / weight,
+                            self._served[endpoint.label] / weight, position)
+                if best is None or rank < best[0]:
+                    best = (rank, endpoint, wait)
+            if best is None:
+                return None
+            _, endpoint, wait = best
+            self._in_flight[endpoint.label] += 1
+            self._served[endpoint.label] += 1
+            return endpoint, wait
+
+    def _release(self, endpoint: PoolEndpoint, succeeded: bool) -> None:
+        with self._lock:
+            self._in_flight[endpoint.label] -= 1
+            if succeeded:
+                self._failing_until.pop(endpoint.label, None)
+            else:
+                self._failing_until[endpoint.label] = time.monotonic() + _retry_delay(
+                    self.config, endpoint.provider, endpoint.model
+                )
+
+    def generate_content(self, prompt: str, model_name: Optional[str] = None, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
+        """Send through one endpoint; ``model_name`` is this pool's label and is not used."""
+        caller_loc = _get_api_caller_location()
+        spec = self.spec()
+        budgets = {endpoint: _max_attempts(self.config, endpoint.provider, endpoint.model) for endpoint in spec.endpoints}
+        max_attempts = sum(budgets.values())
+        failures: Dict[PoolEndpoint, int] = defaultdict(int)
+        attempt = 0
+        last: Optional[APIResponse] = None
+        last_endpoint = spec.endpoints[0]
+
+        def finish(response: APIResponse, endpoint: PoolEndpoint) -> APIResponse:
+            detail = _exception_line(response.get("error_message"))
+            tprint(f"[API ERROR] {self.label}: final failure after {attempt} attempt(s). "
+                   f"Type: {response.get('error_type') or response.get('status')} @ {caller_loc}: {detail}", level="ERROR")
+            return _record_final_failure(response, endpoint.provider, endpoint.model, caller_loc)
+
+        while True:
+            if api_deadline_due(self.config):
+                return finish(_deadline_error(), last_endpoint)
+            picked = self._pick(spec, budgets, failures)
+            if picked is None:
+                break
+            endpoint, wait = picked
+            succeeded = False
+            try:
+                remaining = remaining_api_seconds(self.config)
+                if remaining is not None:
+                    wait = min(wait, max(0.0, remaining))
+                if wait > 0:
+                    time.sleep(wait)
+                attempt += 1
+                budgets[endpoint] -= 1
+                token = _pool_attempt.set(_PoolAttempt(self.name, attempt, max_attempts))
+                try:
+                    # A failed attempt here is not the call's final failure.
+                    with track_api_failures():
+                        response = self._member(endpoint).generate_content(
+                            prompt, endpoint.model, temperature, avalai_role=avalai_role
+                        )
+                finally:
+                    _pool_attempt.reset(token)
+                succeeded = response.get("status") == "SUCCESS"
+            finally:
+                self._release(endpoint, succeeded)
+            meta = response.get("request_meta")
+            if not isinstance(meta, dict):
+                meta = response["request_meta"] = {}
+            meta.setdefault("provider", endpoint.provider)
+            meta.setdefault("model", endpoint.model)
+            meta["pool"] = self.name
+            if succeeded:
+                return response
+            last, last_endpoint = response, endpoint
+            failures[endpoint] += 1
+            error_type = response.get("error_type") or response.get("status")
+            if error_type in ("SessionDeadline", "BatchRefused"):
+                return finish(response, endpoint)  # Retrying elsewhere cannot help.
+            if not _is_retryable(error_type, self.config):
+                budgets[endpoint] = 0  # This endpoint cannot serve this call.
+
+        response = last or {"status": "ERROR", "text": None, "error_type": "RetryError",
+                            "error_message": f"{self.label} has no endpoint to call."}
+        response["retry_exhausted"] = True
+        return finish(response, last_endpoint)
+
+
+def attach_provider_pools(
+    api_managers: Dict[str, Any],
+    global_config: Dict[str, Any],
+    experiment_configs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Add a ProviderPool to ``api_managers`` for every pool a role selects.
+
+    Validates each used pool and checks that a manager exists for each of its
+    providers. The dict is changed in place (and returned), so every later
+    lookup by pool name finds the pool. Calling it again is harmless.
+    """
+    providers = SUPPORTED_API_PROVIDERS
+    for overrides in experiment_configs or [{}]:
+        config = {**global_config, **overrides}
+        name = config.get("experiment_name", "unnamed_experiment")
+        try:
+            specs = validate_provider_pools(config, providers)
+        except ValueError as error:
+            raise ValueError(f"Experiment {name!r}: {error}") from None
+        for spec in specs:
+            existing = api_managers.get(spec.name)
+            if existing is not None and not isinstance(existing, ProviderPool):
+                raise ValueError(f"Pool {spec.name!r} has the name of an initialized API manager.")
+            missing = sorted({endpoint.provider for endpoint in spec.endpoints
+                              if isinstance(api_managers.get(endpoint.provider), (type(None), ProviderPool))})
+            if missing:
+                raise ValueError(
+                    f"Experiment {name!r}: pool {spec.name!r} uses provider(s) {missing} that have "
+                    f"no API manager (initialized: {sorted(k for k, v in api_managers.items() if not isinstance(v, ProviderPool))}). "
+                    "Create a manager for every provider a pool lists."
+                )
+            if existing is None:
+                api_managers[spec.name] = ProviderPool(spec.name, api_managers, global_config)
+    return api_managers

@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from src.api_routing import POOLS_KEY, config_uses_provider
+
 
 MANIFEST_SCHEMA_VERSION = 2
 STATUS_SCHEMA_VERSION = 1
@@ -277,7 +279,8 @@ _RUNTIME_EXACT = {
     "MIN_TIME_BETWEEN_API_CALLS_SECONDS", "HF_HUB_USERNAME", "HF_HUB_REPO_NAME",
     "GLOBAL_API_CALL_DELAY_SECONDS", "GLOBAL_CONSECUTIVE_ERROR_LIMIT",
     "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS", "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES",
-    "GLOBAL_PERIODIC_PAUSE_DURATION_SECONDS", "OFFLINE_MODE", "HARD_QUESTIONS_LENGTH",
+    "GLOBAL_PERIODIC_PAUSE_DURATION_SECONDS", "API_MAX_CONCURRENT_CALLS",
+    "OFFLINE_MODE", "HARD_QUESTIONS_LENGTH",
     "OPENROUTER_BASE_URL", "OPENROUTER_HTTP_REFERER", "OPENROUTER_APP_TITLE",
 }
 
@@ -303,14 +306,10 @@ def sanitize_scientific_config(value: Any) -> Any:
     """Return canonical JSON-safe scientific settings for manifest hashing."""
     if isinstance(value, Mapping):
         is_experiment_config = any(str(key).startswith("API_PROVIDER_") for key in value)
-        uses_openrouter = any(
-            str(key).startswith("API_PROVIDER_") and provider == "openrouter"
-            for key, provider in value.items()
-        )
-        uses_kaggle = any(
-            str(key).startswith("API_PROVIDER_") and provider == "kaggle"
-            for key, provider in value.items()
-        )
+        # A provider counts as used when a role selects it directly or
+        # through a pool (API_PROVIDER_POOLS).
+        uses_openrouter = config_uses_provider(value, "openrouter")
+        uses_kaggle = config_uses_provider(value, "kaggle")
         return {
             str(key): sanitize_scientific_config(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
@@ -321,6 +320,8 @@ def sanitize_scientific_config(value: Any) -> Any:
                 str(key) in INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS
                 and item is None
             )
+            # No pools behaves exactly as before the setting existed.
+            and not (str(key) == POOLS_KEY and not item)
         }
     if isinstance(value, (list, tuple)):
         return [sanitize_scientific_config(item) for item in value]
@@ -355,10 +356,7 @@ def record_avalai_model_provenance(
     history = run_log.setdefault("avalai_model_config_history", [])
     if isinstance(history, list) and (not history or history[-1] != record):
         history.append(record)
-    if any(config.get(key) == "openrouter" for key in (
-        "API_PROVIDER_ADAPTATION", "API_PROVIDER_SOLVER",
-        "API_PROVIDER_EVALUATOR", "API_PROVIDER_SIMPLIFICATION",
-    )):
+    if config_uses_provider(config, "openrouter"):
         openrouter_models = active_openrouter_models(config)
         if isinstance(flags, dict):
             flags.update(openrouter_models)
@@ -928,12 +926,8 @@ def write_worker_status(
     payload["model_rotation"] = {
         "enabled": True,
         "active_avalai_models": active_avalai_models(config),
-        "active_openrouter_models": active_openrouter_models(config) if any(
-            config.get(key) == "openrouter" for key in (
-                "API_PROVIDER_ADAPTATION", "API_PROVIDER_SOLVER",
-                "API_PROVIDER_EVALUATOR", "API_PROVIDER_SIMPLIFICATION",
-            )
-        ) else {},
+        "active_openrouter_models": active_openrouter_models(config)
+        if config_uses_provider(config, "openrouter") else {},
         "runtime_code_fingerprint": config.get("_DISTRIBUTED_RUNTIME_CODE_FINGERPRINT"),
     }
     accepted_code_change = config.get("_DISTRIBUTED_WORKER_CODE_CHANGE")

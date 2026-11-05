@@ -25,10 +25,21 @@ CONFIG = {
     "OFFLINE_MODE": True,  # Set to False for Kaggle/online execution
     
     # Logging & Control
-    "PRINT_API_CALL_DETAILS": True,  
-    "ENABLE_API_RETRY": True,          
-    "MAX_API_RETRIES": 200,  # Maximum total attempts per API call, including the first.
-    "API_RETRY_DELAY_SECONDS": 20.0,
+    "PRINT_API_CALL_DETAILS": True,
+    # Per-provider / per-model limits. Each setting marked [scoped] takes a
+    # plain number, which applies to every provider (each provider counted on
+    # its own, so two providers never wait for each other), or a dict that
+    # refines it; the most specific entry wins:
+    #   5.0                                              every provider
+    #   {"gemini": 5.0, "kaggle": 0.0, "default": 1.0}   per provider, rest 1.0
+    #   {"openrouter": {"default": 1.0, "openai/gpt-4o-mini": 3.0}}
+    #                                                    per model of a provider
+    # A model with its own entry is limited on its own; a provider's other
+    # models share the provider's limit. [scoped/provider] settings accept
+    # provider entries only. Unknown provider names stop the run before it starts.
+    "ENABLE_API_RETRY": True,
+    "MAX_API_RETRIES": 200,  # [scoped] Maximum total attempts per API call, including the first.
+    "API_RETRY_DELAY_SECONDS": 20.0,  # [scoped]
     "RETRY_ALL_API_ERRORS": True,  # Retry API failures except terminal request/auth/payment errors and local deadlines.
     "API_RESPONSE_TRUNCATION_LENGTH": 70,
     # Batch execution is intentionally opt-in until quotas are configured and
@@ -103,14 +114,20 @@ CONFIG = {
     "API_BATCH_POLL_SECONDS": 10.0,         # OpenRouter batch status polling interval
     "API_BATCH_TIMEOUT_SECONDS": 1800.0,    # A batch still unfinished after this fails its requests (they retry)
     "API_BATCH_KAGGLE_N_JOBS": 5,           # Concurrent workers inside one Kaggle Benchmarks batch
-    "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,
-    "API_REQUEST_TIMEOUT_SECONDS": 60.0,    # Per request, every provider (Kaggle proxy too); a Kaggle batch row gets at most twice this
-    "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 1,            # N: Number of consecutive errors to trigger a pause (0 to disable)
-    "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 10.0,  # M: Seconds to sleep when the error limit is reached
-    "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES": 30.0,  # X: Pause every X minutes (0 to disable)
+    "API_KEY_ERROR_COOLDOWN_SECONDS": 20.0,  # [scoped]
+    "API_REQUEST_TIMEOUT_SECONDS": 60.0,    # [scoped/provider] Per request (Kaggle proxy too); a Kaggle batch row gets at most twice this
+    # Error backoff is per provider: N consecutive errors from one provider
+    # pause that provider's new calls only.
+    "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 1,            # [scoped/provider] N: Number of consecutive errors to trigger a pause (0 to disable)
+    "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 10.0,  # [scoped/provider] M: Seconds that provider pauses when the limit is reached
+    "GLOBAL_PERIODIC_PAUSE_INTERVAL_MINUTES": 30.0,  # X: Pause every API call every X minutes (0 to disable)
     "GLOBAL_PERIODIC_PAUSE_DURATION_SECONDS": 10.0,  # Y: Seconds to sleep during the break
     "ENABLE_MIN_TIME_BETWEEN_API_CALLS": True,      # Master switch: Set to True to enforce minimum time between calls
-    "MIN_TIME_BETWEEN_API_CALLS_SECONDS": 0.5,       # Minimum seconds between consecutive API calls to the same provider
+    "MIN_TIME_BETWEEN_API_CALLS_SECONDS": 0.5,       # Floor under every GLOBAL_API_CALL_DELAY_SECONDS gap
+    # [scoped] Requests in flight at once per provider (or per model with its
+    # own entry). None or 0 = no limit. Provider batches are governed by
+    # API_BATCH_MAX_CONCURRENT_BATCHES instead.
+    "API_MAX_CONCURRENT_CALLS": None,
     "BASE_OUTPUT_DIR": BASE_OUTPUT_DIR,
     "DATA_DIR": DATA_DIR,
     "LOGS_DIR": LOGS_DIR,
@@ -118,11 +135,24 @@ CONFIG = {
     "RESULTS_DIR": RESULTS_DIR,
     "EMBEDDINGS_DIR": EMBEDDINGS_DIR,
 
-    # API Provider Selection
+    # API Provider Selection. Each role names a provider, or a pool below.
     "API_PROVIDER_ADAPTATION": "gemini",
     "API_PROVIDER_SOLVER": "gemini",
     "API_PROVIDER_EVALUATOR": "gemini",
     "API_PROVIDER_SIMPLIFICATION": "gemini",
+    # Provider pools: one role served by several (provider, model) endpoints.
+    # Select a pool by name, e.g. "API_PROVIDER_EVALUATOR": "judges". Each call
+    # goes to one endpoint through its provider's own manager (keys, quotas,
+    # gaps, batching); a failed attempt is retried on another endpoint first.
+    # routing "spread" (default) balances calls by weight and calls in flight;
+    # "failover" uses the first endpoint and the next only while it fails.
+    # A pool may also be the bare endpoint list. Logs name the pool as the
+    # model ("pool:judges"); each response's request_meta names the endpoint.
+    #   "judges": {"routing": "spread", "endpoints": [
+    #       {"provider": "gemini", "model": "models/gemma-3-27b-it"},
+    #       {"provider": "openrouter", "model": "openai/gpt-4o-mini", "weight": 2},
+    #   ]},
+    "API_PROVIDER_POOLS": {},
 
     # Gemini API Settings
     "GEMINI_API_KEYS": [
@@ -134,7 +164,8 @@ CONFIG = {
     "GEMINI_MODEL_QUOTAS": {
         "models/gemma-3-27b-it": [{"api_key": None, "rpm": 30, "rpd": 1000}],
     },
-    # Minimum time between outgoing calls to each provider (0 disables this delay).
+    # [scoped] Minimum time between outgoing calls to each provider (0 disables
+    # this delay), e.g. {"openrouter": {"default": 5.0, "author/model": 1.0}}.
     "GLOBAL_API_CALL_DELAY_SECONDS": {"gemini": 5.0, "avalai": 5.0, "openrouter": 5.0, "kaggle": 0.0, "ollama": 0.0},
 
     "GEMINI_MODEL_NAME_ADAPTATION": "models/gemma-3-27b-it",

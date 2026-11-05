@@ -9,7 +9,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from src import api_manager
+from src import api_manager, api_routing
 from src.distributed_execution import (
     DistributedManifestMismatch,
     build_run_manifest,
@@ -216,6 +216,9 @@ class OpenRouterProviderTests(unittest.TestCase):
             ),
             "_usable_notebook_credential": lambda value: bool(value) and "YOUR_" not in str(value),
             "OpenRouterAPIManager": api_manager.OpenRouterAPIManager,
+            "attach_provider_pools": api_manager.attach_provider_pools,
+            "is_pool": api_routing.is_pool,
+            "providers_in_use": api_routing.providers_in_use,
             "startup_progress": lambda message: None,
             "logger": logging.getLogger("openrouter-test"),
         }

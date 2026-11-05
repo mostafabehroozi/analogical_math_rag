@@ -113,9 +113,11 @@ def test_a_call_no_key_could_take_does_not_pause_every_api_call():
     config = {**NO_RETRY, "GLOBAL_CONSECUTIVE_ERROR_LIMIT": 1, "GLOBAL_CONSECUTIVE_ERROR_PAUSE_SECONDS": 600}
     with patch.object(api_manager, "global_pause_manager", pause):
         failing_call(config)
-        assert pause._pause_until == 0.0
+        assert pause.pause_remaining("kaggle") == 0.0
         failing_call(config, {"status": "ERROR", "error_type": "APIConnectionError", "error_message": "down"})
-        assert pause._pause_until > 0.0
+        assert pause.pause_remaining("kaggle") > 0.0
+        # The backoff pauses the failing provider only.
+        assert pause.pause_remaining("openrouter") == 0.0
 
 
 def _coordinator(**overrides):

@@ -47,7 +47,7 @@ def _result_completed(result: Dict[str, Any]) -> bool:
 
 def _model_name(manager: Any, config: Dict[str, Any], role: str) -> str:
     """Resolve a model name while retaining support for lightweight test managers."""
-    if getattr(manager, "provider_name", None) in SUPPORTED_API_PROVIDERS:
+    if getattr(manager, "provider_name", None) in SUPPORTED_API_PROVIDERS | {"pool"}:
         return model_name_for(manager, config, role)
     # Lightweight test managers do not always expose provider_name.
     provider = config.get(f"API_PROVIDER_{'SOLVER' if role == 'solver' else role.upper()}", "gemini")
