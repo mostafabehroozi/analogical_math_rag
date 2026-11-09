@@ -3,9 +3,11 @@
 This is deliberately separate from :mod:`src.layer1_base_execution`, whose
 candidate set downstream readers (Layer 2, the adaptive pipeline) expect to hold
 only zero- and one-shot candidates.  It never calculates evaluator baselines; a
-run that also enables Layer 1 has them there.  For a retrieval set of size K and
+run that also enables Layer 1 has them there.  Groups are drawn from the
+``N = min(LAYER1_GROUPING_TOP_N, K)`` retrieved samples most similar to the
+target (``N = K`` when the limit is None).  For a retrieval set of size K and
 configured group sizes S, its generation cost is
-``G = sum(comb(K, s) for s in S)`` solver calls plus the same number of
+``G = sum(comb(N, s) for s in S)`` solver calls plus the same number of
 target-answer evaluations.  With ``LAYER1_GROUPING_MIRROR_EVALUATION`` every
 group candidate is also cross-evaluated exactly like a Layer-1 candidate
 (Step D: every retrieved sample as evaluator, ``MIRROR_N_OPTIMIZATION`` runs
@@ -48,8 +50,9 @@ def normalize_group_sizes(value: Any, retrieved_count: int) -> List[int]:
         size = int(raw_size)
         if size < 2 or size > retrieved_count:
             raise ValueError(
-                "Every LAYER1_GROUP_SIZES entry must be between 2 and the "
-                f"available retrieved-sample count ({retrieved_count}); got {size}."
+                "Every LAYER1_GROUP_SIZES entry must be between 2 and the number "
+                "of samples groups are drawn from (the retrieved count, or "
+                f"LAYER1_GROUPING_TOP_N when smaller: {retrieved_count}); got {size}."
             )
         if size not in normalized:
             normalized.append(size)
@@ -58,11 +61,52 @@ def normalize_group_sizes(value: Any, retrieved_count: int) -> List[int]:
     return sorted(normalized)
 
 
+def select_grouping_pool(
+    retrieved_set: Sequence[Dict[str, Any]], top_n: Any = None
+) -> List[int]:
+    """Retrieval positions of the samples that groups are drawn from.
+
+    ``top_n`` (``LAYER1_GROUPING_TOP_N``) keeps only the ``top_n`` samples most
+    similar to the target question (highest similarity score, earlier retrieval
+    position on ties); ``None`` keeps every retrieved sample, as does a value
+    above the retrieved count.  The positions are returned in retrieval order and
+    still index the full retrieved set, so candidate ids and evaluators are
+    unchanged by the limit.
+    """
+    count = len(retrieved_set)
+    if top_n is None:
+        return list(range(count))
+    if isinstance(top_n, bool) or not isinstance(top_n, (int, np.integer)):
+        raise ValueError("LAYER1_GROUPING_TOP_N must be None or an integer.")
+    if int(top_n) < 2:
+        raise ValueError(
+            f"LAYER1_GROUPING_TOP_N must be at least 2 (a group has two or more "
+            f"samples); got {top_n}."
+        )
+    ranked = sorted(
+        range(count),
+        key=lambda position: (
+            -float(retrieved_set[position].get("similarity_score") or 0.0),
+            position,
+        ),
+    )
+    return sorted(ranked[: int(top_n)])
+
+
 def enumerate_retrieval_groups(
-    retrieved_set: Sequence[Dict[str, Any]], group_sizes: Sequence[int]
+    retrieved_set: Sequence[Dict[str, Any]],
+    group_sizes: Sequence[int],
+    pool_positions: Optional[Sequence[int]] = None,
 ) -> List[Tuple[int, ...]]:
-    """Return every position-based combination in deterministic order."""
-    positions = range(len(retrieved_set))
+    """Return every position-based combination in deterministic order.
+
+    ``pool_positions`` (see :func:`select_grouping_pool`) restricts the
+    combinations to those retrieval positions; by default every retrieved
+    sample is used.
+    """
+    positions = (
+        range(len(retrieved_set)) if pool_positions is None else sorted(pool_positions)
+    )
     return [
         combination
         for size in group_sizes
@@ -195,6 +239,7 @@ def run_layer1_grouping(
                     "TOP_N_CANDIDATES_RETRIEVAL", 5
                 ),
                 "LAYER1_GROUP_SIZES": list(config.get("LAYER1_GROUP_SIZES", [2])),
+                "LAYER1_GROUPING_TOP_N": config.get("LAYER1_GROUPING_TOP_N"),
                 "LAYER1_GROUPING_PROMPT_TEMPLATE": config.get(
                     "LAYER1_GROUPING_PROMPT_TEMPLATE", "layer1_grouping_solver_v1"
                 ),
@@ -256,10 +301,21 @@ def run_layer1_grouping(
             state["step_statuses"]["retrieval"] = "REUSED"
 
         state["retrieved_set"] = active_retrieved_set
-        group_sizes = normalize_group_sizes(
-            config.get("LAYER1_GROUP_SIZES", [2]), len(active_retrieved_set)
+        # Groups come from the LAYER1_GROUPING_TOP_N nearest samples only; the
+        # whole retrieved set stays the evaluator set for mirror evaluation.
+        pool_positions = select_grouping_pool(
+            active_retrieved_set, config.get("LAYER1_GROUPING_TOP_N")
         )
-        combinations = enumerate_retrieval_groups(active_retrieved_set, group_sizes)
+        group_sizes = normalize_group_sizes(
+            config.get("LAYER1_GROUP_SIZES", [2]), len(pool_positions)
+        )
+        combinations = enumerate_retrieval_groups(
+            active_retrieved_set, group_sizes, pool_positions
+        )
+        state["metadata"]["grouping_pool_positions"] = pool_positions
+        state["metadata"]["grouping_pool_corpus_indices"] = [
+            active_retrieved_set[position]["corpus_index"] for position in pool_positions
+        ]
         state["metadata"]["effective_group_sizes"] = group_sizes
         state["metadata"]["expected_candidate_count"] = len(combinations)
 
@@ -406,4 +462,5 @@ __all__ = [
     "enumerate_retrieval_groups",
     "normalize_group_sizes",
     "run_layer1_grouping",
+    "select_grouping_pool",
 ]

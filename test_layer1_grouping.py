@@ -147,6 +147,39 @@ class GroupCandidateTests(unittest.TestCase):
         self.assertNotIn("cross_evaluation", state["step_statuses"])
         self.assertEqual(len(self.solver.calls), 10)
 
+    def test_top_n_limits_the_pairs_to_the_nearest_samples(self):
+        state = self.group(LAYER1_GROUPING_TOP_N=3)
+        self.assertEqual(state["overall_status"], "SUCCESS")
+        candidates = state["candidate_set"]
+        self.assertEqual(set(candidates), {"group_s2_p0-1", "group_s2_p0-2", "group_s2_p1-2"})
+        self.assertEqual(candidates["group_s2_p1-2"]["source_exemplar_indices"], [2, 0])
+        metadata = state["metadata"]
+        self.assertEqual(metadata["grouping_pool_positions"], [0, 1, 2])
+        self.assertEqual(metadata["grouping_pool_corpus_indices"], [4, 2, 0])
+        self.assertEqual(metadata["expected_candidate_count"], 3)
+        self.assertEqual(metadata["config_snapshot"]["LAYER1_GROUPING_TOP_N"], 3)
+        # The whole retrieved set stays the evaluator set.
+        self.assertEqual(len(state["retrieved_set"]), 5)
+        for row in state["cross_evaluation_matrix"].values():
+            self.assertEqual(row, {index: 1.0 for index in RETRIEVED})
+        self.assertEqual(len(self.solver.calls), 3 + 3 * 5 * 2)
+        self.assertEqual(len(state["ground_truth_labels"]), 3)
+
+    def test_top_n_ranks_by_similarity_and_keeps_all_when_large(self):
+        shuffled = [dict(row) for row in RETRIEVED_SET]
+        shuffled[0]["similarity_score"], shuffled[4]["similarity_score"] = 0.5, 0.9
+        self.assertEqual(layer1_grouping.select_grouping_pool(shuffled, 2), [1, 4])
+        self.assertEqual(layer1_grouping.select_grouping_pool(RETRIEVED_SET, None), [0, 1, 2, 3, 4])
+        self.assertEqual(layer1_grouping.select_grouping_pool(RETRIEVED_SET, 9), [0, 1, 2, 3, 4])
+        for bad in (1, 0, True, "3"):
+            with self.assertRaises(ValueError):
+                layer1_grouping.select_grouping_pool(RETRIEVED_SET, bad)
+        # A group larger than the pool is a configuration error.
+        state = self.group(LAYER1_GROUPING_TOP_N=2, LAYER1_GROUP_SIZES=[3])
+        self.assertEqual(state["overall_status"], "FAILURE")
+        self.assertIn("LAYER1_GROUPING_TOP_N", state["error"])
+        self.assertEqual(self.solver.calls, [])
+
     def test_a_failed_cross_evaluation_leaves_a_partial_state(self):
         with patch.object(pipeline_steps, "_evaluate_mirror_consistency",
                           side_effect=RuntimeError("proxy down")):
@@ -205,6 +238,7 @@ class CombinedExperimentTests(unittest.TestCase):
         self.assertEqual(flags["LAYER1_ZERO_SHOT_CANDIDATES_N"], 3)
         self.assertEqual(flags["MIRROR_N_OPTIMIZATION"], 2)
         self.assertTrue(flags["LAYER1_GROUPING_MIRROR_EVALUATION"])
+        self.assertIn("LAYER1_GROUPING_TOP_N", flags)
 
 
 class IncompleteGroupingIsRetriedTests(unittest.TestCase):

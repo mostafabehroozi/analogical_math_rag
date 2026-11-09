@@ -349,6 +349,12 @@ CONFIG = {
     "APPLY_LAYER1_GROUPING": False,
     "LAYER1_GROUPING_ONLY_MODE": False,
     "LAYER1_GROUP_SIZES": [2],
+    # Draw groups only from the N retrieved samples most similar to the target
+    # (e.g. 3 with sizes [2] -> the 3 pairs of the top 3 instead of all 10 pairs
+    # of the top 5). None = every retrieved sample. Retrieval, the one-shot
+    # candidates and the mirror evaluators still use all TOP_N_CANDIDATES_RETRIEVAL
+    # samples. Every LAYER1_GROUP_SIZES entry must be <= N.
+    "LAYER1_GROUPING_TOP_N": None,
     # "mirror_hypothesis_gen_multi_shot_v1" = the one-shot candidates' prompt
     # with k examples (the default is the earlier companion runs' prompt).
     "LAYER1_GROUPING_PROMPT_TEMPLATE": "layer1_grouping_solver_v1",

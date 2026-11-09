@@ -230,6 +230,15 @@ evaluation call for every configured combination. For example, K=5 and sizes
 baseline calls, and without `LAYER1_GROUPING_MIRROR_EVALUATION` it runs no
 candidate-conditioned CCS calls either.
 
+`LAYER1_GROUPING_TOP_N` limits the groups to the N retrieved samples most
+similar to the target question (default `None` = all K). With K=5,
+`LAYER1_GROUP_SIZES: [2]` and `LAYER1_GROUPING_TOP_N: 3`, only the 3 pairs of
+the 3 nearest samples are made instead of all 10 pairs. Retrieval, the one-shot
+candidates and the mirror evaluators still use all K samples, and candidate ids
+keep their positions in the full retrieved set (`group_s2_p0-1`, `p0-2`, `p1-2`).
+The state's metadata lists the pool in `grouping_pool_positions` and
+`grouping_pool_corpus_indices`. Every group size must be at most N.
+
 ### Few-shot candidates beside the zero- and one-shot candidates
 
 To measure 2-shot (or larger) candidates in the same experiment as the zero-
