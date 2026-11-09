@@ -93,8 +93,35 @@ experiment_configurations[0]["API_PROVIDER_SOLVER"] = "kaggle"
 experiment_configurations[0]["API_PROVIDER_EVALUATOR"] = "kaggle"
 ```
 
-`KAGGLE_REASONING_EFFORT` (and its per-role overrides) accepts `"none"`,
-`"low"`, `"medium"` or `"high"`. The library currently drops `temperature`
+Every Kaggle call sends a reasoning effort through `llm.prompt(reasoning=...)`.
+The Kaggle model proxy maps it onto the model's backend: OpenAI
+`reasoning_effort`, Anthropic extended thinking, Gemini thinking (`"none"` is a
+thinking budget of 0). `KAGGLE_REASONING_EFFORT` defaults to `"none"` (no
+reasoning) and accepts `"none"`, `"low"`, `"medium"`, `"high"` for every
+backend, `"minimal"`, `"xhigh"` and `"max"` for OpenAI models that support
+them, and `"default"` (or `None`) to send nothing so the model's own default
+applies. The first setting that is not `None` wins:
+
+1. `KAGGLE_REASONING_EFFORT_BY_MODEL`: a full model name, then the longest
+   provider prefix ending in `/`;
+2. the role's `KAGGLE_REASONING_EFFORT_ADAPTATION` / `_FINAL_SOLVER` /
+   `_EVALUATOR`;
+3. `KAGGLE_REASONING_EFFORT`.
+
+```python
+CONFIG["KAGGLE_REASONING_EFFORT"] = "none"          # every role, every model
+CONFIG["KAGGLE_REASONING_EFFORT_BY_MODEL"] = {
+    "openai/gpt-6-luna": "none",
+    "anthropic/": "low",                            # every Claude model
+    "openai/o3": "default",                         # rejects "none"
+}
+```
+
+Older OpenAI models (o-series, GPT-5 before 5.1) and Gemini 2.5 Pro reject
+`"none"`; give them `"default"` or a level in the per-model map. A malformed
+value stops the run at the preflight. A distributed run started before
+`"none"` became the default resumes only with `KAGGLE_REASONING_EFFORT=None`.
+The library currently drops `temperature`
 for proxy models, so sampled attempts (Pass@N) use the model default.
 `KAGGLE_MODEL_QUOTAS` paces requests (default 60 per minute).
 

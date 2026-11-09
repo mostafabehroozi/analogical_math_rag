@@ -58,8 +58,11 @@ from src.api_batching import (
 )
 from src.api_manager import (
     SUPPORTED_API_PROVIDERS, attach_provider_pools, bind_api_managers, model_name_for,
+    validate_kaggle_reasoning,
 )
-from src.api_routing import is_pool, pool_spec, role_provider, validate_scoped_settings
+from src.api_routing import (
+    config_uses_provider, is_pool, pool_spec, role_provider, validate_scoped_settings,
+)
 from src.distributed_code_compatibility import (
     WORKER_CODE_CHANGE_STATE_KEY,
     accept_worker_code_change,
@@ -377,6 +380,8 @@ def _check_api_routing(
         name = config.get("experiment_name", "unnamed_experiment")
         try:
             validate_scoped_settings(config, SUPPORTED_API_PROVIDERS)
+            if config_uses_provider(config, "kaggle"):
+                validate_kaggle_reasoning(config)
         except ValueError as error:
             raise ValueError(f"Experiment {name!r}: {error}") from None
         for role, _ in _BATCHABLE_ROLES:
@@ -950,7 +955,10 @@ def run_pipeline_for_single_query(
                     "OPENROUTER_REASONING_EFFORT_EVALUATOR",
                     "KAGGLE_MODEL_NAME_ADAPTATION", "KAGGLE_MODEL_NAME_FINAL_SOLVER",
                     "KAGGLE_MODEL_NAME_EVALUATOR", "KAGGLE_MODEL_NAME_SIMPLIFICATION",
-                    "KAGGLE_REASONING_EFFORT", "AVALAI_REASONING_EFFORT",
+                    "KAGGLE_REASONING_EFFORT", "KAGGLE_REASONING_EFFORT_BY_MODEL",
+                    "KAGGLE_REASONING_EFFORT_ADAPTATION", "KAGGLE_REASONING_EFFORT_FINAL_SOLVER",
+                    "KAGGLE_REASONING_EFFORT_EVALUATOR",
+                    "AVALAI_REASONING_EFFORT",
                     # Layer 1 Flags (a generation retry rebuilds the experiment from these)
                     "APPLY_LAYER1_BASE_EXECUTION", "LAYER1_ONLY_MODE", "LAYER1_CACHE_DIR",
                     "LAYER1_N_CANDIDATES", "LAYER1_ONE_SHOT_CANDIDATES_N", "LAYER1_DATASET_NAME",

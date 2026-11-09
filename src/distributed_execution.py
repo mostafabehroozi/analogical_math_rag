@@ -53,6 +53,12 @@ INHERITED_NONE_SCIENTIFIC_CONFIG_KEYS = frozenset({
     "KAGGLE_REASONING_EFFORT_FINAL_SOLVER",
     "KAGGLE_REASONING_EFFORT_EVALUATOR",
 })
+# Settings added later whose default (None or an empty dict) behaves exactly
+# like the setting being absent, so manifests written before them still match.
+ABSENT_WHEN_EMPTY_CONFIG_KEYS = frozenset({
+    "LAYER1_GROUPING_TOP_N",
+    "KAGGLE_REASONING_EFFORT_BY_MODEL",
+})
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WINDOWS_RESERVED_NAMES = {
@@ -322,6 +328,8 @@ def sanitize_scientific_config(value: Any) -> Any:
             )
             # No pools behaves exactly as before the setting existed.
             and not (str(key) == POOLS_KEY and not item)
+            # Settings whose empty default behaves exactly as before they existed.
+            and not (str(key) in ABSENT_WHEN_EMPTY_CONFIG_KEYS and item in (None, {}))
         }
     if isinstance(value, (list, tuple)):
         return [sanitize_scientific_config(item) for item in value]

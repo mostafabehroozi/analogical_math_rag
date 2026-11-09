@@ -205,6 +205,42 @@ class KaggleBenchmarksTests(_Quiet):
         self.assertEqual(results[2]["text"], "answer:c")
         self.assertTrue(all(("low" == options["reasoning"]) for _, options in self.state["prompts"]))
 
+    def test_reasoning_effort_precedence_is_model_then_role_then_global(self):
+        effort = api_manager.kaggle_reasoning_effort
+        by_model = {"openai/gpt-6-luna": "none", "openai/": "low", "anthropic/": "HIGH ",
+                    "openai/o3": "default"}
+        config = {"KAGGLE_REASONING_EFFORT": "medium", "KAGGLE_REASONING_EFFORT_EVALUATOR": "xhigh",
+                  "KAGGLE_REASONING_EFFORT_BY_MODEL": by_model}
+        self.assertEqual(effort(config, "openai/gpt-6-luna", "evaluator"), "none")
+        self.assertEqual(effort(config, "openai/gpt-6-sol", "evaluator"), "low")    # provider prefix
+        self.assertEqual(effort(config, "anthropic/claude-x", None), "high")        # normalized
+        self.assertIsNone(effort(config, "openai/o3", "final_solver"))              # model default
+        self.assertEqual(effort(config, "google/gemini-2.5-flash", "evaluator"), "xhigh")
+        self.assertEqual(effort(config, "google/gemini-2.5-flash", "final_solver"), "medium")
+        # The shipped default: "none" for every role and model; None sends nothing.
+        from config import CONFIG
+        self.assertEqual(effort(CONFIG, "openai/gpt-6-luna", "final_solver"), "none")
+        self.assertIsNone(effort({"KAGGLE_REASONING_EFFORT": None}, "m", "evaluator"))
+        self.assertIsNone(effort({"KAGGLE_REASONING_EFFORT": "none",
+                                  "KAGGLE_REASONING_EFFORT_ADAPTATION": "default"}, "m", "adaptation"))
+        for bad in ({"KAGGLE_REASONING_EFFORT": "off"},
+                    {"KAGGLE_REASONING_EFFORT_BY_MODEL": {"openai/": "extreme"}},
+                    {"KAGGLE_REASONING_EFFORT_BY_MODEL": ["openai/"]}):
+            with self.assertRaisesRegex(ValueError, "KAGGLE_REASONING_EFFORT"):
+                api_manager.validate_kaggle_reasoning(bad)
+
+    def test_per_model_effort_reaches_direct_and_batched_calls(self):
+        config = {**self.config, "KAGGLE_REASONING_EFFORT_BY_MODEL": {"google/": "default"}}
+        manager = api_manager.KaggleBenchmarksAPIManager({"default": {"rpm": 1000}}, config)
+        manager.generate_content("q", "google/gemini-2.5-flash", avalai_role="evaluator")
+        self.assertEqual(self.state["prompts"], [("q", {})])
+        config["KAGGLE_REASONING_EFFORT_BY_MODEL"] = {"google/gemini-2.5-flash": "high"}
+        bound = manager.for_config({**config, "API_BATCHING_ENABLED": True})
+        concurrently(*[(lambda prompt=prompt: bound.generate_content(prompt, "google/gemini-2.5-flash"))
+                       for prompt in ("a", "c")])
+        self.assertEqual([options for _, options in self.state["prompts"][1:]],
+                         [{"reasoning": "high"}, {"reasoning": "high"}])
+
     def test_unconfigured_proxy_fails_at_setup(self):
         self.kbench.kaggle.is_configured = lambda: False
         with self.assertRaisesRegex(RuntimeError, "MODEL_PROXY_URL"):

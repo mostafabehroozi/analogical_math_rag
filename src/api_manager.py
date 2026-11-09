@@ -21,7 +21,7 @@ import copy
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Deque, Dict, Hashable, Iterator, List, Optional, Tuple, TypedDict, Union
+from typing import Any, Callable, Deque, Dict, Hashable, Iterator, List, Mapping, Optional, Tuple, TypedDict, Union
 from src.api_batching import (
     APIBatchDispatcher, BatchItem, BatchSettings, batch_refusals, batching_enabled,
     batching_setting, fallback_to_direct,
@@ -1320,6 +1320,82 @@ def _kaggle_error_type(message: str) -> str:
 _KAGGLE_SDK_REJECTIONS = (TypeError, AttributeError, ValueError, NotImplementedError, ImportError)
 
 
+# Values kaggle_benchmarks' ``llm.prompt(reasoning=...)`` forwards. Proxy
+# models use its OpenAI-compatible actor, which sends the value as
+# ``reasoning_effort`` to the Kaggle model proxy; the proxy maps it onto each
+# backend (OpenAI reasoning effort, Anthropic extended thinking, Gemini
+# thinking, where "none" means a thinking budget of 0). The library documents
+# "none", "low", "medium" and "high" for every backend; "minimal", "xhigh" and
+# "max" are OpenAI-only levels that some OpenAI models accept.
+KAGGLE_REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# Sends no reasoning setting at all, so the model uses its own default.
+KAGGLE_REASONING_MODEL_DEFAULT = "default"
+KAGGLE_REASONING_ROLE_KEYS = {
+    "adaptation": "KAGGLE_REASONING_EFFORT_ADAPTATION",
+    "final_solver": "KAGGLE_REASONING_EFFORT_FINAL_SOLVER",
+    "evaluator": "KAGGLE_REASONING_EFFORT_EVALUATOR",
+}
+
+
+def _kaggle_effort_value(value: Any, source: str) -> Any:
+    """Normalize one configured effort; None means 'inherit from the next level'."""
+    if value is None:
+        return None
+    effort = str(value).strip().lower()
+    if effort == KAGGLE_REASONING_MODEL_DEFAULT or effort in KAGGLE_REASONING_LEVELS:
+        return effort
+    raise ValueError(
+        f"{source}={value!r} is not a Kaggle reasoning effort; use one of "
+        f"{', '.join(repr(level) for level in KAGGLE_REASONING_LEVELS)}, "
+        f"{KAGGLE_REASONING_MODEL_DEFAULT!r} (send none, the model decides) or None (inherit)."
+    )
+
+
+def kaggle_reasoning_effort(config: Mapping[str, Any], model_name: Optional[str],
+                            role: Optional[str]) -> Optional[str]:
+    """The ``reasoning`` value for one Kaggle call, or None to send none.
+
+    The first setting that is not None wins:
+    1. ``KAGGLE_REASONING_EFFORT_BY_MODEL[model_name]``, then the longest
+       provider-prefix key the model name starts with (e.g. ``"openai/"``);
+    2. the role's ``KAGGLE_REASONING_EFFORT_<ROLE>``;
+    3. ``KAGGLE_REASONING_EFFORT`` (default "none": no reasoning).
+    The value ``"default"`` at any level sends no reasoning setting, so the
+    model's own default applies (needed for models that reject "none").
+    """
+    by_model = config.get("KAGGLE_REASONING_EFFORT_BY_MODEL") or {}
+    if not isinstance(by_model, Mapping):
+        raise ValueError("KAGGLE_REASONING_EFFORT_BY_MODEL must be a dict of model name or prefix -> effort.")
+    candidates = []
+    if model_name is not None:
+        if model_name in by_model:
+            candidates.append((by_model[model_name], f"KAGGLE_REASONING_EFFORT_BY_MODEL[{model_name!r}]"))
+        prefixes = sorted((key for key in by_model
+                           if key != model_name and str(key).endswith("/") and model_name.startswith(str(key))),
+                          key=len, reverse=True)
+        candidates.extend((by_model[key], f"KAGGLE_REASONING_EFFORT_BY_MODEL[{key!r}]") for key in prefixes)
+    role_key = KAGGLE_REASONING_ROLE_KEYS.get(role)
+    if role_key:
+        candidates.append((config.get(role_key), role_key))
+    candidates.append((config.get("KAGGLE_REASONING_EFFORT"), "KAGGLE_REASONING_EFFORT"))
+    for value, source in candidates:
+        effort = _kaggle_effort_value(value, source)
+        if effort is not None:
+            return None if effort == KAGGLE_REASONING_MODEL_DEFAULT else effort
+    return None
+
+
+def validate_kaggle_reasoning(config: Mapping[str, Any]) -> None:
+    """Fail fast on a malformed Kaggle reasoning setting (the run preflight calls this)."""
+    by_model = config.get("KAGGLE_REASONING_EFFORT_BY_MODEL") or {}
+    if not isinstance(by_model, Mapping):
+        raise ValueError("KAGGLE_REASONING_EFFORT_BY_MODEL must be a dict of model name or prefix -> effort.")
+    for key, value in by_model.items():
+        _kaggle_effort_value(value, f"KAGGLE_REASONING_EFFORT_BY_MODEL[{key!r}]")
+    for key in ("KAGGLE_REASONING_EFFORT", *KAGGLE_REASONING_ROLE_KEYS.values()):
+        _kaggle_effort_value(config.get(key), key)
+
+
 class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
     """Kaggle Benchmarks model proxy (``kaggle_benchmarks``), free within the notebook quota.
 
@@ -1383,20 +1459,14 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             llm.client = with_options(timeout=self.timeout_seconds, max_retries=0)
         return llm
 
-    def _prompt_options(self, temperature: Optional[float], role: Optional[str]) -> Dict[str, Any]:
+    def _prompt_options(self, temperature: Optional[float], role: Optional[str],
+                        model_name: Optional[str] = None) -> Dict[str, Any]:
         # The library currently drops temperature for proxy models; it is sent
         # anyway so it takes effect as soon as the proxy supports it.
         options: Dict[str, Any] = {}
         if temperature is not None:
             options["temperature"] = temperature
-        role_key = {
-            "adaptation": "KAGGLE_REASONING_EFFORT_ADAPTATION",
-            "final_solver": "KAGGLE_REASONING_EFFORT_FINAL_SOLVER",
-            "evaluator": "KAGGLE_REASONING_EFFORT_EVALUATOR",
-        }.get(role)
-        effort = self.config.get(role_key) if role_key else None
-        if effort is None:
-            effort = self.config.get("KAGGLE_REASONING_EFFORT")
+        effort = kaggle_reasoning_effort(self.config, model_name, role)
         if effort is not None:
             options["reasoning"] = effort
         return options
@@ -1423,7 +1493,7 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
 
     def generate_content(self, prompt: str, model_name: str, temperature: Optional[float] = None, avalai_role: Optional[str] = None) -> APIResponse:
         self._print(f"request model={model_name} prompt={prompt[:self.truncation_length]!r}")
-        options = self._prompt_options(temperature, avalai_role)
+        options = self._prompt_options(temperature, avalai_role, model_name)
 
         def attempt() -> APIResponse:
             lease = self.scheduler.acquire(model_name)

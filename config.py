@@ -224,12 +224,25 @@ CONFIG = {
     "KAGGLE_MODEL_NAME_EVALUATOR": None,
     "KAGGLE_MODEL_NAME_SIMPLIFICATION": None,
     "KAGGLE_MODEL_QUOTAS": {"default": {"rpm": 60}},
-    # Options: None (model default), "none", "low", "medium", "high". Note: the
-    # kaggle-benchmarks library currently drops temperature for proxy models.
-    "KAGGLE_REASONING_EFFORT": None,
+    # Reasoning effort sent with every Kaggle call (llm.prompt(reasoning=...)).
+    # The proxy maps it onto the model's backend: OpenAI reasoning_effort,
+    # Anthropic extended thinking, Gemini thinking ("none" = budget 0).
+    # Options: "none" (no reasoning), "low", "medium", "high" for every backend;
+    # "minimal", "xhigh", "max" for OpenAI models that accept them;
+    # "default" or None = send nothing, the model's own default applies.
+    # Note: the kaggle-benchmarks library currently drops temperature for proxy models.
+    "KAGGLE_REASONING_EFFORT": "none",
+    # Per-role overrides; None inherits KAGGLE_REASONING_EFFORT (so every role
+    # runs with "none" by default).
     "KAGGLE_REASONING_EFFORT_ADAPTATION": None,
     "KAGGLE_REASONING_EFFORT_FINAL_SOLVER": None,
     "KAGGLE_REASONING_EFFORT_EVALUATOR": None,
+    # Per-model overrides, which win over the role and global settings. A key is
+    # a full model name or a provider prefix ending in "/", e.g.
+    # {"openai/gpt-6-luna": "none", "anthropic/": "low", "openai/o3": "default"}.
+    # Models that reject "none" (older OpenAI o-series/GPT-5, Gemini 2.5 Pro)
+    # need "default" or a level here.
+    "KAGGLE_REASONING_EFFORT_BY_MODEL": {},
 
     # Ollama (Local LLM) Settings
     "OLLAMA_BASE_URL": "http://127.0.0.1:11434",

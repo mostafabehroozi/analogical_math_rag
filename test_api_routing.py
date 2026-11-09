@@ -259,8 +259,16 @@ def test_pool_members_count_as_used_providers():
 
 def test_new_settings_leave_existing_manifests_unchanged():
     before = {"API_PROVIDER_SOLVER": "gemini", "GEMINI_MODEL_NAME_FINAL_SOLVER": "m"}
-    after = {**before, "API_PROVIDER_POOLS": {}, "API_MAX_CONCURRENT_CALLS": {"gemini": 2}}
+    after = {**before, "API_PROVIDER_POOLS": {}, "API_MAX_CONCURRENT_CALLS": {"gemini": 2},
+             "LAYER1_GROUPING_TOP_N": None}
     assert sanitize_scientific_config(after) == sanitize_scientific_config(before)
+    kaggle = {"API_PROVIDER_SOLVER": "kaggle", "KAGGLE_REASONING_EFFORT": None}
+    assert (sanitize_scientific_config({**kaggle, "KAGGLE_REASONING_EFFORT_BY_MODEL": {}})
+            == sanitize_scientific_config(kaggle))
+    # Set values are scientific settings.
+    assert sanitize_scientific_config({**before, "LAYER1_GROUPING_TOP_N": 3})["LAYER1_GROUPING_TOP_N"] == 3
+    limited = sanitize_scientific_config({**kaggle, "KAGGLE_REASONING_EFFORT_BY_MODEL": {"openai/": "none"}})
+    assert limited["KAGGLE_REASONING_EFFORT_BY_MODEL"] == {"openai/": "none"}
 
 
 def test_the_run_preflight_registers_pools_and_reports_their_batching(capsys):
@@ -282,3 +290,7 @@ def test_the_run_preflight_registers_pools_and_reports_their_batching(capsys):
     with pytest.raises(ValueError, match="Experiment 'bad'.*unknown provider 'gemni'"):
         orchestration._check_api_routing(
             [{"experiment_name": "bad", "GLOBAL_API_CALL_DELAY_SECONDS": {"gemni": 1}}], config, managers)
+    with pytest.raises(ValueError, match="Experiment 'k'.*KAGGLE_REASONING_EFFORT_BY_MODEL"):
+        orchestration._check_api_routing(
+            [{"experiment_name": "k", "API_PROVIDER_SOLVER": "kaggle",
+              "KAGGLE_REASONING_EFFORT_BY_MODEL": {"openai/": "nope"}}], config, managers)
