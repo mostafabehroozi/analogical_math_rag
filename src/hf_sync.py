@@ -37,6 +37,7 @@ from huggingface_hub import (
 )
 from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError
 
+from src import console_output
 from src.distributed_execution import (
     DistributedManifestMismatch,
     validate_manifest_compatibility,
@@ -60,6 +61,8 @@ _DISTRIBUTED_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 _DISTRIBUTED_ALLOWED_DIRS = frozenset({"results"})
 _DISTRIBUTED_ALLOWED_ROOT_FILES = frozenset({"status.json"})
 _DISTRIBUTED_ALLOWED_SUFFIXES = frozenset({".json", ".jsonl", ".log", ".csv", ".pkl"})
+# Named result files with another suffix: the failures-only console log.
+_DISTRIBUTED_ALLOWED_RESULT_FILES = frozenset({console_output.PRINTING_LOG_NAME})
 _DISTRIBUTED_SECRET_NAME_MARKERS = (
     "api_key",
     "apikey",
@@ -848,7 +851,8 @@ def _distributed_artifact_allowed(relative_path: Path) -> bool:
     # logs would otherwise be uploaded again after every batch.
     if len(relative_path.parts) != 2 or lowered_parts[0] not in _DISTRIBUTED_ALLOWED_DIRS:
         return False
-    return relative_path.suffix.casefold() in _DISTRIBUTED_ALLOWED_SUFFIXES
+    return (relative_path.suffix.casefold() in _DISTRIBUTED_ALLOWED_SUFFIXES
+            or lowered_name in _DISTRIBUTED_ALLOWED_RESULT_FILES)
 
 
 def _collect_distributed_checkpoint_files(worker_root: Path) -> List[Tuple[Path, Path]]:
@@ -1171,7 +1175,12 @@ def sync_workspace_to_hub(config: dict):
 def periodic_sync_check(loop_counter: int, config: dict):
     """
     Checks if a sync is needed based on the counter and sync interval.
+
+    Every sequential question loop calls this once per question, so it is
+    also where those loops clear a full notebook cell.
     """
+    console_output.configure(config)
+    console_output.maybe_clear_output()
     if _distributed_execution_enabled(config) and not config.get("PERSIST_RESULTS_ONLINE"):
         raise DistributedSyncError(
             "Distributed execution requires PERSIST_RESULTS_ONLINE=True."

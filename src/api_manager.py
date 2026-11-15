@@ -30,6 +30,7 @@ from src.api_routing import (
     PoolEndpoint, PoolSpec, is_pool, pool_label, pool_spec, resolve_scoped, scoped_value,
     used_pool_names, validate_provider_pools,
 )
+from src import console_output
 from src.context_logger import (
     ctx_api_failures, ctx_query_idx, ctx_batch_id, record_api_failure, tprint, track_api_failures,
 )
@@ -434,6 +435,41 @@ def _format_api_log(provider: str, model: str, key: str, duration: float, attemp
     return log_str
 
 
+def quiet_successful_api_calls(config: Mapping[str, Any]) -> bool:
+    """QUIET_SUCCESSFUL_API_CALLS (default True): successful calls go to the log file only."""
+    return bool(config.get("QUIET_SUCCESSFUL_API_CALLS", True))
+
+
+def _final_failure_report(label: str, caller: str, attempts: int, prompt: Optional[str],
+                          response: APIResponse, config: Mapping[str, Any]) -> str:
+    """Everything known about a call that failed for good, for the console.
+
+    Printed once per call (not per retry), so a heavy run whose successful
+    calls are quiet still shows every failure in full.
+    """
+    meta = response.get("request_meta") if isinstance(response.get("request_meta"), dict) else {}
+    message = str(response.get("error_message") or response.get("text") or "No error message returned")
+    details = response.get("error_details")
+    lines = [
+        f"[API ERROR] Final failure: {label}",
+        f"    ↳ TYPE    : {response.get('error_type') or response.get('status')} (status {response.get('status')})",
+        f"    ↳ WHERE   : {caller}",
+        f"    ↳ ATTEMPTS: {attempts}" + (" (retries exhausted)" if response.get("retry_exhausted") else ""),
+    ]
+    if meta:
+        lines.append("    ↳ REQUEST : " + ", ".join(f"{name}={value}" for name, value in meta.items()))
+    lines.append("    ↳ ERROR   : " + message.replace("\n", "\n              "))
+    if details is not None and str(details).strip() and str(details) != message:
+        lines.append("    ↳ DETAILS : " + str(details).replace("\n", "\n              "))
+    if prompt is not None:
+        text = str(prompt)
+        if not config.get("PRINT_FAILED_API_PROMPT_IN_FULL", True):
+            limit = int(config.get("API_RESPONSE_TRUNCATION_LENGTH", 70))
+            text = text[:limit] + ("..." if len(text) > limit else "")
+        lines.append(f"    ↳ PROMPT ({len(str(prompt))} chars):\n" + text)
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class _PoolAttempt:
     """Set while a provider pool makes one attempt: the pool, not the call, retries."""
@@ -548,6 +584,7 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         # that the provider needs a rest (32,000 such refusals paused a Kaggle
         # run 2,135 times on 2026-11-02).
         is_success = (status == "SUCCESS")
+        console_output.record_api_call(provider_name, model_name, duration, is_success)
         if response.get("error_type") not in ("BatchRefused", "ProactiveRateLimit"):
             global_pause_manager.record_result(is_success, config, provider_name)
 
@@ -556,7 +593,8 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         log_msg = _format_api_log(log_provider, model_name, key, duration, shown_attempt, shown_max, status, prompt, response_text, config)
 
         if is_success:
-            tprint(log_msg, level="INFO")
+            # Quiet mode keeps the log in batch_execution.log, off the console.
+            tprint(log_msg, level="DEBUG" if quiet_successful_api_calls(config) else "INFO")
             return response
 
         # If we reach here, it failed
@@ -568,10 +606,8 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
         retryable = _is_retryable(error_type, config)
         if not retryable or attempt == max_attempts:
             response["retry_exhausted"] = attempt == max_attempts
-            # The call log above holds the whole message; this line repeats
-            # its exception line, which says what went wrong.
-            detail = _exception_line(response.get("error_message"))
-            tprint(f"[API ERROR] Final failure. Type: {error_type} @ {caller_loc}: {detail}", level="ERROR")
+            tprint(_final_failure_report(f"{provider_name} | {model_name}", caller_loc, attempt,
+                                         prompt, response, config), level="ERROR")
             return final(response)
 
         # Wait before retrying
@@ -1794,9 +1830,8 @@ class ProviderPool(_ConfigBindable):
         last_endpoint = spec.endpoints[0]
 
         def finish(response: APIResponse, endpoint: PoolEndpoint) -> APIResponse:
-            detail = _exception_line(response.get("error_message"))
-            tprint(f"[API ERROR] {self.label}: final failure after {attempt} attempt(s). "
-                   f"Type: {response.get('error_type') or response.get('status')} @ {caller_loc}: {detail}", level="ERROR")
+            tprint(_final_failure_report(f"{self.label} (last endpoint {endpoint.provider} | {endpoint.model})",
+                                         caller_loc, attempt, prompt, response, self.config), level="ERROR")
             return _record_final_failure(response, endpoint.provider, endpoint.model, caller_loc)
 
         while True:

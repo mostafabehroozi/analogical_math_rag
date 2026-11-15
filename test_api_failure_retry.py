@@ -103,7 +103,10 @@ def test_a_failed_call_is_printed_in_full():
         failing_call(NO_RETRY, {"status": "ERROR", "error_type": "PermissionDeniedError", "error_message": message})
     attempt_log, final_line = (call.args[0] for call in printed.call_args_list)
     assert detail in attempt_log and "_base_client.py" in attempt_log
-    assert final_line.endswith(detail)
+    # The final report holds the whole error, where it came from and the prompt.
+    assert detail in final_line and "_base_client.py" in final_line
+    assert "TYPE    : PermissionDeniedError" in final_line and "WHERE   : test_api_failure_retry.py" in final_line
+    assert final_line.endswith("PROMPT (6 chars):\nprompt")
     ok = api_manager._format_api_log("p", "m", "k", 0.1, 1, 1, "SUCCESS", "prompt", "y" * 500, {})
     assert "y" * 71 not in ok  # Successful replies stay one short line.
 
@@ -246,3 +249,25 @@ def test_a_deferred_solve_with_api_failures_stays_pending(tmp_path):
     assert {index: log["pipeline_status"] for index, log in logs.items()} == {
         0: "SUCCESS", 1: "SUCCESS", 2: "SUCCESS"}
     assert "api_failures" not in logs[2]
+
+
+def test_successful_calls_are_quiet_by_default():
+    ok = {"status": "SUCCESS", "text": "answer"}
+    for config, level in ((NO_RETRY, "DEBUG"), ({**NO_RETRY, "QUIET_SUCCESSFUL_API_CALLS": False}, "INFO")):
+        with patch.object(api_manager, "tprint") as printed:
+            api_manager.execute_with_retry(config, "kaggle", "m", "prompt", lambda: dict(ok))
+        assert [call.kwargs["level"] for call in printed.call_args_list] == [level]
+
+
+def test_failures_still_print_when_quiet():
+    with patch.object(api_manager, "tprint") as printed:
+        failing_call(NO_RETRY, {"status": "ERROR", "error_type": "InternalServerError", "error_message": "boom"})
+    levels = [call.kwargs["level"] for call in printed.call_args_list]
+    assert levels == ["WARNING", "ERROR"]
+
+
+def test_failure_prompt_can_be_cut():
+    config = {**NO_RETRY, "PRINT_FAILED_API_PROMPT_IN_FULL": False, "API_RESPONSE_TRUNCATION_LENGTH": 3}
+    with patch.object(api_manager, "tprint") as printed:
+        failing_call(config, {"status": "ERROR", "error_type": "InternalServerError", "error_message": "boom"})
+    assert printed.call_args_list[-1].args[0].endswith("PROMPT (6 chars):\npro...")

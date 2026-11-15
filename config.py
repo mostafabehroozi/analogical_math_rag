@@ -26,6 +26,33 @@ CONFIG = {
     
     # Logging & Control
     "PRINT_API_CALL_DETAILS": True,
+    # Heavy runs: successful API calls are not printed (they still go to
+    # LOGS_DIR/batch_execution.log). Retries print a warning line, and a call
+    # that fails for good prints a full report: type, caller, provider/model/key,
+    # attempts, the whole error and the whole prompt. False prints every call.
+    # Warnings, errors, progress bars and API timing always print.
+    "QUIET_SUCCESSFUL_API_CALLS": True,
+    "PRINT_FAILED_API_PROMPT_IN_FULL": True,  # False: the failure report cuts the prompt to API_RESPONSE_TRUNCATION_LENGTH.
+    # In a notebook (Kaggle/Jupyter), clear the running cell once it holds
+    # MAX_LINES printed lines or MAX_CHARS characters, whichever comes first
+    # (0 turns that limit off). Checked after every finished question; the
+    # progress bar, the failed questions so far and the API timing are printed
+    # again right after a clear.
+    "AUTO_CLEAR_CELL_OUTPUT": True,
+    "AUTO_CLEAR_CELL_OUTPUT_MAX_LINES": 3000,
+    "AUTO_CLEAR_CELL_OUTPUT_MAX_CHARS": 1_500_000,
+    # RESULTS_DIR/printing.txt: every warning and error (failed API attempts,
+    # final failure reports with prompt, failed questions), never successful
+    # calls. Synced to Hugging Face with the results. None = on while
+    # AUTO_CLEAR_CELL_OUTPUT is on; True/False forces it.
+    "PRINTING_LOG_ENABLED": None,
+    "PRINTING_LOG_MAX_MB": 100,  # Stops writing (with one console warning) past this size.
+    # Average seconds of a successful API call per provider/model, over the
+    # last API_TIMING_WINDOW calls and over all calls. Printed after every
+    # committed batch, after a clear, and every API_TIMING_PRINT_EVERY_CALLS
+    # successful calls in non-batch runs (0 = only those two).
+    "API_TIMING_WINDOW": 50,
+    "API_TIMING_PRINT_EVERY_CALLS": 100,
     # Per-provider / per-model limits. Each setting marked [scoped] takes a
     # plain number, which applies to every provider (each provider counted on
     # its own, so two providers never wait for each other), or a dict that

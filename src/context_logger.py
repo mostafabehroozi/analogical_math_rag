@@ -6,6 +6,8 @@ import contextlib
 import os
 import sys
 
+from src import console_output
+
 
 # 1. CONTEXT VARIABLES (The "Nametags" for threads)
 # contextvars ensures that when Thread A sets its name to "Q#5", 
@@ -144,10 +146,12 @@ def tprint(message: str, level: str = "INFO"):
     elif level == "WARNING":
         print(f"⚠️  {prefix} WARNING: {message}")
         logger.warning(message)
+        console_output.record_failure(f"WARNING {prefix} {message}")
         
     elif level == "ERROR":
         print(f"🔴 {prefix} ERROR: {message}")
         logger.error(message)
+        console_output.record_failure(f"ERROR {prefix} {message}")
         
     elif level == "DEBUG":
         # NOTICE: No print() statement here! 

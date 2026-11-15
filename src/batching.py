@@ -12,6 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from tqdm import tqdm
+from src import console_output
 from src.api_batching import batch_refusals
 from src.context_logger import pipeline_context as api_call_context, track_api_failures
 from src.distributed_execution import distributed_enabled, stop_new_batches_due
@@ -127,8 +128,20 @@ class BatchCoordinator:
         """Execute every question in a batch before one coordinator-owned commit."""
         all_results: List[QuestionResult] = []
         
+        failed_so_far: List[str] = []
+        console_output.configure(self.config)
+
+        def after_clear() -> None:
+            # A clear must not hide a failure: the failed questions are
+            # printed again (all of them are in printing.txt).
+            if failed_so_far:
+                print(f"Failed questions so far: {len(failed_so_far)} (last {min(50, len(failed_so_far))} below)")
+                for line in failed_so_far[-50:]:
+                    print(f"    {line}")
+            pbar.refresh()
+
         # Wrap the execution loop in a tqdm progress bar
-        with tqdm(total=len(items), desc=f"{self.experiment_name} | {self.phase_name}", unit="q") as pbar:
+        with console_output.batch_run(), tqdm(total=len(items), desc=f"{self.experiment_name} | {self.phase_name}", unit="q") as pbar:
             for batch_number, start in enumerate(range(0, len(items), self.batch_size), start=1):
                 # Kaggle sessions have a hard lifetime.  In distributed mode a
                 # single run-level monotonic cutoff is created before the first
@@ -182,6 +195,16 @@ class BatchCoordinator:
                         print(f"[BATCH {batch_id} {completed}/{len(batch_items)}] Q#{result.item.index} {result.terminal_status} ({result.elapsed_seconds:.1f}s)")
                         if result.value.get("api_failures"):
                             print(f"    ↳ {_api_failure_note(result.value['api_failures'])}")
+                        if result.terminal_status != "SUCCESS":
+                            line = f"[BATCH {batch_id}] Q#{result.item.index} {result.terminal_status}"
+                            if result.value.get("api_failures"):
+                                line += f" | {_api_failure_note(result.value['api_failures'])}"
+                            elif result.value.get("batch_error"):
+                                error = result.value["batch_error"]
+                                line += f" | worker exception {error['type']}: {error['message']}\n{error['traceback']}"
+                            failed_so_far.append(line.split("\n", 1)[0])
+                            console_output.record_failure(f"FAILED QUESTION {line}")
+                        console_output.maybe_clear_output(after_clear)
 
                 # A provider batch refused during this batch fails every later
                 # call for its model. Committing would save these questions as
@@ -195,6 +218,7 @@ class BatchCoordinator:
                 
                 self._write_journal(batch_id, "COMMITTED", batch_items, terminal_statuses={str(result.item.index): result.terminal_status for result in results})
                 print(f"[BATCH {batch_id}] committed: success={len(results) - len(failed)} failed={len(failed)}")
+                console_output.print_api_timing_summary()
                 all_results.extend(results)
 
                 pbar.update(len(batch_items))

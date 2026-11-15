@@ -30,7 +30,7 @@ from src.prompts import (
 )
 from src.utils import create_trace_entry
 from src.parallel_utils import run_parallel_api_calls
-from src.api_manager import model_name_for
+from src.api_manager import model_name_for, quiet_successful_api_calls
 from src.evaluation import evaluate_single_answer_with_llm
 # Global cache for embedding norms to massively speed up retrieval and save RAM
 _NORMS_CACHE = {}
@@ -663,7 +663,8 @@ def adapt(
             print(f"    -> Normalizing exemplar {idx}...")
             prompt = create_normalization_prompt(current_text)
             
-            print(f"      [API Context] Calling LLM for: Normalization (Exemplar #{idx})")
+            if not quiet_successful_api_calls(config):
+                print(f"      [API Context] Calling LLM for: Normalization (Exemplar #{idx})")
             response = api_manager.generate_content(
                 prompt, model_name, temperature, avalai_role="adaptation"
             )
@@ -686,7 +687,8 @@ def adapt(
             logger.info(f"Applying transformation 1 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 1 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_1")
-            print(f"      [API Context] Calling LLM for: Transformation 1 (Exemplar #{idx})")
+            if not quiet_successful_api_calls(config):
+                print(f"      [API Context] Calling LLM for: Transformation 1 (Exemplar #{idx})")
             response = api_manager.generate_content(
                 prompt, model_name, temperature, avalai_role="adaptation"
             )
@@ -709,7 +711,8 @@ def adapt(
             logger.info(f"Applying transformation 2 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 2 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_2")
-            print(f"      [API Context] Calling LLM for: Transformation 2 (Exemplar #{idx})")
+            if not quiet_successful_api_calls(config):
+                print(f"      [API Context] Calling LLM for: Transformation 2 (Exemplar #{idx})")
             response = api_manager.generate_content(
                 prompt, model_name, temperature, avalai_role="adaptation"
             )
@@ -732,7 +735,8 @@ def adapt(
             logger.info(f"Applying transformation 3 to exemplar index {idx}.")
             print(f"    -> Applying Transformation 3 to exemplar {idx}...")
             prompt = create_transformation_prompt(target_query, current_text, config, "PROMPT_TEMPLATE_TRANSFORMATION_3")
-            print(f"      [API Context] Calling LLM for: Transformation 3 (Exemplar #{idx})")
+            if not quiet_successful_api_calls(config):
+                print(f"      [API Context] Calling LLM for: Transformation 3 (Exemplar #{idx})")
             response = api_manager.generate_content(
                 prompt, model_name, temperature, avalai_role="adaptation"
             )
@@ -802,7 +806,8 @@ def solve(
         temperature = 0.0 
         
         print("    -> Checking for duplicate questions...")
-        print("      [API Context] Calling LLM for: Duplicate Check")
+        if not quiet_successful_api_calls(config):
+            print("      [API Context] Calling LLM for: Duplicate Check")
         response = api_manager.generate_content(
             prompt, model_name, temperature, avalai_role="adaptation"
         )
@@ -843,7 +848,8 @@ def solve(
     def run_attempt(i: int):
         logger.info(f"Generating attempt {i+1}/{n_attempts}.")
         print(f"    -> Generating solution attempt {i+1}/{n_attempts}...")
-        print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
+        if not quiet_successful_api_calls(config):
+            print(f"      [API Context] Calling LLM for: Final Solution (Attempt #{i+1})")
 
         response = api_manager.generate_content(
             prompt, model_name, temperature, avalai_role="final_solver"
