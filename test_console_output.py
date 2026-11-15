@@ -164,3 +164,18 @@ def test_batch_writes_failed_questions_and_prints_timing(tmp_path, capsys):
 def test_printing_txt_is_synced_by_distributed_workers():
     assert hf_sync._distributed_artifact_allowed(Path("results") / "printing.txt")
     assert not hf_sync._distributed_artifact_allowed(Path("results") / "notes.txt")
+
+
+def test_console_settings_never_change_the_distributed_manifest():
+    # A resumed run with these settings changed must match its manifest
+    # (Kaggle, 2026-11-15: they changed scientific_config_sha256).
+    from config import CONFIG
+    from src.distributed_execution import sanitize_scientific_config
+    console_keys = {"QUIET_SUCCESSFUL_API_CALLS", "PRINT_FAILED_API_PROMPT_IN_FULL", "AUTO_CLEAR_CELL_OUTPUT",
+                    "AUTO_CLEAR_CELL_OUTPUT_MAX_LINES", "AUTO_CLEAR_CELL_OUTPUT_MAX_CHARS", "PRINTING_LOG_ENABLED",
+                    "PRINTING_LOG_MAX_MB", "API_TIMING_WINDOW", "API_TIMING_PRINT_EVERY_CALLS"}
+    assert console_keys <= set(CONFIG)
+    without = {key: value for key, value in CONFIG.items() if key not in console_keys}
+    changed = {key: 12345 for key in console_keys}
+    assert sanitize_scientific_config(dict(CONFIG)) == sanitize_scientific_config(without)
+    assert sanitize_scientific_config({**CONFIG, **changed}) == sanitize_scientific_config(without)
