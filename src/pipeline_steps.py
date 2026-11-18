@@ -159,6 +159,15 @@ def retrieve(
 
         log_time_diagnostic("Handle self-match (O(1) lookup)", self_match_start_time, indent=indent_level)
 
+        # Synthetic/duplicate corpus rows and copies of the target are never
+        # retrieved (CORPUS_FILTER_*). The filter rides on the question index
+        # every caller already passes (src/corpus_filter.ExemplarIndex).
+        corpus_filter = getattr(question_to_index_map, "corpus_filter", None)
+        if corpus_filter is not None and corpus_filter.settings.get("enabled"):
+            blocked = corpus_filter.apply(similarities, target_query)
+            print(f"{'  '*indent_level}Corpus filter: {blocked['hidden_rows']} hidden rows; "
+                  f"{blocked['target_copies']} copies of the target blocked.")
+
         k_retrieve_start_time = time.time()
         eligible_count = int(np.isfinite(similarities).sum())
         if eligible_count == 0:

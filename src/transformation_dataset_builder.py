@@ -175,8 +175,12 @@ def _target_records(
         solutions = hard_solutions or []
         source_name = "hard_questions"
 
+    corpus_filter = exemplar_data.get("corpus_filter") if source_name == "exemplar_corpus" else None
     records: List[Dict[str, Any]] = []
     for index, question in enumerate(questions):
+        # Synthetic and duplicate corpus rows are never targets (CORPUS_FILTER_*).
+        if corpus_filter is not None and corpus_filter.is_excluded(index):
+            continue
         ground_truth = solutions[index] if index < len(solutions) else None
         if not ground_truth and source_name == "hard_questions":
             if index < len(exemplar_data.get("ground_truths", [])):

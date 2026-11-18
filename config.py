@@ -304,7 +304,22 @@ CONFIG = {
     
     "HARD_QUESTIONS_INDICES_PATH": None,  # Will be computed by rebuild_derived_paths()
     "EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH": None,  # Will be computed by rebuild_derived_paths()
-    
+
+    # === Exemplar corpus: the retrieval pool and the source of numina_hard targets ===
+    # "NuminaMath-CoT" (the original) or "NuminaMath-1.5". rebuild_derived_paths() points
+    # the corpus names and the embedding file at it; the NuminaMath-1.5 embedding file is
+    # downloaded from Hugging Face when it is missing (src/corpus_filter.py).
+    "EXEMPLAR_CORPUS": "NuminaMath-CoT",
+    # Synthetic and duplicate rows are hidden from retrieval, numina_hard targets,
+    # hard-question selection and every other corpus reader. Row indices never change.
+    "CORPUS_FILTER_ENABLED": True,
+    # NuminaMath-1.5: its `synthetic` column; NuminaMath-CoT: orca_math, synthetic_amc, synthetic_math.
+    "CORPUS_FILTER_EXCLUDE_SYNTHETIC": True,
+    # Keep one row per group of copies, and never retrieve a copy of the target question.
+    "CORPUS_FILTER_EXCLUDE_DUPLICATES": True,
+    # "ignore_numbers": the same problem with other numbers is a copy; "normalized_text": numbers must match too.
+    "CORPUS_FILTER_DUPLICATE_MATCH": "ignore_numbers",
+
     "ADVANCED_RAG_FULL_LOG_PATH": None,  # Will be computed by rebuild_derived_paths()
     "ADVANCED_RAG_EVALUATION_RESULTS_PATH": None,  # Will be computed by rebuild_derived_paths()
 
@@ -541,10 +556,13 @@ def rebuild_derived_paths():
     
     This is essential for supporting multiple execution modes (offline/online, local/Kaggle).
     """
+    from src.corpus_filter import apply_exemplar_corpus
+
     CONFIG["LOCAL_EMBEDDING_MODEL_PATH"] = os.path.join(CONFIG["DATA_DIR"], "Bert-MLM_arXiv-MP-class_zbMath")
-    CONFIG["LOCAL_EXEMPLAR_CORPUS_PATH"] = os.path.join(CONFIG["DATA_DIR"], "NuminaMath-CoT")
     CONFIG["HARD_QUESTIONS_INDICES_PATH"] = os.path.join(CONFIG["DATA_DIR"], "hard_question_indices.json")
-    CONFIG["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"] = os.path.join(CONFIG["EMBEDDINGS_DIR"], 'embedding_NuminaMath_with_Bert-MLM_arXiv-MP-class_zbMath.npy')
+    # LOCAL_EXEMPLAR_CORPUS_PATH, EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH and the corpus
+    # names follow CONFIG["EXEMPLAR_CORPUS"].
+    apply_exemplar_corpus(CONFIG)
     CONFIG["ADVANCED_RAG_FULL_LOG_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_pipeline_full_log.json")
     CONFIG["ADVANCED_RAG_EVALUATION_RESULTS_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_evaluation_results.pkl")
     CONFIG["LAYER1_CACHE_DIR"] = CONFIG["RESULTS_DIR"]

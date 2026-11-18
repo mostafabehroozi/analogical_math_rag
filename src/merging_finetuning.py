@@ -822,8 +822,13 @@ def retrieve_exemplars_cpu(
     embedded_exemplars: Any,
     embedding_model: Any,
     top_k: int,
+    corpus_filter: Any = None,
 ) -> List[Dict[str, Any]]:
-    """Retrieve on CPU while excluding every normalized exact question match."""
+    """Retrieve on CPU while excluding every normalized exact question match.
+
+    ``corpus_filter`` (src.corpus_filter.CorpusFilter) also hides synthetic and
+    duplicate corpus rows and every copy of ``question``.
+    """
     import numpy as np
 
     if top_k <= 0 or top_k % 2:
@@ -838,6 +843,8 @@ def retrieve_exemplars_cpu(
     similarities = matrix.dot(query_vector) / denominator
     target_id = normalize_question(question)
     similarities[[normalize_question(item) == target_id for item in exemplar_questions]] = -np.inf
+    if corpus_filter is not None and corpus_filter.settings.get("enabled"):
+        corpus_filter.apply(similarities, question)
     eligible = int(np.isfinite(similarities).sum())
     if eligible < top_k:
         raise ValueError(f"Only {eligible} non-identical exemplars are available for top_k={top_k}.")

@@ -165,6 +165,19 @@ def load_target_benchmarks(
                 raise IndexError(f"Invalid hard-question indices: {invalid_indices[:10]}")
             if len(set(hard_indices)) != len(hard_indices):
                 raise ValueError("HARD_QUESTIONS_INDICES_PATH must not contain duplicate indices.")
+            corpus_filter = exemplar_data.get("corpus_filter")
+            if corpus_filter is not None and corpus_filter.settings.get("enabled"):
+                hidden = [index for index in hard_indices if corpus_filter.is_excluded(index)]
+                if hidden:
+                    reasons: Dict[str, int] = {}
+                    for index in hidden:
+                        reasons[corpus_filter.reason(index)] = reasons.get(corpus_filter.reason(index), 0) + 1
+                    raise ValueError(
+                        f"{len(hidden)} of the {len(hard_indices)} numina_hard targets in {indices_path} are rows "
+                        f"the corpus filter hides ({reasons}; first indices {hidden[:10]}). Rebuild the "
+                        "hard-question set with the filter on (the notebook's hard-question cell), or set "
+                        "CONFIG['CORPUS_FILTER_ENABLED'] = False to use this set unchanged."
+                    )
             questions = [str(corpus_questions[index]) for index in hard_indices]
             ground_truths = [str(corpus_solutions[index]) for index in hard_indices]
 

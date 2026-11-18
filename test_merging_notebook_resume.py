@@ -47,7 +47,7 @@ class NotebookPartialResumeTests(TestCase):
         self.judged.append((ground_truth, text))
         return {"status": "SUCCESS", "is_correct": False, "error_details": None}
 
-    def retrieve(self, question, *args, top_k):
+    def retrieve(self, question, *args, top_k, corpus_filter=None):
         self.retrievals.append(question)
         self.retrieval_counts.append(top_k)
         return [{"question": f"Example {i}", "solution": f"Proof {i}"} for i in range(top_k)]

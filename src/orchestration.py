@@ -93,6 +93,14 @@ from src.layer1_grouping import run_layer1_grouping
 from src.layer2_integration import run_layer2_complete_pipeline
 
 from src.utils import save_json, save_json_atomic, load_json
+from src.corpus_filter import (
+    CORPUS_CONFIG_KEYS,
+    attach_corpus_filter,
+    check_saved_logs,
+    corpus_signature,
+    hidden_target_positions,
+    signature_of_exemplar_data,
+)
 from src.hf_sync import (
     download_distributed_run_for_merge,
     ensure_distributed_manifest,
@@ -448,6 +456,61 @@ _DISTRIBUTED_UNSUPPORTED_FLAGS = {
 _DISTRIBUTED_RUNTIME_PATH_KEYS = {
     "RESULTS_DIR", "LAYER1_CACHE_DIR", "LOGS_DIR", "OUTPUTS_DIR",
 }
+
+
+def _check_exemplar_corpus(
+    experiment_configs: List[Dict[str, Any]],
+    global_config: Dict[str, Any],
+    exemplar_data: Dict[str, Any],
+    hard_questions: List[str],
+) -> None:
+    """One corpus and filter per run, never mixed with logs of another.
+
+    The filter is built with the loaded assets, so experiments cannot change it;
+    exemplar_data from an older asset cell gets it here; numina_hard targets must
+    be usable rows; and a single-notebook resume must continue logs made with
+    the same corpus and filter (a distributed run's manifest already pins them).
+    """
+    for overrides in experiment_configs:
+        changed = [
+            key for key in CORPUS_CONFIG_KEYS
+            if key in overrides and overrides[key] != global_config.get(key)
+        ]
+        if changed:
+            raise ValueError(
+                f"Experiment {overrides.get('experiment_name', 'unnamed_experiment')!r} sets {changed}. "
+                "The exemplar corpus and its filter belong to the loaded assets: set them in CONFIG "
+                "before the asset-loading cell, not per experiment."
+            )
+    attach_corpus_filter(exemplar_data, global_config)
+
+    names = global_config.get("TARGET_BENCHMARK_BY_INDEX")
+    if isinstance(names, (list, tuple)) and len(names) == len(hard_questions):
+        positions = [i for i, name in enumerate(names) if str(name).strip().lower() == "numina_hard"]
+    elif str(global_config.get("TARGET_BENCHMARK", "")).strip().lower() == "numina_hard" and not global_config.get(
+            "TARGET_BENCHMARKS"):
+        positions = list(range(len(hard_questions)))
+    else:
+        positions = []
+    hidden = hidden_target_positions(hard_questions, exemplar_data, positions)
+    if hidden:
+        raise ValueError(
+            f"{len(hidden)} numina_hard target(s) are corpus rows the filter hides (synthetic or duplicate; "
+            f"first target positions {hidden[:10]}). Rebuild the hard-question set with the filter on, "
+            "or set CONFIG['CORPUS_FILTER_ENABLED'] = False."
+        )
+
+    corpus_loaded = bool(exemplar_data) and len(exemplar_data.get("questions", ())) > 0
+    if distributed_enabled(global_config) or not corpus_loaded:
+        return
+    for overrides in experiment_configs:
+        name = _merge_experiment_config(global_config, overrides).get("experiment_name", "unnamed_experiment")
+        path = os.path.join(global_config["RESULTS_DIR"], f"{name}_run_log.json")
+        if os.path.exists(path):
+            saved = load_json(path) or []
+            if isinstance(saved, list):
+                check_saved_logs(saved, global_config, f"Run log {path}")
+    print(f"Exemplar corpus for this run: {corpus_signature(global_config)}")
 
 
 def _merge_experiment_config(
@@ -988,15 +1051,19 @@ def run_pipeline_for_single_query(
                     "MIRROR_BENCHMARK_SAMPLES_N",
                     # Full Pipeline Retry Flag
                     "APPLY_FULL_PIPELINE_RETRY",
-                    "EVAL_PARSE_BOXED_GROUND_TRUTH"
+                    "EVAL_PARSE_BOXED_GROUND_TRUTH",
+                    # Exemplar corpus and its synthetic/duplicate filter
+                    *CORPUS_CONFIG_KEYS,
                 ]
             },
             "pipeline_status": "PENDING",
-            "execution_trace": [], 
+            "execution_trace": [],
             "steps": {},
             "steps_alternatives": {},
             "benchmarks": {} #Store Track A results
         }
+    # Which retrieval pool made this log; a resume refuses to mix pools.
+    run_log["exemplar_corpus"] = signature_of_exemplar_data(exemplar_data) or corpus_signature(config)
 
     if distributed_enabled(config):
         record_avalai_model_provenance(run_log, config, run_mode)
@@ -2043,6 +2110,7 @@ def run_experiments(
     _check_api_routing(experiment_configs, global_config, api_managers)
     _require_standard_pipeline_managers(experiment_configs, global_config, api_managers)
     _check_api_batching(experiment_configs, global_config, api_managers)
+    _check_exemplar_corpus(experiment_configs, global_config, exemplar_data, hard_questions)
 
     if distributed_enabled(global_config):
         if global_config.get("DISTRIBUTED_FINALIZER_MODE", False):

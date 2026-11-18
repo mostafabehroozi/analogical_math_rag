@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from src.api_routing import POOLS_KEY, config_uses_provider
+from src.corpus_filter import DEFAULT_EXEMPLAR_CORPUS
 
 
 MANIFEST_SCHEMA_VERSION = 2
@@ -334,6 +335,10 @@ def sanitize_scientific_config(value: Any) -> Any:
             and not (str(key) == POOLS_KEY and not item)
             # Settings whose empty default behaves exactly as before they existed.
             and not (str(key) in ABSENT_WHEN_EMPTY_CONFIG_KEYS and item in (None, {}))
+            # The original corpus without the synthetic/duplicate filter is exactly
+            # the behaviour before these settings existed (src/corpus_filter.py).
+            and not (str(key) == "EXEMPLAR_CORPUS" and item == DEFAULT_EXEMPLAR_CORPUS)
+            and not (str(key).startswith("CORPUS_FILTER_") and value.get("CORPUS_FILTER_ENABLED") is False)
         }
     if isinstance(value, (list, tuple)):
         return [sanitize_scientific_config(item) for item in value]
@@ -499,12 +504,38 @@ def validate_manifest_compatibility(
         )
         if existing_manifest.get(key) != expected_manifest.get(key)
     ]
+    changed_settings = _changed_config_keys(existing_manifest, expected_manifest)
+    hint = ""
+    if any(key == "EXEMPLAR_CORPUS" or key.startswith("CORPUS_FILTER_") for key in changed_settings):
+        hint = (
+            " The exemplar-corpus filter (CORPUS_FILTER_ENABLED, on by default) changes retrieval;"
+            " set CONFIG['CORPUS_FILTER_ENABLED'] = False (and the original EXEMPLAR_CORPUS) to resume"
+            " a run started without it."
+        )
     raise DistributedManifestMismatch(
         "Existing run manifest does not match this invocation"
         + (f" (changed: {', '.join(changed)})" if changed else "")
+        + (f" (changed settings: {', '.join(changed_settings[:12])})" if changed_settings else "")
         + "."
+        + hint
         + " Restore the original code and inputs/config, or choose a new DISTRIBUTED_RUN_ID."
     )
+
+
+def _changed_config_keys(existing_manifest: Mapping[str, Any], expected_manifest: Mapping[str, Any]) -> List[str]:
+    """Scientific setting names that differ between two manifests (any experiment)."""
+    def configs(manifest: Mapping[str, Any]) -> Dict[Any, Mapping[str, Any]]:
+        return {
+            experiment.get("experiment_name"): experiment.get("config") or {}
+            for experiment in manifest.get("experiments", []) if isinstance(experiment, Mapping)
+        }
+    old, new = configs(existing_manifest), configs(expected_manifest)
+    keys = set()
+    for name in set(old) | set(new):
+        a, b = old.get(name, {}), new.get(name, {})
+        if isinstance(a, Mapping) and isinstance(b, Mapping):
+            keys.update(key for key in set(a) | set(b) if a.get(key) != b.get(key))
+    return sorted(str(key) for key in keys)
 
 
 def resolve_code_fingerprint(project_root: os.PathLike[str] | str) -> str:

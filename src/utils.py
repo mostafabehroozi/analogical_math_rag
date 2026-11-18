@@ -446,8 +446,18 @@ def load_exemplar_corpus(config: dict, logger=None):
         
         if use_disk:
             dataset = load_from_disk(load_path)
+            from datasets import DatasetDict
+            if isinstance(dataset, DatasetDict) and "train" in dataset:
+                dataset = dataset["train"]
         else:
-            dataset = load_dataset(load_path, split='train')
+            # A preset corpus is loaded at the revision its embedding file was made from.
+            from src.corpus_filter import EXEMPLAR_CORPUS_PRESETS
+            revision = next((preset["revision"] for preset in EXEMPLAR_CORPUS_PRESETS.values()
+                             if preset["hf_name"] == load_path), None)
+            if revision:
+                dataset = load_dataset(load_path, split='train', revision=revision)
+            else:
+                dataset = load_dataset(load_path, split='train')
         
         if logger:
             logger.info(f"[OK] Successfully loaded exemplar corpus from {source}")
@@ -474,6 +484,12 @@ NUMINA_MATH_SOURCES = (
     "orca_math",
     "synthetic_amc",
     "synthetic_math",
+    # NuminaMath-1.5 only
+    "cn_contest",
+    "inequalities",
+    "metamath",
+    "number_theory",
+    "olympiads_ref",
 )
 
 
@@ -545,8 +561,13 @@ def create_numina_hard_question_set(
     embedding_batch_size=64,
     candidate_pool_size=None,
     shuffle_output=True,
+    corpus_filter=None,
 ):
     """Select NuminaMath rows and save pipeline-compatible hard-question indices.
+
+    ``corpus_filter`` (a :class:`src.corpus_filter.CorpusFilter` built for this
+    dataset) removes synthetic and duplicate rows from every pool; the notebook
+    builds it from CONFIG, so the selection follows ``CORPUS_FILTER_*``.
 
     ``source_percentages`` reserves the stated percentage for each named source.
     Any percentage left up to 100 is sampled from all unlisted sources as one
@@ -587,6 +608,22 @@ def create_numina_hard_question_set(
     if strategy == "farthest" and column_names and question_column not in column_names:
         raise KeyError(f"Dataset has no question column named '{question_column}'.")
 
+    source_values = [str(value).strip().lower() for value in dataset[source_column]]
+    dataset_sources = set(source_values)
+    # Rows hidden by the corpus filter (synthetic and duplicate rows) are never selected.
+    if corpus_filter is not None and corpus_filter.size != len(source_values):
+        raise ValueError(
+            f"corpus_filter covers {corpus_filter.size} rows but the dataset has {len(source_values)}; "
+            "build it from this dataset."
+        )
+    usable = None if corpus_filter is None else ~corpus_filter.excluded
+    usable_count = len(source_values) if usable is None else int(usable.sum())
+    if total_questions > usable_count:
+        raise ValueError(
+            f"Requested {total_questions} rows but only {usable_count} of {len(source_values)} are usable "
+            "after the corpus filter."
+        )
+
     raw_percentages = source_percentages or {}
     if not isinstance(raw_percentages, dict):
         raise TypeError("source_percentages must be a dictionary such as {'amc_aime': 10}.")
@@ -597,6 +634,10 @@ def create_numina_hard_question_set(
             raise ValueError("Do not specify 'other'; it is automatically assigned the remainder.")
         if name not in NUMINA_MATH_SOURCES:
             raise ValueError(f"Unknown NuminaMath source '{name}'. Expected one of {NUMINA_MATH_SOURCES}.")
+        if dataset_sources and name not in dataset_sources:
+            raise ValueError(
+                f"Source '{name}' does not occur in this dataset; its sources are {sorted(dataset_sources)}."
+            )
         if isinstance(raw_percentage, bool) or not isinstance(raw_percentage, (int, float, np.number)):
             raise TypeError(f"Percentage for '{name}' must be numeric.")
         percentage = float(raw_percentage)
@@ -615,7 +656,6 @@ def create_numina_hard_question_set(
     else:
         percentages = {"all": 100.0}
 
-    source_values = [str(value).strip().lower() for value in dataset[source_column]]
     specified_sources = set(percentages) - {"other", "all"}
     pools = {}
     for block_name in percentages:
@@ -625,12 +665,15 @@ def create_numina_hard_question_set(
             pools[block_name] = [i for i, source in enumerate(source_values) if source not in specified_sources]
         else:
             pools[block_name] = [i for i, source in enumerate(source_values) if source == block_name]
+        if usable is not None:
+            pools[block_name] = [i for i in pools[block_name] if usable[i]]
 
     counts = _allocate_percentage_counts(total_questions, percentages)
     for block_name, count in counts.items():
         if count > len(pools[block_name]):
+            hint = " after the corpus filter (synthetic and duplicate rows are hidden)" if usable is not None else ""
             raise ValueError(
-                f"Block '{block_name}' needs {count} rows but only {len(pools[block_name])} are available."
+                f"Block '{block_name}' needs {count} rows but only {len(pools[block_name])} are available{hint}."
             )
 
     rng = np.random.default_rng(random_seed)
@@ -684,6 +727,7 @@ def create_numina_hard_question_set(
         "selected_source_counts": dict(sorted(selected_source_counts.items())),
         "candidate_pool_size": candidate_pool_size,
         "random_seed": random_seed,
+        "corpus_filter": None if corpus_filter is None else corpus_filter.summary(),
     }
 
 

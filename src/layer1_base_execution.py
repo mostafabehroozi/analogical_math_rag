@@ -31,6 +31,12 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 from src.api_manager import model_name_for
 from src.utils import save_json, load_json, create_trace_entry
+from src.corpus_filter import (
+    LEGACY_CORPUS_SIGNATURE,
+    corpus_signature,
+    describe_signature,
+    signature_of_exemplar_data,
+)
 from src.parallel_utils import run_parallel_api_calls
 from src.pipeline_steps import (
     retrieve,
@@ -757,7 +763,9 @@ def run_layer1_base_execution(
         config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0),
     )
     cache_path = _get_cache_path(cache_dir, cache_filename)
-    
+    # The retrieval pool (corpus + synthetic/duplicate filter) this state is made with.
+    current_corpus = signature_of_exemplar_data(exemplar_data) or corpus_signature(config)
+
     cached_state = None
     if not force_reexecution:
         cached_state = _load_cached_state(cache_path, target_query_index)
@@ -783,6 +791,15 @@ def run_layer1_base_execution(
             )
             cached_state = None
         if cached_state:
+            cached_corpus = cached_state.get("metadata", {}).get("config_snapshot", {}).get(
+                "EXEMPLAR_CORPUS_SIGNATURE") or LEGACY_CORPUS_SIGNATURE
+            if cached_corpus != current_corpus:
+                logger.warning(
+                    "Ignoring Layer 1 cache for query #%s: it was made with [%s], this run uses [%s].",
+                    target_query_index, describe_signature(cached_corpus), describe_signature(current_corpus),
+                )
+                cached_state = None
+        if cached_state:
             last_step = cached_state.get("metadata", {}).get("last_completed_step", -1)
             if last_step == 4:  # Full Cache Hit
                 print(f"[LAYER 1 CACHE HIT - FULL] Loaded query #{target_query_index} from {cache_path}")
@@ -806,6 +823,7 @@ def run_layer1_base_execution(
                 "LAYER1_ZERO_SHOT_CANDIDATES_N": config.get("LAYER1_ZERO_SHOT_CANDIDATES_N", 0),
                 "MIRROR_N_OPTIMIZATION": config.get("MIRROR_N_OPTIMIZATION"),
                 "LAYER1_BASE_CCS_ENABLED": bool(config.get("LAYER1_BASE_CCS_ENABLED", False)),
+                "EXEMPLAR_CORPUS_SIGNATURE": current_corpus,
             }
         },
         "target_query_data": {
