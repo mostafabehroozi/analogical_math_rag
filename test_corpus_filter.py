@@ -379,6 +379,26 @@ class GuardTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Mixing them"):
                 orchestration._check_exemplar_corpus([{"experiment_name": "e"}], config, data, [ROWS[0][0]])
 
+    def test_preflight_with_an_old_asset_cell_index(self):
+        # bench_16-style asset cell: {question: row} (one int, not a list), filter attached by run_experiments
+        rows = dataset()
+        data = {"questions": list(rows["problem"]), "solutions": list(rows["solution"]),
+                "embeddings": np.eye(len(ROWS)),
+                "question_to_index": {q: i for i, q in enumerate(rows["problem"])}}
+        config = {"EXEMPLAR_CORPUS": "NuminaMath-1.5", **ON, "TARGET_BENCHMARK": "numina_hard"}
+        with patch("src.utils.load_exemplar_corpus", return_value=rows), tempfile.TemporaryDirectory() as results:
+            config["RESULTS_DIR"] = results
+            orchestration._check_exemplar_corpus([{"experiment_name": "e"}], config, data, [ROWS[0][0], ROWS[3][0]])
+            self.assertIsNotNone(data["question_to_index"].corpus_filter)
+            with self.assertRaisesRegex(ValueError, "1 numina_hard target"):
+                orchestration._check_exemplar_corpus([{"experiment_name": "e"}], config, data,
+                                                     [ROWS[0][0], ROWS[5][0]])
+        # row 0 is a real row number, not "missing"
+        f = data["corpus_filter"]
+        f.reasons[0] = cf.SYNTHETIC
+        self.assertEqual(cf.hidden_target_positions([ROWS[0][0]], data), [0])
+        f.reasons[0] = cf.KEPT
+
     def test_layer1_cache_from_another_pool_is_not_reused(self):
         def run(snapshot, config):
             cached = {"metadata": {"last_completed_step": 4, "config_snapshot": {

@@ -513,6 +513,10 @@ def hidden_target_positions(
     hidden = []
     for position in (range(len(targets)) if positions is None else positions):
         rows = index.get(targets[position])
+        if rows is None:
+            continue
+        # Older asset cells map a question to one row number instead of a list.
+        rows = [rows] if isinstance(rows, (int, np.integer)) else list(rows)
         if rows and all(found.is_excluded(row) for row in rows):
             hidden.append(int(position))
     return hidden
