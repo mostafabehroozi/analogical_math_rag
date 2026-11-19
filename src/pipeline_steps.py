@@ -7,6 +7,7 @@ from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Union, Optional
 import time
 import threading
+import weakref
 
 from src.prompts import (
     PROMPT_TEMPLATES,
@@ -34,6 +35,11 @@ from src.api_manager import model_name_for, quiet_successful_api_calls
 from src.evaluation import evaluate_single_answer_with_llm
 # Global cache for embedding norms to massively speed up retrieval and save RAM
 _NORMS_CACHE = {}
+_SIMILARITY_BLOCK_ROWS = 65536  # rows per block for non-float32 embedding matrices
+# Query vectors by (model, text): the same target is retrieved for by several
+# experiments, and a large embedding model on CPU takes seconds per query.
+_QUERY_EMBEDDING_CACHE = weakref.WeakKeyDictionary()  # model -> {text: vector}
+_QUERY_EMBEDDING_CACHE_MAX = 50000
 # Protects local PyTorch and Numpy resources from being overwhelmed by batch threads
 _LOCAL_COMPUTE_LOCK = threading.Lock()
 
@@ -103,7 +109,15 @@ def retrieve(
     print(f"{'  '*indent_level}Requested top_k: {top_k}")
 
     query_embedding_start_time = time.time()
-    query_embedding = _generate_embeddings([target_query], embedding_model)
+    try:
+        model_cache = _QUERY_EMBEDDING_CACHE.setdefault(embedding_model, {})
+    except TypeError:  # an object that cannot be weakly referenced: no cache
+        model_cache = {}
+    query_embedding = model_cache.get(target_query)
+    if query_embedding is None:
+        query_embedding = _generate_embeddings([target_query], embedding_model)
+        if query_embedding.size and len(model_cache) < _QUERY_EMBEDDING_CACHE_MAX:
+            model_cache[target_query] = query_embedding
     log_time_diagnostic("Generate query embedding", query_embedding_start_time, indent=indent_level)
     print(f"{'  '*indent_level}Query embedding shape: {query_embedding.shape}")
     
@@ -124,11 +138,24 @@ def retrieve(
             similarities = np.zeros(embedded_exemplars.shape[0], dtype=np.float32)
         else:
             q_vec_normalized = q_vec / q_norm
-            # Fast dot product (much more memory efficient than sklearn)
-            dot_prods = np.dot(embedded_exemplars, q_vec_normalized)
-            
-            # Cache the norms of the huge embedded_exemplars matrix
             arr_id = id(embedded_exemplars)
+            if embedded_exemplars.dtype == np.float32:
+                # Fast dot product (much more memory efficient than sklearn)
+                dot_prods = np.dot(embedded_exemplars, q_vec_normalized)
+            else:
+                # float16 files (e.g. MathLeap-Qwen-8B, 7.3 GB): one float32 copy of the
+                # whole matrix would not fit in RAM, so work through it in blocks.
+                dot_prods = np.empty(embedded_exemplars.shape[0], dtype=np.float32)
+                block_norms = None if arr_id in _NORMS_CACHE else np.empty_like(dot_prods)
+                for start in range(0, embedded_exemplars.shape[0], _SIMILARITY_BLOCK_ROWS):
+                    block = np.asarray(embedded_exemplars[start:start + _SIMILARITY_BLOCK_ROWS], dtype=np.float32)
+                    dot_prods[start:start + len(block)] = block @ q_vec_normalized
+                    if block_norms is not None:
+                        block_norms[start:start + len(block)] = np.linalg.norm(block, axis=1)
+                if block_norms is not None:
+                    _NORMS_CACHE[arr_id] = np.maximum(block_norms, 1e-10)
+
+            # Cache the norms of the huge embedded_exemplars matrix
             if arr_id not in _NORMS_CACHE:
                 logger.info("Computing and caching L2 norms for embedded_exemplars...")
                 norms = np.linalg.norm(embedded_exemplars, axis=1)

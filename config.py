@@ -310,6 +310,11 @@ CONFIG = {
     # the corpus names and the embedding file at it; the NuminaMath-1.5 embedding file is
     # downloaded from Hugging Face when it is missing (src/corpus_filter.py).
     "EXEMPLAR_CORPUS": "NuminaMath-CoT",
+    # The model behind the corpus embedding file; queries are embedded with the same model.
+    # "Bert-MLM_arXiv-MP-class_zbMath" (the original, 768 dims) or "MathLeap-Qwen-8B"
+    # (4096 dims, NuminaMath-1.5 only; the 8B model needs about 16 GB of RAM or GPU memory).
+    # rebuild_derived_paths() sets EMBEDDING_MODEL_PATH(_HF) and the embedding file from it.
+    "EXEMPLAR_EMBEDDING_MODEL": "Bert-MLM_arXiv-MP-class_zbMath",
     # Synthetic and duplicate rows are hidden from retrieval, numina_hard targets,
     # hard-question selection and every other corpus reader. Row indices never change.
     "CORPUS_FILTER_ENABLED": True,
@@ -558,10 +563,10 @@ def rebuild_derived_paths():
     """
     from src.corpus_filter import apply_exemplar_corpus
 
-    CONFIG["LOCAL_EMBEDDING_MODEL_PATH"] = os.path.join(CONFIG["DATA_DIR"], "Bert-MLM_arXiv-MP-class_zbMath")
     CONFIG["HARD_QUESTIONS_INDICES_PATH"] = os.path.join(CONFIG["DATA_DIR"], "hard_question_indices.json")
-    # LOCAL_EXEMPLAR_CORPUS_PATH, EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH and the corpus
-    # names follow CONFIG["EXEMPLAR_CORPUS"].
+    # LOCAL_EXEMPLAR_CORPUS_PATH and the corpus names follow CONFIG["EXEMPLAR_CORPUS"];
+    # EMBEDDING_MODEL_PATH(_HF), LOCAL_EMBEDDING_MODEL_PATH and
+    # EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH also follow CONFIG["EXEMPLAR_EMBEDDING_MODEL"].
     apply_exemplar_corpus(CONFIG)
     CONFIG["ADVANCED_RAG_FULL_LOG_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_pipeline_full_log.json")
     CONFIG["ADVANCED_RAG_EVALUATION_RESULTS_PATH"] = os.path.join(CONFIG["RESULTS_DIR"], "advanced_rag_evaluation_results.pkl")

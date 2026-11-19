@@ -323,6 +323,78 @@ class CorpusConfigTest(unittest.TestCase):
                 cf.ensure_exemplar_embeddings({"EXEMPLAR_CORPUS": "NuminaMath-CoT",
                                                "EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH": target})
 
+    def test_embedding_model_choice(self):
+        config = {"EXEMPLAR_CORPUS": "NuminaMath-1.5", "EXEMPLAR_EMBEDDING_MODEL": "MathLeap-Qwen-8B",
+                  "DATA_DIR": "d", "EMBEDDINGS_DIR": "e",
+                  "EMBEDDING_MODEL_PATH": "math-similarity/Bert-MLM_arXiv-MP-class_zbMath",
+                  "EMBEDDING_MODEL_PATH_HF": "math-similarity/Bert-MLM_arXiv-MP-class_zbMath"}
+        cf.apply_exemplar_corpus(config)
+        self.assertEqual(config["EMBEDDING_MODEL_PATH"], "uw-math-ai/MathLeap-Qwen-8B")
+        self.assertEqual(config["EMBEDDING_MODEL_PATH_HF"], "uw-math-ai/MathLeap-Qwen-8B")
+        self.assertEqual(config["LOCAL_EMBEDDING_MODEL_PATH"], os.path.join("d", "MathLeap-Qwen-8B"))
+        self.assertEqual(config["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"],
+                         os.path.join("e", "embedding_NuminaMath-1.5_with_MathLeap-Qwen-8B.npy"))
+        self.assertEqual(cf.embedding_preset(config)["embedding_source"]["bytes"], 7341793408)
+        self.assertEqual(cf.embedding_preset(config)["max_seq_length"], 512)
+        # Back to BERT: both names and the file follow; a custom model path is left alone.
+        back =dict(config, EXEMPLAR_EMBEDDING_MODEL="Bert-MLM_arXiv-MP-class_zbMath")
+        cf.apply_exemplar_corpus(back)
+        self.assertEqual(back["EMBEDDING_MODEL_PATH"], "math-similarity/Bert-MLM_arXiv-MP-class_zbMath")
+        self.assertTrue(back["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"].endswith("_with_Bert-MLM_arXiv-MP-class_zbMath.npy"))
+        custom = dict(config, EMBEDDING_MODEL_PATH="/kaggle/input/my-model")
+        cf.apply_exemplar_corpus(custom)
+        self.assertEqual(custom["EMBEDDING_MODEL_PATH"], "/kaggle/input/my-model")
+        with self.assertRaises(ValueError):  # no MathLeap file for NuminaMath-CoT
+            cf.apply_exemplar_corpus({"EXEMPLAR_CORPUS": "NuminaMath-CoT", "EXEMPLAR_EMBEDDING_MODEL": "MathLeap-Qwen-8B"})
+        with self.assertRaises(ValueError):
+            cf.apply_exemplar_corpus({"EXEMPLAR_EMBEDDING_MODEL": "e5"})
+        self.assertEqual(CONFIG["EXEMPLAR_EMBEDDING_MODEL"], "Bert-MLM_arXiv-MP-class_zbMath")
+        self.assertEqual(CONFIG["EMBEDDING_MODEL_PATH"], "math-similarity/Bert-MLM_arXiv-MP-class_zbMath")
+        self.assertTrue(CONFIG["LOCAL_EMBEDDING_MODEL_PATH"].endswith("Bert-MLM_arXiv-MP-class_zbMath"))
+        # The default model leaves the run manifest as it was; another model changes it.
+        base = {"TOP_N_CANDIDATES_RETRIEVAL": 5}
+        self.assertEqual(sanitize_scientific_config({**base, "EXEMPLAR_EMBEDDING_MODEL": "Bert-MLM_arXiv-MP-class_zbMath"}),
+                         sanitize_scientific_config(base))
+        self.assertIn("EXEMPLAR_EMBEDDING_MODEL",
+                      sanitize_scientific_config({**base, "EXEMPLAR_EMBEDDING_MODEL": "MathLeap-Qwen-8B"}))
+
+    def test_the_loader_embeds_queries_like_the_corpus_file(self):
+        from src.utils import load_embedding_model
+        calls = []
+
+        class Recorder:
+            def __init__(self, path, **kwargs):
+                calls.append((path, kwargs))
+                self.max_seq_length = 128
+
+        module = ModuleType("sentence_transformers")
+        module.SentenceTransformer = Recorder
+        with patch.dict(sys.modules, {"sentence_transformers": module}):
+            bert = load_embedding_model({"EMBEDDING_MODEL_PATH": "math-similarity/Bert-MLM_arXiv-MP-class_zbMath"})
+            leap = load_embedding_model({"EMBEDDING_MODEL_PATH": "uw-math-ai/MathLeap-Qwen-8B",
+                                         "EMBEDDING_MODEL_PATH_HF": "uw-math-ai/MathLeap-Qwen-8B"})
+        self.assertEqual(calls[0], ("math-similarity/Bert-MLM_arXiv-MP-class_zbMath", {"revision": None}))
+        self.assertEqual(bert.max_seq_length, 128)
+        path, kwargs = calls[1]
+        self.assertEqual(path, "uw-math-ai/MathLeap-Qwen-8B")
+        self.assertEqual(kwargs["revision"], cf.EMBEDDING_MODEL_PRESETS["MathLeap-Qwen-8B"]["revision"])
+        self.assertIn(str(kwargs["model_kwargs"]["torch_dtype"]), ("torch.bfloat16", "torch.float16"))
+        self.assertEqual(leap.max_seq_length, 512)
+
+    def test_float16_embeddings_give_the_same_ranking(self):
+        rng = np.random.default_rng(0)
+        matrix = rng.standard_normal((300, 16)).astype(np.float32)
+        matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
+        questions = [f"q{i}" for i in range(300)]
+        query = rng.standard_normal(16).astype(np.float32)
+        found = []
+        for embeddings in (matrix, matrix.astype(np.float16)):
+            with patch.object(pipeline_steps, "_generate_embeddings", return_value=np.asarray([query])), \
+                    patch.object(pipeline_steps, "_SIMILARITY_BLOCK_ROWS", 64):
+                result = pipeline_steps.retrieve("target", None, questions, embeddings, 10, question_to_index_map={})
+            found.append(result["retrieved_indices"])
+        self.assertEqual(found[0], found[1])
+
     def test_manifest_hash_is_unchanged_with_the_filter_off(self):
         base = {"TOP_N_CANDIDATES_RETRIEVAL": 5, "EXEMPLAR_CORPUS_NAME": "AI-MO/NuminaMath-CoT"}
         off = {**base, "EXEMPLAR_CORPUS": "NuminaMath-CoT", "CORPUS_FILTER_ENABLED": False,

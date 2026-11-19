@@ -69,9 +69,40 @@ EXEMPLAR_CORPUS_PRESETS: Dict[str, Dict[str, Any]] = {
             "bytes": 2753172608,
             "sha256": "bd494892fb3978557aa679591d3c21283bc966730976be61ac9d45e9a89d9756",
         },
+        # Embedding files made with other models (EXEMPLAR_EMBEDDING_MODEL); the keys above are the BERT file.
+        "other_embeddings": {
+            "MathLeap-Qwen-8B": {
+                "embedding_file": "embedding_NuminaMath-1.5_with_MathLeap-Qwen-8B.npy",
+                "embedding_source": {
+                    "repo_id": "mostafabehroozi/numinamath-2025",
+                    "repo_type": "dataset",
+                    "revision": "2645d854331504e53fe48dce751afd46b5f462b8",
+                    "filename": "embeddings/embedding_NuminaMath-1.5_with_MathLeap-Qwen-8B.npy",
+                    "bytes": 7341793408,
+                    "sha256": "0dfe92fee277c7a29236d13eb0caa6af61bb4d0fe24c6b15199e8643880f5cba",
+                },
+            },
+        },
         "rows": 896215,
         "synthetic_column": "synthetic",
         "synthetic_sources": ("metamath", "orca_math", "synthetic_math"),
+    },
+}
+
+# The model that embedded the corpus file must also embed every query, with the same settings.
+DEFAULT_EMBEDDING_MODEL = "Bert-MLM_arXiv-MP-class_zbMath"
+EMBEDDING_MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
+    "Bert-MLM_arXiv-MP-class_zbMath": {
+        "hf_name": "math-similarity/Bert-MLM_arXiv-MP-class_zbMath",
+        "revision": None,
+        "max_seq_length": None,   # the model's own setting, as always
+        "large": False,
+    },
+    "MathLeap-Qwen-8B": {
+        "hf_name": "uw-math-ai/MathLeap-Qwen-8B",
+        "revision": "ffe9c2a4a1b7777b890044e40a4e4a4d6346ae23",  # the revision the corpus file was made with
+        "max_seq_length": 512,    # the corpus file used 512 tokens (the model's default is 128)
+        "large": True,            # 8B parameters: loaded in 16-bit, ~16 GB
     },
 }
 
@@ -100,22 +131,49 @@ def corpus_preset(config: Mapping[str, Any]) -> Dict[str, Any]:
     return EXEMPLAR_CORPUS_PRESETS[name]
 
 
+def embedding_preset(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """The chosen embedding model (``EXEMPLAR_EMBEDDING_MODEL``) and its file for the chosen corpus."""
+    name = config.get("EXEMPLAR_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
+    if name not in EMBEDDING_MODEL_PRESETS:
+        raise ValueError(
+            f"EXEMPLAR_EMBEDDING_MODEL must be one of {sorted(EMBEDDING_MODEL_PRESETS)}, got {name!r}."
+        )
+    corpus = corpus_preset(config)
+    if name == DEFAULT_EMBEDDING_MODEL:
+        files = {"embedding_file": corpus["embedding_file"], "embedding_source": corpus.get("embedding_source")}
+    else:
+        files = corpus.get("other_embeddings", {}).get(name)
+        if files is None:
+            raise ValueError(
+                f"There is no {name} embedding file for {config.get('EXEMPLAR_CORPUS') or DEFAULT_EXEMPLAR_CORPUS}; "
+                f"use EXEMPLAR_EMBEDDING_MODEL={DEFAULT_EMBEDDING_MODEL!r} or another corpus."
+            )
+    return {"name": name, **EMBEDDING_MODEL_PRESETS[name], **files}
+
+
 def apply_exemplar_corpus(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Point the corpus names and paths at ``config["EXEMPLAR_CORPUS"]``.
+    """Point the corpus names and paths at ``config["EXEMPLAR_CORPUS"]`` and the
+    embedding model and file at ``config["EXEMPLAR_EMBEDDING_MODEL"]``.
 
     Names the user replaced with a custom location (anything that is not a
     preset's Hugging Face name) are left alone.
     """
     preset = corpus_preset(config)
+    embedding = embedding_preset(config)
     preset_names = {p["hf_name"] for p in EXEMPLAR_CORPUS_PRESETS.values()}
     for key in ("EXEMPLAR_CORPUS_NAME_HF", "EXEMPLAR_CORPUS_NAME"):
         if config.get(key) in (None, "", *preset_names):
             config[key] = preset["hf_name"]
+    model_names = {p["hf_name"] for p in EMBEDDING_MODEL_PRESETS.values()}
+    for key in ("EMBEDDING_MODEL_PATH_HF", "EMBEDDING_MODEL_PATH"):
+        if config.get(key) in (None, "", *model_names):
+            config[key] = embedding["hf_name"]
     if config.get("DATA_DIR"):
         config["LOCAL_EXEMPLAR_CORPUS_PATH"] = os.path.join(config["DATA_DIR"], preset["local_dir"])
+        config["LOCAL_EMBEDDING_MODEL_PATH"] = os.path.join(config["DATA_DIR"], embedding["name"])
     if config.get("EMBEDDINGS_DIR"):
         config["EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH"] = os.path.join(
-            config["EMBEDDINGS_DIR"], preset["embedding_file"]
+            config["EMBEDDINGS_DIR"], embedding["embedding_file"]
         )
     return config
 
@@ -550,7 +608,8 @@ def ensure_exemplar_embeddings(config: Mapping[str, Any], *, download_fn: Any = 
         raise ValueError("EMBEDDED_EXEMPLAR_CORPUS_QUESTIONS_PATH is not set.")
     if os.path.isfile(path):
         return path
-    source = corpus_preset(config).get("embedding_source")
+    embedding = embedding_preset(config)
+    source = embedding.get("embedding_source")
     if not source:
         raise FileNotFoundError(
             f"Embedding file not found: {path}. For {config.get('EXEMPLAR_CORPUS', DEFAULT_EXEMPLAR_CORPUS)} "
@@ -561,7 +620,7 @@ def ensure_exemplar_embeddings(config: Mapping[str, Any], *, download_fn: Any = 
     folder = os.path.dirname(os.path.abspath(path))
     staging = os.path.join(folder, ".exemplar_embedding_download")
     os.makedirs(staging, exist_ok=True)
-    print(f"Downloading the {config.get('EXEMPLAR_CORPUS')} embedding file "
+    print(f"Downloading the {config.get('EXEMPLAR_CORPUS')} {embedding['name']} embedding file "
           f"({source['bytes'] / 1e9:.2f} GB) from {source['repo_id']} ...", flush=True)
     started = time.time()
     token = config.get("HF_SYNC_TOKEN")

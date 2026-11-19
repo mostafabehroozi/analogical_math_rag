@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from src.api_routing import POOLS_KEY, config_uses_provider
-from src.corpus_filter import DEFAULT_EXEMPLAR_CORPUS
+from src.corpus_filter import DEFAULT_EMBEDDING_MODEL, DEFAULT_EXEMPLAR_CORPUS
 
 
 MANIFEST_SCHEMA_VERSION = 2
@@ -338,6 +338,9 @@ def sanitize_scientific_config(value: Any) -> Any:
             # The original corpus without the synthetic/duplicate filter is exactly
             # the behaviour before these settings existed (src/corpus_filter.py).
             and not (str(key) == "EXEMPLAR_CORPUS" and item == DEFAULT_EXEMPLAR_CORPUS)
+            # The original embedding model is the behaviour before EXEMPLAR_EMBEDDING_MODEL existed;
+            # another model also changes EMBEDDING_MODEL_PATH and the embedding shape.
+            and not (str(key) == "EXEMPLAR_EMBEDDING_MODEL" and item == DEFAULT_EMBEDDING_MODEL)
             and not (str(key).startswith("CORPUS_FILTER_") and value.get("CORPUS_FILTER_ENABLED") is False)
         }
     if isinstance(value, (list, tuple)):

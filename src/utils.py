@@ -385,12 +385,32 @@ def load_embedding_model(config: dict, logger=None):
         
         if logger:
             logger.info(f"Loading embedding model from {source}: {load_path}")
-        
-        model = SentenceTransformer(load_path)
-        
+
+        # The chosen preset (EXEMPLAR_EMBEDDING_MODEL) must embed queries exactly as
+        # its corpus file was made: same revision and the same token limit.
+        from src.corpus_filter import EMBEDDING_MODEL_PRESETS
+        preset = next((p for name, p in EMBEDDING_MODEL_PRESETS.items()
+                       if load_path == p["hf_name"] or os.path.basename(os.path.normpath(load_path)) == name), None)
+        if preset is None or not preset.get("large"):
+            model = SentenceTransformer(load_path, revision=(preset or {}).get("revision") if source == "HuggingFace" else None)
+        else:
+            import torch
+            # 16-bit weights (~16 GB for 8B): float16 on a GPU that holds them, bfloat16 on CPU.
+            gpu_ok = torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= 20 * 2**30
+            device, dtype = ("cuda", torch.float16) if gpu_ok else ("cpu", torch.bfloat16)
+            if logger:
+                logger.info(f"Large embedding model: {device}, {dtype}")
+            model = SentenceTransformer(
+                load_path, device=device,
+                revision=preset.get("revision") if source == "HuggingFace" else None,
+                model_kwargs={"torch_dtype": dtype},
+            )
+        if preset is not None and preset.get("max_seq_length"):
+            model.max_seq_length = preset["max_seq_length"]
+
         if logger:
             logger.info(f"[OK] Successfully loaded embedding model from {source}")
-        
+
         return model
         
     except Exception as e:
