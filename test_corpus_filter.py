@@ -50,6 +50,11 @@ class FakeDataset(dict):
     def __len__(self):
         return len(next(iter(self.values())))
 
+    def __getitem__(self, key):
+        if isinstance(key, int):  # one row, like datasets.Dataset
+            return {name: column[key] for name, column in self.items()}
+        return super().__getitem__(key)
+
 
 # A NuminaMath-1.5-like corpus.
 ROWS = [
@@ -66,6 +71,9 @@ ROWS = [
     ("Prove that $n^{n}+(n+1)^{n+1}$ is composite for infinitely many $n$.", "olympiads_ref", False, "Yes"),  # 9
     ("Prove that $n^n + (n + 1)^{n + 1}$ is composite for infinitely many $n$.", "aops_forum", False, "Yes"),  # 10 copy of 9
 ]
+
+
+ROWS_TEXT = [r[0] for r in ROWS]
 
 
 def dataset(rows=ROWS, with_synthetic=True):
@@ -224,6 +232,32 @@ class SelectionTest(unittest.TestCase):
                                                 output_dir=out, corpus_filter=f)
             unfiltered = create_numina_hard_question_set(dataset(), 11, output_dir=out)
             self.assertEqual(sorted(unfiltered["selected_indices"]), list(range(11)))
+
+    def test_allowed_rows_and_precomputed_embeddings(self):
+        rng = np.random.default_rng(3)
+        by_text = {text: rng.normal(size=8).astype(np.float32) for text in ROWS_TEXT}
+        vectors = np.stack([by_text[text] for text in ROWS_TEXT])  # the "embedding file"
+
+        class Model:  # the encoder that made that file
+            def encode(self, questions, **kwargs):
+                return np.stack([by_text[q] for q in questions])
+
+        allowed = np.ones(len(ROWS), dtype=bool)
+        allowed[3] = False
+        f = build()
+        with tempfile.TemporaryDirectory() as out:
+            common = dict(selection_strategy="farthest", output_dir=out, corpus_filter=f, allowed_rows=allowed,
+                          random_seed=7, shuffle_output=False)
+            saved = create_numina_hard_question_set(dataset(), 3, embeddings=vectors, **common)
+            encoded = create_numina_hard_question_set(dataset(), 3, embedding_model=Model(), **common)
+            self.assertEqual(saved["selected_indices"], encoded["selected_indices"])
+            self.assertTrue(set(saved["selected_indices"]) <= {0, 2, 7, 9})
+            self.assertEqual((saved["usable_rows"], saved["embeddings"]), (4, "precomputed"))
+            with self.assertRaisesRegex(ValueError, "one row per dataset row"):
+                create_numina_hard_question_set(dataset(), 3, embeddings=vectors[:3], **common)
+            with self.assertRaisesRegex(ValueError, "allowed_rows must have"):
+                create_numina_hard_question_set(dataset(), 3, embeddings=vectors,
+                                                **{**common, "allowed_rows": allowed[:3]})
 
     def test_numina_hard_targets_must_be_usable_rows(self):
         data = cf.build_exemplar_data(dataset(), np.eye(len(ROWS)), {"EXEMPLAR_CORPUS": "NuminaMath-1.5", **ON})

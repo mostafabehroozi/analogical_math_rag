@@ -504,21 +504,23 @@ def _allocate_percentage_counts(total, percentages):
     return counts
 
 
-def _select_farthest_indices(indices, questions, count, embedding_model, rng, batch_size):
-    """Greedy max-min selection using cosine distance from the selected set."""
+def _select_farthest_indices(indices, questions, count, embedding_model, rng, batch_size, embeddings=None):
+    """Greedy max-min selection using cosine distance from the selected set.
+
+    ``embeddings`` (rows aligned with ``indices``) replaces encoding ``questions``.
+    """
     if count == len(indices):
         return list(indices)
 
-    embeddings = np.asarray(
-        embedding_model.encode(
+    if embeddings is None:
+        embeddings = embedding_model.encode(
             questions,
             batch_size=batch_size,
             convert_to_numpy=True,
             normalize_embeddings=True,
             show_progress_bar=True,
-        ),
-        dtype=np.float32,
-    )
+        )
+    embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim != 2 or embeddings.shape[0] != len(indices):
         raise ValueError("The embedding model returned an unexpected embedding shape.")
 
@@ -562,12 +564,18 @@ def create_numina_hard_question_set(
     candidate_pool_size=None,
     shuffle_output=True,
     corpus_filter=None,
+    allowed_rows=None,
+    embeddings=None,
 ):
     """Select NuminaMath rows and save pipeline-compatible hard-question indices.
 
     ``corpus_filter`` (a :class:`src.corpus_filter.CorpusFilter` built for this
     dataset) removes synthetic and duplicate rows from every pool; the notebook
     builds it from CONFIG, so the selection follows ``CORPUS_FILTER_*``.
+    ``allowed_rows`` (a boolean per row) removes further rows, e.g. proofs or
+    rows without a gradable answer. ``embeddings`` (one row per dataset row,
+    e.g. the corpus embedding file) is used by ``farthest`` instead of encoding
+    the questions, which also makes candidate pre-sampling unnecessary.
 
     ``source_percentages`` reserves the stated percentage for each named source.
     Any percentage left up to 100 is sampled from all unlisted sources as one
@@ -592,8 +600,13 @@ def create_numina_hard_question_set(
     strategy = str(selection_strategy).strip().lower()
     if strategy not in {"random", "farthest"}:
         raise ValueError("selection_strategy must be 'random' or 'farthest'.")
-    if strategy == "farthest" and embedding_model is None:
-        raise ValueError("embedding_model is required for selection_strategy='farthest'.")
+    if strategy == "farthest" and embedding_model is None and embeddings is None:
+        raise ValueError("embedding_model or embeddings is required for selection_strategy='farthest'.")
+    if embeddings is not None and (getattr(embeddings, "ndim", 0) != 2 or len(embeddings) != len(dataset)):
+        raise ValueError(
+            f"embeddings must have one row per dataset row ({len(dataset)}), got shape "
+            f"{getattr(embeddings, 'shape', None)}."
+        )
     if not output_dir:
         raise ValueError("output_dir must be provided.")
     if candidate_pool_size is not None and (
@@ -617,11 +630,16 @@ def create_numina_hard_question_set(
             "build it from this dataset."
         )
     usable = None if corpus_filter is None else ~corpus_filter.excluded
+    if allowed_rows is not None:
+        allowed = np.asarray(allowed_rows, dtype=bool)
+        if allowed.shape != (len(source_values),):
+            raise ValueError(f"allowed_rows must have one value per dataset row ({len(source_values)}).")
+        usable = allowed if usable is None else (usable & allowed)
     usable_count = len(source_values) if usable is None else int(usable.sum())
     if total_questions > usable_count:
         raise ValueError(
             f"Requested {total_questions} rows but only {usable_count} of {len(source_values)} are usable "
-            "after the corpus filter."
+            "after the corpus filter and allowed_rows."
         )
 
     raw_percentages = source_percentages or {}
@@ -671,7 +689,7 @@ def create_numina_hard_question_set(
     counts = _allocate_percentage_counts(total_questions, percentages)
     for block_name, count in counts.items():
         if count > len(pools[block_name]):
-            hint = " after the corpus filter (synthetic and duplicate rows are hidden)" if usable is not None else ""
+            hint = " after the corpus filter and allowed_rows" if usable is not None else ""
             raise ValueError(
                 f"Block '{block_name}' needs {count} rows but only {len(pools[block_name])} are available{hint}."
             )
@@ -687,6 +705,14 @@ def create_numina_hard_question_set(
 
         if strategy == "random":
             chosen = rng.choice(pool, size=count, replace=False).tolist()
+        elif embeddings is not None:
+            rows = np.asarray(pool, dtype=np.int64)
+            order = np.argsort(rows, kind="stable")  # sorted reads from a memory-mapped file
+            pool_embeddings = np.empty((len(rows), embeddings.shape[1]), dtype=np.float32)
+            pool_embeddings[order] = np.asarray(embeddings[rows[order]], dtype=np.float32)
+            chosen = _select_farthest_indices(
+                pool, None, count, None, rng, embedding_batch_size, embeddings=pool_embeddings
+            )
         else:
             questions = [str(dataset[int(index)][question_column]) for index in pool]
             chosen = _select_farthest_indices(
@@ -728,6 +754,9 @@ def create_numina_hard_question_set(
         "candidate_pool_size": candidate_pool_size,
         "random_seed": random_seed,
         "corpus_filter": None if corpus_filter is None else corpus_filter.summary(),
+        "usable_rows": usable_count,
+        "embeddings": "precomputed" if embeddings is not None else (
+            "encoded" if strategy == "farthest" else None),
     }
 
 
