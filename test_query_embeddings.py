@@ -78,6 +78,8 @@ class SavedVectorsTest(unittest.TestCase):
                 write(os.path.join(local_dir, "benchmark_embeddings", BERT))
 
             config = {"EXEMPLAR_EMBEDDING_MODEL": BERT, "EMBEDDINGS_DIR": work}
+            self.assertEqual(EMBEDDING_MODEL_PRESETS[BERT]["benchmark_embeddings_source"]["folder"],
+                             f"benchmark_embeddings/{BERT}", "the published folder is pinned")
             with patch.dict(EMBEDDING_MODEL_PRESETS[BERT], benchmark_embeddings_source=source):
                 folder = qe.ensure_benchmark_embeddings(config, download_fn=download)
             self.assertEqual(folder, os.path.join(work, "benchmark_embeddings", BERT))
@@ -101,10 +103,11 @@ class SavedVectorsTest(unittest.TestCase):
                 self.assertEqual(loads, [], "no model is loaded up front")
                 encoder.encode(["not saved"])
                 self.assertEqual(loads, [EMBEDDING_MODEL_PRESETS[BERT]["hf_name"]])
-                # Without saved vectors the loader falls back to the model.
-                plain = load_embedding_model({"EXEMPLAR_EMBEDDING_MODEL": BERT, "BENCHMARK_EMBEDDINGS_ENABLED": True,
-                                              "EMBEDDINGS_DIR": os.path.join(work, "none"),
-                                              "EMBEDDING_MODEL_PATH": EMBEDDING_MODEL_PRESETS[BERT]["hf_name"]})
+                # Without saved vectors (none local, none published) the loader falls back to the model.
+                with patch.dict(EMBEDDING_MODEL_PRESETS[BERT], benchmark_embeddings_source=None):
+                    plain = load_embedding_model({"EXEMPLAR_EMBEDDING_MODEL": BERT, "BENCHMARK_EMBEDDINGS_ENABLED": True,
+                                                  "EMBEDDINGS_DIR": os.path.join(work, "none"),
+                                                  "EMBEDDING_MODEL_PATH": EMBEDDING_MODEL_PRESETS[BERT]["hf_name"]})
                 self.assertIsInstance(plain, Recorder)
 
     def test_retrieval_uses_the_saved_vectors(self):
