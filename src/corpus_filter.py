@@ -97,12 +97,14 @@ EMBEDDING_MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
         "revision": None,
         "max_seq_length": None,   # the model's own setting, as always
         "large": False,
+        "benchmark_embeddings_source": None,  # saved question vectors (src/query_embeddings.py)
     },
     "MathLeap-Qwen-8B": {
         "hf_name": "uw-math-ai/MathLeap-Qwen-8B",
         "revision": "ffe9c2a4a1b7777b890044e40a4e4a4d6346ae23",  # the revision the corpus file was made with
         "max_seq_length": 512,    # the corpus file used 512 tokens (the model's default is 128)
         "large": True,            # 8B parameters: loaded in 16-bit, ~16 GB
+        "benchmark_embeddings_source": None,
     },
 }
 

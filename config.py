@@ -315,6 +315,12 @@ CONFIG = {
     # (4096 dims, NuminaMath-1.5 only; the 8B model needs about 16 GB of RAM or GPU memory).
     # rebuild_derived_paths() sets EMBEDDING_MODEL_PATH(_HF) and the embedding file from it.
     "EXEMPLAR_EMBEDDING_MODEL": "Bert-MLM_arXiv-MP-class_zbMath",
+    # Benchmark questions (numina_hard, math500, gsm8k, aime25, aime26) embedded once on a
+    # GPU and saved per model (src/query_embeddings.py). Retrieval then never embeds them
+    # here; the model is only loaded for a text without a saved vector. The folder
+    # (default <EMBEDDINGS_DIR>/benchmark_embeddings/<model>) is downloaded if missing.
+    "BENCHMARK_EMBEDDINGS_ENABLED": False,
+    "BENCHMARK_EMBEDDINGS_DIR": None,
     # Synthetic and duplicate rows are hidden from retrieval, numina_hard targets,
     # hard-question selection and every other corpus reader. Row indices never change.
     "CORPUS_FILTER_ENABLED": True,

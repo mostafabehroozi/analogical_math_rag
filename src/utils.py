@@ -347,6 +347,23 @@ def create_trace_entry(
 # --- 7. Local Resource Loading Utilities ---
 
 def load_embedding_model(config: dict, logger=None):
+    """The embedding model for retrieval queries.
+
+    With ``BENCHMARK_EMBEDDINGS_ENABLED`` the questions of every supported benchmark
+    come from saved vectors (src/query_embeddings.py) and the model itself is only
+    loaded if a text without a saved vector is ever embedded.
+    """
+    if config.get("BENCHMARK_EMBEDDINGS_ENABLED"):
+        try:
+            from src.query_embeddings import saved_query_encoder
+            return saved_query_encoder(config, lambda: _load_sentence_transformer(config, logger), logger=logger)
+        except Exception as e:
+            message = f"Saved benchmark embeddings could not be used ({e}); loading the embedding model instead."
+            logger.critical(message, exc_info=True) if logger else print(f"ERROR: {message}")
+    return _load_sentence_transformer(config, logger)
+
+
+def _load_sentence_transformer(config: dict, logger=None):
     """
     Load a SentenceTransformer embedding model from either local disk or HuggingFace.
     

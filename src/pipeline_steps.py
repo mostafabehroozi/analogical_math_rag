@@ -73,7 +73,8 @@ def _generate_embeddings(
     embedding_model: SentenceTransformer,
     batch_size: int = 32
 ) -> np.ndarray:
-    if not isinstance(embedding_model, SentenceTransformer) or not texts:
+    # A SentenceTransformer or src.query_embeddings.SavedQueryEncoder.
+    if not hasattr(embedding_model, "encode") or not texts:
         return np.array([])
     try:
         with _LOCAL_COMPUTE_LOCK: 
