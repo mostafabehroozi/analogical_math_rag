@@ -242,10 +242,27 @@ CONFIG = {
     "OPENROUTER_MODEL_ROUTING": {},
     "OPENROUTER_MODEL_FALLBACKS": {},
 
-    # Kaggle Benchmarks model proxy ("kaggle" provider). Runs only inside a
-    # Kaggle notebook with the kaggle-benchmarks package; calls are billed to
-    # the notebook's free benchmarking budget. Model names are kbench.llms
-    # keys such as "google/gemini-2.5-flash".
+    # Kaggle Benchmarks model proxy ("kaggle" provider), through the
+    # kaggle-benchmarks package; calls are billed to the account's free Model
+    # Proxy budget. Model names are kbench.llms keys such as
+    # "google/gemini-2.5-flash".
+    # Where the proxy key comes from:
+    #   False: from the Kaggle Benchmark Task notebook itself (it sets
+    #          MODEL_PROXY_URL / MODEL_PROXY_API_KEY); nothing else works.
+    #   True:  minted from a Kaggle API token (src/kaggle_proxy_auth.py), so a
+    #          normal Kaggle notebook, a laptop or a server works too. The key
+    #          is short-lived and renewed automatically. Kaggle limits such
+    #          keys to its local-development model list; a model outside it is
+    #          refused (InvalidModel / PermissionDenied).
+    "KAGGLE_PROXY_USE_API_TOKEN": False,
+    # The Kaggle API token (https://www.kaggle.com/settings/api), or a path to
+    # a file holding it. Leave "" to look in turn at the KAGGLE_API_TOKEN
+    # environment variable, a Kaggle Secret named KAGGLE_API_TOKEN,
+    # ~/.kaggle/access_token and ~/.kaggle/kaggle.json. Prefer the Secret:
+    # a token written here is saved with the notebook.
+    "KAGGLE_API_TOKEN": "",
+    # Renew the proxy key when it has less than this many seconds left.
+    "KAGGLE_PROXY_TOKEN_REFRESH_SECONDS": 300,
     "KAGGLE_MODEL_NAME_ADAPTATION": None,
     "KAGGLE_MODEL_NAME_FINAL_SOLVER": None,
     "KAGGLE_MODEL_NAME_EVALUATOR": None,

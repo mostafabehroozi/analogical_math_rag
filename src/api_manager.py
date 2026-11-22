@@ -35,6 +35,7 @@ from src.context_logger import (
     ctx_api_failures, ctx_query_idx, ctx_batch_id, record_api_failure, tprint, track_api_failures,
 )
 from src.distributed_execution import api_deadline_due, remaining_api_seconds
+from src.kaggle_proxy_auth import KaggleProxyCredentials, api_token_enabled
 
 try:  # Keep scheduler/batch tests importable without optional provider SDKs.
     import ollama
@@ -1440,6 +1441,11 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
     other.  Batched calls run one ``task.evaluate`` over a DataFrame of
     prompts; every row is its own task run with its own chat.
     The proxy has no per-user keys, so one pseudo-key carries the RPM quota.
+
+    With KAGGLE_PROXY_USE_API_TOKEN the proxy key is minted from a Kaggle API
+    token (src/kaggle_proxy_auth.py) instead of coming from a Benchmark Task
+    notebook, so the provider also works in a normal notebook or off Kaggle.
+    That key is short-lived: model clients are rebuilt after every new key.
     """
 
     provider_name = "kaggle"
@@ -1447,6 +1453,12 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
     _PROXY_KEY = "model-proxy"
 
     def __init__(self, model_quotas: Dict[str, Any], config: Optional[Dict[str, Any]] = None):
+        self.proxy_credentials: Optional[KaggleProxyCredentials] = None
+        if api_token_enabled(config or {}):
+            # Before the import: kaggle_benchmarks reads the proxy settings when imported.
+            self.proxy_credentials = KaggleProxyCredentials.from_config(config or {})
+            self.proxy_credentials.ensure_fresh()
+            print(self.proxy_credentials.describe())
         try:
             import kaggle_benchmarks as kbench
         except ImportError as error:
@@ -1463,7 +1475,8 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
         super().__init__([self._PROXY_KEY], model_quotas, config)
         self.kbench = kbench
         self.timeout_seconds = _request_timeout(self.config, self.provider_name)
-        self._llms: Dict[str, Any] = {}
+        # model name -> (proxy key generation, client); shared by bound copies.
+        self._llms: Dict[str, Tuple[int, Any]] = {}
         self._llm_lock = threading.Lock()
         self._row_task = None
         self.batcher = APIBatchDispatcher(self.provider_name, self._submit_batch)
@@ -1471,13 +1484,26 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
         self._init_batch_refusals()
 
     def _llm(self, model_name: str) -> Any:
+        return self._llm_with_generation(model_name)[1]
+
+    def _llm_with_generation(self, model_name: str) -> Tuple[int, Any]:
+        """The model's client and the proxy key generation it was built with.
+
+        Without API-token keys the generation is always 0 and a client is
+        built once. With them, a new key (about to expire, or rejected) makes
+        every model's client be rebuilt with it.
+        """
+        generation = self.proxy_credentials.ensure_fresh() if self.proxy_credentials else 0
         with self._llm_lock:
-            if model_name not in self._llms:
-                llm = self.kbench.llms.get(model_name)
+            cached = self._llms.get(model_name)
+            if cached is None or cached[0] != generation:
+                # kbench.llms was built at import, possibly with another key.
+                llm = None if self.proxy_credentials else self.kbench.llms.get(model_name)
                 if llm is None:
                     llm = self.kbench.kaggle.load_model(model_name)
-                self._llms[model_name] = self._bound_requests(llm)
-            return self._llms[model_name]
+                cached = (generation, self._bound_requests(llm))
+                self._llms[model_name] = cached
+            return cached
 
     def _bound_requests(self, llm: Any) -> Any:
         """Give the SDK's OpenAI client API_REQUEST_TIMEOUT_SECONDS and no retries of its own.
@@ -1507,9 +1533,15 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             options["reasoning"] = effort
         return options
 
-    def _failure(self, message: str, meta: Dict[str, Any], model_name: str) -> APIResponse:
+    def _failure(self, message: str, meta: Dict[str, Any], model_name: str,
+                 generation: Optional[int] = None) -> APIResponse:
         error_type = _kaggle_error_type(message)
-        if error_type in ("AuthenticationError", "PermissionDeniedError"):
+        denied = error_type in ("AuthenticationError", "PermissionDeniedError")
+        if denied and self.proxy_credentials is not None:
+            # A minted key expired or was revoked: the retry gets a new one.
+            # Only one per generation, however many calls failed on that key.
+            self.proxy_credentials.invalidate(generation)
+        if denied:
             # Every call shares the one proxy pseudo-key, so disabling it for a
             # denied request failed every later call of the session: a 403 on
             # 1 of 10 batch rows (the other 9 succeeded) left 32,052 calls
@@ -1536,13 +1568,14 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
             if lease is None:
                 return {"status": "RATE_LIMITED", "text": None, "error_type": "ProactiveRateLimit", "error_message": f"No eligible Kaggle proxy quota for {model_name}.", "error_details": self.scheduler.snapshot()}
             meta = self._request_meta(lease)
+            generation = None
             try:
-                llm = self._llm(model_name)
+                generation, llm = self._llm_with_generation(model_name)
                 with _call_slot(self.config, self.provider_name, model_name), \
                         self.kbench.chats.new("analogical-math-rag", orphan=True):
                     text = llm.prompt(prompt, **options)
             except Exception as error:
-                return self._failure(f"{type(error).__name__}: {error}", meta, model_name)
+                return self._failure(f"{type(error).__name__}: {error}", meta, model_name, generation)
             if not text:
                 return {"status": "BLOCKED", "text": None, "error_type": "NoChoices", "error_message": "Kaggle model proxy returned no text.", "request_meta": meta}
             return {"status": "SUCCESS", "text": text, "error_type": None, "error_message": None, "request_meta": meta}
@@ -1618,11 +1651,13 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
                 continue
             metas[position] = self._request_meta(lease)
             runnable.append(position)
+        generation: Optional[int] = None
+
         def fail_runnable(error: Exception) -> List[APIResponse]:
             """Fail the rows that got quota the way a direct call would fail."""
             message = f"{type(error).__name__}: {error}"
-            return [self._failure(message, metas[position], model_name) if position in runnable else response
-                    for position, response in enumerate(responses)]
+            return [self._failure(message, metas[position], model_name, generation) if position in runnable
+                    else response for position, response in enumerate(responses)]
 
         if runnable:
             frame = pd.DataFrame({
@@ -1631,7 +1666,7 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
                 "options": [json.dumps(items[position].payload["options"]) for position in runnable],
             })
             try:
-                llm = self._llm(model_name)
+                generation, llm = self._llm_with_generation(model_name)
             except Exception as error:  # An unknown model fails direct calls too.
                 return fail_runnable(error)
             _pace_provider_call(self.config, self.provider_name, model_name)
@@ -1672,7 +1707,7 @@ class KaggleBenchmarksAPIManager(_BatchRefusalMemory, _KeyedAPIManager):
                 result = getattr(run, "result", None)
                 if run is None or str(getattr(run, "status", "")) != "success" or not isinstance(result, dict):
                     message = getattr(run, "error_message", None) or "Kaggle task run produced no result."
-                    responses[position] = self._failure(str(message), meta, model_name)
+                    responses[position] = self._failure(str(message), meta, model_name, generation)
                 elif not result.get("text"):
                     responses[position] = {"status": "BLOCKED", "text": None, "error_type": "NoChoices",
                                            "error_message": "Kaggle model proxy returned no text.", "request_meta": meta}
