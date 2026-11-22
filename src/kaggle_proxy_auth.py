@@ -176,6 +176,9 @@ def _post(endpoint: str, credential: KaggleCredential, timeout: float,
         import requests
         post_fn = requests.post
     headers, auth = credential.request_auth()
+    # Kaggle answers 404 to requests' default "python-requests/x.y" User-Agent
+    # (checked 2026-11-23); its own SDK sends an empty one, which is accepted.
+    headers = {"User-Agent": "", **headers}
     response = post_fn(f"{KAGGLE_API_URL}/{endpoint}", json={}, headers=headers, auth=auth, timeout=timeout)
     status = getattr(response, "status_code", 0)
     if status == 404:

@@ -98,7 +98,8 @@ class MintTest(unittest.TestCase):
         key = kpa.mint_proxy_key(self.credential, post_fn=post)
         self.assertEqual(calls[0]["url"],
                          "https://api.kaggle.com/v1/models.ModelProxyApiService/CreateDefaultModelProxyToken")
-        self.assertEqual(calls[0]["headers"], {"Authorization": f"Bearer {TOKEN}"})
+        # An empty User-Agent: Kaggle answers 404 to requests' default one.
+        self.assertEqual(calls[0]["headers"], {"User-Agent": "", "Authorization": f"Bearer {TOKEN}"})
         self.assertEqual((key.url, key.api_key), ("https://mp.kaggle.net/models/openapi", "proxy-key"))
         self.assertAlmostEqual(key.expires_at, 1893456000.123456, places=3)
         self.assertNotIn("proxy-key", repr(key))
