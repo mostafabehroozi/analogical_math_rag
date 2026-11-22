@@ -158,6 +158,29 @@ class FreshKeyTest(unittest.TestCase):
         self.assertEqual(creds.ensure_fresh(), 2)
         self.assertEqual(len(self.minted), 2)
 
+    def test_kaggle_returning_the_same_key_keeps_clients_and_is_not_asked_every_call(self):
+        expiry = self.now + 3600
+        asked = []
+
+        def same_key_until_expiry(credential):
+            asked.append(self.now)
+            name = "old" if self.now < expiry else "new"
+            return kpa.ProxyKey("https://proxy", name, expiry if name == "old" else self.now + 7200)
+
+        self.mint = same_key_until_expiry
+        creds = self.credentials()
+        self.assertEqual(creds.ensure_fresh(), 1)
+        creds.invalidate(1)                      # a forced renewal gets the same key back
+        self.assertEqual(creds.ensure_fresh(), 1, "same key: clients are not rebuilt")
+        self.now = expiry - 200                  # within the refresh margin
+        for _ in range(10):
+            creds.ensure_fresh()
+            self.now += 5                        # 50 s of calls
+        self.assertEqual(len(asked), 3, "asked once in the margin, not on every call")
+        self.now = expiry + 1
+        self.assertEqual(creds.ensure_fresh(), 2)
+        self.assertEqual(self.environ["MODEL_PROXY_API_KEY"], "new")
+
     def test_an_existing_default_model_is_kept_and_settings_are_checked(self):
         self.environ["LLM_DEFAULT"] = "notebook/model"
         self.credentials().ensure_fresh()

@@ -276,6 +276,7 @@ class KaggleProxyCredentials:
         self._lock = threading.Lock()
         self._key: Optional[ProxyKey] = None
         self._stale = False
+        self._next_ask_at = 0.0
         self.generation = 0
 
     @classmethod
@@ -291,22 +292,39 @@ class KaggleProxyCredentials:
     def key(self) -> Optional[ProxyKey]:
         return self._key
 
+    # Kaggle hands back the same key until it expires (seen 2026-11-23: a
+    # renewal returned the key with 97 of its 120 min left). Near the end the
+    # answer is that same key again, so it is asked for at most this often.
+    REASK_SECONDS = 60.0
+
     def _needs_new_key(self) -> bool:
         if self._key is None or self._stale:
             return True
-        left = self._key.seconds_left(self._clock())
+        now = self._clock()
+        if now < self._next_ask_at:
+            return False
+        left = self._key.seconds_left(now)
         return left is not None and left <= self.refresh_seconds
 
     def ensure_fresh(self) -> int:
-        """Mint a key if there is none, it is about to expire, or it was rejected; return the generation."""
+        """Get a key if there is none, it is about to expire, or it was rejected; return the generation.
+
+        The generation grows only when Kaggle returns a different key, so
+        clients are rebuilt only when the key really changed.
+        """
         with self._lock:
             if self._needs_new_key():
                 key = self._mint(self.credential)
+                now = self._clock()
+                same = self._key is not None and key.api_key == self._key.api_key
                 self._key, self._stale = key, False
-                self.generation += 1
-                self._install(key)
-                left = key.seconds_left(self._clock())
-                logger.info("Kaggle model proxy key #%d minted from %s%s.", self.generation, self.credential.source,
+                left = key.seconds_left(now)
+                self._next_ask_at = now + self.REASK_SECONDS if left is not None and left <= self.refresh_seconds else 0.0
+                if not same:
+                    self.generation += 1
+                    self._install(key)
+                logger.info("Kaggle model proxy key #%d %s from %s%s.", self.generation,
+                            "unchanged" if same else "minted", self.credential.source,
                             "" if left is None else f"; valid for {left / 60:.0f} min")
             return self.generation
 
