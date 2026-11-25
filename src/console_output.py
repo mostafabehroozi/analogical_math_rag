@@ -212,6 +212,9 @@ class _ApiTimings:
         self.total: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0])
         self.failed: Dict[str, int] = defaultdict(int)
         self.successes = 0
+        # For the green line above each failed call in quiet mode.
+        self.successes_since_failure = 0
+        self.failure_printed = False
 
     def record(self, label: str, seconds: float, succeeded: bool) -> bool:
         """Record one attempt; True when a periodic summary is due."""
@@ -227,6 +230,7 @@ class _ApiTimings:
                 self.total[key][0] += seconds
                 self.total[key][1] += 1
             self.successes += 1
+            self.successes_since_failure += 1
             every = _settings.timing_print_every
             return bool(every) and self.successes % every == 0
 
@@ -253,6 +257,19 @@ _batch_runs = 0
 def record_api_call(provider: str, model: str, seconds: float, succeeded: bool) -> None:
     if api_timings.record(f"{provider} | {model}", seconds, succeeded) and not _batch_runs:
         print_api_timing_summary()
+
+
+def take_successes_since_failure() -> Tuple[int, bool]:
+    """Successful API calls since the previous printed failure, and restart that count.
+
+    Returns ``(count, first)``; ``first`` is True when no failure was printed
+    before in this process, so the count runs from the start of the run.
+    """
+    with _lock:
+        count, first = api_timings.successes_since_failure, not api_timings.failure_printed
+        api_timings.successes_since_failure = 0
+        api_timings.failure_printed = True
+        return count, first
 
 
 def print_api_timing_summary() -> None:

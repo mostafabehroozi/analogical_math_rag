@@ -441,6 +441,21 @@ def quiet_successful_api_calls(config: Mapping[str, Any]) -> bool:
     return bool(config.get("QUIET_SUCCESSFUL_API_CALLS", True))
 
 
+def with_success_count(message: str, config: Mapping[str, Any]) -> str:
+    """Put a green line directly above a failed call (🔴): the successful calls since the previous one.
+
+    Only while QUIET_SUCCESSFUL_API_CALLS is on: the successes are then off the
+    console, and this line shows how many went through between two failures
+    (from the start of the run for the first). Part of the same message, so
+    another thread can never print in between.
+    """
+    if not quiet_successful_api_calls(config):
+        return message
+    count, first = console_output.take_successes_since_failure()
+    since = "the run started" if first else "the previous failure"
+    return f"🟢 Successful API calls since {since}: {count:,}\n{message}"
+
+
 def _final_failure_report(label: str, caller: str, attempts: int, prompt: Optional[str],
                           response: APIResponse, config: Mapping[str, Any]) -> str:
     """Everything known about a call that failed for good, for the console.
@@ -600,7 +615,7 @@ def execute_with_retry(config: Dict[str, Any], provider_name: str, model_name: s
 
         # If we reach here, it failed
         error_type = response.get("error_type") or status
-        tprint(log_msg, level="WARNING")
+        tprint(with_success_count(log_msg, config), level="WARNING")
         if pool_attempt:
             return response
 

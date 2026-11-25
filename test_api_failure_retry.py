@@ -266,6 +266,40 @@ def test_failures_still_print_when_quiet():
     assert levels == ["WARNING", "ERROR"]
 
 
+def test_quiet_failures_show_the_success_count_above_them(monkeypatch):
+    from src import console_output
+    monkeypatch.setattr(console_output, "api_timings", console_output._ApiTimings())
+    ok = {"status": "SUCCESS", "text": "answer"}
+    error = {"status": "ERROR", "error_type": "InternalServerError", "error_message": "boom"}
+    succeed = lambda times: [api_manager.execute_with_retry(NO_RETRY, "kaggle", "m", "prompt", lambda: dict(ok))
+                             for _ in range(times)]
+    with patch.object(api_manager, "tprint") as printed:
+        succeed(3)
+        failing_call(NO_RETRY, error)
+        succeed(5)
+        failing_call(NO_RETRY, error)
+        failing_call(NO_RETRY, error)
+        succeed(1)
+        failing_call(NO_RETRY, error)
+    attempts = [call.args[0] for call in printed.call_args_list if call.kwargs["level"] == "WARNING"]
+    assert [text.split("\n", 2)[:2] for text in attempts] == [
+        ["🟢 Successful API calls since the run started: 3", attempts[0].split("\n")[1]],
+        ["🟢 Successful API calls since the previous failure: 5", attempts[1].split("\n")[1]],
+        ["🟢 Successful API calls since the previous failure: 0", attempts[2].split("\n")[1]],
+        ["🟢 Successful API calls since the previous failure: 1", attempts[3].split("\n")[1]],
+    ]
+    # The green line sits directly above the red failed-call line.
+    assert all("🔴 ERROR" in text.split("\n")[1] for text in attempts)
+    # The final failure report right under it carries no second count.
+    reports = [call.args[0] for call in printed.call_args_list if call.kwargs["level"] == "ERROR"]
+    assert len(reports) == 4 and all(text.startswith("[API ERROR] Final failure") for text in reports)
+
+    loud = {**NO_RETRY, "QUIET_SUCCESSFUL_API_CALLS": False}
+    with patch.object(api_manager, "tprint") as printed:
+        failing_call(loud, error)
+    assert not any("Successful API calls" in call.args[0] for call in printed.call_args_list)
+
+
 def test_failure_prompt_can_be_cut():
     config = {**NO_RETRY, "PRINT_FAILED_API_PROMPT_IN_FULL": False, "API_RESPONSE_TRUNCATION_LENGTH": 3}
     with patch.object(api_manager, "tprint") as printed:
