@@ -55,6 +55,30 @@ only the immutable manifest and its own latest shard, skips strictly successful
 questions, and retries failed/partial questions. Different workers may run at
 different times. Do not run the same worker id concurrently in two notebooks.
 
+### One notebook for every worker, one after another
+
+To work through the whole run from a single notebook instead of one notebook
+per worker id, also set (default `False`):
+
+```python
+CONFIG["DISTRIBUTED_SEQUENTIAL_ALL_WORKERS"] = True
+```
+
+(or a `DISTRIBUTED_SEQUENTIAL_ALL_WORKERS` Kaggle Secret). `run_experiments`
+then ignores `DISTRIBUTED_WORKER_ID` and handles worker 0, 1, 2, ... in order.
+For each worker it reads only the remote `status.json`; a `COMPLETE` worker is
+skipped without downloading its shard. Otherwise the worker runs exactly as a
+single-worker notebook would: restore its shard, resume, checkpoint every batch,
+and write its final status. Once that final checkpoint is durable on Hugging
+Face, its local directory is deleted and its in-memory state is freed before the
+next worker is restored. An `INCOMPLETE` worker (failed questions) is left for a
+later run and the loop goes on; at the soft session limit no new worker starts.
+An error stops the loop and keeps the local files. Rerun the same notebook (same
+run id) after a Kaggle restart: completed workers are skipped and the first
+unfinished one resumes from its last checkpoint. Do not run any of these worker
+ids in another notebook at the same time. Run the finalizer once every worker
+is `COMPLETE`.
+
 ### Special dataset and simplification workflows
 
 Transformation-dataset construction, merging-dataset construction, and Core

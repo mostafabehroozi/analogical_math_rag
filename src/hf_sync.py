@@ -870,6 +870,45 @@ def _collect_distributed_checkpoint_files(worker_root: Path) -> List[Tuple[Path,
     return artifacts
 
 
+def remote_distributed_worker_state(config: dict) -> Optional[str]:
+    """Return the state in this worker's remote status.json, or None.
+
+    Reads only the small status file (never the shard), so a sequential run can
+    skip a worker that is already COMPLETE without downloading its results.
+    Any problem (missing file, network, foreign identity) returns None, and the
+    caller then runs the worker normally, which validates everything.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        run_id, worker_id, worker_count = _validate_distributed_identity(config)
+        hf_token, repo_id = _distributed_repo_id(config)
+        remote_path = f"{get_distributed_worker_remote_prefix(config)}/status.json"
+        with tempfile.TemporaryDirectory(prefix="distributed-status-") as staging_dir:
+            local_path = hf_hub_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                filename=remote_path,
+                revision=_get_distributed_revision(config),
+                token=hf_token,
+                local_dir=staging_dir,
+            )
+            payload = json.loads(Path(local_path).read_text(encoding="utf-8"))
+    except EntryNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning("Could not read the remote worker status: %s", exc)
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("run_id") != run_id
+        or payload.get("worker_id") != worker_id
+        or payload.get("worker_count") != worker_count
+    ):
+        return None
+    state = payload.get("state")
+    return str(state).upper() if state else None
+
+
 def _sync_distributed_worker(config: dict):
     logger = logging.getLogger(__name__)
     run_id, worker_id, _ = _validate_distributed_identity(config)

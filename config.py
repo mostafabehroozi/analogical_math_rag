@@ -96,6 +96,14 @@ CONFIG = {
     # tests, reports) never need this. The accepted change is recorded as
     # provenance in worker status and run logs; the manifest is never rewritten.
     "DISTRIBUTED_ALLOW_WORKER_CODE_CHANGE": False,
+    # One notebook works through every worker of the run, 0, 1, 2, ... in turn,
+    # instead of only DISTRIBUTED_WORKER_ID: it restores each worker from
+    # Hugging Face, resumes it, uploads its final checkpoint, deletes its local
+    # files and frees its memory, then moves on. Workers already COMPLETE on the
+    # Hub are skipped; no new worker starts after the soft session limit. Rerun
+    # with the same run id to continue. Never run it while another notebook
+    # runs one of these worker ids.
+    "DISTRIBUTED_SEQUENTIAL_ALL_WORKERS": False,
     "DISTRIBUTED_RUN_ID": None,
     "DISTRIBUTED_WORKER_COUNT": 5,
     "DISTRIBUTED_WORKER_ID": 0,

@@ -106,6 +106,7 @@ from src.hf_sync import (
     ensure_distributed_manifest,
     initialize_workspace,
     periodic_sync_check,
+    remote_distributed_worker_state,
     periodic_batch_sync_check,
     sync_distributed_merged_results,
     sync_workspace_to_hub,
@@ -915,6 +916,7 @@ def _finalize_distributed_worker_status(
         message=message,
     )
     sync_workspace_to_hub(global_config)
+    global_config["_DISTRIBUTED_LAST_WORKER_STATE"] = state
     print(f"Distributed worker session finished with state={state}.")
     return state
 
@@ -2085,6 +2087,109 @@ def _run_pipeline_items_in_batches(
     return [logs_by_index[index] for index in sorted(logs_by_index)] + unindexed_logs
 
 
+def _release_worker_memory_and_disk(global_config: Dict[str, Any]) -> None:
+    """Free one finished worker before the next one: its local shard and caches.
+
+    Called only after the worker's final checkpoint is durable on Hugging Face
+    (the distributed sync is blocking and raises on failure), so deleting the
+    local worker directory loses nothing; the shared manifest is kept.
+    """
+    import gc
+    import shutil
+
+    worker_root = global_config.get("_DISTRIBUTED_WORKER_ROOT")
+    if worker_root and os.path.isdir(worker_root):
+        shutil.rmtree(worker_root, ignore_errors=True)
+        print(f"Removed the local copy of the finished worker: {worker_root}")
+    # Per-question embeddings of the finished worker's questions.
+    from src import pipeline_steps
+    pipeline_steps._QUERY_EMBEDDING_CACHE.clear()
+    for key in (
+        "_DISTRIBUTED_MANIFEST",
+        "_DISTRIBUTED_ALLOWED_QUERY_INDICES",
+        "_DISTRIBUTED_LAST_WORKER_STATE",
+    ):
+        global_config.pop(key, None)
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _run_distributed_workers_sequentially(
+    experiment_configs: List[Dict[str, Any]],
+    global_config: Dict[str, Any],
+    hard_questions: List[str],
+    embedding_model: SentenceTransformer,
+    exemplar_data: Dict[str, Any],
+    api_managers: Dict[str, Any],
+    hard_solutions: Optional[List[str]],
+) -> Dict[str, List[Dict]]:
+    """Run worker 0, 1, ... of one distributed run, one after another, in this notebook.
+
+    Each worker goes through the normal single-worker path (restore its shard
+    from Hugging Face, resume, checkpoint every batch, write its final status).
+    A worker whose remote status is already COMPLETE is skipped without
+    downloading its shard. After a worker ends, its local files and in-memory
+    state are released before the next worker is restored. The Kaggle session
+    clock is shared, so no new worker starts after the soft time limit.
+    The same worker id must not run in another notebook at the same time.
+    """
+    worker_count = int(global_config["DISTRIBUTED_WORKER_COUNT"])
+    original_worker_id = global_config.get("DISTRIBUTED_WORKER_ID")
+    states: Dict[int, str] = {}
+    print(
+        f"Sequential distributed run: workers 0..{worker_count - 1} of "
+        f"{global_config.get('DISTRIBUTED_RUN_ID')} will run one after another."
+    )
+    global_config["_DISTRIBUTED_SEQUENTIAL_ACTIVE"] = True
+    try:
+        for worker_id in range(worker_count):
+            global_config["DISTRIBUTED_WORKER_ID"] = worker_id
+            if stop_new_batches_due(global_config):
+                print(
+                    f"Soft Kaggle session limit reached; worker {worker_id} and later "
+                    "are left for the next session."
+                )
+                break
+            if remote_distributed_worker_state(global_config) == "COMPLETE":
+                states[worker_id] = "COMPLETE"
+                print(f"Worker {worker_id} is already COMPLETE on Hugging Face; skipping it.")
+                continue
+            print(f"\n===== Sequential distributed run: starting worker {worker_id}/{worker_count - 1} =====")
+            run_experiments(
+                experiment_configs, global_config, hard_questions, embedding_model,
+                exemplar_data, api_managers, hard_solutions,
+            )
+            state = global_config.get("_DISTRIBUTED_LAST_WORKER_STATE")
+            if state is None:
+                raise DistributedExecutionError(
+                    f"Worker {worker_id} returned without writing its final status."
+                )
+            states[worker_id] = state
+            _release_worker_memory_and_disk(global_config)
+            if state == "PAUSED_TIME_LIMIT":
+                break
+    finally:
+        global_config.pop("_DISTRIBUTED_SEQUENTIAL_ACTIVE", None)
+    global_config["DISTRIBUTED_WORKER_ID"] = original_worker_id
+    summary = ", ".join(f"worker {wid}={state}" for wid, state in sorted(states.items()))
+    pending = [wid for wid in range(worker_count) if states.get(wid) != "COMPLETE"]
+    print(f"Sequential distributed run finished: {summary or 'no worker ran'}.")
+    if pending:
+        print(
+            f"Not complete yet: workers {pending}. Rerun this notebook with the same "
+            "run id to continue them."
+        )
+    else:
+        print("Every worker is COMPLETE; run the finalizer notebook next.")
+    global_config["_DISTRIBUTED_SEQUENTIAL_WORKER_STATES"] = states
+    return {}
+
+
 def run_experiments(
     experiment_configs: List[Dict[str, Any]],
     global_config: Dict[str, Any],
@@ -2117,6 +2222,14 @@ def run_experiments(
             raise DistributedExecutionError(
                 "DISTRIBUTED_FINALIZER_MODE=True cannot call run_experiments; call "
                 "finalize_distributed_experiments instead."
+            )
+        if (
+            global_config.get("DISTRIBUTED_SEQUENTIAL_ALL_WORKERS", False)
+            and not global_config.get("_DISTRIBUTED_SEQUENTIAL_ACTIVE", False)
+        ):
+            return _run_distributed_workers_sequentially(
+                experiment_configs, global_config, hard_questions, embedding_model,
+                exemplar_data, api_managers, hard_solutions,
             )
         distributed_manifest = _prepare_distributed_worker(
             global_config,
