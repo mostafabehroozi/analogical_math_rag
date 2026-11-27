@@ -2119,6 +2119,33 @@ def _release_worker_memory_and_disk(global_config: Dict[str, Any]) -> None:
         pass
 
 
+def _sequential_worker_ids(global_config: Dict[str, Any]) -> List[int]:
+    """Worker ids for DISTRIBUTED_SEQUENTIAL_ALL_WORKERS, from DISTRIBUTED_SEQUENTIAL_WORKER_RANGE.
+
+    None means every worker; [first, last] means first..last inclusive.
+    """
+    worker_count = int(global_config["DISTRIBUTED_WORKER_COUNT"])
+    worker_range = global_config.get("DISTRIBUTED_SEQUENTIAL_WORKER_RANGE")
+    if worker_range is None:
+        return list(range(worker_count))
+    if (
+        not isinstance(worker_range, (list, tuple))
+        or len(worker_range) != 2
+        or not all(isinstance(value, int) and not isinstance(value, bool) for value in worker_range)
+    ):
+        raise DistributedExecutionError(
+            "DISTRIBUTED_SEQUENTIAL_WORKER_RANGE must be None or [first, last] worker ids, "
+            f"e.g. [5, 9]; got {worker_range!r}."
+        )
+    first, last = worker_range
+    if not 0 <= first <= last < worker_count:
+        raise DistributedExecutionError(
+            f"DISTRIBUTED_SEQUENTIAL_WORKER_RANGE {list(worker_range)} must satisfy "
+            f"0 <= first <= last <= {worker_count - 1} (DISTRIBUTED_WORKER_COUNT={worker_count})."
+        )
+    return list(range(first, last + 1))
+
+
 def _run_distributed_workers_sequentially(
     experiment_configs: List[Dict[str, Any]],
     global_config: Dict[str, Any],
@@ -2128,7 +2155,10 @@ def _run_distributed_workers_sequentially(
     api_managers: Dict[str, Any],
     hard_solutions: Optional[List[str]],
 ) -> Dict[str, List[Dict]]:
-    """Run worker 0, 1, ... of one distributed run, one after another, in this notebook.
+    """Run workers of one distributed run, one after another, in this notebook.
+
+    The workers are DISTRIBUTED_SEQUENTIAL_WORKER_RANGE [first, last] (both
+    included), or every worker 0..WORKER_COUNT-1 when it is None.
 
     Each worker goes through the normal single-worker path (restore its shard
     from Hugging Face, resume, checkpoint every batch, write its final status).
@@ -2139,15 +2169,17 @@ def _run_distributed_workers_sequentially(
     The same worker id must not run in another notebook at the same time.
     """
     worker_count = int(global_config["DISTRIBUTED_WORKER_COUNT"])
+    worker_ids = _sequential_worker_ids(global_config)
     original_worker_id = global_config.get("DISTRIBUTED_WORKER_ID")
     states: Dict[int, str] = {}
     print(
-        f"Sequential distributed run: workers 0..{worker_count - 1} of "
-        f"{global_config.get('DISTRIBUTED_RUN_ID')} will run one after another."
+        f"Sequential distributed run: workers {worker_ids[0]}..{worker_ids[-1]} "
+        f"(of 0..{worker_count - 1}) of {global_config.get('DISTRIBUTED_RUN_ID')} "
+        "will run one after another."
     )
     global_config["_DISTRIBUTED_SEQUENTIAL_ACTIVE"] = True
     try:
-        for worker_id in range(worker_count):
+        for worker_id in worker_ids:
             global_config["DISTRIBUTED_WORKER_ID"] = worker_id
             if stop_new_batches_due(global_config):
                 print(
@@ -2177,7 +2209,7 @@ def _run_distributed_workers_sequentially(
         global_config.pop("_DISTRIBUTED_SEQUENTIAL_ACTIVE", None)
     global_config["DISTRIBUTED_WORKER_ID"] = original_worker_id
     summary = ", ".join(f"worker {wid}={state}" for wid, state in sorted(states.items()))
-    pending = [wid for wid in range(worker_count) if states.get(wid) != "COMPLETE"]
+    pending = [wid for wid in worker_ids if states.get(wid) != "COMPLETE"]
     print(f"Sequential distributed run finished: {summary or 'no worker ran'}.")
     if pending:
         print(
@@ -2185,7 +2217,13 @@ def _run_distributed_workers_sequentially(
             "run id to continue them."
         )
     else:
-        print("Every worker is COMPLETE; run the finalizer notebook next.")
+        if len(worker_ids) == worker_count:
+            print("Every worker is COMPLETE; run the finalizer notebook next.")
+        else:
+            print(
+                f"Workers {worker_ids[0]}..{worker_ids[-1]} are COMPLETE; run the finalizer "
+                "once the other workers are COMPLETE too."
+            )
     global_config["_DISTRIBUTED_SEQUENTIAL_WORKER_STATES"] = states
     return {}
 

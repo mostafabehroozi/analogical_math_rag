@@ -104,6 +104,10 @@ CONFIG = {
     # with the same run id to continue. Never run it while another notebook
     # runs one of these worker ids.
     "DISTRIBUTED_SEQUENTIAL_ALL_WORKERS": False,
+    # Which workers that sequential mode handles: None = all of them, or
+    # [first, last] with both included, e.g. [5, 9] runs workers 5, 6, 7, 8, 9.
+    # Only used when DISTRIBUTED_SEQUENTIAL_ALL_WORKERS is True.
+    "DISTRIBUTED_SEQUENTIAL_WORKER_RANGE": None,
     "DISTRIBUTED_RUN_ID": None,
     "DISTRIBUTED_WORKER_COUNT": 5,
     "DISTRIBUTED_WORKER_ID": 0,

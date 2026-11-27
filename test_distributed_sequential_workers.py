@@ -69,6 +69,32 @@ class SequentialWorkersTests(unittest.TestCase):
             {0: "COMPLETE", 1: "COMPLETE", 2: "COMPLETE", 3: "COMPLETE"},
         )
 
+    def test_worker_range_runs_only_first_to_last_inclusive(self):
+        self.config["DISTRIBUTED_WORKER_COUNT"] = 10
+        self.config["DISTRIBUTED_SEQUENTIAL_WORKER_RANGE"] = [5, 9]
+        _, ran, _ = self.run_loop({i: "COMPLETE" for i in range(10)}, remote_states={6: "COMPLETE"})
+        self.assertEqual(ran, [5, 7, 8, 9])
+        self.assertEqual(sorted(self.config["_DISTRIBUTED_SEQUENTIAL_WORKER_STATES"]), [5, 6, 7, 8, 9])
+        self.config["DISTRIBUTED_SEQUENTIAL_WORKER_RANGE"] = (3, 3)
+        _, ran, _ = self.run_loop({3: "COMPLETE"})
+        self.assertEqual(ran, [3])
+
+    def test_invalid_worker_range_is_rejected_before_any_worker_runs(self):
+        for bad in ([5], [9, 5], [-1, 2], [0, 4], ["0", "2"], [True, 2], 5, "0-3"):
+            with self.subTest(bad=bad):
+                self.config["DISTRIBUTED_SEQUENTIAL_WORKER_RANGE"] = bad
+                with patch.object(orchestration, "run_experiments") as single, \
+                        patch.object(orchestration, "remote_distributed_worker_state") as remote:
+                    with self.assertRaisesRegex(
+                        orchestration.DistributedExecutionError, "DISTRIBUTED_SEQUENTIAL_WORKER_RANGE"
+                    ):
+                        orchestration._run_distributed_workers_sequentially(
+                            [{"experiment_name": "exp"}], self.config, ["q"], None, {}, {}, ["a"],
+                        )
+                    single.assert_not_called()
+                    remote.assert_not_called()
+                self.assertNotIn("_DISTRIBUTED_SEQUENTIAL_ACTIVE", self.config)
+
     def test_skips_workers_already_complete_on_the_hub(self):
         _, ran, _ = self.run_loop(
             {i: "COMPLETE" for i in range(4)},
@@ -135,6 +161,7 @@ class SequentialWorkersTests(unittest.TestCase):
         from src.distributed_execution import sanitize_scientific_config
 
         self.assertFalse(project_config.CONFIG["DISTRIBUTED_SEQUENTIAL_ALL_WORKERS"])
+        self.assertIsNone(project_config.CONFIG["DISTRIBUTED_SEQUENTIAL_WORKER_RANGE"])
         self.assertNotIn(
             "DISTRIBUTED_SEQUENTIAL_ALL_WORKERS",
             sanitize_scientific_config({"DISTRIBUTED_SEQUENTIAL_ALL_WORKERS": True, "X": 1}),

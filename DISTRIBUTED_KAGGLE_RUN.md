@@ -66,6 +66,16 @@ CONFIG["DISTRIBUTED_SEQUENTIAL_ALL_WORKERS"] = True
 
 (or a `DISTRIBUTED_SEQUENTIAL_ALL_WORKERS` Kaggle Secret). `run_experiments`
 then ignores `DISTRIBUTED_WORKER_ID` and handles worker 0, 1, 2, ... in order.
+To handle only part of the run, also set a range of worker ids (both ends
+included; default `None` = every worker):
+
+```python
+CONFIG["DISTRIBUTED_SEQUENTIAL_WORKER_RANGE"] = [5, 9]  # workers 5, 6, 7, 8, 9
+```
+
+(or a `DISTRIBUTED_SEQUENTIAL_WORKER_RANGE` Kaggle Secret holding `[5, 9]`).
+Different notebooks can then take non-overlapping ranges of the same run at the
+same time, for example `[0, 4]` and `[5, 9]`.
 For each worker it reads only the remote `status.json`; a `COMPLETE` worker is
 skipped without downloading its shard. Otherwise the worker runs exactly as a
 single-worker notebook would: restore its shard, resume, checkpoint every batch,
