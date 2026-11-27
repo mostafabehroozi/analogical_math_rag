@@ -555,6 +555,18 @@ def _atomic_copy(source: Path, destination: Path) -> None:
             temporary.unlink()
 
 
+def _atomic_move(source: Path, destination: Path) -> None:
+    """Like _atomic_copy, but moves a staged download so it is never on disk twice."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".download.tmp")
+    try:
+        shutil.move(str(source), str(temporary))
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def _initialize_distributed_workspace(config: dict, *, expected_manifest: Optional[dict] = None):
     from src.distributed_execution import resolve_code_fingerprint, validate_manifest_integrity
 
@@ -581,6 +593,9 @@ def _initialize_distributed_workspace(config: dict, *, expected_manifest: Option
                 repo_id=repo_id,
                 repo_type="dataset",
                 local_dir=str(staging_root),
+                # Any blob cache this huggingface_hub version keeps is deleted
+                # with the staging folder instead of growing ~/.cache per shard.
+                cache_dir=str(staging_root / ".hf-cache"),
                 token=hf_token,
                 revision=revision,
                 allow_patterns=allow_patterns,
@@ -686,7 +701,7 @@ def _initialize_distributed_workspace(config: dict, *, expected_manifest: Option
                         raise DistributedSyncError(
                             f"Downloaded worker artifact escaped the worker root: {relative_path}"
                         ) from exc
-                    _atomic_copy(source, destination)
+                    _atomic_move(source, destination)
 
         logger.info("Distributed worker workspace initialized at %s.", worker_root)
         print(f"Distributed worker checkpoint restored from Hugging Face ({repo_id})")
@@ -870,6 +885,80 @@ def _collect_distributed_checkpoint_files(worker_root: Path) -> List[Tuple[Path,
     return artifacts
 
 
+def _file_digest(path: Path, algorithm: str, prefix: bytes = b"") -> str:
+    digest = hashlib.new(algorithm)
+    digest.update(prefix)
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def verify_distributed_worker_uploaded(config: dict) -> int:
+    """Raise unless every checkpoint file of this worker is on the Hub, byte for byte.
+
+    Run before a finished worker's local copy is deleted. It compares each
+    allowlisted local file (exactly what _sync_distributed_worker uploads) with
+    the remote file's size and content hash: LFS sha256, or the git blob id for
+    small files. Files are streamed, so nothing large is read into memory.
+    """
+    logger = logging.getLogger(__name__)
+    hf_token, repo_id = _distributed_repo_id(config)
+    revision = _get_distributed_revision(config)
+    max_retries, retry_base = _get_retry_settings(config)
+    worker_root = _get_distributed_worker_root(config, create=False)
+    worker_prefix = get_distributed_worker_remote_prefix(config)
+    artifacts = _collect_distributed_checkpoint_files(worker_root)
+
+    api = HfApi(token=hf_token)
+    for attempt in range(max_retries + 1):
+        try:
+            remote = {
+                entry.path: entry
+                for entry in api.list_repo_tree(
+                    repo_id=repo_id, repo_type="dataset", revision=revision,
+                    path_in_repo=worker_prefix, recursive=True,
+                )
+                if hasattr(entry, "blob_id")
+            }
+            break
+        except Exception as exc:
+            if attempt >= max_retries or not _is_retryable_hf_error(exc):
+                raise DistributedSyncError(
+                    f"Could not list {worker_prefix} on {repo_id}@{revision} to verify the upload."
+                ) from exc
+            _wait_before_retry(logger, "Distributed upload verification", attempt + 1, retry_base)
+
+    problems = []
+    for local_path, relative in artifacts:
+        remote_path = str(PurePosixPath(worker_prefix) / PurePosixPath(relative.as_posix()))
+        entry = remote.get(remote_path)
+        size = local_path.stat().st_size
+        if entry is None:
+            problems.append(f"{remote_path} is missing")
+            continue
+        if entry.size != size:
+            problems.append(f"{remote_path} has {entry.size} bytes, local {size}")
+            continue
+        lfs = getattr(entry, "lfs", None)
+        sha256 = getattr(lfs, "sha256", None) or (lfs.get("sha256") if isinstance(lfs, dict) else None)
+        if sha256:
+            same = _file_digest(local_path, "sha256") == sha256
+        else:
+            same = _file_digest(local_path, "sha1", f"blob {size}\0".encode()) == entry.blob_id
+        if not same:
+            problems.append(f"{remote_path} differs from the local file")
+    if problems:
+        raise DistributedSyncError(
+            f"Worker checkpoint on {repo_id} does not match the local files: " + "; ".join(problems[:10])
+        )
+    print(
+        f"Verified on Hugging Face: all {len(artifacts)} checkpoint file(s) of "
+        f"{worker_prefix.rsplit('/', 1)[-1]} match the local copy."
+    )
+    return len(artifacts)
+
+
 def remote_distributed_worker_state(config: dict) -> Optional[str]:
     """Return the state in this worker's remote status.json, or None.
 
@@ -891,6 +980,7 @@ def remote_distributed_worker_state(config: dict) -> Optional[str]:
                 revision=_get_distributed_revision(config),
                 token=hf_token,
                 local_dir=staging_dir,
+                cache_dir=os.path.join(staging_dir, ".hf-cache"),
             )
             payload = json.loads(Path(local_path).read_text(encoding="utf-8"))
     except EntryNotFoundError:

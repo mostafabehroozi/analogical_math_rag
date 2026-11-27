@@ -102,11 +102,13 @@ from src.corpus_filter import (
     signature_of_exemplar_data,
 )
 from src.hf_sync import (
+    DistributedSyncError,
     download_distributed_run_for_merge,
     ensure_distributed_manifest,
     initialize_workspace,
     periodic_sync_check,
     remote_distributed_worker_state,
+    verify_distributed_worker_uploaded,
     periodic_batch_sync_check,
     sync_distributed_merged_results,
     sync_workspace_to_hub,
@@ -2087,20 +2089,50 @@ def _run_pipeline_items_in_batches(
     return [logs_by_index[index] for index in sorted(logs_by_index)] + unindexed_logs
 
 
+class _DiscardedResults(dict):
+    """run_experiments' result dict for one worker of a sequential run: stores nothing."""
+
+    def __setitem__(self, key, value):
+        pass
+
+
+def _usage_line(global_config: Dict[str, Any]) -> str:
+    """Free disk under BASE_OUTPUT_DIR and this process's resident memory."""
+    import shutil
+
+    parts = []
+    try:
+        free = shutil.disk_usage(global_config.get("BASE_OUTPUT_DIR") or ".").free
+        parts.append(f"disk free {free / 1024 ** 3:.1f} GiB")
+    except OSError:
+        pass
+    try:
+        import psutil
+        parts.append(f"RAM used by this process {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GiB")
+    except Exception:
+        pass
+    return ", ".join(parts) or "usage unavailable"
+
+
 def _release_worker_memory_and_disk(global_config: Dict[str, Any]) -> None:
     """Free one finished worker before the next one: its local shard and caches.
 
-    Called only after the worker's final checkpoint is durable on Hugging Face
-    (the distributed sync is blocking and raises on failure), so deleting the
-    local worker directory loses nothing; the shared manifest is kept.
+    Called only after the worker's final checkpoint was committed to Hugging
+    Face AND verified there file by file (verify_distributed_worker_uploaded),
+    so deleting the local worker directory loses nothing; only the shared
+    manifest stays on disk.
     """
+    import ctypes
     import gc
     import shutil
 
     worker_root = global_config.get("_DISTRIBUTED_WORKER_ROOT")
     if worker_root and os.path.isdir(worker_root):
-        shutil.rmtree(worker_root, ignore_errors=True)
-        print(f"Removed the local copy of the finished worker: {worker_root}")
+        try:
+            shutil.rmtree(worker_root)
+            print(f"Removed the local copy of the finished worker: {worker_root}")
+        except OSError as error:
+            print(f"WARNING: could not fully remove {worker_root} (already on Hugging Face): {error}")
     # Per-question embeddings of the finished worker's questions.
     from src import pipeline_steps
     pipeline_steps._QUERY_EMBEDDING_CACHE.clear()
@@ -2111,12 +2143,19 @@ def _release_worker_memory_and_disk(global_config: Dict[str, Any]) -> None:
     ):
         global_config.pop(key, None)
     gc.collect()
+    # glibc keeps freed heap pages of the big run-log JSON inside the process;
+    # malloc_trim hands them back to the OS (Linux/Kaggle only, no-op elsewhere).
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
     try:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass
+    print(f"Worker released: {_usage_line(global_config)}.")
 
 
 def _sequential_worker_ids(global_config: Dict[str, Any]) -> List[int]:
@@ -2177,6 +2216,9 @@ def _run_distributed_workers_sequentially(
         f"(of 0..{worker_count - 1}) of {global_config.get('DISTRIBUTED_RUN_ID')} "
         "will run one after another."
     )
+    # Downloads through hf_xet may keep a chunk cache (up to 10 GB) under
+    # ~/.cache; each shard is downloaded once, so the cache only costs disk.
+    os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
     global_config["_DISTRIBUTED_SEQUENTIAL_ACTIVE"] = True
     try:
         for worker_id in worker_ids:
@@ -2202,6 +2244,15 @@ def _run_distributed_workers_sequentially(
                     f"Worker {worker_id} returned without writing its final status."
                 )
             states[worker_id] = state
+            # Delete nothing until the Hub holds exactly the local files. A
+            # mismatch (e.g. a log line written after the final sync) gets one
+            # more upload; a second mismatch stops here and keeps the files.
+            try:
+                verify_distributed_worker_uploaded(global_config)
+            except DistributedSyncError as error:
+                print(f"Upload check failed ({error}); uploading worker {worker_id} again.")
+                sync_workspace_to_hub(global_config)
+                verify_distributed_worker_uploaded(global_config)
             _release_worker_memory_and_disk(global_config)
             if state == "PAUSED_TIME_LIMIT":
                 break
@@ -2242,7 +2293,11 @@ def run_experiments(
     Supports both standard and cross-experiment deferred execution modes.
     """
     logger = logging.getLogger(__name__)
-    all_results = {}
+    # A sequential multi-worker run discards the returned logs, so keeping each
+    # finished experiment's full logs here would only hold RAM until the end.
+    all_results = (
+        _DiscardedResults() if global_config.get("_DISTRIBUTED_SEQUENTIAL_ACTIVE") else {}
+    )
     distributed_manifest: Optional[Dict[str, Any]] = None
     distributed_experiment_configs = list(experiment_configs)
 

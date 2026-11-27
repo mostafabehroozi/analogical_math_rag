@@ -79,9 +79,14 @@ same time, for example `[0, 4]` and `[5, 9]`.
 For each worker it reads only the remote `status.json`; a `COMPLETE` worker is
 skipped without downloading its shard. Otherwise the worker runs exactly as a
 single-worker notebook would: restore its shard, resume, checkpoint every batch,
-and write its final status. Once that final checkpoint is durable on Hugging
-Face, its local directory is deleted and its in-memory state is freed before the
-next worker is restored. An `INCOMPLETE` worker (failed questions) is left for a
+and write its final status. After the final upload, every uploaded file is
+compared with the Hub copy (size and content hash); a mismatch is uploaded once
+more and checked again, and a second mismatch stops the run with the local files
+kept. Only then is the worker's local directory deleted and its memory freed
+(logs are not kept in RAM across experiments in this mode, and freed heap is
+returned to the OS), before the next worker is restored. A restore moves the
+downloaded shard into place instead of copying it, so a shard is never on disk
+twice. Each worker's end prints the free disk and the process's RAM. An `INCOMPLETE` worker (failed questions) is left for a
 later run and the loop goes on; at the soft session limit no new worker starts.
 An error stops the loop and keeps the local files. Rerun the same notebook (same
 run id) after a Kaggle restart: completed workers are skipped and the first
